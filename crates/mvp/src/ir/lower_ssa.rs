@@ -67,6 +67,25 @@ pub fn lower_module(tm: &tree::Module) -> ssa::Module {
         .map(|p| (p.fid, p.captures.clone()))
         .collect();
 
+    // FuncIds whose body is PassThrough. Used at AllocClosure emission
+    // to detect "capture flowing into a PassThrough body" so the
+    // builder can mark the source Value (or capture slot) for pin
+    // wiring at SSA→tree time. Inner PassThrough literals are not yet
+    // produced (Stream B work), but top-level PassThrough functions
+    // exist today — and a sibling Lowered function calling them via
+    // a closure-allocation path would still trigger this.
+    let passthrough_fids: HashSet<FuncId> = pending
+        .iter()
+        .filter(|p| match &p.kind {
+            PendingKind::TopLevelPassThrough(_) => true,
+            PendingKind::InnerLiteral(lit) => {
+                matches!(lit.body, FuncBody::PassThrough(_)) || lit.force_passthrough.get()
+            }
+            PendingKind::TopLevel(_) => false,
+        })
+        .map(|p| p.fid)
+        .collect();
+
     // Pass 2: build each pending function in FuncId order. Each
     // `FunctionBuilder::finish()` pushes one slot to `module.functions`,
     // so build-order == FuncId-order is mandatory for the indices to
@@ -75,18 +94,126 @@ pub fn lower_module(tm: &tree::Module) -> ssa::Module {
     for p in &pending {
         match &p.kind {
             PendingKind::TopLevel(f) => {
-                lower_top_level_function(&mut sm, f, &func_names, &inner_captures);
+                lower_top_level_function(
+                    &mut sm,
+                    f,
+                    &func_names,
+                    &inner_captures,
+                    &passthrough_fids,
+                );
             }
             PendingKind::TopLevelPassThrough(lit) => {
                 push_passthrough_function(&mut sm, lit);
             }
             PendingKind::InnerLiteral(lit) => {
-                lower_inner_literal(&mut sm, lit, &p.captures, &func_names, &inner_captures);
+                lower_inner_literal(
+                    &mut sm,
+                    lit,
+                    &p.captures,
+                    &func_names,
+                    &inner_captures,
+                    &passthrough_fids,
+                );
             }
         }
     }
 
+    // Fixed-point propagation: for every Lowered function whose
+    // `captures_pass_through_onward` set is non-empty, walk every
+    // AllocClosure in any other function targeting this function and
+    // propagate the flagged capture slots back into the calling
+    // function's captured-by-passthrough or onward set. Iterate until
+    // no change.
+    propagate_passthrough_captures(&mut sm);
+
     sm
+}
+
+fn propagate_passthrough_captures(sm: &mut ssa::Module) {
+    loop {
+        let mut changed = false;
+        // Snapshot onward sets so we can read while writing into other
+        // functions.
+        let onward: Vec<Vec<usize>> = sm
+            .functions
+            .iter()
+            .map(|f| f.captures_pass_through_onward.clone())
+            .collect();
+
+        for caller_idx in 0..sm.functions.len() {
+            // Collect (target_fid, captures-clone) pairs from this
+            // caller's AllocClosure instructions. Have to clone the
+            // vector to avoid borrowing the function while we mutate
+            // it below.
+            let allocs: Vec<(FuncId, Vec<Operand>)> = match &sm.functions[caller_idx].body {
+                ssa::FunctionBody::Lowered(b) => b
+                    .instructions
+                    .iter()
+                    .filter_map(|inst| match &inst.kind {
+                        InstKind::AllocClosure { func, captures } => {
+                            Some((*func, captures.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect(),
+                ssa::FunctionBody::PassThrough(_) => continue,
+            };
+
+            for (target_fid, captures) in allocs {
+                let target_onward = &onward[target_fid.0 as usize];
+                if target_onward.is_empty() {
+                    continue;
+                }
+                for &slot in target_onward {
+                    if slot >= captures.len() {
+                        continue;
+                    }
+                    match captures[slot] {
+                        Operand::Value(v) => {
+                            let cap = &mut sm.functions[caller_idx].captured_by_passthrough;
+                            if !cap.contains(&v.0) {
+                                cap.push(v.0);
+                                changed = true;
+                            }
+                        }
+                        Operand::Capture(idx) => {
+                            let onw = &mut sm.functions[caller_idx]
+                                .captures_pass_through_onward;
+                            if !onw.contains(&idx) {
+                                onw.push(idx);
+                                changed = true;
+                            }
+                        }
+                        Operand::Const(_) => {}
+                    }
+                }
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+
+    // Post-pass constraint check (mirrors the one in
+    // FunctionBuilder::finish, but propagation can introduce new
+    // captured-by-passthrough Value indices after the builder has
+    // already finished).
+    for func in &sm.functions {
+        if let ssa::FunctionBody::Lowered(body) = &func.body {
+            for &vi in &func.captured_by_passthrough {
+                if body.values[vi as usize].source_name.is_none() {
+                    panic!(
+                        "Value %{vi} in function `{}` is captured into a PassThrough body \
+                         but has no source_name. A synthesized intermediate cannot be \
+                         captured by a PassThrough body — the lowering must capture only \
+                         named source-level bindings.",
+                        func.name
+                    );
+                }
+            }
+        }
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -451,6 +578,8 @@ fn push_passthrough_function(sm: &mut ssa::Module, lit: &tree::FuncLiteral) {
     sm.functions.push(ssa::Function {
         name,
         capture_count: 0,
+        captured_by_passthrough: Vec::new(),
+        captures_pass_through_onward: Vec::new(),
         body: ssa::FunctionBody::PassThrough(ssa::PassThroughBody {
             source,
             param_names,
@@ -468,10 +597,17 @@ fn lower_top_level_function(
     f: &tree::IrFunction,
     func_names: &HashMap<String, FuncId>,
     inner_captures: &HashMap<FuncId, Vec<String>>,
+    passthrough_fids: &HashSet<FuncId>,
 ) {
     let mut builder = FunctionBuilder::new(sm, f.name.clone(), f.params.len() as u32);
     {
-        let mut conv = Converter::new(&mut builder, func_names, inner_captures, &[]);
+        let mut conv = Converter::new(
+            &mut builder,
+            func_names,
+            inner_captures,
+            &[],
+            passthrough_fids,
+        );
         conv.lower_top_level(f);
     }
     builder.finish();
@@ -488,6 +624,7 @@ fn lower_inner_literal(
     captures: &[String],
     func_names: &HashMap<String, FuncId>,
     inner_captures: &HashMap<FuncId, Vec<String>>,
+    passthrough_fids: &HashSet<FuncId>,
 ) {
     let name = lit.name.clone().unwrap_or_default();
 
@@ -519,7 +656,13 @@ fn lower_inner_literal(
     let mut builder =
         FunctionBuilder::new_with_captures(sm, name, lit.params.len() as u32, captures.len());
     {
-        let mut conv = Converter::new(&mut builder, func_names, inner_captures, captures);
+        let mut conv = Converter::new(
+            &mut builder,
+            func_names,
+            inner_captures,
+            captures,
+            passthrough_fids,
+        );
         conv.lower_inner_literal(lit);
     }
     builder.finish();
@@ -561,6 +704,8 @@ fn push_inner_passthrough_function_with_source(
     sm.functions.push(ssa::Function {
         name,
         capture_count,
+        captured_by_passthrough: Vec::new(),
+        captures_pass_through_onward: Vec::new(),
         body: ssa::FunctionBody::PassThrough(ssa::PassThroughBody {
             source,
             param_names,
@@ -602,6 +747,10 @@ struct Converter<'b, 'm> {
     /// builds bind each name to `Operand::Capture(i)` at the entry
     /// block before any user-visible code runs. Empty for top-level.
     own_captures: &'b [String],
+    /// FuncIds whose body is `FunctionBody::PassThrough`. Read at
+    /// AllocClosure emission to flag captures flowing into a
+    /// PassThrough body for pin wiring at SSA→tree time.
+    passthrough_fids: &'b HashSet<FuncId>,
 
     // Symbol allocation
     next_symbol: u32,
@@ -638,12 +787,14 @@ impl<'b, 'm> Converter<'b, 'm> {
         func_names: &'b HashMap<String, FuncId>,
         inner_captures: &'b HashMap<FuncId, Vec<String>>,
         own_captures: &'b [String],
+        passthrough_fids: &'b HashSet<FuncId>,
     ) -> Self {
         Self {
             builder,
             func_names,
             inner_captures,
             own_captures,
+            passthrough_fids,
             next_symbol: 0,
             scopes: Vec::new(),
             current_def: HashMap::new(),
@@ -1326,6 +1477,31 @@ impl<'b, 'm> Converter<'b, 'm> {
             });
             let cb = self.current_block();
             captures.push(self.read_variable(sym, cb));
+        }
+        // If the AllocClosure target has a PassThrough body, every
+        // non-Const capture must be pinned at emit time so the
+        // PassThrough body's lexical references survive renaming. The
+        // transitive case (target is Lowered but its own body
+        // recursively flows captures into a PassThrough) is handled by
+        // the `propagate_passthrough_captures` fixed-point pass after
+        // all functions are built. Note: with B's design, inner
+        // PassThrough literals short-circuit above with empty captures
+        // (their lexical names are pinned via the outer's source_name
+        // chain rather than via SSA-level captures). The branch below
+        // therefore mostly fires for the sibling case: a Lowered
+        // function AllocClosure-ing a top-level PassThrough.
+        if self.passthrough_fids.contains(&fid) {
+            for op in captures.iter() {
+                match op {
+                    Operand::Value(v) => {
+                        self.builder.mark_value_captured_by_passthrough(*v);
+                    }
+                    Operand::Capture(idx) => {
+                        self.builder.mark_capture_pass_through_onward(*idx);
+                    }
+                    Operand::Const(_) => {}
+                }
+            }
         }
         self.emit(InstKind::AllocClosure {
             func: fid,
