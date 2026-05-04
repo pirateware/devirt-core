@@ -68,7 +68,10 @@ impl Ctx<'_> {
         self.scopes.pop();
     }
     fn bind(&mut self, name: String) {
-        self.scopes.last_mut().expect("no active scope").insert(name);
+        self.scopes
+            .last_mut()
+            .expect("no active scope")
+            .insert(name);
     }
     fn is_bound(&self, name: &str) -> bool {
         self.scopes.iter().any(|s| s.contains(name))
@@ -165,11 +168,7 @@ impl Ctx<'_> {
 
     fn walk_expr(&mut self, e: &Expr) {
         match e {
-            Expr::Number(_)
-            | Expr::String(_)
-            | Expr::Bool(_)
-            | Expr::Null
-            | Expr::Undefined => {}
+            Expr::Number(_) | Expr::String(_) | Expr::Bool(_) | Expr::Null | Expr::Undefined => {}
             Expr::Ident(name) => self.use_name(name),
             Expr::Binary { lhs, rhs, .. } => {
                 self.walk_expr(lhs);
@@ -196,7 +195,10 @@ impl Ctx<'_> {
             // Pass 1 has not yet stamped this literal — caller is
             // analyzing in the wrong order. Treat as opaque (no
             // propagation) to avoid panicking, but this is a bug.
-            debug_assert!(false, "free_vars::analyze called before pass 1 stamped FuncId");
+            debug_assert!(
+                false,
+                "free_vars::analyze called before pass 1 stamped FuncId"
+            );
             return;
         };
         if let Some(caps) = self.inner_captures.get(&fid) {

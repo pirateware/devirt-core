@@ -176,7 +176,7 @@ impl Printer<'_> {
                 // function declarations require one in JS).
                 let name = lit.name.as_deref().expect("Stmt::FuncDecl requires a name");
                 self.write_func_header(lit, Some(name));
-                self.write_func_body(&lit.body);
+                self.write_func_body_with_arrow(&lit.body, lit.is_arrow);
             }
         }
     }
@@ -218,9 +218,20 @@ impl Printer<'_> {
     }
 
     fn write_func_body(&mut self, body: &FuncBody) {
+        self.write_func_body_with_arrow(body, false)
+    }
+
+    /// Same as `write_func_body`, but emits `=>` before block/passthrough
+    /// bodies when `is_arrow` is true. `Expression` body always implies
+    /// arrow shape.
+    fn write_func_body_with_arrow(&mut self, body: &FuncBody, is_arrow: bool) {
         match body {
             FuncBody::Stmts(stmts) => {
-                self.buf.push_str(" {\n");
+                if is_arrow {
+                    self.buf.push_str(" => {\n");
+                } else {
+                    self.buf.push_str(" {\n");
+                }
                 self.indent += 1;
                 for s in stmts {
                     self.pad();
@@ -241,7 +252,11 @@ impl Printer<'_> {
                 // outer braces. Stage 5 (emit pipeline) will re-parse +
                 // codegen via oxc; for now this is a faithful textual
                 // round-trip.
-                self.buf.push_str(" {");
+                if is_arrow {
+                    self.buf.push_str(" => {");
+                } else {
+                    self.buf.push_str(" {");
+                }
                 self.buf.push_str(src);
                 self.buf.push('}');
             }
@@ -322,7 +337,7 @@ impl Printer<'_> {
                     self.buf.push('(');
                 }
                 self.write_func_header(lit, lit.name.as_deref());
-                self.write_func_body(&lit.body);
+                self.write_func_body_with_arrow(&lit.body, lit.is_arrow);
                 if !lit.is_arrow {
                     self.buf.push(')');
                 }

@@ -53,8 +53,17 @@ pub fn lower_module(sm: &ssa::Module) -> tree::Module {
 }
 
 pub fn lower_module_with_config(sm: &ssa::Module, cfg: &EmitConfig) -> tree::Module {
+    // Functions that are the target of an `AllocClosure` are NOT
+    // top-level — they're emitted inline as `Expr::Func` / `Stmt::FuncDecl`
+    // by their containing function's lowering. Skip them here so the
+    // module doesn't double-emit.
+    let inner_targets = collect_inner_targets(sm);
+
     let mut items = Vec::with_capacity(sm.functions.len());
     for (i, func) in sm.functions.iter().enumerate() {
+        if inner_targets.contains(&FuncId(i as u32)) {
+            continue;
+        }
         match &func.body {
             ssa::FunctionBody::Lowered(_) => {
                 items.push(Item::Function(lower_function(
@@ -74,6 +83,26 @@ pub fn lower_module_with_config(sm: &ssa::Module, cfg: &EmitConfig) -> tree::Mod
     tree::Module { items }
 }
 
+/// Collect every FuncId that appears as the target of an `AllocClosure`
+/// anywhere in the module. These are the inner literals; the outer's
+/// `lower_function` resugars them inline, so they must not be emitted
+/// at module top-level.
+fn collect_inner_targets(sm: &ssa::Module) -> HashSet<FuncId> {
+    let mut targets = HashSet::new();
+    for f in &sm.functions {
+        let body = match &f.body {
+            ssa::FunctionBody::Lowered(b) => b,
+            ssa::FunctionBody::PassThrough(_) => continue,
+        };
+        for inst in &body.instructions {
+            if let InstKind::AllocClosure { func, .. } = &inst.kind {
+                targets.insert(*func);
+            }
+        }
+    }
+    targets
+}
+
 fn passthrough_to_literal(
     sm: &ssa::Module,
     func: &Function,
@@ -91,6 +120,8 @@ fn passthrough_to_literal(
         is_arrow: pt.is_arrow,
         body: tree::FuncBody::PassThrough(pt.source.clone()),
         func_id: std::cell::Cell::new(None),
+        passthrough_source: Some(pt.source.clone()),
+        force_passthrough: std::cell::Cell::new(false),
     }
     // `func.name` and `pt.function_name` agree by construction (the OXC
     // lowerer populates both); we trust pt.function_name here.
@@ -134,7 +165,7 @@ pub struct EmitConfig {
 }
 
 fn lower_function(sm: &ssa::Module, _id: FuncId, func: &Function, cfg: &EmitConfig) -> IrFunction {
-    let mut ctx = LowerCtx::new(sm, func, cfg);
+    let mut ctx = LowerCtx::new(sm, func, cfg, Vec::new());
     let param_names: Vec<String> = func
         .lowered()
         .params
@@ -179,6 +210,11 @@ struct LowerCtx<'a> {
     loop_info_cache: HashMap<BlockId, Option<LoopInfo>>,
     /// Cached domination relation.
     dom_cache: HashMap<(BlockId, BlockId), bool>,
+    /// Capture-name overrides for `Operand::Capture(idx)`. Empty for
+    /// top-level functions; populated when `AllocClosure` recursively
+    /// lowers an inner Lowered body — each entry is the source-level
+    /// expression text the outer scope uses for that capture slot.
+    capture_names: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -188,7 +224,12 @@ struct LoopInfo {
 }
 
 impl<'a> LowerCtx<'a> {
-    fn new(sm: &'a ssa::Module, func: &'a Function, cfg: &EmitConfig) -> Self {
+    fn new(
+        sm: &'a ssa::Module,
+        func: &'a Function,
+        cfg: &EmitConfig,
+        capture_names: Vec<String>,
+    ) -> Self {
         let (value_names, hoisted) = assign_names(sm, func, cfg);
         Self {
             sm,
@@ -198,6 +239,7 @@ impl<'a> LowerCtx<'a> {
             reachable_cache: HashMap::new(),
             loop_info_cache: HashMap::new(),
             dom_cache: HashMap::new(),
+            capture_names,
         }
     }
 
@@ -217,14 +259,18 @@ impl<'a> LowerCtx<'a> {
             Operand::Const(c) => self.constant_to_expr(c),
             Operand::Capture(idx) => {
                 // Lowered inner functions reference enclosing-scope values
-                // via Operand::Capture(idx). At emit time the closure's
-                // body lives inside the function expression that was
-                // synthesized from the AllocClosure; the capture name is
-                // the outer-scope binding for that capture slot. Stage 5
-                // (emit pipeline) is responsible for plumbing the actual
-                // name in. Until then, render a placeholder so the IR
-                // is debuggable.
-                Expr::Ident(format!("__cap{}", idx))
+                // via Operand::Capture(idx). The outer's `AllocClosure`
+                // recursive lowering supplies a `capture_names` vector
+                // — element `i` is the source-level expression text the
+                // outer uses for that capture slot. When this LowerCtx
+                // is the outermost (top-level) one, no captures are
+                // populated; rendering a placeholder is the debuggable
+                // fallback.
+                if let Some(name) = self.capture_names.get(*idx) {
+                    Expr::Ident(name.clone())
+                } else {
+                    Expr::Ident(format!("__cap{}", idx))
+                }
             }
         }
     }
@@ -503,9 +549,7 @@ impl LowerCtx<'_> {
                 callee: Box::new(Expr::Ident("Array".to_string())),
                 args: vec![],
             },
-            AllocClosure { .. } => {
-                panic!("AllocClosure not lowered: closures aren't yet emitted by the SSA converter")
-            }
+            AllocClosure { func, captures } => self.alloc_closure_to_expr(*func, captures),
             Construct { ctor, args } => Expr::Call {
                 callee: Box::new(self.operand_to_expr(ctor)),
                 args: args.iter().map(|a| self.operand_to_expr(a)).collect(),
@@ -531,6 +575,108 @@ impl LowerCtx<'_> {
                 callee: Box::new(Expr::Ident("eval".to_string())),
                 args: vec![self.operand_to_expr(source)],
             },
+        }
+    }
+
+    /// Recursively lower an inner function (Lowered or PassThrough) into
+    /// an `Expr::Func(FuncLiteral)`. Captures are resolved by rendering
+    /// each capture operand through `operand_to_expr` and stringifying
+    /// the resulting expression — the inner body's `Operand::Capture(i)`
+    /// reads will pick up the same name through the inner LowerCtx's
+    /// `capture_names` vector.
+    fn alloc_closure_to_expr(&self, func: FuncId, captures: &[Operand]) -> Expr {
+        let inner = &self.sm.functions[func.0 as usize];
+
+        // Render each capture to a textual expression. We require each
+        // capture to be a simple identifier or constant — anything more
+        // complex would need a `let` introduced before the FuncLiteral,
+        // which the current lowering pipeline doesn't emit. In practice
+        // the SSA converter always passes Operand::Value or
+        // Operand::Capture here; we render via operand_to_expr and
+        // serialize.
+        let capture_exprs: Vec<Expr> = captures.iter().map(|o| self.operand_to_expr(o)).collect();
+        let capture_names: Vec<String> = capture_exprs
+            .iter()
+            .map(|e| match e {
+                Expr::Ident(n) => n.clone(),
+                // Non-ident captures: stringify the expression. The
+                // resulting text becomes the inner body's reference for
+                // that capture slot. For literal-rendered captures this
+                // is fine; for complex outer expressions we'd want
+                // pre-extraction, which is out of scope for Stream B.
+                _ => render_expr_to_string(e),
+            })
+            .collect();
+
+        let lit = self.build_func_literal(inner, capture_names);
+        Expr::Func(Box::new(lit))
+    }
+
+    fn build_func_literal(
+        &self,
+        inner: &Function,
+        capture_names: Vec<String>,
+    ) -> tree::FuncLiteral {
+        match &inner.body {
+            ssa::FunctionBody::PassThrough(pt) => tree::FuncLiteral {
+                name: pt
+                    .function_name
+                    .map(|s| self.sm.strings.resolve(&s).to_string()),
+                params: pt
+                    .param_names
+                    .iter()
+                    .map(|n| self.sm.strings.resolve(n).to_string())
+                    .collect(),
+                is_async: pt.is_async,
+                is_generator: pt.is_generator,
+                is_arrow: pt.is_arrow,
+                body: tree::FuncBody::PassThrough(pt.source.clone()),
+                func_id: std::cell::Cell::new(None),
+                passthrough_source: Some(pt.source.clone()),
+                force_passthrough: std::cell::Cell::new(false),
+            },
+            ssa::FunctionBody::Lowered(_) => {
+                // Recursively lower the inner body. We use the default
+                // EmitConfig — pin propagation is Stream C's concern.
+                let cfg = EmitConfig::default();
+                let mut ctx = LowerCtx::new(self.sm, inner, &cfg, capture_names);
+                let param_names: Vec<String> = inner
+                    .lowered()
+                    .params
+                    .iter()
+                    .map(|v| ctx.name_for(*v).to_string())
+                    .collect();
+                let mut body = Vec::new();
+                for name in ctx.hoisted_names_in_decl_order() {
+                    body.push(Stmt::Let { name, init: None });
+                }
+                ctx.walk(inner.lowered().entry, None, &mut body);
+
+                // Detect arrow-shaped output? Inner Lowered functions
+                // came from either a function expression or an arrow.
+                // The SSA layer doesn't preserve which; emit as a
+                // function expression conservatively (named if a name
+                // exists, anonymous otherwise). Stream B accepts this
+                // round-trip diff: an arrow input may re-emit as a
+                // function expression. Both are observably equivalent
+                // modulo `this` binding, which we don't model.
+                let name = if !inner.name.is_empty() {
+                    Some(inner.name.clone())
+                } else {
+                    None
+                };
+                tree::FuncLiteral {
+                    name,
+                    params: param_names,
+                    is_async: false,
+                    is_generator: false,
+                    is_arrow: false,
+                    body: tree::FuncBody::Stmts(body),
+                    func_id: std::cell::Cell::new(None),
+                    passthrough_source: None,
+                    force_passthrough: std::cell::Cell::new(false),
+                }
+            }
         }
     }
 
@@ -1014,6 +1160,49 @@ fn pick_name(
             committed.insert(candidate.clone(), vi);
             return candidate;
         }
+    }
+}
+
+/// Best-effort serialization of a tree-IR `Expr` to a JS-shaped string.
+/// Used only for non-identifier capture operands rendered into an inner
+/// closure body's `Operand::Capture` resolution. This is a last-resort
+/// fallback; a more rigorous approach would extract the capture into a
+/// `let` before the FuncLiteral.
+fn render_expr_to_string(e: &Expr) -> String {
+    use crate::ir::tree::{binop_str, unop_str};
+    match e {
+        Expr::Number(n) => format!("{n}"),
+        Expr::String(s) => format!("{s:?}"),
+        Expr::Bool(b) => format!("{b}"),
+        Expr::Null => "null".to_string(),
+        Expr::Undefined => "undefined".to_string(),
+        Expr::Ident(n) => n.clone(),
+        Expr::Binary { op, lhs, rhs } => format!(
+            "({}{}{})",
+            render_expr_to_string(lhs),
+            binop_str(*op),
+            render_expr_to_string(rhs)
+        ),
+        Expr::Unary { op, operand } => {
+            format!("({}{})", unop_str(*op), render_expr_to_string(operand))
+        }
+        Expr::Member { obj, prop } => format!("{}.{}", render_expr_to_string(obj), prop),
+        Expr::Index { obj, index } => {
+            format!(
+                "{}[{}]",
+                render_expr_to_string(obj),
+                render_expr_to_string(index)
+            )
+        }
+        Expr::Call { callee, args } => format!(
+            "{}({})",
+            render_expr_to_string(callee),
+            args.iter()
+                .map(render_expr_to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Expr::Func(_) => "/*func*/".to_string(),
     }
 }
 
