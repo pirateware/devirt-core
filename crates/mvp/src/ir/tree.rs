@@ -90,6 +90,22 @@ pub struct FuncLiteral {
     /// `AllocClosure` for the enclosing scope. `Cell` so the tree-IR
     /// stays `&`-borrowable while the converter runs.
     pub func_id: Cell<Option<FuncId>>,
+    /// Verbatim source slice for this literal's body (between `{` and
+    /// `}`, exclusive — same shape as `FuncBody::PassThrough(s)`).
+    /// Stashed at lower.rs time for every Lowered nested literal so
+    /// pass 1's forward-ref / reassigned-capture rule can re-classify
+    /// the literal to PassThrough cheaply, without re-slicing source.
+    /// `None` means "no source available" — top-level Lowered functions
+    /// don't need this, and tests that build tree-IR by hand may omit it
+    /// (re-classification is then skipped).
+    pub passthrough_source: Option<String>,
+    /// Set by pass 1 of SSA lowering when the forward-ref or
+    /// reassigned-capture rule fires (see project memory
+    /// `closures-disposition-rule`). When `true`, pass 2 routes this
+    /// literal to a PassThrough body using `passthrough_source`. Tests
+    /// that omit `passthrough_source` will not re-classify even if this
+    /// flag is set; the violation is logged via debug_assert in that case.
+    pub force_passthrough: Cell<bool>,
 }
 
 #[derive(Debug, Clone)]

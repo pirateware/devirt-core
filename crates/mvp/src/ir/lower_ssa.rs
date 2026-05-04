@@ -122,7 +122,26 @@ fn discover_module<'a>(tm: &'a tree::Module) -> Vec<PendingFunction<'a>> {
                     kind: PendingKind::TopLevel(f),
                     captures: Vec::new(),
                 });
-                discover_stmts(&f.body, &mut pending, &mut captures_by_fid);
+                // Build outer-body context: reassigned-name set + an
+                // empty bindings-seen-so-far set (params and the
+                // function's own name are bound at body entry).
+                let reassigned = collect_reassigned_names(&f.body);
+                let mut seen: HashSet<String> = HashSet::new();
+                seen.insert(f.name.clone());
+                for p in &f.params {
+                    seen.insert(p.clone());
+                }
+                // Hoist nested FuncDecl names so a textual position
+                // before the decl can still reference the function name
+                // without it counting as forward-ref.
+                hoist_funcdecl_names(&f.body, &mut seen);
+                discover_stmts(
+                    &f.body,
+                    &mut pending,
+                    &mut captures_by_fid,
+                    &mut seen,
+                    &reassigned,
+                );
                 // Top-level functions cannot capture (no enclosing JS
                 // scope). The empty captures list is the load-bearing
                 // statement here, not an oversight.
@@ -150,13 +169,67 @@ fn discover_module<'a>(tm: &'a tree::Module) -> Vec<PendingFunction<'a>> {
     pending
 }
 
+/// Names that appear as the LHS of an `Stmt::Assign` anywhere in
+/// `stmts`, including in nested control-flow blocks. Walks the body
+/// stopping at nested function literals — those have their own scope.
+fn collect_reassigned_names(stmts: &[Stmt]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    walk_reassigned_stmts(stmts, &mut out);
+    out
+}
+
+fn walk_reassigned_stmts(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Assign {
+                target: Expr::Ident(n),
+                ..
+            } => {
+                out.insert(n.clone());
+            }
+            Stmt::Assign { .. } => {}
+            Stmt::Let { .. } | Stmt::Const { .. } | Stmt::ExprStmt(_) | Stmt::Return(_) => {}
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                walk_reassigned_stmts(then_body, out);
+                if let Some(eb) = else_body {
+                    walk_reassigned_stmts(eb, out);
+                }
+            }
+            Stmt::While { body, .. } => walk_reassigned_stmts(body, out),
+            Stmt::Block(ss) => walk_reassigned_stmts(ss, out),
+            Stmt::FuncDecl(_) => {} // nested literal: own scope
+        }
+    }
+}
+
+/// Hoist nested FuncDecl names into `seen` (top-level only — does not
+/// descend into nested control-flow). JS function declarations are
+/// hoisted to the enclosing function scope; this matches our tree-IR
+/// shape (nested FuncDecls live as Stmt::FuncDecl directly under the
+/// function body).
+fn hoist_funcdecl_names(stmts: &[Stmt], seen: &mut HashSet<String>) {
+    for s in stmts {
+        if let Stmt::FuncDecl(lit) = s
+            && let Some(n) = &lit.name
+        {
+            seen.insert(n.clone());
+        }
+    }
+}
+
 fn discover_stmts<'a>(
     stmts: &'a [Stmt],
     pending: &mut Vec<PendingFunction<'a>>,
     captures_by_fid: &mut HashMap<FuncId, Vec<String>>,
+    seen: &mut HashSet<String>,
+    reassigned: &HashSet<String>,
 ) {
     for s in stmts {
-        discover_stmt(s, pending, captures_by_fid);
+        discover_stmt(s, pending, captures_by_fid, seen, reassigned);
     }
 }
 
@@ -164,22 +237,28 @@ fn discover_stmt<'a>(
     s: &'a Stmt,
     pending: &mut Vec<PendingFunction<'a>>,
     captures_by_fid: &mut HashMap<FuncId, Vec<String>>,
+    seen: &mut HashSet<String>,
+    reassigned: &HashSet<String>,
 ) {
     match s {
-        Stmt::Let { init, .. } => {
+        Stmt::Let { name, init } => {
             if let Some(e) = init {
-                discover_expr(e, pending, captures_by_fid);
+                discover_expr(e, pending, captures_by_fid, seen, reassigned);
             }
+            seen.insert(name.clone());
         }
-        Stmt::Const { init, .. } => discover_expr(init, pending, captures_by_fid),
+        Stmt::Const { name, init } => {
+            discover_expr(init, pending, captures_by_fid, seen, reassigned);
+            seen.insert(name.clone());
+        }
         Stmt::Assign { target, value } => {
-            discover_expr(target, pending, captures_by_fid);
-            discover_expr(value, pending, captures_by_fid);
+            discover_expr(target, pending, captures_by_fid, seen, reassigned);
+            discover_expr(value, pending, captures_by_fid, seen, reassigned);
         }
-        Stmt::ExprStmt(e) => discover_expr(e, pending, captures_by_fid),
+        Stmt::ExprStmt(e) => discover_expr(e, pending, captures_by_fid, seen, reassigned),
         Stmt::Return(e) => {
             if let Some(e) = e {
-                discover_expr(e, pending, captures_by_fid);
+                discover_expr(e, pending, captures_by_fid, seen, reassigned);
             }
         }
         Stmt::If {
@@ -187,18 +266,36 @@ fn discover_stmt<'a>(
             then_body,
             else_body,
         } => {
-            discover_expr(cond, pending, captures_by_fid);
-            discover_stmts(then_body, pending, captures_by_fid);
+            discover_expr(cond, pending, captures_by_fid, seen, reassigned);
+            // Inner-block bindings don't escape; clone seen so they
+            // don't pollute the outer state.
+            let mut inner_seen = seen.clone();
+            discover_stmts(
+                then_body,
+                pending,
+                captures_by_fid,
+                &mut inner_seen,
+                reassigned,
+            );
             if let Some(eb) = else_body {
-                discover_stmts(eb, pending, captures_by_fid);
+                let mut inner_seen2 = seen.clone();
+                discover_stmts(eb, pending, captures_by_fid, &mut inner_seen2, reassigned);
             }
         }
         Stmt::While { cond, body } => {
-            discover_expr(cond, pending, captures_by_fid);
-            discover_stmts(body, pending, captures_by_fid);
+            discover_expr(cond, pending, captures_by_fid, seen, reassigned);
+            let mut inner_seen = seen.clone();
+            discover_stmts(body, pending, captures_by_fid, &mut inner_seen, reassigned);
         }
-        Stmt::Block(ss) => discover_stmts(ss, pending, captures_by_fid),
-        Stmt::FuncDecl(lit) => discover_literal(lit, pending, captures_by_fid),
+        Stmt::Block(ss) => {
+            let mut inner_seen = seen.clone();
+            discover_stmts(ss, pending, captures_by_fid, &mut inner_seen, reassigned);
+        }
+        Stmt::FuncDecl(lit) => {
+            // Function name is hoisted (already inserted in `seen` by
+            // hoist_funcdecl_names).
+            discover_literal(lit, pending, captures_by_fid, seen, reassigned);
+        }
     }
 }
 
@@ -206,6 +303,8 @@ fn discover_expr<'a>(
     e: &'a Expr,
     pending: &mut Vec<PendingFunction<'a>>,
     captures_by_fid: &mut HashMap<FuncId, Vec<String>>,
+    seen: &mut HashSet<String>,
+    reassigned: &HashSet<String>,
 ) {
     match e {
         Expr::Number(_)
@@ -215,22 +314,24 @@ fn discover_expr<'a>(
         | Expr::Undefined
         | Expr::Ident(_) => {}
         Expr::Binary { lhs, rhs, .. } => {
-            discover_expr(lhs, pending, captures_by_fid);
-            discover_expr(rhs, pending, captures_by_fid);
+            discover_expr(lhs, pending, captures_by_fid, seen, reassigned);
+            discover_expr(rhs, pending, captures_by_fid, seen, reassigned);
         }
-        Expr::Unary { operand, .. } => discover_expr(operand, pending, captures_by_fid),
+        Expr::Unary { operand, .. } => {
+            discover_expr(operand, pending, captures_by_fid, seen, reassigned)
+        }
         Expr::Call { callee, args } => {
-            discover_expr(callee, pending, captures_by_fid);
+            discover_expr(callee, pending, captures_by_fid, seen, reassigned);
             for a in args {
-                discover_expr(a, pending, captures_by_fid);
+                discover_expr(a, pending, captures_by_fid, seen, reassigned);
             }
         }
-        Expr::Member { obj, .. } => discover_expr(obj, pending, captures_by_fid),
+        Expr::Member { obj, .. } => discover_expr(obj, pending, captures_by_fid, seen, reassigned),
         Expr::Index { obj, index } => {
-            discover_expr(obj, pending, captures_by_fid);
-            discover_expr(index, pending, captures_by_fid);
+            discover_expr(obj, pending, captures_by_fid, seen, reassigned);
+            discover_expr(index, pending, captures_by_fid, seen, reassigned);
         }
-        Expr::Func(lit) => discover_literal(lit, pending, captures_by_fid),
+        Expr::Func(lit) => discover_literal(lit, pending, captures_by_fid, seen, reassigned),
     }
 }
 
@@ -238,6 +339,8 @@ fn discover_literal<'a>(
     lit: &'a FuncLiteral,
     pending: &mut Vec<PendingFunction<'a>>,
     captures_by_fid: &mut HashMap<FuncId, Vec<String>>,
+    outer_seen: &HashSet<String>,
+    outer_reassigned: &HashSet<String>,
 ) {
     // Pre-order: stamp FuncId immediately so any sibling reference
     // discovered later (or parent's later post-order analysis) can read
@@ -252,10 +355,39 @@ fn discover_literal<'a>(
 
     // Recurse into the body to discover deeper nested literals (and to
     // populate their captures before we run free-var analysis on this
-    // one).
+    // one). The inner body has its OWN scope: parameters, hoisted
+    // FuncDecl names, and a fresh reassigned-set.
+    let inner_reassigned = match &lit.body {
+        FuncBody::Stmts(ss) => collect_reassigned_names(ss),
+        FuncBody::Expression(_) | FuncBody::PassThrough(_) => HashSet::new(),
+    };
+    let mut inner_seen: HashSet<String> = HashSet::new();
+    if let Some(n) = &lit.name {
+        inner_seen.insert(n.clone());
+    }
+    for p in &lit.params {
+        inner_seen.insert(p.clone());
+    }
     match &lit.body {
-        FuncBody::Stmts(ss) => discover_stmts(ss, pending, captures_by_fid),
-        FuncBody::Expression(e) => discover_expr(e, pending, captures_by_fid),
+        FuncBody::Stmts(ss) => {
+            hoist_funcdecl_names(ss, &mut inner_seen);
+            discover_stmts(
+                ss,
+                pending,
+                captures_by_fid,
+                &mut inner_seen,
+                &inner_reassigned,
+            );
+        }
+        FuncBody::Expression(e) => {
+            discover_expr(
+                e,
+                pending,
+                captures_by_fid,
+                &mut inner_seen,
+                &inner_reassigned,
+            );
+        }
         // PassThrough bodies are opaque: we cannot discover nested
         // literals inside them, and free-var analysis treats them as
         // capture-less. See `free_vars` module for the limitation.
@@ -266,6 +398,33 @@ fn discover_literal<'a>(
     // analysis. Inner literals' captures are already stamped in
     // `captures_by_fid`, so the analyzer can absorb them.
     let captures = free_vars::analyze(lit, captures_by_fid);
+
+    // Forward-ref / reassigned-capture rule: if any capture is
+    // forward-referenced (not yet in `outer_seen` at this textual
+    // position) or appears in `outer_reassigned`, re-classify this
+    // literal to PassThrough. The check is per project memory
+    // `closures-disposition-rule`.
+    let should_passthrough = captures
+        .iter()
+        .any(|name| !outer_seen.contains(name) || outer_reassigned.contains(name));
+    if should_passthrough {
+        // Source slice is required for re-classification — without it
+        // we'd lose the body. The lower.rs front end always stashes one
+        // for nested literals; tests that build tree-IR by hand may
+        // omit it, in which case we leave the literal as Lowered (and
+        // accept the SSA-level panic the rule was trying to avoid).
+        if lit.passthrough_source.is_some() {
+            lit.force_passthrough.set(true);
+        } else {
+            debug_assert!(
+                false,
+                "forward-ref/reassigned violation on inner literal `{}` but no \
+                 passthrough_source is stashed; cannot re-classify",
+                lit.name.as_deref().unwrap_or("<anon>")
+            );
+        }
+    }
+
     captures_by_fid.insert(fid, captures);
 }
 
@@ -320,10 +479,9 @@ fn lower_top_level_function(
 
 /// Build a Lowered SSA `Function` from a nested `FuncLiteral` whose
 /// body is `FuncBody::Stmts` or `FuncBody::Expression`. PassThrough
-/// inner literals would route through `push_passthrough_function`-style
-/// handling instead; the discovery pass currently does not produce
-/// those (the front end never emits `Stmt::FuncDecl` / `Expr::Func`),
-/// so this path's PassThrough-inner branch is unreachable for now.
+/// inner literals route through `push_inner_passthrough_function`
+/// instead — same shape as `push_passthrough_function` but with the
+/// caller's `capture_count`.
 fn lower_inner_literal(
     sm: &mut ssa::Module,
     lit: &FuncLiteral,
@@ -332,29 +490,91 @@ fn lower_inner_literal(
     inner_captures: &HashMap<FuncId, Vec<String>>,
 ) {
     let name = lit.name.clone().unwrap_or_default();
+
+    // Pass-1 may have flipped `force_passthrough` because of the
+    // forward-ref / reassigned-capture rule. Route the body through
+    // the PassThrough builder using the stashed source slice instead
+    // of trying to lower a Stmts body whose captures don't satisfy
+    // the rule.
+    //
+    // PassThrough inner functions carry capture references lexically
+    // in their preserved source text — `capture_count` is forced to 0
+    // here to match the empty captures vector emitted by the outer's
+    // `alloc_closure_operand`.
+    if lit.force_passthrough.get()
+        && let Some(src) = &lit.passthrough_source
+    {
+        push_inner_passthrough_function_with_source(sm, lit, 0, src.clone());
+        return;
+    }
+
     match &lit.body {
         FuncBody::Stmts(_) | FuncBody::Expression(_) => {}
         FuncBody::PassThrough(_) => {
-            panic!(
-                "inner FuncLiteral `{}` with PassThrough body reached lower_inner_literal — \
-                 the discovery pass should route inner PassThrough literals through \
-                 a separate branch (Stream B)",
-                name
-            );
+            push_inner_passthrough_function(sm, lit, 0);
+            return;
         }
     }
 
-    let mut builder = FunctionBuilder::new_with_captures(
-        sm,
-        name,
-        lit.params.len() as u32,
-        captures.len(),
-    );
+    let mut builder =
+        FunctionBuilder::new_with_captures(sm, name, lit.params.len() as u32, captures.len());
     {
         let mut conv = Converter::new(&mut builder, func_names, inner_captures, captures);
         conv.lower_inner_literal(lit);
     }
     builder.finish();
+}
+
+/// Like `push_passthrough_function`, but for an inner literal that
+/// carries a non-zero `capture_count` (the outer's `AllocClosure`
+/// supplied capture operands; the body references those by name in its
+/// preserved source slice).
+fn push_inner_passthrough_function(
+    sm: &mut ssa::Module,
+    lit: &tree::FuncLiteral,
+    capture_count: usize,
+) {
+    let source = match &lit.body {
+        tree::FuncBody::PassThrough(s) => s.clone(),
+        _ => panic!("push_inner_passthrough_function: body must be PassThrough"),
+    };
+    push_inner_passthrough_function_with_source(sm, lit, capture_count, source);
+}
+
+/// Same as `push_inner_passthrough_function` but takes the source slice
+/// directly — used by the forward-ref / reassigned-capture
+/// re-classification path, where the literal's body is still
+/// `FuncBody::Stmts` but `passthrough_source` carries the original text.
+fn push_inner_passthrough_function_with_source(
+    sm: &mut ssa::Module,
+    lit: &tree::FuncLiteral,
+    capture_count: usize,
+    source: String,
+) {
+    let name = lit.name.clone().unwrap_or_default();
+    let function_name_id = lit.name.as_ref().map(|n| sm.strings.get_or_intern(n));
+    let param_names: Vec<ssa::StrId> = lit
+        .params
+        .iter()
+        .map(|p| sm.strings.get_or_intern(p))
+        .collect();
+    sm.functions.push(ssa::Function {
+        name,
+        capture_count,
+        body: ssa::FunctionBody::PassThrough(ssa::PassThroughBody {
+            source,
+            param_names,
+            function_name: function_name_id,
+            is_async: lit.is_async,
+            is_generator: lit.is_generator,
+            is_arrow: lit.is_arrow,
+            // Arrow expression-body PassThrough is normalized at lower.rs
+            // time: the body slice always parses as a block (we wrap
+            // expression bodies in `return <expr>;`). Keeping
+            // body_is_expression=false here keeps the emit wrapper simple.
+            body_is_expression: false,
+        }),
+    });
 }
 
 // ============================================================================
@@ -482,9 +702,9 @@ impl<'b, 'm> Converter<'b, 'm> {
                         .set_terminator(Terminator::Return { val: Some(v) });
                 }
             }
-            FuncBody::PassThrough(_) => unreachable!(
-                "lower_inner_literal received a PassThrough body; routed elsewhere"
-            ),
+            FuncBody::PassThrough(_) => {
+                unreachable!("lower_inner_literal received a PassThrough body; routed elsewhere")
+            }
         }
 
         self.pop_scope(); // params
@@ -874,10 +1094,7 @@ impl<'b, 'm> Converter<'b, 'm> {
                 // now, in the enclosing scope, and emit an
                 // AllocClosure bound to the function's name.
                 let alloc = self.alloc_closure_operand(lit);
-                let name = lit
-                    .name
-                    .as_ref()
-                    .expect("Stmt::FuncDecl must carry a name");
+                let name = lit.name.as_ref().expect("Stmt::FuncDecl must carry a name");
                 self.tag_binding_source_name(alloc, name);
                 let sym = self.fresh_symbol();
                 self.bind_in_top_scope(name.clone(), sym);
@@ -1076,14 +1293,29 @@ impl<'b, 'm> Converter<'b, 'm> {
             .func_id
             .get()
             .expect("inner FuncLiteral missing FuncId — pass 1 must have stamped it");
+
+        // PassThrough inner functions (or those re-classified to
+        // PassThrough by the forward-ref/reassigned rule) carry their
+        // capture references lexically in the preserved source text.
+        // The SSA AllocClosure does NOT need to thread captures
+        // through — they resolve at re-emit time by the surrounding
+        // scope. Emit an empty capture list and skip the lookup, which
+        // avoids a panic on names that aren't yet textually bound at
+        // this allocation site.
+        let is_passthrough =
+            lit.force_passthrough.get() || matches!(lit.body, FuncBody::PassThrough(_));
+
+        if is_passthrough {
+            return self.emit(InstKind::AllocClosure {
+                func: fid,
+                captures: Vec::new(),
+            });
+        }
+
         // Capture-name list is read from the shared `inner_captures`
         // map rather than re-derived here, so the inner converter and
         // this side agree on order.
-        let names: Vec<String> = self
-            .inner_captures
-            .get(&fid)
-            .cloned()
-            .unwrap_or_default();
+        let names: Vec<String> = self.inner_captures.get(&fid).cloned().unwrap_or_default();
         let mut captures: Vec<Operand> = Vec::with_capacity(names.len());
         for name in &names {
             let sym = self.lookup(name).unwrap_or_else(|| {
@@ -1095,7 +1327,10 @@ impl<'b, 'm> Converter<'b, 'm> {
             let cb = self.current_block();
             captures.push(self.read_variable(sym, cb));
         }
-        self.emit(InstKind::AllocClosure { func: fid, captures })
+        self.emit(InstKind::AllocClosure {
+            func: fid,
+            captures,
+        })
     }
 
     /// Emit an instruction whose result is needed as an `Operand`. Panics if
@@ -2137,6 +2372,8 @@ mod tests {
             is_arrow: false,
             body,
             func_id: Cell::new(None),
+            passthrough_source: None,
+            force_passthrough: Cell::new(false),
         }
     }
 

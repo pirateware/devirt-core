@@ -167,8 +167,10 @@ impl Lowerer<'_> {
             is_async: f.r#async,
             is_generator: f.generator,
             is_arrow: false,
-            body: FuncBody::PassThrough(inner),
+            body: FuncBody::PassThrough(inner.clone()),
             func_id: std::cell::Cell::new(None),
+            passthrough_source: Some(inner),
+            force_passthrough: std::cell::Cell::new(false),
         })
     }
 
@@ -254,6 +256,11 @@ impl Lowerer<'_> {
             .map(|s| self.lower_stmt(s))
             .collect::<Result<Vec<_>, _>>()?;
 
+        // Stash the body's source slice so pass 1 of SSA lowering can
+        // re-classify this literal to PassThrough cheaply if the
+        // forward-ref / reassigned-capture rule fires.
+        let passthrough_source = self.slice_body_inner(body.span()).map(|s| s.to_string());
+
         Ok(FuncLiteral {
             name,
             params,
@@ -262,6 +269,8 @@ impl Lowerer<'_> {
             is_arrow: false,
             body: FuncBody::Stmts(stmts),
             func_id: std::cell::Cell::new(None),
+            passthrough_source,
+            force_passthrough: std::cell::Cell::new(false),
         })
     }
 
@@ -269,10 +278,7 @@ impl Lowerer<'_> {
     /// produce `FuncBody::Stmts`; expression-body arrows (`x => x+1`)
     /// produce `FuncBody::Expression`. Un-lowerable arrows go through
     /// `FuncBody::PassThrough`.
-    fn lower_arrow_literal(
-        &self,
-        a: &js::ArrowFunctionExpression,
-    ) -> Result<FuncLiteral, Error> {
+    fn lower_arrow_literal(&self, a: &js::ArrowFunctionExpression) -> Result<FuncLiteral, Error> {
         let disposition = decide_arrow(a);
         if disposition == Disposition::PassThrough {
             return self.passthrough_arrow(a);
@@ -294,12 +300,10 @@ impl Lowerer<'_> {
         // `a.expression` is true, body.statements has exactly one
         // ExpressionStatement (synthesized by the parser to host the
         // expression body); otherwise it's a regular block.
-        let body = if a.expression {
-            let stmt = a
-                .body
-                .statements
-                .first()
-                .ok_or_else(|| Error::Malformed("expression-body arrow missing statement".into()))?;
+        let (body, passthrough_source) = if a.expression {
+            let stmt = a.body.statements.first().ok_or_else(|| {
+                Error::Malformed("expression-body arrow missing statement".into())
+            })?;
             let expr_inner = match stmt {
                 js::Statement::ExpressionStatement(es) => &es.expression,
                 _ => {
@@ -308,7 +312,15 @@ impl Lowerer<'_> {
                     ));
                 }
             };
-            FuncBody::Expression(Box::new(self.lower_expr(expr_inner)?))
+            // Stash a `return <expr>;` form so pass-1 reclassification
+            // produces a body that re-emits as `=> { return <expr>; }`.
+            let pt = self
+                .slice_span(expr_inner.span())
+                .map(|s| format!("return {};", s));
+            (
+                FuncBody::Expression(Box::new(self.lower_expr(expr_inner)?)),
+                pt,
+            )
         } else {
             let stmts = a
                 .body
@@ -316,7 +328,8 @@ impl Lowerer<'_> {
                 .iter()
                 .map(|s| self.lower_stmt(s))
                 .collect::<Result<Vec<_>, _>>()?;
-            FuncBody::Stmts(stmts)
+            let pt = self.slice_body_inner(a.body.span()).map(|s| s.to_string());
+            (FuncBody::Stmts(stmts), pt)
         };
 
         Ok(FuncLiteral {
@@ -327,6 +340,8 @@ impl Lowerer<'_> {
             is_arrow: true,
             body,
             func_id: std::cell::Cell::new(None),
+            passthrough_source,
+            force_passthrough: std::cell::Cell::new(false),
         })
     }
 
@@ -335,10 +350,7 @@ impl Lowerer<'_> {
     /// the expression text in `return ...;` so the re-emit (which uses
     /// `=> { <slice> }`) parses as a block-body arrow with the same
     /// observable behavior.
-    fn passthrough_arrow(
-        &self,
-        a: &js::ArrowFunctionExpression,
-    ) -> Result<FuncLiteral, Error> {
+    fn passthrough_arrow(&self, a: &js::ArrowFunctionExpression) -> Result<FuncLiteral, Error> {
         let mut param_names = Vec::with_capacity(a.params.items.len());
         for (i, p) in a.params.items.iter().enumerate() {
             match &p.pattern.kind {
@@ -360,11 +372,9 @@ impl Lowerer<'_> {
             // Slice the expression text and wrap it in `return ...;`
             // so `=> { <slice> }` produces a semantically-equivalent
             // block-body arrow at re-emit time.
-            let stmt = a
-                .body
-                .statements
-                .first()
-                .ok_or_else(|| Error::Malformed("expression-body arrow missing statement".into()))?;
+            let stmt = a.body.statements.first().ok_or_else(|| {
+                Error::Malformed("expression-body arrow missing statement".into())
+            })?;
             let expr = match stmt {
                 js::Statement::ExpressionStatement(es) => &es.expression,
                 _ => {
@@ -374,9 +384,9 @@ impl Lowerer<'_> {
                 }
             };
             let span = expr.span();
-            let text = self
-                .slice_span(span)
-                .ok_or_else(|| Error::Malformed("arrow expression-body slice out of range".into()))?;
+            let text = self.slice_span(span).ok_or_else(|| {
+                Error::Malformed("arrow expression-body slice out of range".into())
+            })?;
             format!("return {};", text)
         } else {
             let body_span = a.body.span();
@@ -393,8 +403,10 @@ impl Lowerer<'_> {
             is_async: a.r#async,
             is_generator: false,
             is_arrow: true,
-            body: FuncBody::PassThrough(inner),
+            body: FuncBody::PassThrough(inner.clone()),
             func_id: std::cell::Cell::new(None),
+            passthrough_source: Some(inner),
+            force_passthrough: std::cell::Cell::new(false),
         })
     }
 
@@ -458,7 +470,8 @@ impl Lowerer<'_> {
                 Ok(Stmt::Let { name, init })
             }
             js::VariableDeclarationKind::Const => {
-                let init = init.ok_or_else(|| Error::Malformed("const without initializer".into()))?;
+                let init =
+                    init.ok_or_else(|| Error::Malformed("const without initializer".into()))?;
                 Ok(Stmt::Const { name, init })
             }
             _ => Err(Error::Unsupported("`using` declaration")),
