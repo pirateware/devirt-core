@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 oxc_allocator = "0.40"
 oxc_ast       = "0.40"
+oxc_codegen   = "0.40"
 oxc_parser    = "0.40"
 oxc_span      = "0.40"
 bitflags      = "2"

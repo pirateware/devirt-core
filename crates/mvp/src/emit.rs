@@ -9,6 +9,89 @@ use crate::ir::tree::{
     Expr, FuncBody, FuncLiteral, IrFunction, Item, Module, Stmt, UnOp, binop_str, unop_str,
 };
 
+/// Re-parse a PassThrough body via `oxc_parser` and serialize it back
+/// with `oxc_codegen`, producing `{ ... }` text. The wrapper around the
+/// body synthesizes a function whose form (regular / async /
+/// generator) matches the captured literal so the parser accepts
+/// `await` / `yield` inside the body.
+///
+/// Arrow PassThrough is currently unreachable — disposition does not
+/// route arrows to PassThrough today. We still synthesize a regular-
+/// function wrapper for them; the body grammar overlaps for everything
+/// the parser cares about (arrows can't contain `yield` even if their
+/// body is a block, and `await` is allowed only in async arrows; both
+/// cases route through the regular/async wrapper as configured).
+fn reparse_and_codegen_body(lit: &FuncLiteral, src: &str) -> String {
+    use oxc_allocator::Allocator;
+    use oxc_codegen::{Codegen, Context, Gen};
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+
+    let params_joined = lit.params.join(", ");
+    let keyword = if lit.is_async {
+        if lit.is_generator {
+            "async function*"
+        } else {
+            "async function"
+        }
+    } else if lit.is_generator {
+        "function*"
+    } else {
+        "function"
+    };
+    // Parenthesize so it lands as an expression in the parser.
+    let wrapper = format!("({} ({}) {{{}}})", keyword, params_joined, src);
+
+    let allocator = Allocator::default();
+    let source_type = SourceType::default();
+    let parsed = Parser::new(&allocator, &wrapper, source_type).parse();
+    if !parsed.errors.is_empty() {
+        panic!(
+            "PassThrough body re-parse failed for `{}`:\n{:#?}\nwrapper:\n{}",
+            lit.name.as_deref().unwrap_or("<anon>"),
+            parsed.errors,
+            wrapper
+        );
+    }
+    let program = parsed.program;
+
+    // Walk down: Program → ExpressionStatement → ParenthesizedExpression
+    // (or directly Function) → Function. We only need the function body.
+    let stmt = program
+        .body
+        .first()
+        .expect("re-parsed PassThrough wrapper has no top-level statement");
+    let expr = match stmt {
+        oxc_ast::ast::Statement::ExpressionStatement(es) => &es.expression,
+        other => panic!(
+            "re-parsed PassThrough wrapper top-level statement is not an expression: {other:?}"
+        ),
+    };
+    // Strip parenthesis wrapper.
+    let func_expr = match expr {
+        oxc_ast::ast::Expression::ParenthesizedExpression(p) => &p.expression,
+        e => e,
+    };
+    let func = match func_expr {
+        oxc_ast::ast::Expression::FunctionExpression(f) => f,
+        other => panic!(
+            "re-parsed PassThrough wrapper inner expression is not a function: {other:?}"
+        ),
+    };
+    let body = func
+        .body
+        .as_ref()
+        .expect("re-parsed function expression missing body");
+
+    // Codegen the function body alone. `body.print` writes the
+    // `{ ... }` form including braces. We need the original
+    // source_text wired so codegen can fall back to it for any
+    // span-driven decision; since Program owns it, we reuse it.
+    let mut codegen = Codegen::new();
+    body.print(&mut codegen, Context::default());
+    codegen.into_source_text()
+}
+
 pub fn emit(module: &Module) -> String {
     let mut out = String::new();
     let mut p = Printer {
@@ -49,7 +132,7 @@ impl Printer<'_> {
                     .as_deref()
                     .expect("Item::PassThroughFunction requires a name");
                 self.write_func_header(lit, Some(name));
-                self.write_func_body(&lit.body);
+                self.write_func_body(lit);
                 self.buf.push('\n');
             }
             Item::Stmt(s) => {
@@ -176,7 +259,7 @@ impl Printer<'_> {
                 // function declarations require one in JS).
                 let name = lit.name.as_deref().expect("Stmt::FuncDecl requires a name");
                 self.write_func_header(lit, Some(name));
-                self.write_func_body(&lit.body);
+                self.write_func_body(lit);
             }
         }
     }
@@ -217,8 +300,8 @@ impl Printer<'_> {
         self.buf.push(')');
     }
 
-    fn write_func_body(&mut self, body: &FuncBody) {
-        match body {
+    fn write_func_body(&mut self, lit: &FuncLiteral) {
+        match &lit.body {
             FuncBody::Stmts(stmts) => {
                 self.buf.push_str(" {\n");
                 self.indent += 1;
@@ -236,14 +319,21 @@ impl Printer<'_> {
                 self.expr(e);
             }
             FuncBody::PassThrough(src) => {
-                // Source-preserved body. We emit the slice verbatim
-                // surrounded by braces; the slice was stored without the
-                // outer braces. Stage 5 (emit pipeline) will re-parse +
-                // codegen via oxc; for now this is a faithful textual
-                // round-trip.
-                self.buf.push_str(" {");
-                self.buf.push_str(src);
-                self.buf.push('}');
+                // Source-preserved body. Re-parse + codegen via
+                // `oxc_codegen` so the body's text survives later
+                // local IR transformations of the surrounding code
+                // (the alternative — verbatim splicing — works once
+                // but breaks if any pass rewrites a name the body
+                // refers to). The wrapper synthesizes a minimal
+                // function expression so the parser sees a function
+                // body, then we extract the body's serialized form.
+                //
+                // Acceptable degradation: comments are dropped (the
+                // re-parse + codegen path does not preserve them).
+                // Per the T2 spec this is in scope.
+                self.buf.push(' ');
+                let body_str = reparse_and_codegen_body(lit, src);
+                self.buf.push_str(&body_str);
             }
         }
     }
@@ -322,7 +412,7 @@ impl Printer<'_> {
                     self.buf.push('(');
                 }
                 self.write_func_header(lit, lit.name.as_deref());
-                self.write_func_body(&lit.body);
+                self.write_func_body(lit);
                 if !lit.is_arrow {
                     self.buf.push(')');
                 }

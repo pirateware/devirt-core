@@ -57,11 +57,29 @@ pub fn lower_module_with_config(sm: &ssa::Module, cfg: &EmitConfig) -> tree::Mod
     for (i, func) in sm.functions.iter().enumerate() {
         match &func.body {
             ssa::FunctionBody::Lowered(_) => {
+                // Augment the caller-supplied EmitConfig with this
+                // function's own captured-by-passthrough pins. Each
+                // Value in that set must keep its source_name
+                // unchanged in the emitted output, because some inner
+                // PassThrough body refers to it lexically. The
+                // `unwrap` here is the constraint enforced at
+                // SSA-build time: an unnamed Value cannot reach this
+                // set.
+                let mut local_cfg = cfg.clone();
+                for &vi in &func.captured_by_passthrough {
+                    let def = &func.lowered().values[vi as usize];
+                    let strid = def.source_name.expect(
+                        "captured-by-passthrough Value missing source_name — \
+                         should have been caught at FunctionBuilder::finish()",
+                    );
+                    let name = sm.strings.resolve(&strid).to_string();
+                    local_cfg.immovable_names.insert(vi, name);
+                }
                 items.push(Item::Function(lower_function(
                     sm,
                     FuncId(i as u32),
                     func,
-                    cfg,
+                    &local_cfg,
                 )));
             }
             ssa::FunctionBody::PassThrough(pt) => {

@@ -529,6 +529,23 @@ pub struct Function {
     /// `Operand::Capture(i)` indices satisfy `i < capture_count`.
     pub capture_count: usize,
     pub body: FunctionBody,
+    /// Value indices (within this function's Lowered body) that flow
+    /// — directly or transitively — into a PassThrough closure body via
+    /// some `AllocClosure` capture slot. The PassThrough body refers to
+    /// these values lexically by their `source_name`, so the renamer
+    /// must pin them: see `EmitConfig.immovable_names`. Always empty for
+    /// PassThrough functions.
+    pub captured_by_passthrough: Vec<u32>,
+    /// Capture-slot indices on THIS function whose value, in the
+    /// enclosing scope, must be treated as captured-by-passthrough.
+    /// Populated when this Lowered function's body contains an
+    /// `AllocClosure` whose capture operand was `Operand::Capture(idx)`
+    /// and the target was PassThrough (or transitively reaches one).
+    /// The fixed-point pass after lowering walks every AllocClosure
+    /// targeting THIS function and propagates each flagged index back
+    /// into the calling function's `captured_by_passthrough` (if the
+    /// operand was a Value) or onward set (if it was a Capture).
+    pub captures_pass_through_onward: Vec<usize>,
 }
 
 pub enum FunctionBody {
@@ -628,6 +645,14 @@ pub struct FunctionBuilder<'m> {
     pub capture_count: usize,
     pub body: LoweredBody,
     current: Option<BlockId>,
+    /// Side-table populated by the SSA converter as it emits
+    /// AllocClosure into PassThrough targets. Drained into
+    /// `Function.captured_by_passthrough` at `finish()`.
+    pub captured_by_passthrough: Vec<u32>,
+    /// Side-table populated for Operand::Capture(idx) flows into
+    /// PassThrough captures. Drained at `finish()` into
+    /// `Function.captures_pass_through_onward`.
+    pub captures_pass_through_onward: Vec<usize>,
 }
 
 impl<'m> FunctionBuilder<'m> {
@@ -659,6 +684,28 @@ impl<'m> FunctionBuilder<'m> {
             capture_count,
             body,
             current: None,
+            captured_by_passthrough: Vec::new(),
+            captures_pass_through_onward: Vec::new(),
+        }
+    }
+
+    /// Mark a Value as flowing into a PassThrough body via some
+    /// `AllocClosure` capture slot. Idempotent. The constraint that
+    /// the Value must have a `source_name` is enforced at `finish()`
+    /// rather than here, because the call sites that mark
+    /// (alloc_closure_operand) tag the binding's source name in a
+    /// later step within the same lowering.
+    pub fn mark_value_captured_by_passthrough(&mut self, v: Value) {
+        if !self.captured_by_passthrough.contains(&v.0) {
+            self.captured_by_passthrough.push(v.0);
+        }
+    }
+
+    /// Mark a capture slot on THIS function as flowing into a
+    /// PassThrough body in some inner closure. Idempotent.
+    pub fn mark_capture_pass_through_onward(&mut self, idx: usize) {
+        if !self.captures_pass_through_onward.contains(&idx) {
+            self.captures_pass_through_onward.push(idx);
         }
     }
 
@@ -759,11 +806,28 @@ impl<'m> FunctionBuilder<'m> {
                 }
             }
         }
+        // Constraint: every captured-by-passthrough Value must carry a
+        // source_name. PassThrough bodies refer to their captures by
+        // lexical name, so a synthesized intermediate (no name) cannot
+        // possibly be the right thing to capture into one. Bug in the
+        // lowering, not the input — surface loudly.
+        for &vi in &self.captured_by_passthrough {
+            let def = &self.body.values[vi as usize];
+            if def.source_name.is_none() {
+                panic!(
+                    "Value %{vi} is captured into a PassThrough body but has no source_name. \
+                     A synthesized intermediate cannot be captured by a PassThrough body — \
+                     the lowering must capture only named source-level bindings."
+                );
+            }
+        }
         let fid = FuncId(self.module.functions.len() as u32);
         self.module.functions.push(Function {
             name: self.name,
             capture_count: self.capture_count,
             body: FunctionBody::Lowered(self.body),
+            captured_by_passthrough: self.captured_by_passthrough,
+            captures_pass_through_onward: self.captures_pass_through_onward,
         });
         fid
     }
