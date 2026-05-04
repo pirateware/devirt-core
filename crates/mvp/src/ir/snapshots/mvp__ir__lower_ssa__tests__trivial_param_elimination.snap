@@ -1,9 +1,8 @@
 ---
 source: src/ir/lower_ssa.rs
-assertion_line: 1315
 expression: pretty_module(&m)
 ---
-fn @f(%0) {
+fn @f(%0["n"]) {
   bb0:                                  ; preds: <none>
     br bb1(0)
 
@@ -12,7 +11,7 @@ fn @f(%0) {
     cbr %3, bb2, bb3
 
   bb2:                                  ; preds: bb1
-    %4 = add_generic %1, 1              ; may_throw
+    %4["i"] = add_generic %1, 1         ; may_throw
     br bb1(%4)
 
   bb3:                                  ; preds: bb1

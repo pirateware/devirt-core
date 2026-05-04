@@ -466,7 +466,7 @@ pub struct BasicBlock {
 }
 
 #[derive(Clone, Debug)]
-pub enum ValueDef {
+pub enum ValueDefKind {
     Inst(InstId),
     BlockParam {
         block: BlockId,
@@ -478,6 +478,42 @@ pub enum ValueDef {
     /// reuse the Value index without renumbering, so the slot is marked
     /// `Removed` and skipped by validation/printing.
     Removed,
+}
+
+/// Per-Value definition record. `source_name`, when present, names the
+/// source-level binding this value first held — set by the front-end for
+/// `let`/`const` bindings and function parameters, and consumed by the
+/// out-of-SSA renamer to preserve original names. None for synthesized
+/// intermediates (block params, expression sub-results) and for retired
+/// slots.
+#[derive(Clone, Debug)]
+pub struct ValueDef {
+    pub kind: ValueDefKind,
+    pub source_name: Option<StrId>,
+}
+
+impl ValueDef {
+    pub fn new(kind: ValueDefKind) -> Self {
+        Self {
+            kind,
+            source_name: None,
+        }
+    }
+    pub fn inst(id: InstId) -> Self {
+        Self::new(ValueDefKind::Inst(id))
+    }
+    pub fn block_param(block: BlockId, index: u32) -> Self {
+        Self::new(ValueDefKind::BlockParam { block, index })
+    }
+    pub fn arg(idx: u32) -> Self {
+        Self::new(ValueDefKind::Arg(idx))
+    }
+    pub fn removed() -> Self {
+        Self::new(ValueDefKind::Removed)
+    }
+    pub fn is_removed(&self) -> bool {
+        matches!(self.kind, ValueDefKind::Removed)
+    }
 }
 
 pub struct Function {
@@ -535,7 +571,7 @@ impl<'m> FunctionBuilder<'m> {
         };
         for i in 0..num_args {
             let v = Value(func.values.len() as u32);
-            func.values.push(ValueDef::Arg(i));
+            func.values.push(ValueDef::arg(i));
             func.params.push(v);
         }
         Self {
@@ -574,7 +610,7 @@ impl<'m> FunctionBuilder<'m> {
     pub fn add_block_param(&mut self, block: BlockId) -> Value {
         let index = self.func.blocks[block.0 as usize].params.len() as u32;
         let v = Value(self.func.values.len() as u32);
-        self.func.values.push(ValueDef::BlockParam { block, index });
+        self.func.values.push(ValueDef::block_param(block, index));
         self.func.blocks[block.0 as usize].params.push(v);
         v
     }
@@ -593,9 +629,17 @@ impl<'m> FunctionBuilder<'m> {
             None
         } else {
             let v = Value(self.func.values.len() as u32);
-            self.func.values.push(ValueDef::Inst(inst_id));
+            self.func.values.push(ValueDef::inst(inst_id));
             Some(v)
         }
+    }
+
+    /// Tag the most recently allocated Value with a source-level name.
+    /// Caller passes the Value returned by `add_inst` (or any other
+    /// builder method that produces a Value); the renamer will prefer
+    /// this name when emitting the binding for that value.
+    pub fn set_source_name(&mut self, v: Value, name: StrId) {
+        self.func.values[v.0 as usize].source_name = Some(name);
     }
 
     pub fn set_terminator(&mut self, term: Terminator) {
@@ -787,7 +831,7 @@ impl Function {
                         func: fid,
                         kind: ValidationErrorKind::DanglingValue { value: *v },
                     });
-                } else if matches!(values[v.0 as usize], ValueDef::Removed) {
+                } else if values[v.0 as usize].is_removed() {
                     errors.push(ValidationError {
                         func: fid,
                         kind: ValidationErrorKind::OperandReferencesRemovedValue { value: *v },
@@ -840,8 +884,8 @@ impl Function {
 
         // ValueDef sanity.
         for (vi, def) in self.values.iter().enumerate() {
-            match def {
-                ValueDef::Inst(iid) => {
+            match &def.kind {
+                ValueDefKind::Inst(iid) => {
                     if (iid.0 as usize) >= inst_count {
                         errors.push(ValidationError {
                             func: fid,
@@ -849,7 +893,7 @@ impl Function {
                         });
                     }
                 }
-                ValueDef::BlockParam { block, index } => {
+                ValueDefKind::BlockParam { block, index } => {
                     if (block.0 as usize) >= block_count {
                         errors.push(ValidationError {
                             func: fid,
@@ -867,7 +911,7 @@ impl Function {
                         }
                     }
                 }
-                ValueDef::Arg(_) | ValueDef::Removed => {}
+                ValueDefKind::Arg(_) | ValueDefKind::Removed => {}
             }
         }
     }
@@ -1039,6 +1083,9 @@ pub fn pretty_function(m: &Module, id: FuncId) -> String {
             out.push_str(", ");
         }
         write!(out, "%{}", p.0).unwrap();
+        if let Some(name) = func.values[p.0 as usize].source_name {
+            write!(out, "[\"{}\"]", m.strings.resolve(&name)).unwrap();
+        }
     }
     out.push_str(") {\n");
     for (i, blk) in func.blocks.iter().enumerate() {
@@ -1090,7 +1137,11 @@ fn write_inst(out: &mut String, iid: InstId, func: &Function, m: &Module) {
     let mut line = String::from("    ");
     if !inst.kind.is_void() {
         let v = find_value_for_inst(func, iid);
-        write!(line, "%{} = ", v.0).unwrap();
+        write!(line, "%{}", v.0).unwrap();
+        if let Some(name) = func.values[v.0 as usize].source_name {
+            write!(line, "[\"{}\"]", m.strings.resolve(&name)).unwrap();
+        }
+        line.push_str(" = ");
     }
     write_inst_kind(&mut line, &inst.kind, m);
     let eff = inst.kind.effect();
@@ -1100,7 +1151,7 @@ fn write_inst(out: &mut String, iid: InstId, func: &Function, m: &Module) {
 
 fn find_value_for_inst(func: &Function, iid: InstId) -> Value {
     for (i, def) in func.values.iter().enumerate() {
-        if let ValueDef::Inst(j) = def
+        if let ValueDefKind::Inst(j) = &def.kind
             && *j == iid
         {
             return Value(i as u32);

@@ -16,8 +16,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ir::ssa::{
-    self, BasicBlock, BlockId, Constant, FuncId, FunctionBuilder, InstKind, Operand, Purity,
-    Terminator, Value, ValueDef,
+    self, BasicBlock, BlockId, Constant, FuncId, FunctionBuilder, InstKind, Operand, Purity, StrId,
+    Terminator, Value, ValueDef, ValueDefKind,
 };
 use crate::ir::tree::{self, BinOp, Expr, Stmt, UnOp};
 
@@ -107,6 +107,12 @@ struct Converter<'b, 'm> {
     // Sealed blocks. A sealed block promises no further predecessors will be
     // added, which means reads can fully resolve through `add_param_operands`.
     sealed: HashSet<BlockId>,
+
+    // Source name (interned) for each SymbolId that originated from a
+    // named source binding. Used to annotate block params introduced by
+    // Braun for that SymbolId so the out-of-SSA renamer can recover the
+    // original name across loop carriers.
+    symbol_names: HashMap<SymbolId, StrId>,
 }
 
 impl<'b, 'm> Converter<'b, 'm> {
@@ -119,6 +125,7 @@ impl<'b, 'm> Converter<'b, 'm> {
             current_def: HashMap::new(),
             incomplete_params: HashMap::new(),
             sealed: HashSet::new(),
+            symbol_names: HashMap::new(),
         }
     }
 
@@ -149,6 +156,11 @@ impl<'b, 'm> Converter<'b, 'm> {
             let sym = self.fresh_symbol();
             self.bind_in_top_scope(pname.clone(), sym);
             let arg_val = self.builder.func.params[i];
+            // Annotate the parameter Value with its source name so the
+            // out-of-SSA renamer emits e.g. `function f(a, b)` rather than
+            // `function f(_a0, _a1)`.
+            let name_id = self.builder.intern(pname);
+            self.builder.set_source_name(arg_val, name_id);
             self.write_variable(sym, entry, Operand::Value(arg_val));
         }
 
@@ -185,6 +197,8 @@ impl<'b, 'm> Converter<'b, 'm> {
     }
 
     fn bind_in_top_scope(&mut self, name: String, sym: SymbolId) {
+        let id = self.builder.intern(&name);
+        self.symbol_names.insert(sym, id);
         self.scopes
             .last_mut()
             .expect("no active scope")
@@ -206,6 +220,25 @@ impl<'b, 'm> Converter<'b, 'm> {
         s
     }
 
+    /// Annotate an Operand-defined value with the source-level binding
+    /// name. Only tags values that don't yet have a name — this matters
+    /// for `let r = x;` where the RHS is an Ident already-tagged via its
+    /// original binding ("x"); re-tagging it as "r" would lose the
+    /// stronger name. The renamer's first-claim-wins handles the case
+    /// where two distinct Insts coincide on the same name.
+    ///
+    /// No-op for Const operands and for retired Values.
+    fn tag_binding_source_name(&mut self, op: Operand, name: &str) {
+        if let Operand::Value(v) = op {
+            let def = &self.builder.func.values[v.0 as usize];
+            if def.is_removed() || def.source_name.is_some() {
+                return;
+            }
+            let id = self.builder.intern(name);
+            self.builder.set_source_name(v, id);
+        }
+    }
+
     // ------------------------------------------------------------------
     // Braun primitives
     // ------------------------------------------------------------------
@@ -225,6 +258,7 @@ impl<'b, 'm> Converter<'b, 'm> {
         if !self.sealed.contains(&block) {
             // Unsealed: speculatively add a param and queue it for filling.
             let param = self.builder.add_block_param(block);
+            self.tag_block_param_with_symbol(param, var);
             self.incomplete_params
                 .entry(block)
                 .or_default()
@@ -243,8 +277,15 @@ impl<'b, 'm> Converter<'b, 'm> {
         // Sealed with multiple preds. Add a param, write the placeholder
         // BEFORE recursing so cycles bottom out. Then fill operands.
         let param = self.builder.add_block_param(block);
+        self.tag_block_param_with_symbol(param, var);
         self.write_variable(var, block, Operand::Value(param));
         self.add_param_operands(var, block, param)
+    }
+
+    fn tag_block_param_with_symbol(&mut self, param: Value, var: SymbolId) {
+        if let Some(&name) = self.symbol_names.get(&var) {
+            self.builder.set_source_name(param, name);
+        }
     }
 
     fn add_param_operands(&mut self, var: SymbolId, block: BlockId, param: Value) -> Operand {
@@ -259,9 +300,9 @@ impl<'b, 'm> Converter<'b, 'm> {
     fn try_remove_trivial_param(&mut self, param: Value) -> Operand {
         // Look up the block and current index of the param. If it's not a
         // block param (or already removed), bail out conservatively.
-        let (block, idx) = match self.builder.func.values[param.0 as usize] {
-            ValueDef::BlockParam { block, index } => (block, index as usize),
-            ValueDef::Removed => return Operand::Const(Constant::Undefined),
+        let (block, idx) = match self.builder.func.values[param.0 as usize].kind {
+            ValueDefKind::BlockParam { block, index } => (block, index as usize),
+            ValueDefKind::Removed => return Operand::Const(Constant::Undefined),
             _ => return Operand::Value(param),
         };
 
@@ -310,14 +351,14 @@ impl<'b, 'm> Converter<'b, 'm> {
         }
 
         // Retire the Value slot.
-        self.builder.func.values[param.0 as usize] = ValueDef::Removed;
+        self.builder.func.values[param.0 as usize] = ValueDef::removed();
 
         // Recurse on users that may have become trivial.
         for u in block_param_users {
             if u == param {
                 continue;
             }
-            if matches!(self.builder.func.values[u.0 as usize], ValueDef::Removed) {
+            if self.builder.func.values[u.0 as usize].is_removed() {
                 continue;
             }
             self.try_remove_trivial_param(u);
@@ -337,10 +378,7 @@ impl<'b, 'm> Converter<'b, 'm> {
         for (sym, param) in entries {
             // A param may have been retired by an earlier iteration's
             // recursive trivial-removal; skip in that case.
-            if matches!(
-                self.builder.func.values[param.0 as usize],
-                ValueDef::Removed
-            ) {
+            if self.builder.func.values[param.0 as usize].is_removed() {
                 continue;
             }
             self.add_param_operands(sym, b, param);
@@ -369,6 +407,7 @@ impl<'b, 'm> Converter<'b, 'm> {
                     Some(e) => self.convert_expr(e),
                     None => Operand::Const(Constant::Undefined),
                 };
+                self.tag_binding_source_name(op, name);
                 let sym = self.fresh_symbol();
                 self.bind_in_top_scope(name.clone(), sym);
                 let cb = self.current_block();
@@ -376,6 +415,7 @@ impl<'b, 'm> Converter<'b, 'm> {
             }
             Stmt::Const { name, init } => {
                 let op = self.convert_expr(init);
+                self.tag_binding_source_name(op, name);
                 let sym = self.fresh_symbol();
                 self.bind_in_top_scope(name.clone(), sym);
                 let cb = self.current_block();
@@ -386,6 +426,11 @@ impl<'b, 'm> Converter<'b, 'm> {
                 match target {
                     Expr::Ident(name) => {
                         if let Some(sym) = self.lookup(name) {
+                            // Tag the new value with the binding's source
+                            // name so a same-name reassignment chain
+                            // re-emerges in emit (suffix-disambiguated by
+                            // the renamer when needed).
+                            self.tag_binding_source_name(val_op, name);
                             let cb = self.current_block();
                             self.write_variable(sym, cb, val_op);
                         } else {
@@ -864,7 +909,8 @@ impl<'b, 'm> Converter<'b, 'm> {
         // once.
         let trailing: Vec<Value> = blk.params[idx..].to_vec();
         for (offset, v) in trailing.iter().enumerate() {
-            if let ValueDef::BlockParam { index, .. } = &mut self.builder.func.values[v.0 as usize]
+            if let ValueDefKind::BlockParam { index, .. } =
+                &mut self.builder.func.values[v.0 as usize].kind
             {
                 *index = (idx + offset) as u32;
             }
@@ -1235,7 +1281,7 @@ fn _unused_basic_block(_: &BasicBlock) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::ssa::{Terminator, ValueDef, pretty_module};
+    use crate::ir::ssa::{Terminator, pretty_module};
     use crate::lower::parse_and_lower;
 
     fn lower_js(src: &str) -> ssa::Module {
@@ -1425,7 +1471,7 @@ mod tests {
         let removed_count = m.functions[0]
             .values
             .iter()
-            .filter(|v| matches!(v, ValueDef::Removed))
+            .filter(|v| v.is_removed())
             .count();
         // We expect at least one Removed entry (the eliminated param).
         assert!(
@@ -1576,6 +1622,20 @@ mod tests {
                 t => panic!("expected `ret <Number>`; got {t:?} for src `{src}`"),
             }
         }
+    }
+
+    /// SSA pretty-printer annotates Inst-defined values with their source
+    /// name, e.g. `%2["x"] = add ...`. Visible only when source_name was
+    /// populated by lowering.
+    #[test]
+    fn ssa_dump_includes_source_name_annotation() {
+        let src = r#"function f() { let x = 1 + 2; return x; }"#;
+        let m = lower_js(src);
+        let dump = pretty_module(&m);
+        assert!(
+            dump.contains("[\"x\"]"),
+            "expected source-name annotation `[\"x\"]` in dump:\n{dump}"
+        );
     }
 
     /// `globalThis.foo` (member access on the explicit `globalThis` ident)

@@ -2,12 +2,12 @@
 source: src/ir/lower_tree.rs
 expression: out
 ---
-function f(_a0) {
-  let _t0;
-  if (_a0) {
-    _t0 = 2;
+function f(c) {
+  let x;
+  if (c) {
+    x = 2;
   } else {
-    _t0 = 3;
+    x = 3;
   }
-  return _t0;
+  return x;
 }

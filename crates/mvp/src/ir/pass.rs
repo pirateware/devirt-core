@@ -325,7 +325,7 @@ mod tests {
     /// reliance on private items would fail loudly. Keep as a smoke test.
     #[test]
     fn value_def_export_is_visible() {
-        let _arg = ValueDef::Arg(0);
+        let _arg = ValueDef::arg(0);
     }
 
     /// Captures the (pass_name, function_pretty_print) pair for every

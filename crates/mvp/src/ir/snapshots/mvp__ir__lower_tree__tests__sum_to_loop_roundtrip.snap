@@ -2,19 +2,19 @@
 source: src/ir/lower_tree.rs
 expression: out
 ---
-function sum_to(_a0) {
+function sum_to(n) {
+  let i;
   let _t0;
-  let _t1;
-  let _t2;
-  let _t3;
-  let _t4;
-  _t0 = 0;
-  _t2 = 0;
-  while ((_t0 < _a0)) {
-    _t3 = (_t2 + _t0);
-    _t4 = (_t0 + 1);
-    _t0 = _t4;
-    _t2 = _t3;
+  let s;
+  let s_1;
+  let i_1;
+  i = 0;
+  s = 0;
+  while ((i < n)) {
+    s_1 = (s + i);
+    i_1 = (i + 1);
+    i = i_1;
+    s = s_1;
   }
-  return _t2;
+  return s;
 }

@@ -2,20 +2,20 @@
 source: src/ir/lower_tree.rs
 expression: out
 ---
-function fibonacci(_a0) {
+function fibonacci(n) {
   let _t0;
   let _t1;
   let _t2;
   let _t3;
   let _t4;
   let _t5;
-  _t0 = (_a0 <= 1);
+  _t0 = (n <= 1);
   if (_t0) {
-    return _a0;
+    return n;
   } else {
-    _t1 = (_a0 - 1);
+    _t1 = (n - 1);
     _t2 = fibonacci(_t1);
-    _t3 = (_a0 - 2);
+    _t3 = (n - 2);
     _t4 = fibonacci(_t3);
     _t5 = (_t2 + _t4);
     return _t5;

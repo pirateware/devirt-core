@@ -2,8 +2,8 @@
 source: src/ir/lower_tree.rs
 expression: out
 ---
-function f(_a0) {
-  if (_a0) {
+function f(c) {
+  if (c) {
     return 1;
   } else {
     return 2;

@@ -1,9 +1,8 @@
 ---
 source: src/ir/lower_ssa.rs
-assertion_line: 1156
 expression: pretty_module(&m)
 ---
-fn @fibonacci(%0) {
+fn @fibonacci(%0["n"]) {
   bb0:                                  ; preds: <none>
     %1 = le %0, 1                       ; may_throw
     cbr %1, bb1, bb2

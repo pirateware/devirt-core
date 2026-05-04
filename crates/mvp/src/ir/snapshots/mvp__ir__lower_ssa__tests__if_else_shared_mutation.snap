@@ -1,9 +1,8 @@
 ---
 source: src/ir/lower_ssa.rs
-assertion_line: 1228
 expression: pretty_module(&m)
 ---
-fn @f(%0) {
+fn @f(%0["c"]) {
   bb0:                                  ; preds: <none>
     cbr %0, bb1, bb2
 

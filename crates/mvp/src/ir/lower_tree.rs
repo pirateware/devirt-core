@@ -40,7 +40,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ir::ssa::{
     self, BlockId, Constant, FuncId, Function, InstId, InstKind, Operand, Terminator, Value,
-    ValueDef,
+    ValueDefKind,
 };
 use crate::ir::tree::{self, BinOp, Expr, IrFunction, Item, Stmt, UnOp};
 
@@ -49,15 +49,45 @@ use crate::ir::tree::{self, BinOp, Expr, IrFunction, Item, Stmt, UnOp};
 // ============================================================================
 
 pub fn lower_module(sm: &ssa::Module) -> tree::Module {
+    lower_module_with_config(sm, &EmitConfig::default())
+}
+
+pub fn lower_module_with_config(sm: &ssa::Module, cfg: &EmitConfig) -> tree::Module {
     let mut items = Vec::with_capacity(sm.functions.len());
     for (i, func) in sm.functions.iter().enumerate() {
-        items.push(Item::Function(lower_function(sm, FuncId(i as u32), func)));
+        items.push(Item::Function(lower_function(
+            sm,
+            FuncId(i as u32),
+            func,
+            cfg,
+        )));
     }
     tree::Module { items }
 }
 
-fn lower_function(sm: &ssa::Module, _id: FuncId, func: &Function) -> IrFunction {
-    let mut ctx = LowerCtx::new(sm, func);
+/// Configuration for the out-of-SSA renamer.
+///
+/// `immovable_names` pins specific Values to specific names — typically
+/// because some downstream emit (a PassThrough closure body, a debug
+/// pin) lexically references the name and cannot tolerate a
+/// suffix-renamed substitute. The pinned name is reserved: other Values
+/// that prefer it via `source_name` get suffix-disambiguated, and the
+/// suffix-collision path skips the pinned name when generating
+/// candidates. Pinning two distinct Values to the same name is a caller
+/// bug and panics.
+///
+/// Implementation note: the ticket spec described this as
+/// `HashSet<String>`, but a per-Value mapping is required to express
+/// "this specific Value owns this name" — without it, the conflict
+/// (test 8) and route-around (test 7) scenarios are indistinguishable
+/// from the renamer's perspective.
+#[derive(Default, Debug, Clone)]
+pub struct EmitConfig {
+    pub immovable_names: HashMap<u32, String>,
+}
+
+fn lower_function(sm: &ssa::Module, _id: FuncId, func: &Function, cfg: &EmitConfig) -> IrFunction {
+    let mut ctx = LowerCtx::new(sm, func, cfg);
     let param_names: Vec<String> = func
         .params
         .iter()
@@ -110,27 +140,8 @@ struct LoopInfo {
 }
 
 impl<'a> LowerCtx<'a> {
-    fn new(sm: &'a ssa::Module, func: &'a Function) -> Self {
-        // Allocate names. A single per-function counter for both block params
-        // and instruction-defined values prevents collisions across nested
-        // scopes (and the predicted-bug list specifically calls this out).
-        let mut value_names = HashMap::new();
-        let mut hoisted = Vec::new();
-        let mut t_counter: u32 = 0;
-        for (i, def) in func.values.iter().enumerate() {
-            match def {
-                ValueDef::Arg(idx) => {
-                    value_names.insert(i as u32, format!("_a{}", idx));
-                }
-                ValueDef::Inst(_) | ValueDef::BlockParam { .. } => {
-                    let name = format!("_t{}", t_counter);
-                    t_counter += 1;
-                    value_names.insert(i as u32, name.clone());
-                    hoisted.push(name);
-                }
-                ValueDef::Removed => {}
-            }
-        }
+    fn new(sm: &'a ssa::Module, func: &'a Function, cfg: &EmitConfig) -> Self {
+        let (value_names, hoisted) = assign_names(sm, func, cfg);
         Self {
             sm,
             func,
@@ -590,7 +601,7 @@ impl LowerCtx<'_> {
     fn try_inline_cond(&self, header: BlockId, cond_op: &Operand) -> (Expr, bool) {
         let blk = &self.func.blocks[header.0 as usize];
         if let Operand::Value(cv) = cond_op
-            && let ValueDef::Inst(cv_inst) = self.func.values[cv.0 as usize]
+            && let ValueDefKind::Inst(cv_inst) = self.func.values[cv.0 as usize].kind
             && blk.instructions.len() == 1
             && blk.instructions[0] == cv_inst
         {
@@ -800,9 +811,145 @@ impl LowerCtx<'_> {
 // Free helpers
 // ============================================================================
 
+/// Two-pass renamer. Returns a `(value_index → final_name)` map and the
+/// list of `_tN`-style hoisted-temporary names whose `let` declarations
+/// must be emitted at the function body's top.
+///
+/// Determinism: the COLLECT pass walks Values in index order (which is
+/// the order `FunctionBuilder` allocates them — left-to-right by
+/// instruction emission and parameter declaration). The ASSIGN pass
+/// honors the COLLECT order so two equivalent SSA modules produce
+/// byte-identical names.
+///
+/// Scope: collisions are detected at function granularity, not per JS
+/// block. This is a deliberate simplification documented in the ticket
+/// — two source-level `i`s in unrelated for-loops emit as `i` and
+/// `i_1` rather than both as `i` (which would be JS-legal under block
+/// scoping). Output is slightly uglier in pathological cases, but the
+/// renamer is dramatically simpler. Revisit if quality complaints
+/// surface.
+fn assign_names(
+    sm: &ssa::Module,
+    func: &Function,
+    cfg: &EmitConfig,
+) -> (HashMap<u32, String>, Vec<String>) {
+    let mut final_names: HashMap<u32, String> = HashMap::new();
+    let mut committed: HashMap<String, u32> = HashMap::new();
+    let mut hoisted: Vec<String> = Vec::new();
+    let mut t_counter: u32 = 0;
+
+    // Pre-claim every pinned name to the pinned Value. Caller
+    // staging-conflict (two distinct Values pinned to the same name)
+    // panics here.
+    let pinned_names: std::collections::HashSet<&str> =
+        cfg.immovable_names.values().map(|s| s.as_str()).collect();
+    for (&vi, name) in &cfg.immovable_names {
+        if let Some(&prior) = committed.get(name)
+            && prior != vi
+        {
+            panic!(
+                "EmitConfig.immovable_names pins both %{prior} and %{vi} to `{name}`. \
+                 Caller bug — two distinct Values cannot share an immovable name."
+            );
+        }
+        committed.insert(name.clone(), vi);
+        final_names.insert(vi, name.clone());
+    }
+
+    for (i, def) in func.values.iter().enumerate() {
+        let vi = i as u32;
+        if final_names.contains_key(&vi) {
+            // Already assigned via pinning; if it's an Inst or
+            // BlockParam its name still needs to surface in `hoisted`
+            // so the function-top let-block declares it.
+            if matches!(
+                def.kind,
+                ValueDefKind::Inst(_) | ValueDefKind::BlockParam { .. }
+            ) {
+                hoisted.push(final_names[&vi].clone());
+            }
+            continue;
+        }
+        match &def.kind {
+            ValueDefKind::Removed => continue,
+            ValueDefKind::Arg(_) => {
+                let preferred = def.source_name.map(|s| sm.strings.resolve(&s).to_string());
+                let chosen = pick_name(
+                    preferred,
+                    &mut committed,
+                    vi,
+                    &pinned_names,
+                    &mut t_counter,
+                    false,
+                );
+                final_names.insert(vi, chosen);
+            }
+            ValueDefKind::Inst(_) | ValueDefKind::BlockParam { .. } => {
+                let preferred = def.source_name.map(|s| sm.strings.resolve(&s).to_string());
+                let chosen = pick_name(
+                    preferred,
+                    &mut committed,
+                    vi,
+                    &pinned_names,
+                    &mut t_counter,
+                    true,
+                );
+                hoisted.push(chosen.clone());
+                final_names.insert(vi, chosen);
+            }
+        }
+    }
+
+    (final_names, hoisted)
+}
+
+/// Resolve the final name for a single Value. `for_let` controls only
+/// whether the synthesized fallback uses the `_tN` (true) or `_aN`
+/// (false) prefix; both prefixes share the committed-name space because
+/// emitted JS scopes them together.
+///
+/// `pinned` is the set of names already locked by EmitConfig. The
+/// suffix-collision path skips any candidate that lands on a pinned
+/// name; bare-name preference for a pinned name fails through to the
+/// suffix path (the pin's owner already claimed the bare slot).
+fn pick_name(
+    preferred: Option<String>,
+    committed: &mut HashMap<String, u32>,
+    vi: u32,
+    pinned: &std::collections::HashSet<&str>,
+    t_counter: &mut u32,
+    for_let: bool,
+) -> String {
+    if let Some(want) = preferred {
+        if !committed.contains_key(&want) && !pinned.contains(want.as_str()) {
+            committed.insert(want.clone(), vi);
+            return want;
+        }
+        let mut k: u32 = 1;
+        loop {
+            let candidate = format!("{want}_{k}");
+            if !committed.contains_key(&candidate) && !pinned.contains(candidate.as_str()) {
+                committed.insert(candidate.clone(), vi);
+                return candidate;
+            }
+            k += 1;
+        }
+    }
+
+    loop {
+        let prefix = if for_let { "_t" } else { "_a" };
+        let candidate = format!("{prefix}{}", *t_counter);
+        *t_counter += 1;
+        if !committed.contains_key(&candidate) && !pinned.contains(candidate.as_str()) {
+            committed.insert(candidate.clone(), vi);
+            return candidate;
+        }
+    }
+}
+
 fn find_value_for_inst(func: &Function, iid: InstId) -> Value {
     for (i, def) in func.values.iter().enumerate() {
-        if let ValueDef::Inst(j) = def
+        if let ValueDefKind::Inst(j) = &def.kind
             && *j == iid
         {
             return Value(i as u32);
@@ -1184,5 +1331,189 @@ mod tests {
         "#;
         let harness = "console.log(f(true)); console.log(f(false)); console.log(f(0)); console.log(f(\"x\"));";
         assert_behavior_equivalent(src, harness);
+    }
+
+    // =====================================================================
+    // T1: name-preservation acceptance tests
+    // =====================================================================
+
+    /// Two distinct named lets in the same scope retain their original
+    /// names. Non-trivial inits used so the SSA actually creates a Value
+    /// for each binding (constant-init lets fold away in lowering — the
+    /// name has nothing to attach to).
+    #[test]
+    fn distinct_named_lets_preserve_names() {
+        let src = r#"function f(a) { let x = a + 1; let y = a + 2; return x + y; }"#;
+        let out = full_roundtrip(src);
+        assert!(out.contains("let x"), "expected `let x`:\n{out}");
+        assert!(out.contains("let y"), "expected `let y`:\n{out}");
+    }
+
+    /// Function parameters emit by their original source names.
+    #[test]
+    fn parameter_names_preserved() {
+        let src = r#"function f(a, b) { return a + b; }"#;
+        let out = full_roundtrip(src);
+        assert!(
+            out.contains("function f(a, b)"),
+            "expected `function f(a, b)`:\n{out}"
+        );
+        assert!(!out.contains("_a0"));
+        assert!(!out.contains("_a1"));
+    }
+
+    /// Reassignment becomes a fresh `let` with a numeric suffix. This is
+    /// the documented T1 gap: the SSA shape produces two distinct values
+    /// both annotated with the source name, and the renamer suffix-
+    /// disambiguates the second. A future ticket will recover the
+    /// original mutation pattern.
+    ///
+    /// Non-trivial RHS so the SSA produces an Inst for each assignment
+    /// (constants fold to `Operand::Const` and have nothing to tag).
+    #[test]
+    fn reassignment_becomes_fresh_let() {
+        let src = r#"function f(a) { let x = a + 1; x = a + 2; return x; }"#;
+        let out = full_roundtrip(src);
+        assert!(out.contains("let x"), "expected `let x`:\n{out}");
+        assert!(
+            out.contains("let x_1"),
+            "expected `let x_1` for the reassignment:\n{out}"
+        );
+        assert!(
+            out.contains("return x_1"),
+            "expected `return x_1` (the latest value):\n{out}"
+        );
+    }
+
+    /// Lexical shadowing: outer x and inner x get x and x_1 under the
+    /// conservative function-flat scope. JS would allow both to be `x`
+    /// under block scoping, but the renamer treats the entire function
+    /// body as one namespace for collision detection. See `assign_names`
+    /// for the rationale.
+    ///
+    /// Non-trivial inits, plus a use of the inner x in the same branch,
+    /// so SSA actually materializes both bindings as Values.
+    #[test]
+    fn lexical_shadow_inner_gets_suffix() {
+        let src = r#"
+            function f(a, c) {
+                let x = a + 1;
+                let r = 0;
+                if (c) {
+                    let x = a + 2;
+                    r = x;
+                }
+                return x + r;
+            }
+        "#;
+        let out = full_roundtrip(src);
+        assert!(out.contains("let x"), "outer x missing:\n{out}");
+        // The inner let gets x_1 — even though JS scoping would allow
+        // both to be `x` in distinct blocks. Conservative simplification.
+        assert!(
+            out.contains("let x_1"),
+            "inner shadowing x should emit as x_1:\n{out}"
+        );
+    }
+
+    /// Synthetic intermediates remain `_tN`. We do not invent names for
+    /// expression sub-results.
+    #[test]
+    fn complex_expr_intermediates_emit_as_t() {
+        let src = r#"function f(a, b, c, d) { let r = (a + b) * (c - d); return r; }"#;
+        let out = full_roundtrip(src);
+        assert!(out.contains("let r"), "expected `let r`:\n{out}");
+        // The (a+b) and (c-d) sub-expressions have no source names.
+        assert!(
+            out.contains("_t0") || out.contains("_t1"),
+            "expected synthesized intermediates `_tN`:\n{out}"
+        );
+    }
+
+    // =====================================================================
+    // EmitConfig — pinned-name behavior. Direct unit tests against the
+    // renamer rather than via the full pipeline.
+    // =====================================================================
+
+    /// A pinned Value gets exactly its required name. A second Value
+    /// preferring the same source name is suffix-disambiguated, even
+    /// though it would otherwise win the bare slot by walk order.
+    #[test]
+    fn emit_config_pin_routes_other_value_around() {
+        use crate::ir::ssa::{
+            Constant, FunctionBuilder, InstKind, Module as SsaModule, Operand, Terminator,
+        };
+        let mut module = SsaModule::new();
+        let mut b = FunctionBuilder::new(&mut module, "f", 0);
+        let bb0 = b.new_block();
+        b.switch_to_block(bb0);
+        let v_a = b
+            .add_inst(InstKind::AddGeneric {
+                lhs: Operand::Const(Constant::Int32(1)),
+                rhs: Operand::Const(Constant::Int32(2)),
+            })
+            .unwrap();
+        let v_b = b
+            .add_inst(InstKind::AddGeneric {
+                lhs: Operand::Const(Constant::Int32(3)),
+                rhs: Operand::Const(Constant::Int32(4)),
+            })
+            .unwrap();
+        let y_id = b.intern("y");
+        b.set_source_name(v_a, y_id);
+        b.set_source_name(v_b, y_id);
+        b.set_terminator(Terminator::Return {
+            val: Some(Operand::Value(v_b)),
+        });
+        b.finish();
+
+        // Pin v_b to "y". The earlier-walked v_a — which prefers "y"
+        // via source_name — must be suffix-disambiguated to "y_1".
+        let mut cfg = EmitConfig::default();
+        cfg.immovable_names.insert(v_b.0, "y".to_string());
+        let tm_out = lower_module_with_config(&module, &cfg);
+        let out = crate::emit::emit(&tm_out);
+        assert!(
+            out.contains("let y_1"),
+            "v_a should be routed to y_1 because v_b is pinned:\n{out}"
+        );
+        assert!(
+            out.contains("let y"),
+            "v_b should still get exactly `y`:\n{out}"
+        );
+    }
+
+    /// Pinning two distinct Values to the same name is a caller bug.
+    #[test]
+    #[should_panic(expected = "two distinct Values cannot share an immovable name")]
+    fn emit_config_pin_conflict_panics() {
+        use crate::ir::ssa::{
+            Constant, FunctionBuilder, InstKind, Module as SsaModule, Operand, Terminator,
+        };
+        let mut module = SsaModule::new();
+        let mut b = FunctionBuilder::new(&mut module, "f", 0);
+        let bb0 = b.new_block();
+        b.switch_to_block(bb0);
+        let v_a = b
+            .add_inst(InstKind::AddGeneric {
+                lhs: Operand::Const(Constant::Int32(1)),
+                rhs: Operand::Const(Constant::Int32(2)),
+            })
+            .unwrap();
+        let v_b = b
+            .add_inst(InstKind::AddGeneric {
+                lhs: Operand::Const(Constant::Int32(3)),
+                rhs: Operand::Const(Constant::Int32(4)),
+            })
+            .unwrap();
+        b.set_terminator(Terminator::Return {
+            val: Some(Operand::Value(v_b)),
+        });
+        b.finish();
+
+        let mut cfg = EmitConfig::default();
+        cfg.immovable_names.insert(v_a.0, "y".to_string());
+        cfg.immovable_names.insert(v_b.0, "y".to_string());
+        let _ = lower_module_with_config(&module, &cfg);
     }
 }
