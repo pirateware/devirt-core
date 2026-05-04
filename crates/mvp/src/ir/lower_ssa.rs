@@ -503,6 +503,15 @@ impl<'b, 'm> Converter<'b, 'm> {
                 }
                 self.pop_scope();
             }
+            Stmt::FuncDecl(_) => {
+                // Stage 4 will lower nested function declarations into an
+                // AllocClosure bound at this point. Until then, the tree-IR
+                // never carries this variant: lower.rs still rejects nested
+                // function declarations at parse time, so this arm is
+                // unreachable in production. Panic to make any premature
+                // construction loud.
+                panic!("Stmt::FuncDecl reached SSA lowering before stage 4 wired closures")
+            }
         }
     }
 
@@ -680,6 +689,13 @@ impl<'b, 'm> Converter<'b, 'm> {
                     index: idx_op,
                     purity,
                 })
+            }
+            Expr::Func(_) => {
+                // Stage 4 wires function expressions into AllocClosure.
+                // See Stmt::FuncDecl arm above for the same reasoning —
+                // lower.rs cannot yet emit Expr::Func from JS source, so
+                // this arm is unreachable in production.
+                panic!("Expr::Func reached SSA lowering before stage 4 wired closures")
             }
         }
     }

@@ -3,6 +3,11 @@
 //! Not yet SSA, not yet a CFG — just enough to demonstrate that the
 //! pipeline owns a representation distinct from the OXC AST.
 
+// Closure variants (`Stmt::FuncDecl`, `Expr::Func`, `FuncLiteral`,
+// `FuncBody`) are wired up by later T2 stages; suppress unused-variant
+// warnings until then.
+#![allow(dead_code)]
+
 use std::fmt::Write as _;
 
 #[derive(Debug, Clone)]
@@ -50,6 +55,41 @@ pub enum Stmt {
         body: Vec<Stmt>,
     },
     Block(Vec<Stmt>),
+    /// Nested function declaration (`function name(...) { ... }` inside
+    /// another function body). Top-level declarations stay as
+    /// `Item::Function`; this variant is reserved for inner ones, which
+    /// the lowering emits at their textual position (we do not hoist
+    /// — see project memory: closures-disposition-rule).
+    FuncDecl(FuncLiteral),
+}
+
+/// Shared shape for function expressions, arrow functions, and nested
+/// function declarations. Top-level functions still use `IrFunction`;
+/// the two are kept distinct because top-level functions cannot be
+/// PassThrough or anonymous.
+#[derive(Debug, Clone)]
+pub struct FuncLiteral {
+    /// `Some` for `function name(...){}` and `function name(){...}`
+    /// expressions; `None` for anonymous expressions and arrows.
+    pub name: Option<String>,
+    pub params: Vec<String>,
+    pub is_async: bool,
+    pub is_generator: bool,
+    pub is_arrow: bool,
+    pub body: FuncBody,
+}
+
+#[derive(Debug, Clone)]
+pub enum FuncBody {
+    /// Lowered body — the normal pipeline shape.
+    Stmts(Vec<Stmt>),
+    /// Arrow expression body — `(x) => x + 1`. Only valid when
+    /// `is_arrow` is true.
+    Expression(Box<Expr>),
+    /// Source-preserved body — the original JS source text between
+    /// the body's `{` and `}` (exclusive of the braces). Re-parsed and
+    /// re-emitted at the final emit step.
+    PassThrough(String),
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +121,7 @@ pub enum Expr {
         obj: Box<Expr>,
         index: Box<Expr>,
     },
+    Func(Box<FuncLiteral>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,6 +267,47 @@ fn dump_stmt(out: &mut String, s: &Stmt, depth: usize) {
             }
             writeln!(out, "{pad}}}").unwrap();
         }
+        Stmt::FuncDecl(lit) => {
+            dump_func_literal(out, lit, depth);
+        }
+    }
+}
+
+fn dump_func_literal(out: &mut String, lit: &FuncLiteral, depth: usize) {
+    let pad = "  ".repeat(depth);
+    let name = lit.name.as_deref().unwrap_or("<anon>");
+    let kw = if lit.is_arrow {
+        "arrow"
+    } else if lit.is_generator {
+        "fn*"
+    } else {
+        "fn"
+    };
+    let modifiers = if lit.is_async { "async " } else { "" };
+    write!(
+        out,
+        "{pad}{modifiers}{kw} {name}({})",
+        lit.params.join(", ")
+    )
+    .unwrap();
+    match &lit.body {
+        FuncBody::Stmts(body) => {
+            out.push_str(" {\n");
+            for s in body {
+                dump_stmt(out, s, depth + 1);
+            }
+            writeln!(out, "{pad}}}").unwrap();
+        }
+        FuncBody::Expression(e) => {
+            writeln!(out, " => {}", dump_expr(e)).unwrap();
+        }
+        FuncBody::PassThrough(src) => {
+            out.push_str(" passthrough {\n");
+            for line in src.lines() {
+                writeln!(out, "{pad}  {line}").unwrap();
+            }
+            writeln!(out, "{pad}}}").unwrap();
+        }
     }
 }
 
@@ -248,5 +330,25 @@ fn dump_expr(e: &Expr) -> String {
         ),
         Expr::Member { obj, prop } => format!("{}.{}", dump_expr(obj), prop),
         Expr::Index { obj, index } => format!("{}[{}]", dump_expr(obj), dump_expr(index)),
+        Expr::Func(lit) => {
+            let name = lit.name.as_deref().unwrap_or("<anon>");
+            let kw = if lit.is_arrow {
+                "arrow"
+            } else if lit.is_generator {
+                "fn*"
+            } else {
+                "fn"
+            };
+            let modifiers = if lit.is_async { "async " } else { "" };
+            let body_marker = match &lit.body {
+                FuncBody::Stmts(_) => "{...}",
+                FuncBody::Expression(_) => "=> ...",
+                FuncBody::PassThrough(_) => "passthrough {...}",
+            };
+            format!(
+                "{modifiers}{kw} {name}({}) {body_marker}",
+                lit.params.join(", ")
+            )
+        }
     }
 }

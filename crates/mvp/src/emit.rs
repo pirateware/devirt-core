@@ -5,7 +5,9 @@
 
 use std::fmt::Write as _;
 
-use crate::ir::tree::{Expr, IrFunction, Item, Module, Stmt, UnOp, binop_str, unop_str};
+use crate::ir::tree::{
+    Expr, FuncBody, FuncLiteral, IrFunction, Item, Module, Stmt, UnOp, binop_str, unop_str,
+};
 
 pub fn emit(module: &Module) -> String {
     let mut out = String::new();
@@ -158,6 +160,81 @@ impl Printer<'_> {
                 self.pad();
                 self.buf.push('}');
             }
+            Stmt::FuncDecl(lit) => {
+                // Inner function declarations: `function name(...) {...}`.
+                // FuncDecl variants always have a name (statement-position
+                // function declarations require one in JS).
+                let name = lit.name.as_deref().expect("Stmt::FuncDecl requires a name");
+                self.write_func_header(lit, Some(name));
+                self.write_func_body(&lit.body);
+            }
+        }
+    }
+
+    fn write_func_header(&mut self, lit: &FuncLiteral, name: Option<&str>) {
+        if lit.is_arrow {
+            // Arrows have no leading keyword. The header writes the
+            // parameter list only; `=>` and the body follow in
+            // write_func_body.
+            self.buf.push('(');
+            for (i, p) in lit.params.iter().enumerate() {
+                if i > 0 {
+                    self.buf.push_str(", ");
+                }
+                self.buf.push_str(p);
+            }
+            self.buf.push(')');
+            return;
+        }
+        if lit.is_async {
+            self.buf.push_str("async ");
+        }
+        self.buf.push_str("function");
+        if lit.is_generator {
+            self.buf.push('*');
+        }
+        if let Some(n) = name {
+            self.buf.push(' ');
+            self.buf.push_str(n);
+        }
+        self.buf.push('(');
+        for (i, p) in lit.params.iter().enumerate() {
+            if i > 0 {
+                self.buf.push_str(", ");
+            }
+            self.buf.push_str(p);
+        }
+        self.buf.push(')');
+    }
+
+    fn write_func_body(&mut self, body: &FuncBody) {
+        match body {
+            FuncBody::Stmts(stmts) => {
+                self.buf.push_str(" {\n");
+                self.indent += 1;
+                for s in stmts {
+                    self.pad();
+                    self.stmt(s);
+                    self.buf.push('\n');
+                }
+                self.indent -= 1;
+                self.pad();
+                self.buf.push('}');
+            }
+            FuncBody::Expression(e) => {
+                self.buf.push_str(" => ");
+                self.expr(e);
+            }
+            FuncBody::PassThrough(src) => {
+                // Source-preserved body. We emit the slice verbatim
+                // surrounded by braces; the slice was stored without the
+                // outer braces. Stage 5 (emit pipeline) will re-parse +
+                // codegen via oxc; for now this is a faithful textual
+                // round-trip.
+                self.buf.push_str(" {");
+                self.buf.push_str(src);
+                self.buf.push('}');
+            }
         }
     }
 
@@ -225,6 +302,20 @@ impl Printer<'_> {
                 self.buf.push('[');
                 self.expr(index);
                 self.buf.push(']');
+            }
+            Expr::Func(lit) => {
+                // Function expressions: parenthesize so the caller can
+                // splice them anywhere an expression is legal (statement
+                // positions starting with `function` would otherwise be
+                // ambiguous with declarations).
+                if !lit.is_arrow {
+                    self.buf.push('(');
+                }
+                self.write_func_header(lit, lit.name.as_deref());
+                self.write_func_body(&lit.body);
+                if !lit.is_arrow {
+                    self.buf.push(')');
+                }
             }
         }
     }
