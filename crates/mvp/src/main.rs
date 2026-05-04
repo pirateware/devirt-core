@@ -4,8 +4,7 @@
 //!     JS source --[oxc_parser]--> OXC AST --[lower]--> IR --[emit]--> JS source
 //!
 //! This is intentionally a single-file demo. The real architecture
-//! (SSA + CFG + effects lattice + passes + abstract interpreter) is described
-//! in PLAN.md. This file shows the *shape* of the pipeline so the rest of the
+//! This file shows the *shape* of the pipeline so the rest of the
 //! project can be filled in around it.
 //!
 //! Subset of JS supported:
@@ -21,8 +20,7 @@
 //!   - block statements
 //!
 //! Anything outside this subset returns a structured `UnsupportedConstruct`
-//! error rather than silently producing wrong IR. That's the rule from
-//! CLAUDE.md: no silent approximations.
+//! error rather than silently producing wrong IR.
 //!
 //! Run:
 //!     cargo run                    # runs the built-in fibonacci demo
@@ -849,7 +847,8 @@ function reverse(str) {
 }
 
 function isPalindrome(str) {
-    return cleaned == reverse(cleaned);
+    var cleaned = str.toLowerCase().replace(/[^a-z]/g, '');
+    return cleaned === reverse(cleaned);
 }
 
 "#;
