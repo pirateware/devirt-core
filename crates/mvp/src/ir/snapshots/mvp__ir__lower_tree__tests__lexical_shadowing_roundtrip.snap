@@ -1,0 +1,10 @@
+---
+source: src/ir/lower_tree.rs
+expression: out
+---
+function f() {
+  if (true) {
+  } else {
+  }
+  return 1;
+}

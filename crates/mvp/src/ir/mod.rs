@@ -2,5 +2,6 @@
 //! analysis-friendly form. Conversion between them comes in a later milestone.
 
 pub mod lower_ssa;
+pub mod lower_tree;
 pub mod ssa;
 pub mod tree;

@@ -13,3 +13,9 @@ lasso         = "0.7"
 
 [dev-dependencies]
 insta         = "1"
+
+[features]
+# Behavior-preservation tests shell out to `node`. Enabled with
+# `cargo test --features node-tests`. Off by default so CI can run without
+# a Node runtime installed.
+node-tests = []

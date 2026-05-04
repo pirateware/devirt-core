@@ -1,0 +1,20 @@
+---
+source: src/ir/lower_tree.rs
+expression: out
+---
+function sum_to(_a0) {
+  let _t0;
+  let _t1;
+  let _t2;
+  let _t3;
+  let _t4;
+  _t0 = 0;
+  _t2 = 0;
+  while ((_t0 < _a0)) {
+    _t3 = (_t2 + _t0);
+    _t4 = (_t0 + 1);
+    _t0 = _t4;
+    _t2 = _t3;
+  }
+  return _t2;
+}
