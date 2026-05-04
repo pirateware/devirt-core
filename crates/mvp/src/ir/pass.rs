@@ -251,8 +251,8 @@ mod tests {
             "breaking"
         }
         fn run(&mut self, func: &mut Function) -> Result<bool, Error> {
-            let entry = func.entry;
-            func.blocks[entry.0 as usize].terminator = Terminator::Branch {
+            let entry = func.lowered_mut().entry;
+            func.lowered_mut().blocks[entry.0 as usize].terminator = Terminator::Branch {
                 target: BlockId(9999),
                 args: vec![],
             };
@@ -298,8 +298,8 @@ mod tests {
         }
         fn run(&mut self, func: &mut Function) -> Result<bool, Error> {
             // Same breakage as BreakingPass, but with a configurable name.
-            let entry = func.entry;
-            func.blocks[entry.0 as usize].terminator = Terminator::Branch {
+            let entry = func.lowered_mut().entry;
+            func.lowered_mut().blocks[entry.0 as usize].terminator = Terminator::Branch {
                 target: BlockId(7777),
                 args: vec![],
             };

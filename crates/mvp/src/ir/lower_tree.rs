@@ -89,6 +89,7 @@ pub struct EmitConfig {
 fn lower_function(sm: &ssa::Module, _id: FuncId, func: &Function, cfg: &EmitConfig) -> IrFunction {
     let mut ctx = LowerCtx::new(sm, func, cfg);
     let param_names: Vec<String> = func
+        .lowered()
         .params
         .iter()
         .map(|v| ctx.name_for(*v).to_string())
@@ -104,7 +105,7 @@ fn lower_function(sm: &ssa::Module, _id: FuncId, func: &Function, cfg: &EmitConf
         body.push(Stmt::Let { name, init: None });
     }
 
-    ctx.walk(func.entry, None, &mut body);
+    ctx.walk(func.lowered().entry, None, &mut body);
 
     IrFunction {
         name: func.name.clone(),
@@ -167,6 +168,17 @@ impl<'a> LowerCtx<'a> {
         match op {
             Operand::Value(v) => Expr::Ident(self.name_for(*v).to_string()),
             Operand::Const(c) => self.constant_to_expr(c),
+            Operand::Capture(idx) => {
+                // Lowered inner functions reference enclosing-scope values
+                // via Operand::Capture(idx). At emit time the closure's
+                // body lives inside the function expression that was
+                // synthesized from the AllocClosure; the capture name is
+                // the outer-scope binding for that capture slot. Stage 5
+                // (emit pipeline) is responsible for plumbing the actual
+                // name in. Until then, render a placeholder so the IR
+                // is debuggable.
+                Expr::Ident(format!("__cap{}", idx))
+            }
         }
     }
 
@@ -219,7 +231,9 @@ impl LowerCtx<'_> {
 
             self.emit_block_insts(cur, out);
 
-            let term = self.func.blocks[cur.0 as usize].terminator.clone();
+            let term = self.func.lowered().blocks[cur.0 as usize]
+                .terminator
+                .clone();
             match term {
                 Terminator::Return { val } => {
                     let e = val.as_ref().map(|v| self.operand_to_expr(v));
@@ -298,14 +312,14 @@ impl LowerCtx<'_> {
     /// instruction's result Value is bound to its hoisted name via plain
     /// assignment — the `let` was emitted at function-body top.
     fn emit_block_insts(&self, cur: BlockId, out: &mut Vec<Stmt>) {
-        let blk = &self.func.blocks[cur.0 as usize];
+        let blk = &self.func.lowered().blocks[cur.0 as usize];
         for &iid in &blk.instructions {
             self.emit_inst(iid, out);
         }
     }
 
     fn emit_inst(&self, iid: InstId, out: &mut Vec<Stmt>) {
-        let kind = &self.func.instructions[iid.0 as usize].kind;
+        let kind = &self.func.lowered().instructions[iid.0 as usize].kind;
         if kind.is_void() {
             // Stores produce no value. Emit as a side-effecting statement.
             match kind {
@@ -486,7 +500,7 @@ impl LowerCtx<'_> {
     /// top, so `Stmt::Assign` is always sufficient — no `let` ever needed
     /// here.
     fn emit_edge_copies(&self, target: BlockId, args: &[Operand], out: &mut Vec<Stmt>) {
-        let target_blk = &self.func.blocks[target.0 as usize];
+        let target_blk = &self.func.lowered().blocks[target.0 as usize];
         debug_assert_eq!(
             target_blk.params.len(),
             args.len(),
@@ -520,7 +534,7 @@ impl LowerCtx<'_> {
     /// The body walks until reaching `header` again (the back-edge), at
     /// which point the back-edge copies are emitted at the body's tail.
     fn emit_loop(&mut self, header: BlockId, info: LoopInfo, out: &mut Vec<Stmt>) {
-        let header_blk = &self.func.blocks[header.0 as usize];
+        let header_blk = &self.func.lowered().blocks[header.0 as usize];
         let cond_op = match &header_blk.terminator {
             Terminator::CondBranch { cond, .. } => *cond,
             _ => unreachable!("loop_info already validated CondBranch terminator"),
@@ -599,13 +613,13 @@ impl LowerCtx<'_> {
     /// header, return the inlined expression and `true`; else return the
     /// fallback (use the cond Value's name) and `false`.
     fn try_inline_cond(&self, header: BlockId, cond_op: &Operand) -> (Expr, bool) {
-        let blk = &self.func.blocks[header.0 as usize];
+        let blk = &self.func.lowered().blocks[header.0 as usize];
         if let Operand::Value(cv) = cond_op
-            && let ValueDefKind::Inst(cv_inst) = self.func.values[cv.0 as usize].kind
+            && let ValueDefKind::Inst(cv_inst) = self.func.lowered().values[cv.0 as usize].kind
             && blk.instructions.len() == 1
             && blk.instructions[0] == cv_inst
         {
-            let kind = &self.func.instructions[cv_inst.0 as usize].kind;
+            let kind = &self.func.lowered().instructions[cv_inst.0 as usize].kind;
             return (self.inst_kind_to_expr(kind), true);
         }
         // Fallback. If header has zero instructions, this still works — we
@@ -629,7 +643,7 @@ impl LowerCtx<'_> {
     }
 
     fn compute_loop_info(&mut self, b: BlockId) -> Option<LoopInfo> {
-        let block = &self.func.blocks[b.0 as usize];
+        let block = &self.func.lowered().blocks[b.0 as usize];
         let (then_b, else_b) = match &block.terminator {
             Terminator::CondBranch { then_b, else_b, .. } => (*then_b, *else_b),
             _ => return None,
@@ -676,7 +690,7 @@ impl LowerCtx<'_> {
         if dominator == dominated {
             return true;
         }
-        if dominator == self.func.entry {
+        if dominator == self.func.lowered().entry {
             return true;
         }
         let key = (dominator, dominated);
@@ -684,7 +698,7 @@ impl LowerCtx<'_> {
             return *v;
         }
         let mut visited: HashSet<BlockId> = HashSet::new();
-        let mut stack = vec![self.func.entry];
+        let mut stack = vec![self.func.lowered().entry];
         let mut reaches_target = false;
         while let Some(b) = stack.pop() {
             if b == dominator {
@@ -697,7 +711,10 @@ impl LowerCtx<'_> {
                 reaches_target = true;
                 break;
             }
-            for (succ, _) in self.func.blocks[b.0 as usize].terminator.successors() {
+            for (succ, _) in self.func.lowered().blocks[b.0 as usize]
+                .terminator
+                .successors()
+            {
                 stack.push(succ);
             }
         }
@@ -722,7 +739,10 @@ impl LowerCtx<'_> {
             if !visited.insert(b) {
                 continue;
             }
-            for (succ, _) in self.func.blocks[b.0 as usize].terminator.successors() {
+            for (succ, _) in self.func.lowered().blocks[b.0 as usize]
+                .terminator
+                .successors()
+            {
                 stack.push(succ);
             }
         }
@@ -794,7 +814,10 @@ impl LowerCtx<'_> {
                 if !visited.insert(b) {
                     continue;
                 }
-                for (succ, _) in self.func.blocks[b.0 as usize].terminator.successors() {
+                for (succ, _) in self.func.lowered().blocks[b.0 as usize]
+                    .terminator
+                    .successors()
+                {
                     if succ == target {
                         return depth;
                     }
@@ -856,7 +879,7 @@ fn assign_names(
         final_names.insert(vi, name.clone());
     }
 
-    for (i, def) in func.values.iter().enumerate() {
+    for (i, def) in func.lowered().values.iter().enumerate() {
         let vi = i as u32;
         if final_names.contains_key(&vi) {
             // Already assigned via pinning; if it's an Inst or
@@ -948,7 +971,7 @@ fn pick_name(
 }
 
 fn find_value_for_inst(func: &Function, iid: InstId) -> Value {
-    for (i, def) in func.values.iter().enumerate() {
+    for (i, def) in func.lowered().values.iter().enumerate() {
         if let ValueDefKind::Inst(j) = &def.kind
             && *j == iid
         {

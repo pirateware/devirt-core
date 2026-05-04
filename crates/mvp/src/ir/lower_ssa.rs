@@ -155,7 +155,7 @@ impl<'b, 'm> Converter<'b, 'm> {
         for (i, pname) in f.params.iter().enumerate() {
             let sym = self.fresh_symbol();
             self.bind_in_top_scope(pname.clone(), sym);
-            let arg_val = self.builder.func.params[i];
+            let arg_val = self.builder.body.params[i];
             // Annotate the parameter Value with its source name so the
             // out-of-SSA renamer emits e.g. `function f(a, b)` rather than
             // `function f(_a0, _a1)`.
@@ -230,7 +230,7 @@ impl<'b, 'm> Converter<'b, 'm> {
     /// No-op for Const operands and for retired Values.
     fn tag_binding_source_name(&mut self, op: Operand, name: &str) {
         if let Operand::Value(v) = op {
-            let def = &self.builder.func.values[v.0 as usize];
+            let def = &self.builder.body.values[v.0 as usize];
             if def.is_removed() || def.source_name.is_some() {
                 return;
             }
@@ -300,7 +300,7 @@ impl<'b, 'm> Converter<'b, 'm> {
     fn try_remove_trivial_param(&mut self, param: Value) -> Operand {
         // Look up the block and current index of the param. If it's not a
         // block param (or already removed), bail out conservatively.
-        let (block, idx) = match self.builder.func.values[param.0 as usize].kind {
+        let (block, idx) = match self.builder.body.values[param.0 as usize].kind {
             ValueDefKind::BlockParam { block, index } => (block, index as usize),
             ValueDefKind::Removed => return Operand::Const(Constant::Undefined),
             _ => return Operand::Value(param),
@@ -351,14 +351,14 @@ impl<'b, 'm> Converter<'b, 'm> {
         }
 
         // Retire the Value slot.
-        self.builder.func.values[param.0 as usize] = ValueDef::removed();
+        self.builder.body.values[param.0 as usize] = ValueDef::removed();
 
         // Recurse on users that may have become trivial.
         for u in block_param_users {
             if u == param {
                 continue;
             }
-            if self.builder.func.values[u.0 as usize].is_removed() {
+            if self.builder.body.values[u.0 as usize].is_removed() {
                 continue;
             }
             self.try_remove_trivial_param(u);
@@ -378,7 +378,7 @@ impl<'b, 'm> Converter<'b, 'm> {
         for (sym, param) in entries {
             // A param may have been retired by an earlier iteration's
             // recursive trivial-removal; skip in that case.
-            if self.builder.func.values[param.0 as usize].is_removed() {
+            if self.builder.body.values[param.0 as usize].is_removed() {
                 continue;
             }
             self.add_param_operands(sym, b, param);
@@ -810,7 +810,7 @@ impl<'b, 'm> Converter<'b, 'm> {
         self.builder.switch_to_block(rhs_b);
         let rhs_op = self.convert_expr(rhs);
         let rhs_end = self.current_block();
-        self.builder.func.blocks[rhs_end.0 as usize].terminator = Terminator::Branch {
+        self.builder.body.blocks[rhs_end.0 as usize].terminator = Terminator::Branch {
             target: join_b,
             args: vec![rhs_op],
         };
@@ -857,7 +857,7 @@ impl<'b, 'm> Converter<'b, 'm> {
 
     fn is_terminated(&self, b: BlockId) -> bool {
         !matches!(
-            self.builder.func.blocks[b.0 as usize].terminator,
+            self.builder.body.blocks[b.0 as usize].terminator,
             Terminator::Unreachable
         )
     }
@@ -867,7 +867,7 @@ impl<'b, 'm> Converter<'b, 'm> {
     /// happen in our converter, but guards against degenerate IRs).
     fn predecessors_of(&self, target: BlockId) -> Vec<BlockId> {
         let mut out = Vec::new();
-        for (i, blk) in self.builder.func.blocks.iter().enumerate() {
+        for (i, blk) in self.builder.body.blocks.iter().enumerate() {
             for (succ, _) in blk.terminator.successors() {
                 if succ == target {
                     let src = BlockId(i as u32);
@@ -883,19 +883,19 @@ impl<'b, 'm> Converter<'b, 'm> {
 
     /// Operand at `index` in `src`'s edge args targeting `dst`.
     fn edge_arg_at(&self, src: BlockId, dst: BlockId, index: usize) -> Option<Operand> {
-        let blk = &self.builder.func.blocks[src.0 as usize];
+        let blk = &self.builder.body.blocks[src.0 as usize];
         edge_args(&blk.terminator, dst).and_then(|args| args.get(index).copied())
     }
 
     /// Append `op` to `src`'s edge args targeting `dst`.
     fn append_edge_arg(&mut self, src: BlockId, dst: BlockId, op: Operand) {
-        let blk = &mut self.builder.func.blocks[src.0 as usize];
+        let blk = &mut self.builder.body.blocks[src.0 as usize];
         push_edge_arg(&mut blk.terminator, dst, op);
     }
 
     /// Strip the operand at `index` from `src`'s edge args targeting `dst`.
     fn remove_edge_arg_at(&mut self, src: BlockId, dst: BlockId, index: usize) {
-        let blk = &mut self.builder.func.blocks[src.0 as usize];
+        let blk = &mut self.builder.body.blocks[src.0 as usize];
         remove_edge_arg(&mut blk.terminator, dst, index);
     }
 
@@ -903,14 +903,14 @@ impl<'b, 'm> Converter<'b, 'm> {
     /// down by one in their `ValueDef`s so block-param value lookups stay
     /// consistent.
     fn remove_block_param(&mut self, block: BlockId, idx: usize) {
-        let blk = &mut self.builder.func.blocks[block.0 as usize];
+        let blk = &mut self.builder.body.blocks[block.0 as usize];
         blk.params.remove(idx);
         // Snapshot indices to avoid borrowing both `blocks` and `values` at
         // once.
         let trailing: Vec<Value> = blk.params[idx..].to_vec();
         for (offset, v) in trailing.iter().enumerate() {
             if let ValueDefKind::BlockParam { index, .. } =
-                &mut self.builder.func.values[v.0 as usize].kind
+                &mut self.builder.body.values[v.0 as usize].kind
             {
                 *index = (idx + offset) as u32;
             }
@@ -923,9 +923,9 @@ impl<'b, 'm> Converter<'b, 'm> {
     /// incomings may have just become trivial.
     fn find_block_param_users(&self, target: Value) -> Vec<Value> {
         let mut out = Vec::new();
-        for blk in &self.builder.func.blocks {
+        for blk in &self.builder.body.blocks {
             for (succ, args) in blk.terminator.successors() {
-                let succ_blk = &self.builder.func.blocks[succ.0 as usize];
+                let succ_blk = &self.builder.body.blocks[succ.0 as usize];
                 for (i, arg) in args.iter().enumerate() {
                     if let Operand::Value(v) = arg
                         && *v == target
@@ -945,7 +945,7 @@ impl<'b, 'm> Converter<'b, 'm> {
     /// Substitute every `Operand::Value(old)` with `new` across all
     /// instructions, all terminators, and the converter's own `current_def`.
     fn replace_value_uses(&mut self, old: Value, new: Operand) {
-        for inst in &mut self.builder.func.instructions {
+        for inst in &mut self.builder.body.instructions {
             walk_inst_operands_mut(&mut inst.kind, &mut |op| {
                 if let Operand::Value(v) = op
                     && *v == old
@@ -954,7 +954,7 @@ impl<'b, 'm> Converter<'b, 'm> {
                 }
             });
         }
-        for blk in &mut self.builder.func.blocks {
+        for blk in &mut self.builder.body.blocks {
             walk_term_operands_mut(&mut blk.terminator, &mut |op| {
                 if let Operand::Value(v) = op
                     && *v == old
@@ -1300,7 +1300,7 @@ mod tests {
     /// Count live block params (skipping any `Removed` slots, which would
     /// indicate a bug — block.params is shifted to compact on removal).
     fn live_param_count(func: &ssa::Function, b: BlockId) -> usize {
-        func.blocks[b.0 as usize].params.len()
+        func.lowered().blocks[b.0 as usize].params.len()
     }
 
     #[test]
@@ -1365,8 +1365,8 @@ mod tests {
 
         // The branches' edge args should be Const(2) and Const(3)
         // respectively — no instructions emitted in the branch bodies.
-        let then_b = &m.functions[0].blocks[1];
-        let else_b = &m.functions[0].blocks[2];
+        let then_b = &m.functions[0].lowered().blocks[1];
+        let else_b = &m.functions[0].lowered().blocks[2];
         match &then_b.terminator {
             Terminator::Branch { target, args } => {
                 assert_eq!(*target, join);
@@ -1402,6 +1402,7 @@ mod tests {
         // unchanged (the inner x = 2 binds a different SymbolId). After
         // trivial-param removal, the return should literally be `ret 1`.
         let last_block = m.functions[0]
+            .lowered()
             .blocks
             .iter()
             .rev()
@@ -1451,6 +1452,7 @@ mod tests {
         // The exit block's return should read the constant 1, since x is
         // never modified in the loop.
         let exit_block = m.functions[0]
+            .lowered()
             .blocks
             .iter()
             .rev()
@@ -1469,6 +1471,7 @@ mod tests {
         // the validator already enforces this, but assert it explicitly to
         // catch regressions in trivial-removal bookkeeping.
         let removed_count = m.functions[0]
+            .lowered()
             .values
             .iter()
             .filter(|v| v.is_removed())
@@ -1497,7 +1500,7 @@ mod tests {
         let m = lower_js(src);
 
         let mut saw_global_load = false;
-        for inst in &m.functions[0].instructions {
+        for inst in &m.functions[0].lowered().instructions {
             if let InstKind::LoadProp {
                 obj: Operand::Const(Constant::GlobalThis),
                 key,
@@ -1525,7 +1528,7 @@ mod tests {
         let src = r#"function f(x) { return Math.floor(x); }"#;
         let m = lower_js(src);
 
-        let saw_math = m.functions[0].instructions.iter().any(|i| {
+        let saw_math = m.functions[0].lowered().instructions.iter().any(|i| {
             matches!(
                 i.kind,
                 InstKind::LoadProp {
@@ -1548,7 +1551,7 @@ mod tests {
         let m = lower_js(src);
 
         let mut saw_global_store = false;
-        for inst in &m.functions[0].instructions {
+        for inst in &m.functions[0].lowered().instructions {
             if let InstKind::StoreProp {
                 obj: Operand::Const(Constant::GlobalThis),
                 key,
@@ -1579,6 +1582,7 @@ mod tests {
         let m = lower_js(src);
 
         let ret_block = m.functions[0]
+            .lowered()
             .blocks
             .iter()
             .find(|b| matches!(b.terminator, Terminator::Return { val: Some(_) }))
@@ -1605,6 +1609,7 @@ mod tests {
         ] {
             let m = lower_js(src);
             let ret_block = m.functions[0]
+                .lowered()
                 .blocks
                 .iter()
                 .find(|b| matches!(b.terminator, Terminator::Return { val: Some(_) }))
@@ -1668,7 +1673,7 @@ mod tests {
         let m = lower_js(src);
 
         // No global LoadProp anywhere in the function.
-        let leaked = m.functions[0].instructions.iter().any(|i| {
+        let leaked = m.functions[0].lowered().instructions.iter().any(|i| {
             matches!(
                 i.kind,
                 InstKind::LoadProp {
@@ -1681,6 +1686,7 @@ mod tests {
 
         // After trivial-param removal the return collapses to `ret 1`.
         let ret_block = m.functions[0]
+            .lowered()
             .blocks
             .iter()
             .find(|b| matches!(b.terminator, Terminator::Return { val: Some(_) }))

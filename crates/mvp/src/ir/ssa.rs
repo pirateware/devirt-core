@@ -60,6 +60,12 @@ pub enum Constant {
 pub enum Operand {
     Value(Value),
     Const(Constant),
+    /// Reference to a closure capture, by index into the enclosing
+    /// `Function`'s captures list. Only valid inside a function whose
+    /// SSA body was produced as the body of a lowered inner function;
+    /// resolved at emit time against the outer scope's value flowing
+    /// into the matching `AllocClosure` capture slot.
+    Capture(usize),
 }
 
 // ============================================================================
@@ -518,11 +524,74 @@ impl ValueDef {
 
 pub struct Function {
     pub name: String,
+    /// Number of captures this function takes from its enclosing scope.
+    /// Always 0 for top-level functions. Inside a Lowered body, valid
+    /// `Operand::Capture(i)` indices satisfy `i < capture_count`.
+    pub capture_count: usize,
+    pub body: FunctionBody,
+}
+
+pub enum FunctionBody {
+    Lowered(LoweredBody),
+    PassThrough(PassThroughBody),
+}
+
+pub struct LoweredBody {
     pub params: Vec<Value>,
     pub blocks: Vec<BasicBlock>,
     pub instructions: Vec<Instruction>,
     pub values: Vec<ValueDef>,
     pub entry: BlockId,
+}
+
+/// Source-preserved function body. We hold an owned slice of the original
+/// JS source covering the body (between `{` and `}`, exclusive of the
+/// braces themselves), plus enough metadata to synthesize the function
+/// header at emit time. Captured operands live on the `AllocClosure` in
+/// the outer function — they are NOT stored here.
+pub struct PassThroughBody {
+    pub source: String,
+    pub param_names: Vec<StrId>,
+    pub function_name: Option<StrId>,
+    pub is_async: bool,
+    pub is_generator: bool,
+    pub is_arrow: bool,
+    /// True iff the original arrow had an expression body (no surrounding
+    /// braces). Always false for non-arrow functions. Influences the
+    /// re-parse wrapper at emit time.
+    pub body_is_expression: bool,
+}
+
+impl Function {
+    /// Borrow the lowered body. Panics if this is a PassThrough function.
+    /// Most call sites in the lowering and pass pipeline only ever see
+    /// Lowered bodies; sites that need to handle both should match on
+    /// `&self.body` directly.
+    pub fn lowered(&self) -> &LoweredBody {
+        match &self.body {
+            FunctionBody::Lowered(b) => b,
+            FunctionBody::PassThrough(_) => {
+                panic!("expected Lowered body for function `{}`", self.name)
+            }
+        }
+    }
+    pub fn lowered_mut(&mut self) -> &mut LoweredBody {
+        match &mut self.body {
+            FunctionBody::Lowered(b) => b,
+            FunctionBody::PassThrough(_) => {
+                panic!("expected Lowered body for function `{}`", self.name)
+            }
+        }
+    }
+    pub fn as_lowered(&self) -> Option<&LoweredBody> {
+        match &self.body {
+            FunctionBody::Lowered(b) => Some(b),
+            FunctionBody::PassThrough(_) => None,
+        }
+    }
+    pub fn is_pass_through(&self) -> bool {
+        matches!(self.body, FunctionBody::PassThrough(_))
+    }
 }
 
 pub struct Module {
@@ -555,14 +624,24 @@ impl Default for Module {
 
 pub struct FunctionBuilder<'m> {
     pub module: &'m mut Module,
-    pub func: Function,
+    pub name: String,
+    pub capture_count: usize,
+    pub body: LoweredBody,
     current: Option<BlockId>,
 }
 
 impl<'m> FunctionBuilder<'m> {
     pub fn new(module: &'m mut Module, name: impl Into<String>, num_args: u32) -> Self {
-        let mut func = Function {
-            name: name.into(),
+        Self::new_with_captures(module, name, num_args, 0)
+    }
+
+    pub fn new_with_captures(
+        module: &'m mut Module,
+        name: impl Into<String>,
+        num_args: u32,
+        capture_count: usize,
+    ) -> Self {
+        let mut body = LoweredBody {
             params: Vec::with_capacity(num_args as usize),
             blocks: Vec::new(),
             instructions: Vec::new(),
@@ -570,13 +649,15 @@ impl<'m> FunctionBuilder<'m> {
             entry: BlockId(0),
         };
         for i in 0..num_args {
-            let v = Value(func.values.len() as u32);
-            func.values.push(ValueDef::arg(i));
-            func.params.push(v);
+            let v = Value(body.values.len() as u32);
+            body.values.push(ValueDef::arg(i));
+            body.params.push(v);
         }
         Self {
             module,
-            func,
+            name: name.into(),
+            capture_count,
+            body,
             current: None,
         }
     }
@@ -590,15 +671,15 @@ impl<'m> FunctionBuilder<'m> {
     }
 
     pub fn new_block(&mut self) -> BlockId {
-        let id = BlockId(self.func.blocks.len() as u32);
-        self.func.blocks.push(BasicBlock {
+        let id = BlockId(self.body.blocks.len() as u32);
+        self.body.blocks.push(BasicBlock {
             params: Vec::new(),
             instructions: Vec::new(),
             terminator: Terminator::Unreachable,
             predecessors: Vec::new(),
         });
-        if self.func.blocks.len() == 1 {
-            self.func.entry = id;
+        if self.body.blocks.len() == 1 {
+            self.body.entry = id;
         }
         id
     }
@@ -608,10 +689,10 @@ impl<'m> FunctionBuilder<'m> {
     }
 
     pub fn add_block_param(&mut self, block: BlockId) -> Value {
-        let index = self.func.blocks[block.0 as usize].params.len() as u32;
-        let v = Value(self.func.values.len() as u32);
-        self.func.values.push(ValueDef::block_param(block, index));
-        self.func.blocks[block.0 as usize].params.push(v);
+        let index = self.body.blocks[block.0 as usize].params.len() as u32;
+        let v = Value(self.body.values.len() as u32);
+        self.body.values.push(ValueDef::block_param(block, index));
+        self.body.blocks[block.0 as usize].params.push(v);
         v
     }
 
@@ -619,17 +700,17 @@ impl<'m> FunctionBuilder<'m> {
         let block = self
             .current
             .expect("no current block; call switch_to_block first");
-        let inst_id = InstId(self.func.instructions.len() as u32);
+        let inst_id = InstId(self.body.instructions.len() as u32);
         let void = kind.is_void();
-        self.func.instructions.push(Instruction { kind });
-        self.func.blocks[block.0 as usize]
+        self.body.instructions.push(Instruction { kind });
+        self.body.blocks[block.0 as usize]
             .instructions
             .push(inst_id);
         if void {
             None
         } else {
-            let v = Value(self.func.values.len() as u32);
-            self.func.values.push(ValueDef::inst(inst_id));
+            let v = Value(self.body.values.len() as u32);
+            self.body.values.push(ValueDef::inst(inst_id));
             Some(v)
         }
     }
@@ -639,22 +720,31 @@ impl<'m> FunctionBuilder<'m> {
     /// builder method that produces a Value); the renamer will prefer
     /// this name when emitting the binding for that value.
     pub fn set_source_name(&mut self, v: Value, name: StrId) {
-        self.func.values[v.0 as usize].source_name = Some(name);
+        self.body.values[v.0 as usize].source_name = Some(name);
     }
 
     pub fn set_terminator(&mut self, term: Terminator) {
         let block = self.current.expect("no current block");
-        self.func.blocks[block.0 as usize].terminator = term;
+        self.body.blocks[block.0 as usize].terminator = term;
+    }
+
+    /// Borrow the in-progress body. Equivalent to `Function::lowered`
+    /// for callers that need to inspect blocks/values during build.
+    pub fn body(&self) -> &LoweredBody {
+        &self.body
+    }
+    pub fn body_mut(&mut self) -> &mut LoweredBody {
+        &mut self.body
     }
 
     pub fn finish(mut self) -> FuncId {
-        for blk in self.func.blocks.iter_mut() {
+        for blk in self.body.blocks.iter_mut() {
             blk.predecessors.clear();
         }
-        let n = self.func.blocks.len();
+        let n = self.body.blocks.len();
         for src_idx in 0..n {
             let src = BlockId(src_idx as u32);
-            let succs: Vec<BlockId> = self.func.blocks[src_idx]
+            let succs: Vec<BlockId> = self.body.blocks[src_idx]
                 .terminator
                 .successors()
                 .iter()
@@ -662,7 +752,7 @@ impl<'m> FunctionBuilder<'m> {
                 .collect();
             for t in succs {
                 if (t.0 as usize) < n {
-                    let preds = &mut self.func.blocks[t.0 as usize].predecessors;
+                    let preds = &mut self.body.blocks[t.0 as usize].predecessors;
                     if !preds.contains(&src) {
                         preds.push(src);
                     }
@@ -670,7 +760,11 @@ impl<'m> FunctionBuilder<'m> {
             }
         }
         let fid = FuncId(self.module.functions.len() as u32);
-        self.module.functions.push(self.func);
+        self.module.functions.push(Function {
+            name: self.name,
+            capture_count: self.capture_count,
+            body: FunctionBody::Lowered(self.body),
+        });
         fid
     }
 }
@@ -723,6 +817,12 @@ pub enum ValidationErrorKind {
     OperandReferencesRemovedValue {
         value: Value,
     },
+    EmptyPassThroughSource,
+    /// Capture index out of range for the enclosing function's
+    /// declared `capture_count`.
+    DanglingCapture {
+        index: usize,
+    },
 }
 
 impl Module {
@@ -742,22 +842,37 @@ impl Module {
 
 impl Function {
     fn validate_into(&self, fid: FuncId, num_funcs: usize, errors: &mut Vec<ValidationError>) {
-        let block_count = self.blocks.len();
-        let inst_count = self.instructions.len();
-        let value_count = self.values.len();
+        let body = match &self.body {
+            FunctionBody::Lowered(b) => b,
+            FunctionBody::PassThrough(pt) => {
+                // PassThrough validity: source is non-empty. The validator
+                // does NOT parse or walk into the body slice — that is the
+                // emitter's job, and any malformed source is caught there.
+                if pt.source.is_empty() {
+                    errors.push(ValidationError {
+                        func: fid,
+                        kind: ValidationErrorKind::EmptyPassThroughSource,
+                    });
+                }
+                return;
+            }
+        };
+        let block_count = body.blocks.len();
+        let inst_count = body.instructions.len();
+        let value_count = body.values.len();
 
         // (6) Entry has no predecessors.
-        if (self.entry.0 as usize) < block_count
-            && !self.blocks[self.entry.0 as usize].predecessors.is_empty()
+        if (body.entry.0 as usize) < block_count
+            && !body.blocks[body.entry.0 as usize].predecessors.is_empty()
         {
             errors.push(ValidationError {
                 func: fid,
-                kind: ValidationErrorKind::EntryHasPredecessors { block: self.entry },
+                kind: ValidationErrorKind::EntryHasPredecessors { block: body.entry },
             });
         }
 
         // (1, 2 forward, 3) Forward edges: predecessors and arity match.
-        for (src_idx, src_blk) in self.blocks.iter().enumerate() {
+        for (src_idx, src_blk) in body.blocks.iter().enumerate() {
             let src = BlockId(src_idx as u32);
             for (target, args) in src_blk.terminator.successors() {
                 if (target.0 as usize) >= block_count {
@@ -767,7 +882,7 @@ impl Function {
                     });
                     continue;
                 }
-                let dst = &self.blocks[target.0 as usize];
+                let dst = &body.blocks[target.0 as usize];
                 if args.len() != dst.params.len() {
                     errors.push(ValidationError {
                         func: fid,
@@ -793,7 +908,7 @@ impl Function {
         }
 
         // (2 reverse) Each listed predecessor's terminator targets us.
-        for (dst_idx, dst_blk) in self.blocks.iter().enumerate() {
+        for (dst_idx, dst_blk) in body.blocks.iter().enumerate() {
             let dst = BlockId(dst_idx as u32);
             for &pred in &dst_blk.predecessors {
                 if (pred.0 as usize) >= block_count {
@@ -803,7 +918,7 @@ impl Function {
                     });
                     continue;
                 }
-                let pred_blk = &self.blocks[pred.0 as usize];
+                let pred_blk = &body.blocks[pred.0 as usize];
                 let actually = pred_blk
                     .terminator
                     .successors()
@@ -823,7 +938,8 @@ impl Function {
         }
 
         // (4, 7) Operand and InstId references in bounds.
-        let values = &self.values;
+        let values = &body.values;
+        let capture_count = self.capture_count;
         let check_op = |op: &Operand, errors: &mut Vec<ValidationError>| match op {
             Operand::Value(v) => {
                 if (v.0 as usize) >= value_count {
@@ -847,11 +963,19 @@ impl Function {
                 }
             }
             Operand::Const(_) => {}
+            Operand::Capture(idx) => {
+                if *idx >= capture_count {
+                    errors.push(ValidationError {
+                        func: fid,
+                        kind: ValidationErrorKind::DanglingCapture { index: *idx },
+                    });
+                }
+            }
         };
-        for inst in &self.instructions {
+        for inst in &body.instructions {
             walk_inst_operands(&inst.kind, |op| check_op(op, errors));
         }
-        for blk in &self.blocks {
+        for blk in &body.blocks {
             walk_term_operands(&blk.terminator, |op| check_op(op, errors));
             for &iid in &blk.instructions {
                 if (iid.0 as usize) >= inst_count {
@@ -864,7 +988,7 @@ impl Function {
         }
 
         // (8) Switch case keys unique within a switch.
-        for (b_idx, blk) in self.blocks.iter().enumerate() {
+        for (b_idx, blk) in body.blocks.iter().enumerate() {
             if let Terminator::Switch { cases, .. } = &blk.terminator {
                 let mut seen: Vec<&Constant> = Vec::new();
                 for (i, c) in cases.iter().enumerate() {
@@ -883,7 +1007,7 @@ impl Function {
         }
 
         // ValueDef sanity.
-        for (vi, def) in self.values.iter().enumerate() {
+        for (vi, def) in body.values.iter().enumerate() {
             match &def.kind {
                 ValueDefKind::Inst(iid) => {
                     if (iid.0 as usize) >= inst_count {
@@ -900,7 +1024,7 @@ impl Function {
                             kind: ValidationErrorKind::DanglingBlock { block: *block },
                         });
                     } else {
-                        let blk = &self.blocks[block.0 as usize];
+                        let blk = &body.blocks[block.0 as usize];
                         let v = Value(vi as u32);
                         if (*index as usize) >= blk.params.len() || blk.params[*index as usize] != v
                         {
@@ -1077,28 +1201,61 @@ pub fn pretty_module(m: &Module) -> String {
 pub fn pretty_function(m: &Module, id: FuncId) -> String {
     let func = &m.functions[id.0 as usize];
     let mut out = String::new();
+    let body = match &func.body {
+        FunctionBody::Lowered(b) => b,
+        FunctionBody::PassThrough(pt) => {
+            write!(out, "fn @{}(", func.name).unwrap();
+            for (i, name) in pt.param_names.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(m.strings.resolve(name));
+            }
+            out.push_str(") passthrough");
+            if func.capture_count > 0 {
+                write!(out, " captures={}", func.capture_count).unwrap();
+            }
+            if pt.is_async {
+                out.push_str(" async");
+            }
+            if pt.is_generator {
+                out.push_str(" gen");
+            }
+            if pt.is_arrow {
+                out.push_str(" arrow");
+            }
+            out.push_str(" {\n");
+            for line in pt.source.lines() {
+                out.push_str("  ");
+                out.push_str(line);
+                out.push('\n');
+            }
+            out.push_str("}\n");
+            return out;
+        }
+    };
     write!(out, "fn @{}(", func.name).unwrap();
-    for (i, p) in func.params.iter().enumerate() {
+    for (i, p) in body.params.iter().enumerate() {
         if i > 0 {
             out.push_str(", ");
         }
         write!(out, "%{}", p.0).unwrap();
-        if let Some(name) = func.values[p.0 as usize].source_name {
+        if let Some(name) = body.values[p.0 as usize].source_name {
             write!(out, "[\"{}\"]", m.strings.resolve(&name)).unwrap();
         }
     }
     out.push_str(") {\n");
-    for (i, blk) in func.blocks.iter().enumerate() {
+    for (i, blk) in body.blocks.iter().enumerate() {
         if i > 0 {
             out.push('\n');
         }
-        write_block(&mut out, BlockId(i as u32), blk, func, m);
+        write_block(&mut out, BlockId(i as u32), blk, body, m);
     }
     out.push_str("}\n");
     out
 }
 
-fn write_block(out: &mut String, id: BlockId, blk: &BasicBlock, func: &Function, m: &Module) {
+fn write_block(out: &mut String, id: BlockId, blk: &BasicBlock, func: &LoweredBody, m: &Module) {
     let mut header = String::new();
     write!(header, "  bb{}", id.0).unwrap();
     if !blk.params.is_empty() {
@@ -1132,7 +1289,7 @@ fn write_block(out: &mut String, id: BlockId, blk: &BasicBlock, func: &Function,
     write_terminator(out, &blk.terminator, func, m);
 }
 
-fn write_inst(out: &mut String, iid: InstId, func: &Function, m: &Module) {
+fn write_inst(out: &mut String, iid: InstId, func: &LoweredBody, m: &Module) {
     let inst = &func.instructions[iid.0 as usize];
     let mut line = String::from("    ");
     if !inst.kind.is_void() {
@@ -1149,7 +1306,7 @@ fn write_inst(out: &mut String, iid: InstId, func: &Function, m: &Module) {
     push_with_comment(out, &line, comment.as_deref());
 }
 
-fn find_value_for_inst(func: &Function, iid: InstId) -> Value {
+fn find_value_for_inst(func: &LoweredBody, iid: InstId) -> Value {
     for (i, def) in func.values.iter().enumerate() {
         if let ValueDefKind::Inst(j) = &def.kind
             && *j == iid
@@ -1316,6 +1473,7 @@ fn write_operand(out: &mut String, op: &Operand, m: &Module) {
     match op {
         Operand::Value(v) => write!(out, "%{}", v.0).unwrap(),
         Operand::Const(c) => write_constant(out, c, m),
+        Operand::Capture(idx) => write!(out, "^{}", idx).unwrap(),
     }
 }
 
@@ -1357,7 +1515,7 @@ fn write_string_literal(out: &mut String, s: &str) {
     out.push('"');
 }
 
-fn write_terminator(out: &mut String, t: &Terminator, _func: &Function, m: &Module) {
+fn write_terminator(out: &mut String, t: &Terminator, _func: &LoweredBody, m: &Module) {
     let mut line = String::from("    ");
     match t {
         Terminator::Branch { target, args } => {
@@ -1481,7 +1639,7 @@ mod tests {
     fn sum_to_builds_validates_and_dumps() {
         let mut module = Module::new();
         let mut b = FunctionBuilder::new(&mut module, "sum_to", 1);
-        let arg0 = b.func.params[0];
+        let arg0 = b.body.params[0];
 
         let bb0 = b.new_block();
         let bb1 = b.new_block();
