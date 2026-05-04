@@ -1,0 +1,18 @@
+---
+source: src/ir/lower_ssa.rs
+assertion_line: 1228
+expression: pretty_module(&m)
+---
+fn @f(%0) {
+  bb0:                                  ; preds: <none>
+    cbr %0, bb1, bb2
+
+  bb1:                                  ; preds: bb0
+    br bb3(2)
+
+  bb2:                                  ; preds: bb0
+    br bb3(3)
+
+  bb3(%1):                              ; preds: bb1, bb2
+    ret %1
+}

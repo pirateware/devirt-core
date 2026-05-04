@@ -1,0 +1,21 @@
+---
+source: src/ir/lower_ssa.rs
+assertion_line: 1184
+expression: pretty_module(&m)
+---
+fn @sum_to(%0) {
+  bb0:                                  ; preds: <none>
+    br bb1(0, 0)
+
+  bb1(%1, %4):                          ; preds: bb0, bb2
+    %3 = lt %1, %0                      ; may_throw
+    cbr %3, bb2, bb3
+
+  bb2:                                  ; preds: bb1
+    %5 = add_generic %4, %1             ; may_throw
+    %6 = add_generic %1, 1              ; may_throw
+    br bb1(%6, %5)
+
+  bb3:                                  ; preds: bb1
+    ret %4
+}

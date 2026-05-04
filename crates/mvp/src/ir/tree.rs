@@ -24,6 +24,7 @@ pub struct IrFunction {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::enum_variant_names)]
 pub enum Stmt {
     Let {
         name: String,

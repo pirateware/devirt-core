@@ -12,7 +12,6 @@
 
 use bitflags::bitflags;
 use lasso::{Rodeo, Spur};
-use std::collections::HashSet;
 use std::fmt::Write as _;
 
 // ============================================================================
@@ -45,6 +44,10 @@ pub enum Constant {
     String(StrId),
     Null,
     Undefined,
+    /// A reference to another function in the module. Produced by the SSA
+    /// converter for direct function-name bindings; the printer renders it as
+    /// `@name`.
+    Func(FuncId),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -90,63 +93,165 @@ pub struct Instruction {
 #[derive(Clone, Debug)]
 pub enum InstKind {
     // Generic arithmetic — frontend always emits these.
-    AddGeneric { lhs: Operand, rhs: Operand },
-    SubGeneric { lhs: Operand, rhs: Operand },
-    MulGeneric { lhs: Operand, rhs: Operand },
-    DivGeneric { lhs: Operand, rhs: Operand },
-    ModGeneric { lhs: Operand, rhs: Operand },
+    AddGeneric {
+        lhs: Operand,
+        rhs: Operand,
+    },
+    SubGeneric {
+        lhs: Operand,
+        rhs: Operand,
+    },
+    MulGeneric {
+        lhs: Operand,
+        rhs: Operand,
+    },
+    DivGeneric {
+        lhs: Operand,
+        rhs: Operand,
+    },
+    ModGeneric {
+        lhs: Operand,
+        rhs: Operand,
+    },
 
     // Typed fast-paths — emitted only by the typed-specializer pass.
-    AddNumber { lhs: Operand, rhs: Operand },
-    SubNumber { lhs: Operand, rhs: Operand },
-    MulNumber { lhs: Operand, rhs: Operand },
-    AddInt32 { lhs: Operand, rhs: Operand },
-    SubInt32 { lhs: Operand, rhs: Operand },
-    MulInt32 { lhs: Operand, rhs: Operand },
+    AddNumber {
+        lhs: Operand,
+        rhs: Operand,
+    },
+    SubNumber {
+        lhs: Operand,
+        rhs: Operand,
+    },
+    MulNumber {
+        lhs: Operand,
+        rhs: Operand,
+    },
+    AddInt32 {
+        lhs: Operand,
+        rhs: Operand,
+    },
+    SubInt32 {
+        lhs: Operand,
+        rhs: Operand,
+    },
+    MulInt32 {
+        lhs: Operand,
+        rhs: Operand,
+    },
 
-    ConcatStr { lhs: Operand, rhs: Operand },
+    ConcatStr {
+        lhs: Operand,
+        rhs: Operand,
+    },
 
     // Logical
-    Not { operand: Operand },
-    LogAnd { lhs: Operand, rhs: Operand },
-    LogOr { lhs: Operand, rhs: Operand },
+    Not {
+        operand: Operand,
+    },
+    LogAnd {
+        lhs: Operand,
+        rhs: Operand,
+    },
+    LogOr {
+        lhs: Operand,
+        rhs: Operand,
+    },
 
     // Comparisons
-    Eq { lhs: Operand, rhs: Operand },        // ==  (loose; coerces; may throw)
-    StrictEq { lhs: Operand, rhs: Operand },  // === (no coercion)
-    Lt { lhs: Operand, rhs: Operand },
-    Le { lhs: Operand, rhs: Operand },
+    Eq {
+        lhs: Operand,
+        rhs: Operand,
+    }, // ==  (loose; coerces; may throw)
+    StrictEq {
+        lhs: Operand,
+        rhs: Operand,
+    }, // === (no coercion)
+    Lt {
+        lhs: Operand,
+        rhs: Operand,
+    },
+    Le {
+        lhs: Operand,
+        rhs: Operand,
+    },
 
     // Property access. `pure` records "we have proved this read has no
     // observable side effect" (no getter, no Proxy, no TDZ); the frontend
     // always emits pure=false. Stores produce no value.
-    LoadProp { obj: Operand, key: StrId, pure: bool },
-    StoreProp { obj: Operand, key: StrId, val: Operand },
-    LoadIndex { obj: Operand, index: Operand, pure: bool },
-    StoreIndex { obj: Operand, index: Operand, val: Operand },
+    LoadProp {
+        obj: Operand,
+        key: StrId,
+        pure: bool,
+    },
+    StoreProp {
+        obj: Operand,
+        key: StrId,
+        val: Operand,
+    },
+    LoadIndex {
+        obj: Operand,
+        index: Operand,
+        pure: bool,
+    },
+    StoreIndex {
+        obj: Operand,
+        index: Operand,
+        val: Operand,
+    },
 
     // Allocation — pure (a fresh allocation is a fresh identity).
     AllocObject,
-    AllocArray { length: Option<u32> },
-    AllocClosure { func: FuncId, captures: Vec<Operand> },
+    AllocArray {
+        length: Option<u32>,
+    },
+    AllocClosure {
+        func: FuncId,
+        captures: Vec<Operand>,
+    },
 
     // Calls
-    Call { callee: Operand, args: Vec<Operand> },
-    CallMethod { obj: Operand, method: StrId, args: Vec<Operand> },
-    Construct { ctor: Operand, args: Vec<Operand> },
+    Call {
+        callee: Operand,
+        args: Vec<Operand>,
+    },
+    CallMethod {
+        obj: Operand,
+        method: StrId,
+        args: Vec<Operand>,
+    },
+    Construct {
+        ctor: Operand,
+        args: Vec<Operand>,
+    },
 
     // Coercions (explicit — no implicit JS coercions inside the IR).
-    ToNumber { val: Operand },
-    ToString { val: Operand },
-    ToBool { val: Operand },
-    ToInt32 { val: Operand },
+    ToNumber {
+        val: Operand,
+    },
+    ToString {
+        val: Operand,
+    },
+    ToBool {
+        val: Operand,
+    },
+    ToInt32 {
+        val: Operand,
+    },
 
     // Misc
-    Typeof { val: Operand },
-    Instanceof { obj: Operand, ctor: Operand },
+    Typeof {
+        val: Operand,
+    },
+    Instanceof {
+        obj: Operand,
+        ctor: Operand,
+    },
 
     // Escape hatch — opaque, blocks all reordering and analysis.
-    OpaqueEval { source: Operand },
+    OpaqueEval {
+        source: Operand,
+    },
 }
 
 impl InstKind {
@@ -201,7 +306,10 @@ impl InstKind {
     }
 
     pub fn is_void(&self) -> bool {
-        matches!(self, InstKind::StoreProp { .. } | InstKind::StoreIndex { .. })
+        matches!(
+            self,
+            InstKind::StoreProp { .. } | InstKind::StoreIndex { .. }
+        )
     }
 }
 
@@ -265,8 +373,10 @@ impl Terminator {
                 default_args,
                 ..
             } => {
-                let mut s: Vec<(BlockId, &[Operand])> =
-                    cases.iter().map(|c| (c.target, c.args.as_slice())).collect();
+                let mut s: Vec<(BlockId, &[Operand])> = cases
+                    .iter()
+                    .map(|c| (c.target, c.args.as_slice()))
+                    .collect();
                 s.push((*default, default_args.as_slice()));
                 s
             }
@@ -292,8 +402,16 @@ pub struct BasicBlock {
 #[derive(Clone, Debug)]
 pub enum ValueDef {
     Inst(InstId),
-    BlockParam { block: BlockId, index: u32 },
+    BlockParam {
+        block: BlockId,
+        index: u32,
+    },
     Arg(u32),
+    /// A retired Value slot. The SSA converter's trivial-param removal
+    /// retires block-param Values once their uses are replaced; we cannot
+    /// reuse the Value index without renumbering, so the slot is marked
+    /// `Removed` and skipped by validation/printing.
+    Removed,
 }
 
 pub struct Function {
@@ -317,6 +435,10 @@ impl Module {
             strings: Rodeo::new(),
         }
     }
+
+    pub fn function(&self, id: FuncId) -> &Function {
+        &self.functions[id.0 as usize]
+    }
 }
 
 impl Default for Module {
@@ -333,7 +455,6 @@ pub struct FunctionBuilder<'m> {
     pub module: &'m mut Module,
     pub func: Function,
     current: Option<BlockId>,
-    sealed: HashSet<BlockId>,
 }
 
 impl<'m> FunctionBuilder<'m> {
@@ -355,8 +476,11 @@ impl<'m> FunctionBuilder<'m> {
             module,
             func,
             current: None,
-            sealed: HashSet::new(),
         }
+    }
+
+    pub fn current_block(&self) -> Option<BlockId> {
+        self.current
     }
 
     pub fn intern(&mut self, s: &str) -> StrId {
@@ -411,14 +535,6 @@ impl<'m> FunctionBuilder<'m> {
     pub fn set_terminator(&mut self, term: Terminator) {
         let block = self.current.expect("no current block");
         self.func.blocks[block.0 as usize].terminator = term;
-    }
-
-    /// Mark a block as having all its predecessors known. Currently a
-    /// bookkeeping no-op; the Braun-style construction algorithm uses this to
-    /// resolve deferred block-param fills, which will be wired up when
-    /// tree-IR → SSA conversion lands.
-    pub fn seal_block(&mut self, b: BlockId) {
-        self.sealed.insert(b);
     }
 
     pub fn finish(mut self) -> FuncId {
@@ -484,6 +600,9 @@ pub enum ValidationErrorKind {
     DanglingInst {
         inst: InstId,
     },
+    DanglingFunc {
+        func: FuncId,
+    },
     SwitchDuplicateKey {
         block: BlockId,
         key_index: usize,
@@ -491,13 +610,17 @@ pub enum ValidationErrorKind {
     BlockParamMisregistered {
         value: Value,
     },
+    OperandReferencesRemovedValue {
+        value: Value,
+    },
 }
 
 impl Module {
     pub fn validate(&self) -> Result<(), Vec<ValidationError>> {
         let mut errors = Vec::new();
+        let num_funcs = self.functions.len();
         for (i, f) in self.functions.iter().enumerate() {
-            f.validate_into(FuncId(i as u32), &mut errors);
+            f.validate_into(FuncId(i as u32), num_funcs, &mut errors);
         }
         if errors.is_empty() {
             Ok(())
@@ -508,7 +631,7 @@ impl Module {
 }
 
 impl Function {
-    fn validate_into(&self, fid: FuncId, errors: &mut Vec<ValidationError>) {
+    fn validate_into(&self, fid: FuncId, num_funcs: usize, errors: &mut Vec<ValidationError>) {
         let block_count = self.blocks.len();
         let inst_count = self.instructions.len();
         let value_count = self.values.len();
@@ -590,15 +713,30 @@ impl Function {
         }
 
         // (4, 7) Operand and InstId references in bounds.
-        let check_op = |op: &Operand, errors: &mut Vec<ValidationError>| {
-            if let Operand::Value(v) = op {
+        let values = &self.values;
+        let check_op = |op: &Operand, errors: &mut Vec<ValidationError>| match op {
+            Operand::Value(v) => {
                 if (v.0 as usize) >= value_count {
                     errors.push(ValidationError {
                         func: fid,
                         kind: ValidationErrorKind::DanglingValue { value: *v },
                     });
+                } else if matches!(values[v.0 as usize], ValueDef::Removed) {
+                    errors.push(ValidationError {
+                        func: fid,
+                        kind: ValidationErrorKind::OperandReferencesRemovedValue { value: *v },
+                    });
                 }
             }
+            Operand::Const(Constant::Func(f)) => {
+                if (f.0 as usize) >= num_funcs {
+                    errors.push(ValidationError {
+                        func: fid,
+                        kind: ValidationErrorKind::DanglingFunc { func: *f },
+                    });
+                }
+            }
+            Operand::Const(_) => {}
         };
         for inst in &self.instructions {
             walk_inst_operands(&inst.kind, |op| check_op(op, errors));
@@ -663,7 +801,7 @@ impl Function {
                         }
                     }
                 }
-                ValueDef::Arg(_) => {}
+                ValueDef::Arg(_) | ValueDef::Removed => {}
             }
         }
     }
@@ -681,6 +819,7 @@ fn const_eq(a: &Constant, b: &Constant) -> bool {
         (String(x), String(y)) => x == y,
         (Null, Null) => true,
         (Undefined, Undefined) => true,
+        (Func(x), Func(y)) => x.0 == y.0,
         _ => false,
     }
 }
@@ -813,16 +952,17 @@ const COMMENT_COL: usize = 40;
 
 pub fn pretty_module(m: &Module) -> String {
     let mut out = String::new();
-    for (i, f) in m.functions.iter().enumerate() {
+    for i in 0..m.functions.len() {
         if i > 0 {
             out.push('\n');
         }
-        out.push_str(&pretty_function(f, &m.strings));
+        out.push_str(&pretty_function(m, FuncId(i as u32)));
     }
     out
 }
 
-pub fn pretty_function(func: &Function, strings: &Rodeo) -> String {
+pub fn pretty_function(m: &Module, id: FuncId) -> String {
+    let func = &m.functions[id.0 as usize];
     let mut out = String::new();
     write!(out, "fn @{}(", func.name).unwrap();
     for (i, p) in func.params.iter().enumerate() {
@@ -836,13 +976,13 @@ pub fn pretty_function(func: &Function, strings: &Rodeo) -> String {
         if i > 0 {
             out.push('\n');
         }
-        write_block(&mut out, BlockId(i as u32), blk, func, strings);
+        write_block(&mut out, BlockId(i as u32), blk, func, m);
     }
     out.push_str("}\n");
     out
 }
 
-fn write_block(out: &mut String, id: BlockId, blk: &BasicBlock, func: &Function, strings: &Rodeo) {
+fn write_block(out: &mut String, id: BlockId, blk: &BasicBlock, func: &Function, m: &Module) {
     let mut header = String::new();
     write!(header, "  bb{}", id.0).unwrap();
     if !blk.params.is_empty() {
@@ -871,19 +1011,19 @@ fn write_block(out: &mut String, id: BlockId, blk: &BasicBlock, func: &Function,
     push_with_comment(out, &header, Some(&preds));
 
     for &iid in &blk.instructions {
-        write_inst(out, iid, func, strings);
+        write_inst(out, iid, func, m);
     }
-    write_terminator(out, &blk.terminator, func, strings);
+    write_terminator(out, &blk.terminator, func, m);
 }
 
-fn write_inst(out: &mut String, iid: InstId, func: &Function, strings: &Rodeo) {
+fn write_inst(out: &mut String, iid: InstId, func: &Function, m: &Module) {
     let inst = &func.instructions[iid.0 as usize];
     let mut line = String::from("    ");
     if !inst.kind.is_void() {
         let v = find_value_for_inst(func, iid);
         write!(line, "%{} = ", v.0).unwrap();
     }
-    write_inst_kind(&mut line, &inst.kind, strings);
+    write_inst_kind(&mut line, &inst.kind, m);
     let eff = inst.kind.effect();
     let comment = fmt_effect(eff);
     push_with_comment(out, &line, comment.as_deref());
@@ -891,53 +1031,57 @@ fn write_inst(out: &mut String, iid: InstId, func: &Function, strings: &Rodeo) {
 
 fn find_value_for_inst(func: &Function, iid: InstId) -> Value {
     for (i, def) in func.values.iter().enumerate() {
-        if let ValueDef::Inst(j) = def {
-            if *j == iid {
-                return Value(i as u32);
-            }
+        if let ValueDef::Inst(j) = def
+            && *j == iid
+        {
+            return Value(i as u32);
         }
     }
     panic!("instruction {iid:?} has no value-def");
 }
 
-fn write_inst_kind(out: &mut String, kind: &InstKind, strings: &Rodeo) {
+fn write_inst_kind(out: &mut String, kind: &InstKind, m: &Module) {
     use InstKind::*;
     match kind {
-        AddGeneric { lhs, rhs } => write_binop(out, "add_generic", lhs, rhs, strings),
-        SubGeneric { lhs, rhs } => write_binop(out, "sub_generic", lhs, rhs, strings),
-        MulGeneric { lhs, rhs } => write_binop(out, "mul_generic", lhs, rhs, strings),
-        DivGeneric { lhs, rhs } => write_binop(out, "div_generic", lhs, rhs, strings),
-        ModGeneric { lhs, rhs } => write_binop(out, "mod_generic", lhs, rhs, strings),
-        AddNumber { lhs, rhs } => write_binop(out, "add_number", lhs, rhs, strings),
-        SubNumber { lhs, rhs } => write_binop(out, "sub_number", lhs, rhs, strings),
-        MulNumber { lhs, rhs } => write_binop(out, "mul_number", lhs, rhs, strings),
-        AddInt32 { lhs, rhs } => write_binop(out, "add_int32", lhs, rhs, strings),
-        SubInt32 { lhs, rhs } => write_binop(out, "sub_int32", lhs, rhs, strings),
-        MulInt32 { lhs, rhs } => write_binop(out, "mul_int32", lhs, rhs, strings),
-        ConcatStr { lhs, rhs } => write_binop(out, "concat_str", lhs, rhs, strings),
+        AddGeneric { lhs, rhs } => write_binop(out, "add_generic", lhs, rhs, m),
+        SubGeneric { lhs, rhs } => write_binop(out, "sub_generic", lhs, rhs, m),
+        MulGeneric { lhs, rhs } => write_binop(out, "mul_generic", lhs, rhs, m),
+        DivGeneric { lhs, rhs } => write_binop(out, "div_generic", lhs, rhs, m),
+        ModGeneric { lhs, rhs } => write_binop(out, "mod_generic", lhs, rhs, m),
+        AddNumber { lhs, rhs } => write_binop(out, "add_number", lhs, rhs, m),
+        SubNumber { lhs, rhs } => write_binop(out, "sub_number", lhs, rhs, m),
+        MulNumber { lhs, rhs } => write_binop(out, "mul_number", lhs, rhs, m),
+        AddInt32 { lhs, rhs } => write_binop(out, "add_int32", lhs, rhs, m),
+        SubInt32 { lhs, rhs } => write_binop(out, "sub_int32", lhs, rhs, m),
+        MulInt32 { lhs, rhs } => write_binop(out, "mul_int32", lhs, rhs, m),
+        ConcatStr { lhs, rhs } => write_binop(out, "concat_str", lhs, rhs, m),
         Not { operand } => {
             out.push_str("not ");
-            write_operand(out, operand, strings);
+            write_operand(out, operand, m);
         }
-        LogAnd { lhs, rhs } => write_binop(out, "log_and", lhs, rhs, strings),
-        LogOr { lhs, rhs } => write_binop(out, "log_or", lhs, rhs, strings),
-        Eq { lhs, rhs } => write_binop(out, "eq", lhs, rhs, strings),
-        StrictEq { lhs, rhs } => write_binop(out, "strict_eq", lhs, rhs, strings),
-        Lt { lhs, rhs } => write_binop(out, "lt", lhs, rhs, strings),
-        Le { lhs, rhs } => write_binop(out, "le", lhs, rhs, strings),
+        LogAnd { lhs, rhs } => write_binop(out, "log_and", lhs, rhs, m),
+        LogOr { lhs, rhs } => write_binop(out, "log_or", lhs, rhs, m),
+        Eq { lhs, rhs } => write_binop(out, "eq", lhs, rhs, m),
+        StrictEq { lhs, rhs } => write_binop(out, "strict_eq", lhs, rhs, m),
+        Lt { lhs, rhs } => write_binop(out, "lt", lhs, rhs, m),
+        Le { lhs, rhs } => write_binop(out, "le", lhs, rhs, m),
         LoadProp { obj, key, pure } => {
-            out.push_str(if *pure { "load_prop_pure " } else { "load_prop " });
-            write_operand(out, obj, strings);
+            out.push_str(if *pure {
+                "load_prop_pure "
+            } else {
+                "load_prop "
+            });
+            write_operand(out, obj, m);
             out.push_str(", ");
-            write_string_literal(out, strings.resolve(key));
+            write_string_literal(out, m.strings.resolve(key));
         }
         StoreProp { obj, key, val } => {
             out.push_str("store_prop ");
-            write_operand(out, obj, strings);
+            write_operand(out, obj, m);
             out.push_str(", ");
-            write_string_literal(out, strings.resolve(key));
+            write_string_literal(out, m.strings.resolve(key));
             out.push_str(", ");
-            write_operand(out, val, strings);
+            write_operand(out, val, m);
         }
         LoadIndex { obj, index, pure } => {
             out.push_str(if *pure {
@@ -945,17 +1089,17 @@ fn write_inst_kind(out: &mut String, kind: &InstKind, strings: &Rodeo) {
             } else {
                 "load_index "
             });
-            write_operand(out, obj, strings);
+            write_operand(out, obj, m);
             out.push_str(", ");
-            write_operand(out, index, strings);
+            write_operand(out, index, m);
         }
         StoreIndex { obj, index, val } => {
             out.push_str("store_index ");
-            write_operand(out, obj, strings);
+            write_operand(out, obj, m);
             out.push_str(", ");
-            write_operand(out, index, strings);
+            write_operand(out, index, m);
             out.push_str(", ");
-            write_operand(out, val, strings);
+            write_operand(out, val, m);
         }
         AllocObject => out.push_str("alloc_object"),
         AllocArray { length } => match length {
@@ -963,76 +1107,97 @@ fn write_inst_kind(out: &mut String, kind: &InstKind, strings: &Rodeo) {
             None => out.push_str("alloc_array len=?"),
         },
         AllocClosure { func, captures } => {
-            write!(out, "alloc_closure @f{}, [", func.0).unwrap();
+            write!(out, "alloc_closure @{}, [", func_label(m, *func)).unwrap();
             for (i, c) in captures.iter().enumerate() {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                write_operand(out, c, strings);
+                write_operand(out, c, m);
             }
             out.push(']');
         }
         Call { callee, args } => {
             out.push_str("call ");
-            write_operand(out, callee, strings);
-            write_arg_list(out, args, strings);
+            write_callee(out, callee, m);
+            write_arg_list(out, args, m);
         }
         CallMethod { obj, method, args } => {
             out.push_str("call_method ");
-            write_operand(out, obj, strings);
+            write_operand(out, obj, m);
             out.push_str(", ");
-            write_string_literal(out, strings.resolve(method));
+            write_string_literal(out, m.strings.resolve(method));
             out.push_str(", ");
-            write_arg_list(out, args, strings);
+            write_arg_list(out, args, m);
         }
         Construct { ctor, args } => {
             out.push_str("construct ");
-            write_operand(out, ctor, strings);
-            write_arg_list(out, args, strings);
+            write_callee(out, ctor, m);
+            write_arg_list(out, args, m);
         }
-        ToNumber { val } => unop(out, "to_number", val, strings),
-        ToString { val } => unop(out, "to_string", val, strings),
-        ToBool { val } => unop(out, "to_bool", val, strings),
-        ToInt32 { val } => unop(out, "to_int32", val, strings),
-        Typeof { val } => unop(out, "typeof", val, strings),
-        Instanceof { obj, ctor } => write_binop(out, "instanceof", obj, ctor, strings),
-        OpaqueEval { source } => unop(out, "opaque_eval", source, strings),
+        ToNumber { val } => unop(out, "to_number", val, m),
+        ToString { val } => unop(out, "to_string", val, m),
+        ToBool { val } => unop(out, "to_bool", val, m),
+        ToInt32 { val } => unop(out, "to_int32", val, m),
+        Typeof { val } => unop(out, "typeof", val, m),
+        Instanceof { obj, ctor } => write_binop(out, "instanceof", obj, ctor, m),
+        OpaqueEval { source } => unop(out, "opaque_eval", source, m),
     }
 }
 
-fn write_binop(out: &mut String, name: &str, lhs: &Operand, rhs: &Operand, strings: &Rodeo) {
+/// Render a function reference as `name` if known, else `f<id>`. Caller
+/// supplies the leading `@`.
+fn func_label(m: &Module, id: FuncId) -> String {
+    if (id.0 as usize) < m.functions.len() {
+        m.functions[id.0 as usize].name.clone()
+    } else {
+        format!("f{}", id.0)
+    }
+}
+
+/// Direct-call rendering shortcut: a callee that is `Const(Func(id))` is
+/// rendered as `@name` rather than the generic constant form so call sites
+/// to known functions read naturally.
+fn write_callee(out: &mut String, op: &Operand, m: &Module) {
+    if let Operand::Const(Constant::Func(id)) = op {
+        write!(out, "@{}", func_label(m, *id)).unwrap();
+    } else {
+        write_operand(out, op, m);
+    }
+}
+
+fn write_binop(out: &mut String, name: &str, lhs: &Operand, rhs: &Operand, m: &Module) {
     out.push_str(name);
     out.push(' ');
-    write_operand(out, lhs, strings);
+    write_operand(out, lhs, m);
     out.push_str(", ");
-    write_operand(out, rhs, strings);
+    write_operand(out, rhs, m);
 }
 
-fn unop(out: &mut String, name: &str, val: &Operand, strings: &Rodeo) {
+fn unop(out: &mut String, name: &str, val: &Operand, m: &Module) {
     out.push_str(name);
     out.push(' ');
-    write_operand(out, val, strings);
+    write_operand(out, val, m);
 }
 
-fn write_arg_list(out: &mut String, args: &[Operand], strings: &Rodeo) {
+fn write_arg_list(out: &mut String, args: &[Operand], m: &Module) {
     out.push('(');
     for (i, a) in args.iter().enumerate() {
         if i > 0 {
             out.push_str(", ");
         }
-        write_operand(out, a, strings);
+        write_operand(out, a, m);
     }
     out.push(')');
 }
 
-fn write_operand(out: &mut String, op: &Operand, strings: &Rodeo) {
+fn write_operand(out: &mut String, op: &Operand, m: &Module) {
     match op {
         Operand::Value(v) => write!(out, "%{}", v.0).unwrap(),
-        Operand::Const(c) => write_constant(out, c, strings),
+        Operand::Const(c) => write_constant(out, c, m),
     }
 }
 
-fn write_constant(out: &mut String, c: &Constant, strings: &Rodeo) {
+fn write_constant(out: &mut String, c: &Constant, m: &Module) {
     match c {
         Constant::Number(n) => {
             if n.is_nan() {
@@ -1047,9 +1212,10 @@ fn write_constant(out: &mut String, c: &Constant, strings: &Rodeo) {
         }
         Constant::Int32(n) => write!(out, "{}i32", n).unwrap(),
         Constant::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Constant::String(s) => write_string_literal(out, strings.resolve(s)),
+        Constant::String(s) => write_string_literal(out, m.strings.resolve(s)),
         Constant::Null => out.push_str("null"),
         Constant::Undefined => out.push_str("undefined"),
+        Constant::Func(id) => write!(out, "@{}", func_label(m, *id)).unwrap(),
     }
 }
 
@@ -1068,12 +1234,12 @@ fn write_string_literal(out: &mut String, s: &str) {
     out.push('"');
 }
 
-fn write_terminator(out: &mut String, t: &Terminator, _func: &Function, strings: &Rodeo) {
+fn write_terminator(out: &mut String, t: &Terminator, _func: &Function, m: &Module) {
     let mut line = String::from("    ");
     match t {
         Terminator::Branch { target, args } => {
             write!(line, "br ").unwrap();
-            write_block_target(&mut line, *target, args, strings);
+            write_block_target(&mut line, *target, args, m);
         }
         Terminator::CondBranch {
             cond,
@@ -1083,11 +1249,11 @@ fn write_terminator(out: &mut String, t: &Terminator, _func: &Function, strings:
             else_args,
         } => {
             line.push_str("cbr ");
-            write_operand(&mut line, cond, strings);
+            write_operand(&mut line, cond, m);
             line.push_str(", ");
-            write_block_target(&mut line, *then_b, then_args, strings);
+            write_block_target(&mut line, *then_b, then_args, m);
             line.push_str(", ");
-            write_block_target(&mut line, *else_b, else_args, strings);
+            write_block_target(&mut line, *else_b, else_args, m);
         }
         Terminator::Switch {
             val,
@@ -1096,37 +1262,37 @@ fn write_terminator(out: &mut String, t: &Terminator, _func: &Function, strings:
             default_args,
         } => {
             line.push_str("switch ");
-            write_operand(&mut line, val, strings);
+            write_operand(&mut line, val, m);
             line.push_str(", [");
             push_with_comment(out, &line, None);
             for c in cases {
                 let mut case_line = String::from("        ");
-                write_constant(&mut case_line, &c.key, strings);
+                write_constant(&mut case_line, &c.key, m);
                 case_line.push_str(": ");
-                write_block_target(&mut case_line, c.target, &c.args, strings);
+                write_block_target(&mut case_line, c.target, &c.args, m);
                 case_line.push(',');
                 push_with_comment(out, &case_line, None);
             }
             let mut tail = String::from("    ] default ");
-            write_block_target(&mut tail, *default, default_args, strings);
+            write_block_target(&mut tail, *default, default_args, m);
             push_with_comment(out, &tail, None);
             return;
         }
         Terminator::Return { val: Some(v) } => {
             line.push_str("ret ");
-            write_operand(&mut line, v, strings);
+            write_operand(&mut line, v, m);
         }
         Terminator::Return { val: None } => line.push_str("ret"),
         Terminator::Throw { val } => {
             line.push_str("throw ");
-            write_operand(&mut line, val, strings);
+            write_operand(&mut line, val, m);
         }
         Terminator::Unreachable => line.push_str("unreachable"),
     }
     push_with_comment(out, &line, None);
 }
 
-fn write_block_target(out: &mut String, target: BlockId, args: &[Operand], strings: &Rodeo) {
+fn write_block_target(out: &mut String, target: BlockId, args: &[Operand], m: &Module) {
     write!(out, "bb{}", target.0).unwrap();
     if !args.is_empty() {
         out.push('(');
@@ -1134,7 +1300,7 @@ fn write_block_target(out: &mut String, target: BlockId, args: &[Operand], strin
             if i > 0 {
                 out.push_str(", ");
             }
-            write_operand(out, a, strings);
+            write_operand(out, a, m);
         }
         out.push(')');
     }
@@ -1251,7 +1417,7 @@ mod tests {
         let _fid = b.finish();
         module.validate().expect("ssa module should validate");
 
-        let dump = pretty_function(&module.functions[0], &module.strings);
+        let dump = pretty_function(&module, FuncId(0));
         insta::assert_snapshot!(dump, @r#"
         fn @sum_to(%0) {
           bb0:                                  ; preds: <none>
@@ -1299,9 +1465,9 @@ mod tests {
         b.finish();
 
         let errs = module.validate().unwrap_err();
-        assert!(errs.iter().any(|e| matches!(
-            e.kind,
-            ValidationErrorKind::EdgeArityMismatch { .. }
-        )));
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e.kind, ValidationErrorKind::EdgeArityMismatch { .. }))
+        );
     }
 }

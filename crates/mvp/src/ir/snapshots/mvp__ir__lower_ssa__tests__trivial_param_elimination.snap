@@ -1,0 +1,20 @@
+---
+source: src/ir/lower_ssa.rs
+assertion_line: 1315
+expression: pretty_module(&m)
+---
+fn @f(%0) {
+  bb0:                                  ; preds: <none>
+    br bb1(0)
+
+  bb1(%1):                              ; preds: bb0, bb2
+    %3 = lt %1, %0                      ; may_throw
+    cbr %3, bb2, bb3
+
+  bb2:                                  ; preds: bb1
+    %4 = add_generic %1, 1              ; may_throw
+    br bb1(%4)
+
+  bb3:                                  ; preds: bb1
+    ret 1
+}
