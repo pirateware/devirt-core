@@ -1,0 +1,10 @@
+---
+source: src/ir/lower_tree.rs
+assertion_line: 1055
+expression: out
+---
+function f() {
+  let _t0;
+  _t0 = foo;
+  return _t0;
+}

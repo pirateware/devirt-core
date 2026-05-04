@@ -171,6 +171,13 @@ impl<'a> LowerCtx<'a> {
             // reads of the function name. Function declarations are
             // top-level, so the binding is in scope at every call site.
             Constant::Func(id) => Expr::Ident(self.sm.functions[id.0 as usize].name.clone()),
+            // `GlobalThis` used as a value (not as the obj of a LoadProp /
+            // StoreProp — those short-circuit at the inst level) emits as
+            // the literal `globalThis` identifier. Note this is
+            // intentionally a lossy normalization: `window`, `self`, and
+            // `global` collapse to the same Const(GlobalThis) and therefore
+            // all re-emit as `globalThis`.
+            Constant::GlobalThis => Expr::Ident("globalThis".to_string()),
         }
     }
 }
@@ -291,16 +298,26 @@ impl LowerCtx<'_> {
         if kind.is_void() {
             // Stores produce no value. Emit as a side-effecting statement.
             match kind {
-                InstKind::StoreProp { obj, key, val } => {
-                    out.push(Stmt::Assign {
-                        target: Expr::Member {
+                InstKind::StoreProp { obj, key, val, .. } => {
+                    let prop = self.sm.strings.resolve(key).to_string();
+                    // Stores rooted at `Const(GlobalThis)` re-emit as bare
+                    // `name = value`, undoing the structural indirection
+                    // introduced by the unbound-write lowering.
+                    let target = match obj {
+                        Operand::Const(Constant::GlobalThis) => Expr::Ident(prop),
+                        _ => Expr::Member {
                             obj: Box::new(self.operand_to_expr(obj)),
-                            prop: self.sm.strings.resolve(key).to_string(),
+                            prop,
                         },
+                    };
+                    out.push(Stmt::Assign {
+                        target,
                         value: self.operand_to_expr(val),
                     });
                 }
-                InstKind::StoreIndex { obj, index, val } => {
+                InstKind::StoreIndex {
+                    obj, index, val, ..
+                } => {
                     out.push(Stmt::Assign {
                         target: Expr::Index {
                             obj: Box::new(self.operand_to_expr(obj)),
@@ -360,10 +377,20 @@ impl LowerCtx<'_> {
             StrictEq { lhs, rhs } => self.binop(BinOp::StrictEq, lhs, rhs),
             Lt { lhs, rhs } => self.binop(BinOp::Lt, lhs, rhs),
             Le { lhs, rhs } => self.binop(BinOp::Le, lhs, rhs),
-            LoadProp { obj, key, .. } => Expr::Member {
-                obj: Box::new(self.operand_to_expr(obj)),
-                prop: self.sm.strings.resolve(key).to_string(),
-            },
+            LoadProp { obj, key, .. } => {
+                let prop = self.sm.strings.resolve(key).to_string();
+                // Reads rooted at `Const(GlobalThis)` re-emit as a bare
+                // identifier (`console`, not `globalThis.console`),
+                // undoing the structural indirection introduced by the
+                // unbound-read lowering.
+                match obj {
+                    Operand::Const(Constant::GlobalThis) => Expr::Ident(prop),
+                    _ => Expr::Member {
+                        obj: Box::new(self.operand_to_expr(obj)),
+                        prop,
+                    },
+                }
+            }
             LoadIndex { obj, index, .. } => Expr::Index {
                 obj: Box::new(self.operand_to_expr(obj)),
                 index: Box::new(self.operand_to_expr(index)),
@@ -404,9 +431,9 @@ impl LowerCtx<'_> {
                 callee: Box::new(Expr::Ident("Array".to_string())),
                 args: vec![],
             },
-            AllocClosure { .. } => panic!(
-                "AllocClosure not lowered: closures aren't yet emitted by the SSA converter"
-            ),
+            AllocClosure { .. } => {
+                panic!("AllocClosure not lowered: closures aren't yet emitted by the SSA converter")
+            }
             Construct { ctor, args } => Expr::Call {
                 callee: Box::new(self.operand_to_expr(ctor)),
                 args: args.iter().map(|a| self.operand_to_expr(a)).collect(),
@@ -518,9 +545,7 @@ impl LowerCtx<'_> {
         // Determine which cbr branch is the body and which is the exit (the
         // ordering depends on how lower_while's cbr ended up).
         let (body_args, exit_args) = match &header_blk.terminator {
-            Terminator::CondBranch {
-                then_b, else_b, ..
-            } => {
+            Terminator::CondBranch { then_b, else_b, .. } => {
                 if *then_b == info.body_b {
                     (cbr_then_args.clone(), cbr_else_args.clone())
                 } else {
@@ -595,9 +620,7 @@ impl LowerCtx<'_> {
     fn compute_loop_info(&mut self, b: BlockId) -> Option<LoopInfo> {
         let block = &self.func.blocks[b.0 as usize];
         let (then_b, else_b) = match &block.terminator {
-            Terminator::CondBranch {
-                then_b, else_b, ..
-            } => (*then_b, *else_b),
+            Terminator::CondBranch { then_b, else_b, .. } => (*then_b, *else_b),
             _ => return None,
         };
 
@@ -812,9 +835,7 @@ mod tests {
         // Re-parse the emitted JS. This is a structural sanity check; it
         // doesn't prove behavior preservation but catches gross syntax bugs.
         parse_and_lower(&out).unwrap_or_else(|e| {
-            panic!(
-                "emitted JS failed to re-parse: {e}\n--- emitted ---\n{out}\n--- end ---"
-            )
+            panic!("emitted JS failed to re-parse: {e}\n--- emitted ---\n{out}\n--- end ---")
         });
         out
     }
@@ -961,6 +982,85 @@ mod tests {
     }
 
     // ====================================================================
+    // Globals model — round-trips. Each test confirms the unbound-ident
+    // lowering survives the full pipeline and re-emits as JS that re-parses.
+    // ====================================================================
+
+    /// The current out-of-SSA pass emits each SSA value as its own
+    /// `_tN = ...;` statement; expression chaining like `console.log("hi")`
+    /// only re-fuses once an inliner runs (a future pass). We therefore
+    /// assert on the parts — `console` and `.log` and the string arg —
+    /// that the IR reliably preserves. The snapshot pins the full shape.
+    #[test]
+    fn console_log_roundtrip() {
+        let src = r#"function f() { console.log("hi"); }"#;
+        let out = full_roundtrip(src);
+        assert!(out.contains("console"), "missing `console`:\n{out}");
+        assert!(out.contains(".log"), "missing `.log`:\n{out}");
+        assert!(out.contains("\"hi\""), "missing `\"hi\"`:\n{out}");
+        assert!(
+            !out.contains("globalThis"),
+            "GlobalThis indirection should be invisible in emit:\n{out}"
+        );
+        insta::assert_snapshot!(out);
+    }
+
+    #[test]
+    fn math_floor_roundtrip() {
+        let src = r#"function f(x) { return Math.floor(x); }"#;
+        let out = full_roundtrip(src);
+        assert!(out.contains("Math"), "missing `Math`:\n{out}");
+        assert!(out.contains(".floor"), "missing `.floor`:\n{out}");
+        insta::assert_snapshot!(out);
+    }
+
+    #[test]
+    fn unbound_write_roundtrip() {
+        let src = r#"function f() { x = 1; }"#;
+        let out = full_roundtrip(src);
+        // The store re-emits as a bare assignment (`x = 1;`), not
+        // `globalThis.x = 1;`.
+        assert!(out.contains("x = 1"), "expected `x = 1` in output:\n{out}");
+        assert!(
+            !out.contains("globalThis"),
+            "GlobalThis indirection should be invisible in emit:\n{out}"
+        );
+        insta::assert_snapshot!(out);
+    }
+
+    /// `globalThis.foo` collapses to bare `foo` after the round-trip — the
+    /// SSA already merges them (verified in `lower_ssa::tests::
+    /// globalthis_dot_foo_normalizes_to_bare_foo`); this test confirms the
+    /// out-of-SSA pass picks the bare-identifier surface form. The literal
+    /// `globalThis` substring must NOT survive — that's the whole point of
+    /// the lossy normalization.
+    #[test]
+    fn globalthis_dot_foo_emits_as_bare_foo() {
+        let src = r#"function f() { return globalThis.foo; }"#;
+        let out = full_roundtrip(src);
+        assert!(out.contains("foo"), "expected `foo` in output:\n{out}");
+        assert!(
+            !out.contains("globalThis"),
+            "explicit `globalThis` indirection should be erased:\n{out}"
+        );
+        insta::assert_snapshot!(out);
+    }
+
+    #[test]
+    fn lexical_console_shadowing_roundtrip() {
+        let src = r#"function f() { let console = 1; return console; }"#;
+        let out = full_roundtrip(src);
+        // The local binding shadows the global, so the return collapses to
+        // `return 1` after trivial-param removal — no `console` ident,
+        // no global lookup.
+        assert!(
+            out.contains("return 1"),
+            "shadowed `console` should fold to `return 1`:\n{out}"
+        );
+        insta::assert_snapshot!(out);
+    }
+
+    // ====================================================================
     // Behavior-preservation tests (feature-gated on `node-tests`).
     //
     // These shell out to `node` to evaluate both the original source and
@@ -1082,8 +1182,7 @@ mod tests {
                 return 2;
             }
         "#;
-        let harness =
-            "console.log(f(true)); console.log(f(false)); console.log(f(0)); console.log(f(\"x\"));";
+        let harness = "console.log(f(true)); console.log(f(false)); console.log(f(0)); console.log(f(\"x\"));";
         assert_behavior_equivalent(src, harness);
     }
 }

@@ -48,6 +48,12 @@ pub enum Constant {
     /// converter for direct function-name bindings; the printer renders it as
     /// `@name`.
     Func(FuncId),
+    /// Sentinel for the JS global object. Produced by the unbound-identifier
+    /// lowering path so that `console.log` and friends become structured
+    /// `LoadProp(GlobalThis, "console")` instead of a panic. Treat this as
+    /// opaque: no folding against other constants. The out-of-SSA pass
+    /// recognizes it as a load-root and emits the bare property name.
+    GlobalThis,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -78,6 +84,63 @@ impl Effect {
     /// dead-code-eliminated.
     pub fn removable_when_unused(self) -> bool {
         !self.intersects(Effect::WRITES_HEAP | Effect::MAY_THROW | Effect::MAY_DIVERGE)
+    }
+}
+
+/// Three-tier classification of property access purity. Sits between the
+/// generic `Effect` lattice (which describes the result) and the syntactic
+/// instruction kind (which only knows "load" vs "store"). A pass that proves
+/// a tighter bound on a specific access site bumps the access up the tiers;
+/// the frontend defaults to the most pessimistic tier the access could
+/// require.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Purity {
+    /// No observable effect beyond a heap read (LoadProp/LoadIndex) or a
+    /// heap write (StoreProp/StoreIndex). Implies the proven absence of any
+    /// getter/setter, Proxy trap, or coercion that could throw or diverge.
+    /// Almost never produced by the frontend; reserved for analyses that can
+    /// prove the access target is a plain own data property.
+    Pure,
+    /// Heap read/write that may throw but cannot otherwise diverge or mutate
+    /// other heap state. The canonical use is global-object accesses
+    /// (`Math`, `console`, etc.): under sloppy-mode-equivalent semantics
+    /// they read/write the global record and may throw on undefined, but
+    /// they don't trigger arbitrary user code. CSE across multiple `Throws`
+    /// reads of the same key is sound when no intervening instruction has
+    /// `WRITES_HEAP`.
+    Throws,
+    /// Full opacity: getter, setter, Proxy trap, or any access for which
+    /// the frontend lacks evidence of narrower behavior. Blocks reordering
+    /// and analysis.
+    Opaque,
+}
+
+impl Purity {
+    fn load_effect(self) -> Effect {
+        match self {
+            Purity::Pure => Effect::READS_HEAP,
+            Purity::Throws => Effect::READS_HEAP | Effect::MAY_THROW,
+            Purity::Opaque => Effect::OPAQUE,
+        }
+    }
+
+    fn store_effect(self) -> Effect {
+        match self {
+            Purity::Pure => Effect::WRITES_HEAP,
+            Purity::Throws => Effect::WRITES_HEAP | Effect::MAY_THROW,
+            Purity::Opaque => Effect::OPAQUE,
+        }
+    }
+
+    /// Suffix used by the pretty-printer for non-default tiers. `Opaque` is
+    /// the historical default and renders without a suffix to keep existing
+    /// snapshots stable.
+    fn suffix(self) -> &'static str {
+        match self {
+            Purity::Pure => "_pure",
+            Purity::Throws => "_throws",
+            Purity::Opaque => "",
+        }
     }
 }
 
@@ -176,28 +239,31 @@ pub enum InstKind {
         rhs: Operand,
     },
 
-    // Property access. `pure` records "we have proved this read has no
-    // observable side effect" (no getter, no Proxy, no TDZ); the frontend
-    // always emits pure=false. Stores produce no value.
+    // Property access. `purity` records the tightest effect bound the
+    // emitter (or a later analysis) can prove for this site. The frontend
+    // defaults to `Opaque` for arbitrary-object accesses and `Throws` for
+    // global-object accesses. Stores produce no value.
     LoadProp {
         obj: Operand,
         key: StrId,
-        pure: bool,
+        purity: Purity,
     },
     StoreProp {
         obj: Operand,
         key: StrId,
         val: Operand,
+        purity: Purity,
     },
     LoadIndex {
         obj: Operand,
         index: Operand,
-        pure: bool,
+        purity: Purity,
     },
     StoreIndex {
         obj: Operand,
         index: Operand,
         val: Operand,
+        purity: Purity,
     },
 
     // Allocation — pure (a fresh allocation is a fresh identity).
@@ -290,13 +356,13 @@ impl InstKind {
             | ToInt32 { .. }
             | Instanceof { .. } => Effect::MAY_THROW,
 
-            // Heap reads: pure-marked variants are READS_HEAP only; otherwise opaque
-            // (a getter or Proxy trap can do anything, including diverge).
-            LoadProp { pure: true, .. } | LoadIndex { pure: true, .. } => Effect::READS_HEAP,
-            LoadProp { .. } | LoadIndex { .. } => Effect::OPAQUE,
+            // Heap reads: dispatched by the per-site Purity tier.
+            LoadProp { purity, .. } | LoadIndex { purity, .. } => purity.load_effect(),
 
-            // Stores: setters can do anything.
-            StoreProp { .. } | StoreIndex { .. } => Effect::OPAQUE,
+            // Stores: dispatched by the per-site Purity tier. Defaults to
+            // Opaque (setter can do anything) unless an analysis proves
+            // narrower behavior.
+            StoreProp { purity, .. } | StoreIndex { purity, .. } => purity.store_effect(),
 
             // Calls: opaque by default. A future analysis can refine specific calls.
             Call { .. } | CallMethod { .. } | Construct { .. } | OpaqueEval { .. } => {
@@ -820,6 +886,7 @@ fn const_eq(a: &Constant, b: &Constant) -> bool {
         (Null, Null) => true,
         (Undefined, Undefined) => true,
         (Func(x), Func(y)) => x.0 == y.0,
+        (GlobalThis, GlobalThis) => true,
         _ => false,
     }
 }
@@ -858,7 +925,9 @@ fn walk_inst_operands(kind: &InstKind, mut f: impl FnMut(&Operand)) {
             f(obj);
             f(index);
         }
-        StoreIndex { obj, index, val } => {
+        StoreIndex {
+            obj, index, val, ..
+        } => {
             f(obj);
             f(index);
             f(val);
@@ -1065,36 +1134,38 @@ fn write_inst_kind(out: &mut String, kind: &InstKind, m: &Module) {
         StrictEq { lhs, rhs } => write_binop(out, "strict_eq", lhs, rhs, m),
         Lt { lhs, rhs } => write_binop(out, "lt", lhs, rhs, m),
         Le { lhs, rhs } => write_binop(out, "le", lhs, rhs, m),
-        LoadProp { obj, key, pure } => {
-            out.push_str(if *pure {
-                "load_prop_pure "
-            } else {
-                "load_prop "
-            });
+        LoadProp { obj, key, purity } => {
+            write!(out, "load_prop{} ", purity.suffix()).unwrap();
             write_operand(out, obj, m);
             out.push_str(", ");
             write_string_literal(out, m.strings.resolve(key));
         }
-        StoreProp { obj, key, val } => {
-            out.push_str("store_prop ");
+        StoreProp {
+            obj,
+            key,
+            val,
+            purity,
+        } => {
+            write!(out, "store_prop{} ", purity.suffix()).unwrap();
             write_operand(out, obj, m);
             out.push_str(", ");
             write_string_literal(out, m.strings.resolve(key));
             out.push_str(", ");
             write_operand(out, val, m);
         }
-        LoadIndex { obj, index, pure } => {
-            out.push_str(if *pure {
-                "load_index_pure "
-            } else {
-                "load_index "
-            });
+        LoadIndex { obj, index, purity } => {
+            write!(out, "load_index{} ", purity.suffix()).unwrap();
             write_operand(out, obj, m);
             out.push_str(", ");
             write_operand(out, index, m);
         }
-        StoreIndex { obj, index, val } => {
-            out.push_str("store_index ");
+        StoreIndex {
+            obj,
+            index,
+            val,
+            purity,
+        } => {
+            write!(out, "store_index{} ", purity.suffix()).unwrap();
             write_operand(out, obj, m);
             out.push_str(", ");
             write_operand(out, index, m);
@@ -1216,6 +1287,7 @@ fn write_constant(out: &mut String, c: &Constant, m: &Module) {
         Constant::Null => out.push_str("null"),
         Constant::Undefined => out.push_str("undefined"),
         Constant::Func(id) => write!(out, "@{}", func_label(m, *id)).unwrap(),
+        Constant::GlobalThis => out.push_str("globalThis"),
     }
 }
 

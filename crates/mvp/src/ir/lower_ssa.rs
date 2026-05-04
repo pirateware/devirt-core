@@ -16,8 +16,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ir::ssa::{
-    self, BasicBlock, BlockId, Constant, FuncId, FunctionBuilder, InstKind, Operand, Terminator,
-    Value, ValueDef,
+    self, BasicBlock, BlockId, Constant, FuncId, FunctionBuilder, InstKind, Operand, Purity,
+    Terminator, Value, ValueDef,
 };
 use crate::ir::tree::{self, BinOp, Expr, Stmt, UnOp};
 
@@ -385,28 +385,50 @@ impl<'b, 'm> Converter<'b, 'm> {
                 let val_op = self.convert_expr(value);
                 match target {
                     Expr::Ident(name) => {
-                        let sym = self
-                            .lookup(name)
-                            .unwrap_or_else(|| panic!("assignment to unbound identifier {name}"));
-                        let cb = self.current_block();
-                        self.write_variable(sym, cb, val_op);
+                        if let Some(sym) = self.lookup(name) {
+                            let cb = self.current_block();
+                            self.write_variable(sym, cb, val_op);
+                        } else {
+                            // Sloppy-mode-equivalent unbound write: lowers to
+                            // a property store on the global object. Strict
+                            // mode would throw on the unbound write; we
+                            // accept the divergence (see read-side note).
+                            // The special-case constants (globalThis,
+                            // undefined, NaN, Infinity, …) are read-only at
+                            // the language level; assigning to them is a
+                            // no-op in sloppy mode and a TypeError in strict
+                            // mode. We model the no-op by routing through
+                            // the global store anyway — the value lands in
+                            // a globalThis property of that name.
+                            let key = self.builder.intern(name);
+                            self.builder.add_inst(InstKind::StoreProp {
+                                obj: Operand::Const(Constant::GlobalThis),
+                                key,
+                                val: val_op,
+                                purity: Purity::Throws,
+                            });
+                        }
                     }
                     Expr::Member { obj, prop } => {
                         let obj_op = self.convert_expr(obj);
                         let key = self.builder.intern(prop);
+                        let purity = property_access_purity(&obj_op);
                         self.builder.add_inst(InstKind::StoreProp {
                             obj: obj_op,
                             key,
                             val: val_op,
+                            purity,
                         });
                     }
                     Expr::Index { obj, index } => {
                         let obj_op = self.convert_expr(obj);
                         let idx_op = self.convert_expr(index);
+                        let purity = property_access_purity(&obj_op);
                         self.builder.add_inst(InstKind::StoreIndex {
                             obj: obj_op,
                             index: idx_op,
                             val: val_op,
+                            purity,
                         });
                     }
                     _ => panic!("invalid assignment target: {target:?}"),
@@ -563,11 +585,26 @@ impl<'b, 'm> Converter<'b, 'm> {
             Expr::Null => Operand::Const(Constant::Null),
             Expr::Undefined => Operand::Const(Constant::Undefined),
             Expr::Ident(name) => {
-                let sym = self
-                    .lookup(name)
-                    .unwrap_or_else(|| panic!("read of unbound identifier {name}"));
-                let cb = self.current_block();
-                self.read_variable(sym, cb)
+                if let Some(sym) = self.lookup(name) {
+                    let cb = self.current_block();
+                    return self.read_variable(sym, cb);
+                }
+                // Unbound identifier: lower as a property access on the
+                // global object (or a special-case constant). Strict-mode JS
+                // would throw ReferenceError on a bare unbound read while
+                // `globalThis.foo` would return undefined; we treat both
+                // identically (sloppy-mode-equivalent) — acceptable for
+                // malware analysis, where strict-mode divergence is rare and
+                // not load-bearing for understanding intent.
+                if let Some(c) = special_global_constant(name) {
+                    return Operand::Const(c);
+                }
+                let key = self.builder.intern(name);
+                self.emit(InstKind::LoadProp {
+                    obj: Operand::Const(Constant::GlobalThis),
+                    key,
+                    purity: Purity::Throws,
+                })
             }
             Expr::Binary { op, lhs, rhs } => self.convert_binary(*op, lhs, rhs),
             Expr::Unary { op, operand } => self.convert_unary(*op, operand),
@@ -582,19 +619,21 @@ impl<'b, 'm> Converter<'b, 'm> {
             Expr::Member { obj, prop } => {
                 let obj_op = self.convert_expr(obj);
                 let key = self.builder.intern(prop);
+                let purity = property_access_purity(&obj_op);
                 self.emit(InstKind::LoadProp {
                     obj: obj_op,
                     key,
-                    pure: false,
+                    purity,
                 })
             }
             Expr::Index { obj, index } => {
                 let obj_op = self.convert_expr(obj);
                 let idx_op = self.convert_expr(index);
+                let purity = property_access_purity(&obj_op);
                 self.emit(InstKind::LoadIndex {
                     obj: obj_op,
                     index: idx_op,
-                    pure: false,
+                    purity,
                 })
             }
         }
@@ -892,6 +931,39 @@ impl<'b, 'm> Converter<'b, 'm> {
 // Free helpers (don't need Converter state)
 // ============================================================================
 
+/// Recognize identifiers whose JS semantics is "always evaluate to a fixed
+/// constant" — applied only when the name is not lexically bound (the caller
+/// checks lookup() first, so a local `let undefined = 1` shadows correctly).
+///
+/// `NaN` and `Infinity` use the existing `Constant::Number` variants rather
+/// than dedicated variants: a future constant-folding pass that produces NaN
+/// from `0/0` (or Infinity from `1/0`) will yield the same canonical form,
+/// avoiding two ways to spell the same value.
+fn special_global_constant(name: &str) -> Option<Constant> {
+    match name {
+        "globalThis" | "window" | "self" | "global" => Some(Constant::GlobalThis),
+        "undefined" => Some(Constant::Undefined),
+        "NaN" => Some(Constant::Number(f64::NAN)),
+        "Infinity" => Some(Constant::Number(f64::INFINITY)),
+        _ => None,
+    }
+}
+
+/// Pick the `Purity` tier for a property access whose object operand is
+/// `obj`. Accesses rooted at `Const(GlobalThis)` get `Throws` (they read or
+/// write the global record and may throw, but don't trigger user-defined
+/// getters/setters under our semantic model); everything else stays
+/// `Opaque`. Without this, `globalThis.foo` would lower to `Opaque` while
+/// the bare unbound read of `foo` would lower to `Throws` — the same
+/// observable JS denoted by two different SSA shapes, defeating CSE on
+/// equivalent rewrites.
+fn property_access_purity(obj: &Operand) -> Purity {
+    match obj {
+        Operand::Const(Constant::GlobalThis) => Purity::Throws,
+        _ => Purity::Opaque,
+    }
+}
+
 fn operand_eq(a: &Operand, b: &Operand) -> bool {
     match (a, b) {
         (Operand::Value(x), Operand::Value(y)) => x == y,
@@ -910,6 +982,7 @@ fn const_bit_eq(a: &Constant, b: &Constant) -> bool {
         (Null, Null) => true,
         (Undefined, Undefined) => true,
         (Func(x), Func(y)) => x.0 == y.0,
+        (GlobalThis, GlobalThis) => true,
         _ => false,
     }
 }
@@ -1061,7 +1134,9 @@ fn walk_inst_operands_mut(kind: &mut InstKind, f: &mut impl FnMut(&mut Operand))
             f(obj);
             f(index);
         }
-        StoreIndex { obj, index, val } => {
+        StoreIndex {
+            obj, index, val, ..
+        } => {
             f(obj);
             f(index);
             f(val);
@@ -1359,5 +1434,204 @@ mod tests {
         );
 
         insta::assert_snapshot!(pretty_module(&m));
+    }
+
+    // ====================================================================
+    // Globals model
+    // ====================================================================
+
+    /// `console.log("hi")` survives the SSA pass without panicking and
+    /// produces a `LoadProp` rooted at `Const(GlobalThis)` for the global
+    /// read of `console`. The `Throws` purity is the key signal: it's the
+    /// proof that we're using the new precision tier rather than collapsing
+    /// to Opaque.
+    #[test]
+    fn unbound_console_call_lowers_to_global_load() {
+        let src = r#"function f() { console.log("hi"); }"#;
+        let m = lower_js(src);
+
+        let mut saw_global_load = false;
+        for inst in &m.functions[0].instructions {
+            if let InstKind::LoadProp {
+                obj: Operand::Const(Constant::GlobalThis),
+                key,
+                purity,
+            } = inst.kind
+            {
+                assert_eq!(purity, Purity::Throws, "global read should use Throws");
+                assert_eq!(m.strings.resolve(&key), "console");
+                saw_global_load = true;
+            }
+        }
+        assert!(
+            saw_global_load,
+            "expected a LoadProp(GlobalThis, \"console\") instruction"
+        );
+
+        insta::assert_snapshot!(pretty_module(&m));
+    }
+
+    /// `Math.floor(x)` exercises the same path as `console.log` plus a
+    /// member-call rather than a method-call (the front end currently
+    /// produces `Call(LoadProp(...), args)`, not `CallMethod`).
+    #[test]
+    fn unbound_math_floor_lowers_to_global_load() {
+        let src = r#"function f(x) { return Math.floor(x); }"#;
+        let m = lower_js(src);
+
+        let saw_math = m.functions[0].instructions.iter().any(|i| {
+            matches!(
+                i.kind,
+                InstKind::LoadProp {
+                    obj: Operand::Const(Constant::GlobalThis),
+                    purity: Purity::Throws,
+                    ..
+                }
+            )
+        });
+        assert!(saw_math, "expected a LoadProp(GlobalThis, \"Math\")");
+
+        insta::assert_snapshot!(pretty_module(&m));
+    }
+
+    /// `x = 1` with `x` unbound becomes a global-store rooted at
+    /// `Const(GlobalThis)`. Mirror of the read-side test.
+    #[test]
+    fn unbound_write_lowers_to_global_store() {
+        let src = r#"function f() { x = 1; }"#;
+        let m = lower_js(src);
+
+        let mut saw_global_store = false;
+        for inst in &m.functions[0].instructions {
+            if let InstKind::StoreProp {
+                obj: Operand::Const(Constant::GlobalThis),
+                key,
+                purity,
+                ..
+            } = inst.kind
+            {
+                assert_eq!(purity, Purity::Throws, "global write should use Throws");
+                assert_eq!(m.strings.resolve(&key), "x");
+                saw_global_store = true;
+            }
+        }
+        assert!(
+            saw_global_store,
+            "expected a StoreProp(GlobalThis, \"x\", _) instruction"
+        );
+
+        insta::assert_snapshot!(pretty_module(&m));
+    }
+
+    /// `let y = undefined; return y;` — `undefined` is a special-case
+    /// constant lookup, not a global read. Validates that `Constant::
+    /// Undefined` (not a global LoadProp) reaches the return after
+    /// trivial-param removal collapses the chain.
+    #[test]
+    fn undefined_lowers_to_constant_undefined() {
+        let src = r#"function f() { let y = undefined; return y; }"#;
+        let m = lower_js(src);
+
+        let ret_block = m.functions[0]
+            .blocks
+            .iter()
+            .find(|b| matches!(b.terminator, Terminator::Return { val: Some(_) }))
+            .expect("function should have a Return");
+        match &ret_block.terminator {
+            Terminator::Return {
+                val: Some(Operand::Const(Constant::Undefined)),
+            } => {}
+            t => panic!("expected `ret undefined`; got {t:?}"),
+        }
+    }
+
+    /// `NaN` and `Infinity` use `Constant::Number(f64::NAN)` and
+    /// `Constant::Number(f64::INFINITY)` — the existing canonical form
+    /// rather than dedicated variants. This is the Q1 design decision: a
+    /// future constant-folding pass that produces NaN from `0/0` agrees
+    /// with the unbound-ident reads on the same canonical form, avoiding
+    /// two ways to spell the same value.
+    #[test]
+    fn nan_and_infinity_use_number_constants() {
+        for (src, expected_bits) in [
+            ("function f() { return NaN; }", f64::NAN.to_bits()),
+            ("function f() { return Infinity; }", f64::INFINITY.to_bits()),
+        ] {
+            let m = lower_js(src);
+            let ret_block = m.functions[0]
+                .blocks
+                .iter()
+                .find(|b| matches!(b.terminator, Terminator::Return { val: Some(_) }))
+                .expect("function should have a Return");
+            match &ret_block.terminator {
+                Terminator::Return {
+                    val: Some(Operand::Const(Constant::Number(n))),
+                } => {
+                    assert_eq!(
+                        n.to_bits(),
+                        expected_bits,
+                        "expected canonical Number constant for src `{src}`"
+                    );
+                }
+                t => panic!("expected `ret <Number>`; got {t:?} for src `{src}`"),
+            }
+        }
+    }
+
+    /// `globalThis.foo` (member access on the explicit `globalThis` ident)
+    /// produces SSA byte-identical to the bare `foo`. Both share the same
+    /// `LoadProp(GlobalThis, "foo", Throws)` shape — `globalThis` is
+    /// recognized as a special-case constant on the read side, and the
+    /// Member arm picks `Throws` purity for GlobalThis-rooted access.
+    /// This is a *lossy* normalization: the user can no longer tell which
+    /// spelling the source used, which is the correct trade-off for a
+    /// deobfuscator (the obfuscator's choice of spelling is noise).
+    #[test]
+    fn globalthis_dot_foo_normalizes_to_bare_foo() {
+        let with_explicit = lower_js("function f() { return globalThis.foo; }");
+        let bare = lower_js("function f() { return foo; }");
+        assert_eq!(
+            pretty_module(&with_explicit),
+            pretty_module(&bare),
+            "globalThis.foo and bare foo must produce identical SSA"
+        );
+    }
+
+    /// A local `let console = 1;` shadows the special-case lookup —
+    /// reads of `console` resolve via the normal Braun path to the local
+    /// binding, never to `LoadProp(GlobalThis, "console")`. The whole
+    /// shadowing-supports-globals contract relies on lookup() running
+    /// before special-case resolution.
+    #[test]
+    fn lexical_binding_shadows_global() {
+        let src = r#"function f() { let console = 1; return console; }"#;
+        let m = lower_js(src);
+
+        // No global LoadProp anywhere in the function.
+        let leaked = m.functions[0].instructions.iter().any(|i| {
+            matches!(
+                i.kind,
+                InstKind::LoadProp {
+                    obj: Operand::Const(Constant::GlobalThis),
+                    ..
+                }
+            )
+        });
+        assert!(!leaked, "local `console` must shadow the global lookup");
+
+        // After trivial-param removal the return collapses to `ret 1`.
+        let ret_block = m.functions[0]
+            .blocks
+            .iter()
+            .find(|b| matches!(b.terminator, Terminator::Return { val: Some(_) }))
+            .expect("function should have a Return");
+        match &ret_block.terminator {
+            Terminator::Return {
+                val: Some(Operand::Const(Constant::Number(n))),
+            } => {
+                assert_eq!(*n, 1.0, "shadowed `console` should return 1");
+            }
+            t => panic!("expected `ret 1`; got {t:?}"),
+        }
     }
 }

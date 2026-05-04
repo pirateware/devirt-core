@@ -1,0 +1,8 @@
+---
+source: src/ir/lower_tree.rs
+assertion_line: 1069
+expression: out
+---
+function f() {
+  return 1;
+}

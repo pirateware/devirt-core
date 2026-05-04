@@ -1,0 +1,14 @@
+---
+source: src/ir/lower_tree.rs
+assertion_line: 1020
+expression: out
+---
+function f(_a0) {
+  let _t0;
+  let _t1;
+  let _t2;
+  _t0 = Math;
+  _t1 = _t0.floor;
+  _t2 = _t1(_a0);
+  return _t2;
+}
