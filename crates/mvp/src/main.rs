@@ -40,6 +40,7 @@ use std::fs;
 use std::process::ExitCode;
 
 use crate::emit::emit;
+use crate::ir::pass::PassManager;
 use crate::ir::{lower_ssa, lower_tree, ssa, tree};
 use crate::lower::parse_and_lower;
 
@@ -95,9 +96,17 @@ fn main() -> ExitCode {
     print!("{}", tree::dump(&module));
 
     let final_module = if via_ssa {
-        let ssa_module = lower_ssa::lower_module(&module);
+        let mut ssa_module = lower_ssa::lower_module(&module);
         if let Err(errs) = ssa_module.validate() {
             eprintln!("\ninternal error: SSA module failed validation: {errs:#?}");
+            return ExitCode::FAILURE;
+        }
+        // Pass pipeline runs between SSA build and out-of-SSA. Empty for
+        // now — real passes (constant folding, DCE) land in follow-up
+        // tickets. The empty pipeline must short-circuit cleanly.
+        let mut pm = PassManager::new();
+        if let Err(e) = pm.run_module(&mut ssa_module) {
+            eprintln!("\ninternal error: pass pipeline failed: {e}");
             return ExitCode::FAILURE;
         }
         println!("===== SSA-IR =====");

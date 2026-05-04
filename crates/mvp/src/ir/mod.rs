@@ -3,5 +3,6 @@
 
 pub mod lower_ssa;
 pub mod lower_tree;
+pub mod pass;
 pub mod ssa;
 pub mod tree;
