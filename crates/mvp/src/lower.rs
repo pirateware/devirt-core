@@ -19,6 +19,16 @@ use crate::ir::disposition::{Disposition, decide};
 use crate::ir::tree::*;
 
 pub fn parse_and_lower(source: &str) -> Result<Module, Error> {
+    parse_and_lower_with_decider(source, decide)
+}
+
+/// Test-only entry point that injects a custom disposition decider so
+/// the asymmetric debug cross-check in `lower_top_function` can be
+/// exercised by hand-crafted "lying" walkers (T2 Stream D).
+pub(crate) fn parse_and_lower_with_decider(
+    source: &str,
+    decider: fn(&js::FormalParameters, &js::FunctionBody) -> Disposition,
+) -> Result<Module, Error> {
     let allocator = Allocator::default();
     let source_type = SourceType::default();
     let ret = Parser::new(&allocator, source, source_type).parse();
@@ -32,7 +42,7 @@ pub fn parse_and_lower(source: &str) -> Result<Module, Error> {
         return Err(Error::Parse(msg));
     }
     let lowerer = Lowerer { source };
-    lowerer.lower_program(&ret.program)
+    lowerer.lower_program_with_decider(&ret.program, decider)
 }
 
 /// Carries the source string so PassThrough bodies can be sliced from
@@ -44,22 +54,40 @@ struct Lowerer<'src> {
 }
 
 impl Lowerer<'_> {
-    fn lower_program(&self, prog: &js::Program) -> Result<Module, Error> {
+    fn lower_program_with_decider(
+        &self,
+        prog: &js::Program,
+        decider: fn(&js::FormalParameters, &js::FunctionBody) -> Disposition,
+    ) -> Result<Module, Error> {
         let mut items = Vec::with_capacity(prog.body.len());
         for stmt in &prog.body {
-            items.push(self.lower_top_stmt(stmt)?);
+            items.push(self.lower_top_stmt(stmt, decider)?);
         }
         Ok(Module { items })
     }
 
-    fn lower_top_stmt(&self, stmt: &js::Statement) -> Result<Item, Error> {
+    fn lower_top_stmt(
+        &self,
+        stmt: &js::Statement,
+        decider: fn(&js::FormalParameters, &js::FunctionBody) -> Disposition,
+    ) -> Result<Item, Error> {
         match stmt {
-            js::Statement::FunctionDeclaration(f) => self.lower_top_function(f),
+            js::Statement::FunctionDeclaration(f) => {
+                self.lower_top_function_with_decider(f, decider)
+            }
             _ => Ok(Item::Stmt(lower_stmt(stmt)?)),
         }
     }
 
-    fn lower_top_function(&self, f: &js::Function) -> Result<Item, Error> {
+    /// Same as `lower_top_function`, but the disposition decider is
+    /// injected. Production always passes `disposition::decide`; tests
+    /// pass a hand-crafted "lying" walker to exercise the asymmetric
+    /// debug cross-check (T2 Stream D).
+    pub(crate) fn lower_top_function_with_decider(
+        &self,
+        f: &js::Function,
+        decider: fn(&js::FormalParameters, &js::FunctionBody) -> Disposition,
+    ) -> Result<Item, Error> {
         let name =
             f.id.as_ref()
                 .map(|i| i.name.to_string())
@@ -74,7 +102,7 @@ impl Lowerer<'_> {
             .as_ref()
             .ok_or(Error::Unsupported("function declaration without a body"))?;
 
-        let disposition = decide(&f.params, body);
+        let disposition = decider(&f.params, body);
 
         if disposition == Disposition::PassThrough {
             return Ok(Item::PassThroughFunction(self.passthrough_literal(
@@ -85,6 +113,59 @@ impl Lowerer<'_> {
         }
 
         // Lowered: same path as before T2.
+        let result = self.lower_function_lowered(&name, f, body);
+
+        // === T2 Stream D: asymmetric debug cross-check ===
+        //
+        // The disposition walker said `Lowered`. The lowering MUST NOT
+        // come back with `Error::Unsupported` — that would mean the
+        // walker is too permissive (it accepted a construct the
+        // lowering can't actually represent), and we'd silently fall
+        // through to a hard error in production. In debug builds we
+        // turn that into a loud panic naming the construct so the
+        // walker bug is impossible to miss.
+        //
+        // The OPPOSITE direction (walker too conservative — it said
+        // PassThrough but the lowering would have succeeded) is
+        // intentionally NOT caught here. That direction is recoverable:
+        // a function we could have optimized stays preserved, no
+        // correctness issue. Catching it would require speculatively
+        // running the lowering on every PassThrough body, which is
+        // expensive and produces false positives (e.g. inner-function
+        // capture rules that the walker can't see). See T2_PLAN.md
+        // Stream D and the design notes in `disposition.rs`.
+        //
+        // Release builds compile this block out entirely (the
+        // `cfg!(debug_assertions)` is a const-folded `false`, the
+        // branch is dead code, and the `if` collapses), so there is
+        // no runtime cost when assertions are off.
+        //
+        // TODO(stream-b): nested-function lowering sites (in
+        // `lower_function_literal` once Stream B lands) also need this
+        // cross-check. Apply the same pattern there.
+        if cfg!(debug_assertions)
+            && let Err(Error::Unsupported(what)) = &result
+        {
+            panic!(
+                "T2 cross-check: disposition walker said `Lowered` for \
+                 function `{name}` but lowering returned \
+                 Error::Unsupported({what:?}). The walker in \
+                 `ir::disposition` is too permissive — it accepted a \
+                 construct the lowering cannot represent. Either tighten \
+                 the walker to reject this construct, or extend the \
+                 lowering to handle it."
+            );
+        }
+
+        result
+    }
+
+    fn lower_function_lowered(
+        &self,
+        name: &str,
+        f: &js::Function,
+        body: &js::FunctionBody,
+    ) -> Result<Item, Error> {
         let mut params = Vec::with_capacity(f.params.items.len());
         for p in &f.params.items {
             match &p.pattern.kind {
@@ -106,7 +187,7 @@ impl Lowerer<'_> {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Item::Function(IrFunction {
-            name,
+            name: name.to_string(),
             params,
             body: stmts,
         }))

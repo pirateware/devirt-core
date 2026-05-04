@@ -27,29 +27,15 @@
 //!     cargo run -- --no-ssa file.js      # bypass SSA round-trip
 //!     cargo run -- --via-ssa file.js     # explicit (default)
 
-mod emit;
-mod error;
-mod ir;
-mod lower;
-
-#[cfg(test)]
-mod tests;
-
 use std::env;
 use std::fs;
 use std::process::ExitCode;
 
-use crate::emit::emit;
-use crate::ir::pass::PassManager;
-use crate::ir::{lower_ssa, lower_tree, ssa, tree};
-use crate::lower::parse_and_lower;
-
-pub(crate) const DEMO: &str = r#"
-function fibonacci(n) {
-        if (n <= 1) return n;
-        return fibonacci(n - 1) + fibonacci(n - 2);
-    }
-"#;
+use mvp::DEMO;
+use mvp::emit::emit;
+use mvp::ir::pass::PassManager;
+use mvp::ir::{lower_ssa, lower_tree, ssa, tree};
+use mvp::lower::parse_and_lower;
 
 fn main() -> ExitCode {
     let mut args: Vec<String> = env::args().skip(1).collect();
