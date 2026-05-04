@@ -55,14 +55,60 @@ pub fn lower_module(sm: &ssa::Module) -> tree::Module {
 pub fn lower_module_with_config(sm: &ssa::Module, cfg: &EmitConfig) -> tree::Module {
     let mut items = Vec::with_capacity(sm.functions.len());
     for (i, func) in sm.functions.iter().enumerate() {
-        items.push(Item::Function(lower_function(
-            sm,
-            FuncId(i as u32),
-            func,
-            cfg,
-        )));
+        match &func.body {
+            ssa::FunctionBody::Lowered(_) => {
+                items.push(Item::Function(lower_function(
+                    sm,
+                    FuncId(i as u32),
+                    func,
+                    cfg,
+                )));
+            }
+            ssa::FunctionBody::PassThrough(pt) => {
+                items.push(Item::PassThroughFunction(passthrough_to_literal(
+                    sm, func, pt,
+                )));
+            }
+        }
     }
     tree::Module { items }
+}
+
+fn passthrough_to_literal(
+    sm: &ssa::Module,
+    func: &Function,
+    pt: &ssa::PassThroughBody,
+) -> tree::FuncLiteral {
+    tree::FuncLiteral {
+        name: pt.function_name.map(|n| sm.strings.resolve(&n).to_string()),
+        params: pt
+            .param_names
+            .iter()
+            .map(|n| sm.strings.resolve(n).to_string())
+            .collect(),
+        is_async: pt.is_async,
+        is_generator: pt.is_generator,
+        is_arrow: pt.is_arrow,
+        body: tree::FuncBody::PassThrough(pt.source.clone()),
+    }
+    // `func.name` and `pt.function_name` agree by construction (the OXC
+    // lowerer populates both); we trust pt.function_name here.
+    .into_with_func_name_check(&func.name)
+}
+
+trait FuncLiteralCheckExt {
+    fn into_with_func_name_check(self, expected: &str) -> Self;
+}
+impl FuncLiteralCheckExt for tree::FuncLiteral {
+    fn into_with_func_name_check(self, expected: &str) -> Self {
+        debug_assert!(
+            self.name.as_deref().unwrap_or(expected) == expected,
+            "PassThrough function name mismatch: tree={:?} ssa={:?}",
+            self.name,
+            expected
+        );
+        self
+    }
 }
 
 /// Configuration for the out-of-SSA renamer.

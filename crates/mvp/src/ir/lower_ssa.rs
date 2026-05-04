@@ -28,34 +28,74 @@ use crate::ir::tree::{self, BinOp, Expr, Stmt, UnOp};
 pub fn lower_module(tm: &tree::Module) -> ssa::Module {
     let mut sm = ssa::Module::new();
 
-    // Pass 1: assign FuncIds to top-level function declarations in source
-    // order. `FunctionBuilder::finish` pushes into `module.functions` in the
-    // same order, so the FuncIds we hand out here line up with the ones
-    // assigned at finish time.
-    let func_names: HashMap<String, FuncId> = tm
-        .items
-        .iter()
-        .filter_map(|it| {
-            if let tree::Item::Function(f) = it {
-                Some(f.name.clone())
-            } else {
-                None
-            }
-        })
-        .enumerate()
-        .map(|(i, n)| (n, FuncId(i as u32)))
-        .collect();
-
-    // Pass 2: lower each function. Top-level statements (non-functions) are
-    // currently dropped; the tree-IR allows them but the SSA module shape is
-    // function-only.
+    // Pass 1: assign FuncIds to all top-level function-shaped items
+    // (Lowered and PassThrough alike) in source order. Both variants
+    // result in a `Function` slot in the module, in the same order.
+    let mut func_names: HashMap<String, FuncId> = HashMap::new();
+    let mut idx: u32 = 0;
     for it in &tm.items {
-        if let tree::Item::Function(f) = it {
-            lower_function(&mut sm, f, &func_names);
+        match it {
+            tree::Item::Function(f) => {
+                func_names.insert(f.name.clone(), FuncId(idx));
+                idx += 1;
+            }
+            tree::Item::PassThroughFunction(lit) => {
+                if let Some(name) = &lit.name {
+                    func_names.insert(name.clone(), FuncId(idx));
+                }
+                idx += 1;
+            }
+            tree::Item::Stmt(_) => {}
+        }
+    }
+
+    // Pass 2: lower each function. Top-level statements (non-functions)
+    // are currently dropped; the tree-IR allows them but the SSA module
+    // shape is function-only.
+    for it in &tm.items {
+        match it {
+            tree::Item::Function(f) => {
+                lower_function(&mut sm, f, &func_names);
+            }
+            tree::Item::PassThroughFunction(lit) => {
+                push_passthrough_function(&mut sm, lit);
+            }
+            tree::Item::Stmt(_) => {}
         }
     }
 
     sm
+}
+
+/// Build an SSA `Function` with `FunctionBody::PassThrough` from a
+/// tree-IR `FuncLiteral` whose body is `FuncBody::PassThrough`. No
+/// `FunctionBuilder` involved — PassThrough functions have no blocks,
+/// values, or instructions.
+fn push_passthrough_function(sm: &mut ssa::Module, lit: &tree::FuncLiteral) {
+    let source = match &lit.body {
+        tree::FuncBody::PassThrough(s) => s.clone(),
+        _ => panic!("Item::PassThroughFunction must carry a PassThrough body"),
+    };
+    let name = lit.name.clone().unwrap_or_default();
+    let function_name_id = lit.name.as_ref().map(|n| sm.strings.get_or_intern(n));
+    let param_names: Vec<ssa::StrId> = lit
+        .params
+        .iter()
+        .map(|p| sm.strings.get_or_intern(p))
+        .collect();
+    sm.functions.push(ssa::Function {
+        name,
+        capture_count: 0,
+        body: ssa::FunctionBody::PassThrough(ssa::PassThroughBody {
+            source,
+            param_names,
+            function_name: function_name_id,
+            is_async: lit.is_async,
+            is_generator: lit.is_generator,
+            is_arrow: lit.is_arrow,
+            body_is_expression: false,
+        }),
+    });
 }
 
 fn lower_function(

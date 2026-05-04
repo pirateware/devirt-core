@@ -136,8 +136,13 @@ impl PassManager {
     }
 
     /// Convenience: run the pipeline on every function in the module.
+    /// PassThrough functions are skipped — their bodies are
+    /// source-preserved and never inspected by passes.
     pub fn run_module(&mut self, module: &mut Module) -> Result<(), Error> {
         for i in 0..module.functions.len() {
+            if module.functions[i].is_pass_through() {
+                continue;
+            }
             self.run(module, FuncId(i as u32))?;
         }
         Ok(())

@@ -42,6 +42,16 @@ impl Printer<'_> {
                 self.function(f);
                 self.buf.push('\n');
             }
+            Item::PassThroughFunction(lit) => {
+                self.pad();
+                let name = lit
+                    .name
+                    .as_deref()
+                    .expect("Item::PassThroughFunction requires a name");
+                self.write_func_header(lit, Some(name));
+                self.write_func_body(&lit.body);
+                self.buf.push('\n');
+            }
             Item::Stmt(s) => {
                 self.pad();
                 self.stmt(s);

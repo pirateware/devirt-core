@@ -2,13 +2,20 @@
 //!
 //! `parse_and_lower` owns the parser arena for its whole body, then lowers
 //! the AST into our owned IR before the arena is dropped.
+//!
+//! T2 introduces per-function disposition: a function body that uses any
+//! construct outside our supported subset becomes `PassThrough` —
+//! preserved as an owned source slice and re-emitted at the final
+//! emit step. Top-level non-function statements still error on
+//! unsupported constructs (T2 only changes function-body handling).
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast as js;
 use oxc_parser::Parser;
-use oxc_span::SourceType;
+use oxc_span::{GetSpan, SourceType};
 
 use crate::error::Error;
+use crate::ir::disposition::{Disposition, decide};
 use crate::ir::tree::*;
 
 pub fn parse_and_lower(source: &str) -> Result<Module, Error> {
@@ -24,50 +31,175 @@ pub fn parse_and_lower(source: &str) -> Result<Module, Error> {
             .join("\n");
         return Err(Error::Parse(msg));
     }
-    lower_program(&ret.program)
+    let lowerer = Lowerer { source };
+    lowerer.lower_program(&ret.program)
 }
 
-fn lower_program(prog: &js::Program) -> Result<Module, Error> {
-    let mut items = Vec::with_capacity(prog.body.len());
-    for stmt in &prog.body {
-        items.push(lower_top_stmt(stmt)?);
+/// Carries the source string so PassThrough bodies can be sliced from
+/// it. The source must outlive every owned slice we extract — our
+/// PassThrough bodies clone substrings into owned `String`s at slice
+/// time, so the lifetime is bounded by this struct.
+struct Lowerer<'src> {
+    source: &'src str,
+}
+
+impl Lowerer<'_> {
+    fn lower_program(&self, prog: &js::Program) -> Result<Module, Error> {
+        let mut items = Vec::with_capacity(prog.body.len());
+        for stmt in &prog.body {
+            items.push(self.lower_top_stmt(stmt)?);
+        }
+        Ok(Module { items })
     }
-    Ok(Module { items })
-}
 
-fn lower_top_stmt(stmt: &js::Statement) -> Result<Item, Error> {
-    match stmt {
-        js::Statement::FunctionDeclaration(f) => Ok(Item::Function(lower_function(f)?)),
-        _ => Ok(Item::Stmt(lower_stmt(stmt)?)),
-    }
-}
-
-fn lower_function(f: &js::Function) -> Result<IrFunction, Error> {
-    let name =
-        f.id.as_ref()
-            .map(|i| i.name.to_string())
-            .ok_or(Error::Unsupported("anonymous function declaration"))?;
-
-    let mut params = Vec::with_capacity(f.params.items.len());
-    for p in &f.params.items {
-        match &p.pattern.kind {
-            js::BindingPatternKind::BindingIdentifier(id) => {
-                params.push(id.name.to_string());
-            }
-            _ => return Err(Error::Unsupported("destructuring or default parameter")),
+    fn lower_top_stmt(&self, stmt: &js::Statement) -> Result<Item, Error> {
+        match stmt {
+            js::Statement::FunctionDeclaration(f) => self.lower_top_function(f),
+            _ => Ok(Item::Stmt(lower_stmt(stmt)?)),
         }
     }
 
-    let body = match &f.body {
-        Some(b) => b
+    fn lower_top_function(&self, f: &js::Function) -> Result<Item, Error> {
+        let name =
+            f.id.as_ref()
+                .map(|i| i.name.to_string())
+                .ok_or(Error::Unsupported("anonymous function declaration"))?;
+
+        // Empty bodies are vacuously lowerable; `body` is None for
+        // ambient declarations we don't accept anyway. Reject with
+        // a clear error so we don't silently produce an empty
+        // PassThrough.
+        let body = f
+            .body
+            .as_ref()
+            .ok_or(Error::Unsupported("function declaration without a body"))?;
+
+        let disposition = decide(&f.params, body);
+
+        if disposition == Disposition::PassThrough {
+            return Ok(Item::PassThroughFunction(self.passthrough_literal(
+                Some(name),
+                f,
+                body,
+            )?));
+        }
+
+        // Lowered: same path as before T2.
+        let mut params = Vec::with_capacity(f.params.items.len());
+        for p in &f.params.items {
+            match &p.pattern.kind {
+                js::BindingPatternKind::BindingIdentifier(id) => {
+                    params.push(id.name.to_string());
+                }
+                _ => {
+                    // Disposition should have routed this to PassThrough.
+                    // Reaching here means walker-too-permissive.
+                    return Err(Error::Unsupported("destructuring or default parameter"));
+                }
+            }
+        }
+
+        let stmts = body
             .statements
             .iter()
             .map(lower_stmt)
-            .collect::<Result<Vec<_>, _>>()?,
-        None => Vec::new(),
-    };
+            .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(IrFunction { name, params, body })
+        Ok(Item::Function(IrFunction {
+            name,
+            params,
+            body: stmts,
+        }))
+    }
+
+    /// Build a `FuncLiteral` whose body is a PassThrough source slice.
+    /// Captures parameter names and the async/generator flags from the
+    /// OXC `Function`. The slice covers the body's contents between
+    /// `{` and `}`, exclusive.
+    fn passthrough_literal(
+        &self,
+        name: Option<String>,
+        f: &js::Function,
+        body: &js::FunctionBody,
+    ) -> Result<FuncLiteral, Error> {
+        // Param names: use the binding identifier when present;
+        // otherwise emit a synthetic placeholder. The body source is
+        // verbatim, so destructuring patterns inside the *body* still
+        // work; only the param-list textual rendering uses these
+        // names. We emit them faithfully when we can.
+        let mut param_names = Vec::with_capacity(f.params.items.len());
+        for (i, p) in f.params.items.iter().enumerate() {
+            match &p.pattern.kind {
+                js::BindingPatternKind::BindingIdentifier(id) => {
+                    param_names.push(id.name.to_string());
+                }
+                _ => {
+                    // Best-effort textual round-trip: re-extract the
+                    // parameter source slice. Falls back to a synthetic
+                    // name if slicing fails.
+                    let span = p.pattern.span();
+                    param_names.push(
+                        self.slice_span(span)
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| format!("__p{}", i)),
+                    );
+                }
+            }
+        }
+
+        let body_span = body.span();
+        let inner = self
+            .slice_body_inner(body_span)
+            .ok_or(Error::Malformed(
+                "PassThrough body span out of range".into(),
+            ))?
+            .to_string();
+
+        Ok(FuncLiteral {
+            name,
+            params: param_names,
+            is_async: f.r#async,
+            is_generator: f.generator,
+            is_arrow: false,
+            body: FuncBody::PassThrough(inner),
+        })
+    }
+
+    /// Slice the source between a span's `{` and `}` (exclusive). The
+    /// body-span includes the braces; we strip them so the caller can
+    /// re-wrap.
+    fn slice_body_inner(&self, span: oxc_span::Span) -> Option<&str> {
+        let s = span.start as usize;
+        let e = span.end as usize;
+        let bytes = self.source.as_bytes();
+        if e > self.source.len() || s >= e {
+            return None;
+        }
+        // Skip leading `{`, trailing `}` if present.
+        let inner_start = if bytes.get(s) == Some(&b'{') {
+            s + 1
+        } else {
+            s
+        };
+        let inner_end = if bytes.get(e - 1) == Some(&b'}') {
+            e - 1
+        } else {
+            e
+        };
+        if inner_end < inner_start {
+            return None;
+        }
+        Some(&self.source[inner_start..inner_end])
+    }
+
+    fn slice_span(&self, span: oxc_span::Span) -> Option<&str> {
+        let s = span.start as usize;
+        let e = span.end as usize;
+        if e > self.source.len() || s > e {
+            return None;
+        }
+        Some(&self.source[s..e])
+    }
 }
 
 fn lower_stmt(stmt: &js::Statement) -> Result<Stmt, Error> {

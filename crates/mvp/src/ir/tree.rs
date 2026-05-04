@@ -18,6 +18,11 @@ pub struct Module {
 #[derive(Debug, Clone)]
 pub enum Item {
     Function(IrFunction),
+    /// Top-level function whose body contains constructs the lowering
+    /// can't represent in the IR. The body is preserved as raw source
+    /// text; the renamer/passes don't see it. Re-emitted verbatim
+    /// (modulo the wrapper) at the final emit step.
+    PassThroughFunction(FuncLiteral),
     Stmt(Stmt),
 }
 
@@ -206,6 +211,16 @@ pub fn dump(module: &Module) -> String {
                     dump_stmt(&mut out, s, 1);
                 }
                 out.push_str("}\n\n");
+            }
+            Item::PassThroughFunction(lit) => {
+                let name = lit.name.as_deref().unwrap_or("<anon>");
+                writeln!(&mut out, "fn {name}({}) passthrough", lit.params.join(", ")).unwrap();
+                if let FuncBody::PassThrough(src) = &lit.body {
+                    for line in src.lines() {
+                        writeln!(&mut out, "  {line}").unwrap();
+                    }
+                }
+                out.push_str("end\n\n");
             }
             Item::Stmt(s) => {
                 dump_stmt(&mut out, s, 0);
