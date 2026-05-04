@@ -15,57 +15,263 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::ir::free_vars;
 use crate::ir::ssa::{
     self, BasicBlock, BlockId, Constant, FuncId, FunctionBuilder, InstKind, Operand, Purity, StrId,
     Terminator, Value, ValueDef, ValueDefKind,
 };
-use crate::ir::tree::{self, BinOp, Expr, Stmt, UnOp};
+use crate::ir::tree::{self, BinOp, Expr, FuncBody, FuncLiteral, Stmt, UnOp};
 
 // ============================================================================
 // Public entry points
 // ============================================================================
 
 pub fn lower_module(tm: &tree::Module) -> ssa::Module {
-    let mut sm = ssa::Module::new();
+    // Pass 1: discover every function-shaped node — top-level
+    // `Item::Function` / `Item::PassThroughFunction`, plus inner
+    // `Stmt::FuncDecl` / `Expr::Func` reachable from a Lowered body.
+    // Each gets a FuncId assigned in DFS pre-order; nested literals
+    // also have their FuncId stamped on the `Cell` of their
+    // `FuncLiteral` so pass 2's outer build can look them up cheaply
+    // when emitting `AllocClosure`.
+    //
+    // Captures are computed in post-order (innermost first) so the
+    // free-var analysis can absorb nested literals' captures into the
+    // enclosing function's own list — `A` must capture every name
+    // captured by a nested `B` that `A` itself does not bind.
+    let pending = discover_module(tm);
 
-    // Pass 1: assign FuncIds to all top-level function-shaped items
-    // (Lowered and PassThrough alike) in source order. Both variants
-    // result in a `Function` slot in the module, in the same order.
+    // `func_names` maps top-level function names to their FuncId so the
+    // converter can resolve direct references (recursion, sibling
+    // calls) to `Constant::Func(@name)`. Inner names are NOT included
+    // — a nested function's identifier resolves via the lexical
+    // binding the outer's lowering sets up at the `Stmt::FuncDecl`
+    // textual position.
     let mut func_names: HashMap<String, FuncId> = HashMap::new();
-    let mut idx: u32 = 0;
-    for it in &tm.items {
-        match it {
-            tree::Item::Function(f) => {
-                func_names.insert(f.name.clone(), FuncId(idx));
-                idx += 1;
-            }
-            tree::Item::PassThroughFunction(lit) => {
-                if let Some(name) = &lit.name {
-                    func_names.insert(name.clone(), FuncId(idx));
-                }
-                idx += 1;
-            }
-            tree::Item::Stmt(_) => {}
+    for p in &pending {
+        if let PendingKind::TopLevel(f) = &p.kind {
+            func_names.insert(f.name.clone(), p.fid);
+        } else if let PendingKind::TopLevelPassThrough(lit) = &p.kind
+            && let Some(name) = &lit.name
+        {
+            func_names.insert(name.clone(), p.fid);
         }
     }
 
-    // Pass 2: lower each function. Top-level statements (non-functions)
-    // are currently dropped; the tree-IR allows them but the SSA module
-    // shape is function-only.
-    for it in &tm.items {
-        match it {
-            tree::Item::Function(f) => {
-                lower_function(&mut sm, f, &func_names);
+    // `inner_captures` is the by-FuncId capture list, used by both the
+    // outer's `AllocClosure` emission (to know how many slots and in
+    // what order) and the inner's converter (to seed `Operand::Capture(i)`
+    // bindings for those names).
+    let inner_captures: HashMap<FuncId, Vec<String>> = pending
+        .iter()
+        .map(|p| (p.fid, p.captures.clone()))
+        .collect();
+
+    // Pass 2: build each pending function in FuncId order. Each
+    // `FunctionBuilder::finish()` pushes one slot to `module.functions`,
+    // so build-order == FuncId-order is mandatory for the indices to
+    // line up.
+    let mut sm = ssa::Module::new();
+    for p in &pending {
+        match &p.kind {
+            PendingKind::TopLevel(f) => {
+                lower_top_level_function(&mut sm, f, &func_names, &inner_captures);
             }
-            tree::Item::PassThroughFunction(lit) => {
+            PendingKind::TopLevelPassThrough(lit) => {
                 push_passthrough_function(&mut sm, lit);
             }
-            tree::Item::Stmt(_) => {}
+            PendingKind::InnerLiteral(lit) => {
+                lower_inner_literal(&mut sm, lit, &p.captures, &func_names, &inner_captures);
+            }
         }
     }
 
     sm
 }
+
+// ----------------------------------------------------------------------
+// Pass 1: discovery
+// ----------------------------------------------------------------------
+
+/// One per function-shaped node in the source. Indexed by FuncId
+/// (i.e. `pending[fid.0 as usize].fid == fid`).
+struct PendingFunction<'a> {
+    fid: FuncId,
+    kind: PendingKind<'a>,
+    /// Free-var names this function captures from its enclosing scope,
+    /// alphabetically sorted. Top-level functions always have an empty
+    /// list (they have no enclosing JS scope).
+    captures: Vec<String>,
+}
+
+enum PendingKind<'a> {
+    TopLevel(&'a tree::IrFunction),
+    TopLevelPassThrough(&'a tree::FuncLiteral),
+    InnerLiteral(&'a tree::FuncLiteral),
+}
+
+fn discover_module<'a>(tm: &'a tree::Module) -> Vec<PendingFunction<'a>> {
+    let mut pending: Vec<PendingFunction<'a>> = Vec::new();
+    let mut captures_by_fid: HashMap<FuncId, Vec<String>> = HashMap::new();
+    for it in &tm.items {
+        match it {
+            tree::Item::Function(f) => {
+                let fid = FuncId(pending.len() as u32);
+                pending.push(PendingFunction {
+                    fid,
+                    kind: PendingKind::TopLevel(f),
+                    captures: Vec::new(),
+                });
+                discover_stmts(&f.body, &mut pending, &mut captures_by_fid);
+                // Top-level functions cannot capture (no enclosing JS
+                // scope). The empty captures list is the load-bearing
+                // statement here, not an oversight.
+                captures_by_fid.insert(fid, Vec::new());
+            }
+            tree::Item::PassThroughFunction(lit) => {
+                let fid = FuncId(pending.len() as u32);
+                lit.func_id.set(Some(fid));
+                pending.push(PendingFunction {
+                    fid,
+                    kind: PendingKind::TopLevelPassThrough(lit),
+                    captures: Vec::new(),
+                });
+                captures_by_fid.insert(fid, Vec::new());
+            }
+            tree::Item::Stmt(_) => {}
+        }
+    }
+    // Apply captures back into the pending list.
+    for p in pending.iter_mut() {
+        if let Some(c) = captures_by_fid.get(&p.fid) {
+            p.captures = c.clone();
+        }
+    }
+    pending
+}
+
+fn discover_stmts<'a>(
+    stmts: &'a [Stmt],
+    pending: &mut Vec<PendingFunction<'a>>,
+    captures_by_fid: &mut HashMap<FuncId, Vec<String>>,
+) {
+    for s in stmts {
+        discover_stmt(s, pending, captures_by_fid);
+    }
+}
+
+fn discover_stmt<'a>(
+    s: &'a Stmt,
+    pending: &mut Vec<PendingFunction<'a>>,
+    captures_by_fid: &mut HashMap<FuncId, Vec<String>>,
+) {
+    match s {
+        Stmt::Let { init, .. } => {
+            if let Some(e) = init {
+                discover_expr(e, pending, captures_by_fid);
+            }
+        }
+        Stmt::Const { init, .. } => discover_expr(init, pending, captures_by_fid),
+        Stmt::Assign { target, value } => {
+            discover_expr(target, pending, captures_by_fid);
+            discover_expr(value, pending, captures_by_fid);
+        }
+        Stmt::ExprStmt(e) => discover_expr(e, pending, captures_by_fid),
+        Stmt::Return(e) => {
+            if let Some(e) = e {
+                discover_expr(e, pending, captures_by_fid);
+            }
+        }
+        Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            discover_expr(cond, pending, captures_by_fid);
+            discover_stmts(then_body, pending, captures_by_fid);
+            if let Some(eb) = else_body {
+                discover_stmts(eb, pending, captures_by_fid);
+            }
+        }
+        Stmt::While { cond, body } => {
+            discover_expr(cond, pending, captures_by_fid);
+            discover_stmts(body, pending, captures_by_fid);
+        }
+        Stmt::Block(ss) => discover_stmts(ss, pending, captures_by_fid),
+        Stmt::FuncDecl(lit) => discover_literal(lit, pending, captures_by_fid),
+    }
+}
+
+fn discover_expr<'a>(
+    e: &'a Expr,
+    pending: &mut Vec<PendingFunction<'a>>,
+    captures_by_fid: &mut HashMap<FuncId, Vec<String>>,
+) {
+    match e {
+        Expr::Number(_)
+        | Expr::String(_)
+        | Expr::Bool(_)
+        | Expr::Null
+        | Expr::Undefined
+        | Expr::Ident(_) => {}
+        Expr::Binary { lhs, rhs, .. } => {
+            discover_expr(lhs, pending, captures_by_fid);
+            discover_expr(rhs, pending, captures_by_fid);
+        }
+        Expr::Unary { operand, .. } => discover_expr(operand, pending, captures_by_fid),
+        Expr::Call { callee, args } => {
+            discover_expr(callee, pending, captures_by_fid);
+            for a in args {
+                discover_expr(a, pending, captures_by_fid);
+            }
+        }
+        Expr::Member { obj, .. } => discover_expr(obj, pending, captures_by_fid),
+        Expr::Index { obj, index } => {
+            discover_expr(obj, pending, captures_by_fid);
+            discover_expr(index, pending, captures_by_fid);
+        }
+        Expr::Func(lit) => discover_literal(lit, pending, captures_by_fid),
+    }
+}
+
+fn discover_literal<'a>(
+    lit: &'a FuncLiteral,
+    pending: &mut Vec<PendingFunction<'a>>,
+    captures_by_fid: &mut HashMap<FuncId, Vec<String>>,
+) {
+    // Pre-order: stamp FuncId immediately so any sibling reference
+    // discovered later (or parent's later post-order analysis) can read
+    // it from the Cell.
+    let fid = FuncId(pending.len() as u32);
+    lit.func_id.set(Some(fid));
+    pending.push(PendingFunction {
+        fid,
+        kind: PendingKind::InnerLiteral(lit),
+        captures: Vec::new(),
+    });
+
+    // Recurse into the body to discover deeper nested literals (and to
+    // populate their captures before we run free-var analysis on this
+    // one).
+    match &lit.body {
+        FuncBody::Stmts(ss) => discover_stmts(ss, pending, captures_by_fid),
+        FuncBody::Expression(e) => discover_expr(e, pending, captures_by_fid),
+        // PassThrough bodies are opaque: we cannot discover nested
+        // literals inside them, and free-var analysis treats them as
+        // capture-less. See `free_vars` module for the limitation.
+        FuncBody::PassThrough(_) => {}
+    }
+
+    // Post-order: now compute this literal's captures using free-var
+    // analysis. Inner literals' captures are already stamped in
+    // `captures_by_fid`, so the analyzer can absorb them.
+    let captures = free_vars::analyze(lit, captures_by_fid);
+    captures_by_fid.insert(fid, captures);
+}
+
+// ----------------------------------------------------------------------
+// Pass 2: build
+// ----------------------------------------------------------------------
 
 /// Build an SSA `Function` with `FunctionBody::PassThrough` from a
 /// tree-IR `FuncLiteral` whose body is `FuncBody::PassThrough`. No
@@ -98,15 +304,55 @@ fn push_passthrough_function(sm: &mut ssa::Module, lit: &tree::FuncLiteral) {
     });
 }
 
-fn lower_function(
+fn lower_top_level_function(
     sm: &mut ssa::Module,
     f: &tree::IrFunction,
     func_names: &HashMap<String, FuncId>,
+    inner_captures: &HashMap<FuncId, Vec<String>>,
 ) {
     let mut builder = FunctionBuilder::new(sm, f.name.clone(), f.params.len() as u32);
     {
-        let mut conv = Converter::new(&mut builder, func_names);
-        conv.lower(f);
+        let mut conv = Converter::new(&mut builder, func_names, inner_captures, &[]);
+        conv.lower_top_level(f);
+    }
+    builder.finish();
+}
+
+/// Build a Lowered SSA `Function` from a nested `FuncLiteral` whose
+/// body is `FuncBody::Stmts` or `FuncBody::Expression`. PassThrough
+/// inner literals would route through `push_passthrough_function`-style
+/// handling instead; the discovery pass currently does not produce
+/// those (the front end never emits `Stmt::FuncDecl` / `Expr::Func`),
+/// so this path's PassThrough-inner branch is unreachable for now.
+fn lower_inner_literal(
+    sm: &mut ssa::Module,
+    lit: &FuncLiteral,
+    captures: &[String],
+    func_names: &HashMap<String, FuncId>,
+    inner_captures: &HashMap<FuncId, Vec<String>>,
+) {
+    let name = lit.name.clone().unwrap_or_default();
+    match &lit.body {
+        FuncBody::Stmts(_) | FuncBody::Expression(_) => {}
+        FuncBody::PassThrough(_) => {
+            panic!(
+                "inner FuncLiteral `{}` with PassThrough body reached lower_inner_literal — \
+                 the discovery pass should route inner PassThrough literals through \
+                 a separate branch (Stream B)",
+                name
+            );
+        }
+    }
+
+    let mut builder = FunctionBuilder::new_with_captures(
+        sm,
+        name,
+        lit.params.len() as u32,
+        captures.len(),
+    );
+    {
+        let mut conv = Converter::new(&mut builder, func_names, inner_captures, captures);
+        conv.lower_inner_literal(lit);
     }
     builder.finish();
 }
@@ -125,6 +371,17 @@ struct SymbolId(u32);
 struct Converter<'b, 'm> {
     builder: &'b mut FunctionBuilder<'m>,
     func_names: &'b HashMap<String, FuncId>,
+    /// By-FuncId capture-name lists. Used when emitting an
+    /// `AllocClosure` for a nested literal: the operand vector is built
+    /// by resolving each capture name through the converter's own
+    /// `lookup`, in the same order the inner converter will bind them
+    /// to `Operand::Capture(idx)`. Sharing the order is mandatory; both
+    /// sides agree by reading from this map.
+    inner_captures: &'b HashMap<FuncId, Vec<String>>,
+    /// This function's own captures, in declared order. Inner-literal
+    /// builds bind each name to `Operand::Capture(i)` at the entry
+    /// block before any user-visible code runs. Empty for top-level.
+    own_captures: &'b [String],
 
     // Symbol allocation
     next_symbol: u32,
@@ -156,10 +413,17 @@ struct Converter<'b, 'm> {
 }
 
 impl<'b, 'm> Converter<'b, 'm> {
-    fn new(builder: &'b mut FunctionBuilder<'m>, func_names: &'b HashMap<String, FuncId>) -> Self {
+    fn new(
+        builder: &'b mut FunctionBuilder<'m>,
+        func_names: &'b HashMap<String, FuncId>,
+        inner_captures: &'b HashMap<FuncId, Vec<String>>,
+        own_captures: &'b [String],
+    ) -> Self {
         Self {
             builder,
             func_names,
+            inner_captures,
+            own_captures,
             next_symbol: 0,
             scopes: Vec::new(),
             current_def: HashMap::new(),
@@ -169,19 +433,79 @@ impl<'b, 'm> Converter<'b, 'm> {
         }
     }
 
-    fn lower(&mut self, f: &tree::IrFunction) {
-        // Entry block. Sealed from the start because nothing branches into it.
+    fn lower_top_level(&mut self, f: &tree::IrFunction) {
+        let entry = self.setup_entry_with_module_scope();
+        self.lower_params(&f.params, entry);
+        for stmt in &f.body {
+            self.lower_stmt(stmt);
+        }
+        self.finish_lowering();
+    }
+
+    fn lower_inner_literal(&mut self, lit: &FuncLiteral) {
+        let entry = self.setup_entry_with_module_scope();
+
+        // Scope 1.5: capture bindings. Each capture name resolves to
+        // `Operand::Capture(i)` for the inner body's reads. Allocated
+        // before the param scope so a same-named param shadows a
+        // capture (matches JS lexical-shadowing semantics).
+        self.push_scope();
+        for (i, cname) in self.own_captures.iter().enumerate() {
+            let sym = self.fresh_symbol();
+            self.bind_in_top_scope(cname.clone(), sym);
+            self.write_variable(sym, entry, Operand::Capture(i));
+        }
+
+        // A named function expression binds its own name to itself. We
+        // model that via a synthetic capture: the outer's `AllocClosure`
+        // emits the binding, but for now the simpler self-reference path
+        // is to bind the name as a capture-style sym pointing at the
+        // matching `Constant::Func` — the inner can then call itself.
+        // Stream A defers this: the front end does not yet produce
+        // anonymous-named function expressions, so the absence is
+        // dormant.
+
+        self.push_scope();
+        self.lower_params(&lit.params, entry);
+
+        match &lit.body {
+            FuncBody::Stmts(stmts) => {
+                for s in stmts {
+                    self.lower_stmt(s);
+                }
+            }
+            FuncBody::Expression(e) => {
+                let v = self.convert_expr(e);
+                let cb = self.current_block();
+                if !self.is_terminated(cb) {
+                    self.builder
+                        .set_terminator(Terminator::Return { val: Some(v) });
+                }
+            }
+            FuncBody::PassThrough(_) => unreachable!(
+                "lower_inner_literal received a PassThrough body; routed elsewhere"
+            ),
+        }
+
+        self.pop_scope(); // params
+        self.pop_scope(); // captures
+        self.pop_scope(); // module
+        self.implicit_return();
+    }
+
+    /// Create the entry block and bind module-level function names in
+    /// scope 0. Returns the entry BlockId so the caller can write
+    /// captures/params against it.
+    fn setup_entry_with_module_scope(&mut self) -> BlockId {
         let entry = self.builder.new_block();
         self.builder.switch_to_block(entry);
         self.sealed.insert(entry);
 
-        // Scope 0: module — top-level function names bound to Constant::Func.
-        // This makes references to other top-level functions (and the
-        // function's own name, for recursion) resolve via the normal Braun
-        // path.
+        // Scope 0: module — top-level function names bound to
+        // Constant::Func. Makes references to top-level functions (and
+        // the function's own name, for recursion) resolve via the
+        // normal Braun path.
         self.push_scope();
-        // Iterate in deterministic order so the SymbolId assignment is
-        // reproducible across runs.
         let mut sorted_names: Vec<(&String, &FuncId)> = self.func_names.iter().collect();
         sorted_names.sort_by_key(|(n, _)| n.as_str());
         for (name, fid) in sorted_names {
@@ -189,31 +513,32 @@ impl<'b, 'm> Converter<'b, 'm> {
             self.bind_in_top_scope(name.clone(), sym);
             self.write_variable(sym, entry, Operand::Const(Constant::Func(*fid)));
         }
+        entry
+    }
 
-        // Scope 1: function parameters and body locals.
+    fn lower_params(&mut self, params: &[String], entry: BlockId) {
         self.push_scope();
-        for (i, pname) in f.params.iter().enumerate() {
+        for (i, pname) in params.iter().enumerate() {
             let sym = self.fresh_symbol();
             self.bind_in_top_scope(pname.clone(), sym);
             let arg_val = self.builder.body.params[i];
-            // Annotate the parameter Value with its source name so the
-            // out-of-SSA renamer emits e.g. `function f(a, b)` rather than
-            // `function f(_a0, _a1)`.
             let name_id = self.builder.intern(pname);
             self.builder.set_source_name(arg_val, name_id);
             self.write_variable(sym, entry, Operand::Value(arg_val));
         }
+    }
 
-        for stmt in &f.body {
-            self.lower_stmt(stmt);
-        }
+    /// Pop the param + module scopes and emit an implicit `return
+    /// undefined` if the current block lacks a terminator. Used by the
+    /// top-level function path; the inner-literal path handles its own
+    /// scope ladder because it has an extra capture scope.
+    fn finish_lowering(&mut self) {
+        self.pop_scope(); // params
+        self.pop_scope(); // module
+        self.implicit_return();
+    }
 
-        self.pop_scope();
-        self.pop_scope();
-
-        // Implicit return undefined: any block that fell off the end without
-        // setting a terminator gets one now. JS function bodies that end
-        // without `return` evaluate to undefined.
+    fn implicit_return(&mut self) {
         let cb = self
             .builder
             .current_block()
@@ -543,14 +868,21 @@ impl<'b, 'm> Converter<'b, 'm> {
                 }
                 self.pop_scope();
             }
-            Stmt::FuncDecl(_) => {
-                // Stage 4 will lower nested function declarations into an
-                // AllocClosure bound at this point. Until then, the tree-IR
-                // never carries this variant: lower.rs still rejects nested
-                // function declarations at parse time, so this arm is
-                // unreachable in production. Panic to make any premature
-                // construction loud.
-                panic!("Stmt::FuncDecl reached SSA lowering before stage 4 wired closures")
+            Stmt::FuncDecl(lit) => {
+                // Inner function declaration. Pass 1 stamped a FuncId
+                // and computed a captures list; we resolve those names
+                // now, in the enclosing scope, and emit an
+                // AllocClosure bound to the function's name.
+                let alloc = self.alloc_closure_operand(lit);
+                let name = lit
+                    .name
+                    .as_ref()
+                    .expect("Stmt::FuncDecl must carry a name");
+                self.tag_binding_source_name(alloc, name);
+                let sym = self.fresh_symbol();
+                self.bind_in_top_scope(name.clone(), sym);
+                let cb = self.current_block();
+                self.write_variable(sym, cb, alloc);
             }
         }
     }
@@ -730,14 +1062,40 @@ impl<'b, 'm> Converter<'b, 'm> {
                     purity,
                 })
             }
-            Expr::Func(_) => {
-                // Stage 4 wires function expressions into AllocClosure.
-                // See Stmt::FuncDecl arm above for the same reasoning —
-                // lower.rs cannot yet emit Expr::Func from JS source, so
-                // this arm is unreachable in production.
-                panic!("Expr::Func reached SSA lowering before stage 4 wired closures")
-            }
+            Expr::Func(lit) => self.alloc_closure_operand(lit),
         }
+    }
+
+    /// Resolve a nested literal's pre-allocated FuncId and its captures
+    /// list, then emit an `AllocClosure` whose capture operands are
+    /// each name's value in the enclosing scope (this converter's
+    /// `lookup` + Braun read). The returned `Operand::Value` is the
+    /// freshly allocated closure, ready to bind or pass on.
+    fn alloc_closure_operand(&mut self, lit: &FuncLiteral) -> Operand {
+        let fid = lit
+            .func_id
+            .get()
+            .expect("inner FuncLiteral missing FuncId — pass 1 must have stamped it");
+        // Capture-name list is read from the shared `inner_captures`
+        // map rather than re-derived here, so the inner converter and
+        // this side agree on order.
+        let names: Vec<String> = self
+            .inner_captures
+            .get(&fid)
+            .cloned()
+            .unwrap_or_default();
+        let mut captures: Vec<Operand> = Vec::with_capacity(names.len());
+        for name in &names {
+            let sym = self.lookup(name).unwrap_or_else(|| {
+                panic!(
+                    "AllocClosure capture `{}` for f{} is not in scope at allocation site",
+                    name, fid.0
+                )
+            });
+            let cb = self.current_block();
+            captures.push(self.read_variable(sym, cb));
+        }
+        self.emit(InstKind::AllocClosure { func: fid, captures })
     }
 
     /// Emit an instruction whose result is needed as an `Operand`. Panics if
@@ -1755,5 +2113,171 @@ mod tests {
             }
             t => panic!("expected `ret 1`; got {t:?}"),
         }
+    }
+
+    // ====================================================================
+    // T2 Stream A: closure infrastructure smoke tests
+    //
+    // The front end (lower.rs) does not yet produce `Stmt::FuncDecl` /
+    // `Expr::Func`, so these tests construct tree-IR by hand to prove the
+    // pass-1 discovery, AllocClosure emission, and capture binding all
+    // line up. They also lock in the contract that an inner literal's
+    // FuncId is stamped on its `Cell` at discovery time.
+    // ====================================================================
+
+    use crate::ir::tree::{FuncBody, FuncLiteral, Item, Module};
+    use std::cell::Cell;
+
+    fn fresh_lit(name: Option<&str>, params: Vec<&str>, body: FuncBody) -> FuncLiteral {
+        FuncLiteral {
+            name: name.map(String::from),
+            params: params.into_iter().map(String::from).collect(),
+            is_async: false,
+            is_generator: false,
+            is_arrow: false,
+            body,
+            func_id: Cell::new(None),
+        }
+    }
+
+    #[test]
+    fn nested_funcdecl_lowers_to_alloc_closure() {
+        // function outer(x) {
+        //   function inner(y) { return x + y; } // captures x
+        //   return inner(1);
+        // }
+        let inner = fresh_lit(
+            Some("inner"),
+            vec!["y"],
+            FuncBody::Stmts(vec![Stmt::Return(Some(Expr::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Ident("x".to_string())),
+                rhs: Box::new(Expr::Ident("y".to_string())),
+            }))]),
+        );
+        let outer_body = vec![
+            Stmt::FuncDecl(inner),
+            Stmt::Return(Some(Expr::Call {
+                callee: Box::new(Expr::Ident("inner".to_string())),
+                args: vec![Expr::Number(1.0)],
+            })),
+        ];
+        let outer = tree::IrFunction {
+            name: "outer".to_string(),
+            params: vec!["x".to_string()],
+            body: outer_body,
+        };
+        let tm = Module {
+            items: vec![Item::Function(outer)],
+        };
+
+        let sm = lower_module(&tm);
+        sm.validate().unwrap_or_else(|errs| {
+            panic!(
+                "validation failed:\n{:#?}\n--- dump ---\n{}",
+                errs,
+                pretty_module(&sm)
+            );
+        });
+
+        assert_eq!(sm.functions.len(), 2, "outer + inner");
+        assert_eq!(sm.functions[0].name, "outer");
+        assert_eq!(sm.functions[1].name, "inner");
+        assert_eq!(
+            sm.functions[1].capture_count, 1,
+            "inner captures `x` from outer"
+        );
+
+        // Outer must contain an AllocClosure for FuncId(1) with one
+        // capture sourced from outer's argument value.
+        let mut saw_alloc = false;
+        for inst in &sm.functions[0].lowered().instructions {
+            if let InstKind::AllocClosure { func, captures } = &inst.kind {
+                assert_eq!(func.0, 1, "AllocClosure should target inner FuncId");
+                assert_eq!(captures.len(), 1);
+                // The single capture is the outer's `x` parameter.
+                match captures[0] {
+                    Operand::Value(_) => {}
+                    other => panic!("expected Value capture for x, got {other:?}"),
+                }
+                saw_alloc = true;
+            }
+        }
+        assert!(saw_alloc, "outer should emit AllocClosure(@inner, [x])");
+
+        // Inner must read x via `Operand::Capture(0)`. Walk inner's
+        // instructions; any add referencing Capture(0) wins.
+        let inner_body = sm.functions[1].lowered();
+        let mut saw_capture = false;
+        for inst in &inner_body.instructions {
+            if let InstKind::AddGeneric { lhs, rhs } = &inst.kind
+                && (matches!(lhs, Operand::Capture(0)) || matches!(rhs, Operand::Capture(0)))
+            {
+                saw_capture = true;
+            }
+        }
+        assert!(
+            saw_capture,
+            "inner should reference the captured x via Operand::Capture(0)"
+        );
+    }
+
+    #[test]
+    fn nested_func_expr_in_let_lowers_to_alloc_closure() {
+        // function outer(a) {
+        //   let f = function (b) { return a + b; };
+        //   return f;
+        // }
+        let inner = fresh_lit(
+            None,
+            vec!["b"],
+            FuncBody::Stmts(vec![Stmt::Return(Some(Expr::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Ident("a".to_string())),
+                rhs: Box::new(Expr::Ident("b".to_string())),
+            }))]),
+        );
+        let outer = tree::IrFunction {
+            name: "outer".to_string(),
+            params: vec!["a".to_string()],
+            body: vec![
+                Stmt::Let {
+                    name: "f".to_string(),
+                    init: Some(Expr::Func(Box::new(inner))),
+                },
+                Stmt::Return(Some(Expr::Ident("f".to_string()))),
+            ],
+        };
+        let tm = Module {
+            items: vec![Item::Function(outer)],
+        };
+        let sm = lower_module(&tm);
+        sm.validate().expect("validation must succeed");
+        assert_eq!(sm.functions.len(), 2);
+        assert_eq!(sm.functions[1].capture_count, 1);
+    }
+
+    #[test]
+    fn discovery_assigns_funcid_in_dfs_preorder() {
+        // outer { inner1 { innermost } inner2 } — IDs should be
+        // outer=0, inner1=1, innermost=2, inner2=3.
+        let innermost = fresh_lit(Some("innermost"), vec![], FuncBody::Stmts(vec![]));
+        let inner1 = fresh_lit(
+            Some("inner1"),
+            vec![],
+            FuncBody::Stmts(vec![Stmt::FuncDecl(innermost)]),
+        );
+        let inner2 = fresh_lit(Some("inner2"), vec![], FuncBody::Stmts(vec![]));
+        let outer = tree::IrFunction {
+            name: "outer".to_string(),
+            params: vec![],
+            body: vec![Stmt::FuncDecl(inner1), Stmt::FuncDecl(inner2)],
+        };
+        let tm = Module {
+            items: vec![Item::Function(outer)],
+        };
+        let sm = lower_module(&tm);
+        let names: Vec<&str> = sm.functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["outer", "inner1", "innermost", "inner2"]);
     }
 }

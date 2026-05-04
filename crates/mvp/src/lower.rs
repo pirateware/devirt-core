@@ -162,6 +162,7 @@ impl Lowerer<'_> {
             is_generator: f.generator,
             is_arrow: false,
             body: FuncBody::PassThrough(inner),
+            func_id: std::cell::Cell::new(None),
         })
     }
 

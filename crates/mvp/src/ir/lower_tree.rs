@@ -90,6 +90,7 @@ fn passthrough_to_literal(
         is_generator: pt.is_generator,
         is_arrow: pt.is_arrow,
         body: tree::FuncBody::PassThrough(pt.source.clone()),
+        func_id: std::cell::Cell::new(None),
     }
     // `func.name` and `pt.function_name` agree by construction (the OXC
     // lowerer populates both); we trust pt.function_name here.

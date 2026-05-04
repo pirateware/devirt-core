@@ -8,7 +8,10 @@
 // warnings until then.
 #![allow(dead_code)]
 
+use std::cell::Cell;
 use std::fmt::Write as _;
+
+use crate::ir::ssa::FuncId;
 
 #[derive(Debug, Clone)]
 pub struct Module {
@@ -82,6 +85,11 @@ pub struct FuncLiteral {
     pub is_generator: bool,
     pub is_arrow: bool,
     pub body: FuncBody,
+    /// FuncId assigned during SSA lowering's pass 1 (function discovery).
+    /// `None` until pass 1 fills it; pass 2 reads it when emitting an
+    /// `AllocClosure` for the enclosing scope. `Cell` so the tree-IR
+    /// stays `&`-borrowable while the converter runs.
+    pub func_id: Cell<Option<FuncId>>,
 }
 
 #[derive(Debug, Clone)]
