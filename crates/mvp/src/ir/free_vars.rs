@@ -14,17 +14,22 @@
 //! `inner_captures` is already populated for every nested literal by
 //! the time we analyze the enclosing one.
 //!
-//! `FuncBody::PassThrough` bodies are opaque to this analysis: their
-//! captures cannot be inferred from tree-IR alone. Stream A does not
-//! emit any nested literals, so this hole is dormant; later streams
-//! that produce nested PassThrough bodies will need to compute
-//! captures from the original source slice (or default to a
-//! conservative over-approximation).
+//! `FuncBody::PassThrough` bodies are opaque to *passes*, not to
+//! *scope analysis*. The free-variable set of a PassThrough body must
+//! still be computed correctly so captures flow into the surrounding
+//! `AllocClosure` and the outer's bindings stay alive (otherwise DCE
+//! drops them and the renamer never receives a pin signal — the
+//! emitted PassThrough text then references names that no longer
+//! exist, producing `ReferenceError` at runtime). This module
+//! delegates PassThrough analysis to `pt_free_vars`, which parses the
+//! source slice with OXC and walks the AST scope-aware. See that
+//! module's header for the rationale.
 
 #![allow(dead_code)]
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+use crate::ir::pt_free_vars;
 use crate::ir::ssa::FuncId;
 use crate::ir::tree::{Expr, FuncBody, FuncLiteral, Stmt};
 
@@ -32,6 +37,19 @@ use crate::ir::tree::{Expr, FuncBody, FuncLiteral, Stmt};
 /// function whose body references nothing from outside its own
 /// parameters, name, and locals.
 pub fn analyze(lit: &FuncLiteral, inner_captures: &HashMap<FuncId, Vec<String>>) -> Vec<String> {
+    // PassThrough bodies need a parser-aware walk over the source
+    // slice (see module doc). Tree-IR walk is right for Stmts /
+    // Expression bodies.
+    if let FuncBody::PassThrough(src) = &lit.body {
+        return pt_free_vars::analyze_passthrough(
+            src,
+            &lit.params,
+            lit.name.as_deref(),
+            lit.is_async,
+            lit.is_generator,
+        );
+    }
+
     let mut ctx = Ctx {
         free: BTreeSet::new(),
         scopes: Vec::new(),

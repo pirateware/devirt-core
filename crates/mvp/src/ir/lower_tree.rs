@@ -201,6 +201,20 @@ fn lower_function(sm: &ssa::Module, _id: FuncId, func: &Function, cfg: &EmitConf
         body.push(Stmt::Let { name, init: None });
     }
 
+    // Forced let-declarations: names referenced lexically by some
+    // nested PassThrough body, declared via `Stmt::Let` in this
+    // function. The synthesized `StoreProp(GlobalThis, name, val)`
+    // emits the assignment; without the explicit `let` here, the
+    // assignment would silently target the global. See
+    // `Function.forced_let_decls` doc.
+    for &sid in &func.forced_let_decls {
+        let n = ctx.sm.strings.resolve(&sid).to_string();
+        body.push(Stmt::Let {
+            name: n,
+            init: None,
+        });
+    }
+
     ctx.walk(func.lowered().entry, None, &mut body);
 
     IrFunction {
@@ -471,7 +485,14 @@ impl LowerCtx<'_> {
             let v = find_value_for_inst(self.func, iid);
             self.name_for(v).to_string()
         };
-        let value_expr = self.inst_kind_to_expr(kind);
+        // Inst lowering may need to synthesize predecessor statements
+        // (e.g. PassThrough closures capturing const-bound names that
+        // never materialize as Inst values; without a synthetic
+        // `let x = <const>;` here, the PassThrough body's lexical
+        // reference to `x` would dangle in the emitted code).
+        let mut pre_stmts: Vec<Stmt> = Vec::new();
+        let value_expr = self.inst_kind_to_expr(kind, &mut pre_stmts);
+        out.extend(pre_stmts);
         out.push(Stmt::Assign {
             target: Expr::Ident(name),
             value: value_expr,
@@ -482,7 +503,7 @@ impl LowerCtx<'_> {
     /// current SSA converter actually emits are handled fully; the rest
     /// either fall through to a reasonable approximation or panic with a
     /// TODO message.
-    fn inst_kind_to_expr(&self, kind: &InstKind) -> Expr {
+    fn inst_kind_to_expr(&self, kind: &InstKind, pre_stmts: &mut Vec<Stmt>) -> Expr {
         use InstKind::*;
         match kind {
             // Generic arithmetic — frontend's primary emit shape.
@@ -567,7 +588,9 @@ impl LowerCtx<'_> {
                 callee: Box::new(Expr::Ident("Array".to_string())),
                 args: vec![],
             },
-            AllocClosure { func, captures } => self.alloc_closure_to_expr(*func, captures),
+            AllocClosure { func, captures } => {
+                self.alloc_closure_to_expr(*func, captures, pre_stmts)
+            }
             Construct { ctor, args } => Expr::Call {
                 callee: Box::new(self.operand_to_expr(ctor)),
                 args: args.iter().map(|a| self.operand_to_expr(a)).collect(),
@@ -602,32 +625,73 @@ impl LowerCtx<'_> {
     /// the resulting expression — the inner body's `Operand::Capture(i)`
     /// reads will pick up the same name through the inner LowerCtx's
     /// `capture_names` vector.
-    fn alloc_closure_to_expr(&self, func: FuncId, captures: &[Operand]) -> Expr {
+    fn alloc_closure_to_expr(
+        &self,
+        func: FuncId,
+        captures: &[Operand],
+        pre_stmts: &mut Vec<Stmt>,
+    ) -> Expr {
         let inner = &self.sm.functions[func.0 as usize];
 
-        // Render each capture to a textual expression. We require each
-        // capture to be a simple identifier or constant — anything more
-        // complex would need a `let` introduced before the FuncLiteral,
-        // which the current lowering pipeline doesn't emit. In practice
-        // the SSA converter always passes Operand::Value or
-        // Operand::Capture here; we render via operand_to_expr and
-        // serialize.
-        let capture_exprs: Vec<Expr> = captures.iter().map(|o| self.operand_to_expr(o)).collect();
-        let capture_names: Vec<String> = capture_exprs
-            .iter()
-            .map(|e| match e {
-                Expr::Ident(n) => n.clone(),
-                // Non-ident captures: stringify the expression. The
-                // resulting text becomes the inner body's reference for
-                // that capture slot. For literal-rendered captures this
-                // is fine; for complex outer expressions we'd want
-                // pre-extraction, which is out of scope for Stream B.
-                _ => render_expr_to_string(e),
-            })
-            .collect();
+        // Look up the SSA-side capture-name list. Inner Lowered bodies
+        // need `capture_names` to resolve `Operand::Capture(idx)`;
+        // PassThrough bodies use lexical names from their source
+        // slice, but we still need the names here to synthesize
+        // pre-let bindings for any const-only captures (otherwise the
+        // outer's emit lacks a `let x = ...` for names referenced by
+        // the PassThrough body — DCE has already removed any
+        // would-be Inst, and without a let the body's `x` dangles).
+        let cap_names: Vec<String> = match &inner.body {
+            ssa::FunctionBody::PassThrough(_) => self.passthrough_capture_names(func),
+            ssa::FunctionBody::Lowered(_) => captures
+                .iter()
+                .map(|o| match self.operand_to_expr(o) {
+                    Expr::Ident(n) => n,
+                    other => render_expr_to_string(&other),
+                })
+                .collect(),
+        };
 
-        let lit = self.build_func_literal(inner, capture_names);
+        // Note: outer's let-bindings + assignments for names
+        // referenced by this PassThrough body are emitted via the
+        // outer Function's `forced_let_decls` (declaration) and
+        // synthesized `StoreProp(GlobalThis, name, val)` instructions
+        // produced at SSA lowering time. See `pt_referenced_names`
+        // in lower_ssa.rs. We don't prepend pre-lets here.
+        let _ = &pre_stmts; // pre_stmts may still be used by other arms
+
+        let lit = self.build_func_literal(inner, cap_names);
         Expr::Func(Box::new(lit))
+    }
+
+    /// Recover the alphabetically-sorted capture-name list for a
+    /// PassThrough function. The list was computed during SSA
+    /// lowering's pass 1 and stashed in `inner_captures`; here we
+    /// re-derive it from the function's body source by re-running
+    /// the PassThrough free-var analysis. Cheap (small slice, single
+    /// parse) and avoids threading a side table through the
+    /// SSA→tree boundary.
+    fn passthrough_capture_names(&self, func: FuncId) -> Vec<String> {
+        let f = &self.sm.functions[func.0 as usize];
+        let pt = match &f.body {
+            ssa::FunctionBody::PassThrough(pt) => pt,
+            _ => return Vec::new(),
+        };
+        let params: Vec<String> = pt
+            .param_names
+            .iter()
+            .map(|n| self.sm.strings.resolve(n).to_string())
+            .collect();
+        let name = pt
+            .function_name
+            .map(|s| self.sm.strings.resolve(&s).to_string());
+        crate::ir::pt_free_vars::analyze_passthrough(
+            &pt.source,
+            &params,
+            name.as_deref(),
+            pt.is_async,
+            pt.is_generator,
+        )
     }
 
     fn build_func_literal(
@@ -667,6 +731,13 @@ impl LowerCtx<'_> {
                 let mut body = Vec::new();
                 for name in ctx.hoisted_names_in_decl_order() {
                     body.push(Stmt::Let { name, init: None });
+                }
+                for &sid in &inner.forced_let_decls {
+                    let n = ctx.sm.strings.resolve(&sid).to_string();
+                    body.push(Stmt::Let {
+                        name: n,
+                        init: None,
+                    });
                 }
                 ctx.walk(inner.lowered().entry, None, &mut body);
 
@@ -831,7 +902,12 @@ impl LowerCtx<'_> {
             && blk.instructions[0] == cv_inst
         {
             let kind = &self.func.lowered().instructions[cv_inst.0 as usize].kind;
-            return (self.inst_kind_to_expr(kind), true);
+            // Inlining a cond expression cannot itself produce
+            // pre-stmts (cond inlining is only for a single
+            // single-block-instruction; AllocClosure is never the
+            // cond of a CondBranch). A discarded sink suffices.
+            let mut sink = Vec::new();
+            return (self.inst_kind_to_expr(kind, &mut sink), true);
         }
         // Fallback. If header has zero instructions, this still works — we
         // just read the cond name (or constant). If it has more than one

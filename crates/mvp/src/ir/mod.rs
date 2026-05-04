@@ -4,6 +4,7 @@
 pub mod disposition;
 pub mod free_vars;
 pub mod lower_ssa;
+pub mod pt_free_vars;
 pub mod lower_tree;
 pub mod pass;
 pub mod ssa;

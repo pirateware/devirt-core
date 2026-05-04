@@ -70,10 +70,7 @@ pub fn lower_module(tm: &tree::Module) -> ssa::Module {
     // FuncIds whose body is PassThrough. Used at AllocClosure emission
     // to detect "capture flowing into a PassThrough body" so the
     // builder can mark the source Value (or capture slot) for pin
-    // wiring at SSA→tree time. Inner PassThrough literals are not yet
-    // produced (Stream B work), but top-level PassThrough functions
-    // exist today — and a sibling Lowered function calling them via
-    // a closure-allocation path would still trigger this.
+    // wiring at SSA→tree time.
     let passthrough_fids: HashSet<FuncId> = pending
         .iter()
         .filter(|p| match &p.kind {
@@ -86,6 +83,39 @@ pub fn lower_module(tm: &tree::Module) -> ssa::Module {
         .map(|p| p.fid)
         .collect();
 
+    // For each function, the union of capture-name lists of its
+    // direct child literals — i.e. "names a nested function (or its
+    // PassThrough descendant via free-var bubble-up) needs from this
+    // function's scope." Reads of these names are unaffected;
+    // *writes* (Stmt::Assign target=Ident) need to materialize as a
+    // textual reassignment in the emitted output, even when the
+    // value is a constant. Const-to-const assignments dissolve into
+    // Braun bookkeeping with no Inst, so a PassThrough body that
+    // lexically references the name would otherwise see only the
+    // initial value at runtime — the architectural rule from
+    // `pt_free_vars`'s module doc: PassThrough is opaque to passes
+    // but not to scope analysis, and source-level mutations of
+    // PT-referenced names must survive. The fix: at Stmt::Assign,
+    // synthesize a `StoreProp(GlobalThis, name, val)` which lower_tree
+    // re-emits as `name = val` (lexical resolution then hits the
+    // local let-binding).
+    let pt_referenced_for_fid: HashMap<FuncId, HashSet<String>> = {
+        let mut m: HashMap<FuncId, HashSet<String>> = HashMap::new();
+        for p in &pending {
+            m.entry(p.fid).or_default();
+        }
+        for p in &pending {
+            if let Some(parent) = p.parent {
+                let caps = inner_captures.get(&p.fid).cloned().unwrap_or_default();
+                let entry = m.entry(parent).or_default();
+                for n in caps {
+                    entry.insert(n);
+                }
+            }
+        }
+        m
+    };
+
     // Pass 2: build each pending function in FuncId order. Each
     // `FunctionBuilder::finish()` pushes one slot to `module.functions`,
     // so build-order == FuncId-order is mandatory for the indices to
@@ -94,18 +124,27 @@ pub fn lower_module(tm: &tree::Module) -> ssa::Module {
     for p in &pending {
         match &p.kind {
             PendingKind::TopLevel(f) => {
+                let pt_refs = pt_referenced_for_fid
+                    .get(&p.fid)
+                    .cloned()
+                    .unwrap_or_default();
                 lower_top_level_function(
                     &mut sm,
                     f,
                     &func_names,
                     &inner_captures,
                     &passthrough_fids,
+                    pt_refs,
                 );
             }
             PendingKind::TopLevelPassThrough(lit) => {
                 push_passthrough_function(&mut sm, lit);
             }
             PendingKind::InnerLiteral(lit) => {
+                let pt_refs = pt_referenced_for_fid
+                    .get(&p.fid)
+                    .cloned()
+                    .unwrap_or_default();
                 lower_inner_literal(
                     &mut sm,
                     lit,
@@ -113,6 +152,7 @@ pub fn lower_module(tm: &tree::Module) -> ssa::Module {
                     &func_names,
                     &inner_captures,
                     &passthrough_fids,
+                    pt_refs,
                 );
             }
         }
@@ -229,6 +269,11 @@ struct PendingFunction<'a> {
     /// alphabetically sorted. Top-level functions always have an empty
     /// list (they have no enclosing JS scope).
     captures: Vec<String>,
+    /// FuncId of the lexically-enclosing function. `None` for top-level
+    /// items (which have no JS-level outer). Used to compute
+    /// `pt_referenced_for_fid` — the union of children's captures
+    /// per parent.
+    parent: Option<FuncId>,
 }
 
 enum PendingKind<'a> {
@@ -248,6 +293,7 @@ fn discover_module<'a>(tm: &'a tree::Module) -> Vec<PendingFunction<'a>> {
                     fid,
                     kind: PendingKind::TopLevel(f),
                     captures: Vec::new(),
+                    parent: None,
                 });
                 // Build outer-body context: reassigned-name set + an
                 // empty bindings-seen-so-far set (params and the
@@ -268,6 +314,7 @@ fn discover_module<'a>(tm: &'a tree::Module) -> Vec<PendingFunction<'a>> {
                     &mut captures_by_fid,
                     &mut seen,
                     &reassigned,
+                    fid,
                 );
                 // Top-level functions cannot capture (no enclosing JS
                 // scope). The empty captures list is the load-bearing
@@ -281,6 +328,7 @@ fn discover_module<'a>(tm: &'a tree::Module) -> Vec<PendingFunction<'a>> {
                     fid,
                     kind: PendingKind::TopLevelPassThrough(lit),
                     captures: Vec::new(),
+                    parent: None,
                 });
                 captures_by_fid.insert(fid, Vec::new());
             }
@@ -354,9 +402,10 @@ fn discover_stmts<'a>(
     captures_by_fid: &mut HashMap<FuncId, Vec<String>>,
     seen: &mut HashSet<String>,
     reassigned: &HashSet<String>,
+    parent_fid: FuncId,
 ) {
     for s in stmts {
-        discover_stmt(s, pending, captures_by_fid, seen, reassigned);
+        discover_stmt(s, pending, captures_by_fid, seen, reassigned, parent_fid);
     }
 }
 
@@ -366,26 +415,27 @@ fn discover_stmt<'a>(
     captures_by_fid: &mut HashMap<FuncId, Vec<String>>,
     seen: &mut HashSet<String>,
     reassigned: &HashSet<String>,
+    parent_fid: FuncId,
 ) {
     match s {
         Stmt::Let { name, init } => {
             if let Some(e) = init {
-                discover_expr(e, pending, captures_by_fid, seen, reassigned);
+                discover_expr(e, pending, captures_by_fid, seen, reassigned, parent_fid);
             }
             seen.insert(name.clone());
         }
         Stmt::Const { name, init } => {
-            discover_expr(init, pending, captures_by_fid, seen, reassigned);
+            discover_expr(init, pending, captures_by_fid, seen, reassigned, parent_fid);
             seen.insert(name.clone());
         }
         Stmt::Assign { target, value } => {
-            discover_expr(target, pending, captures_by_fid, seen, reassigned);
-            discover_expr(value, pending, captures_by_fid, seen, reassigned);
+            discover_expr(target, pending, captures_by_fid, seen, reassigned, parent_fid);
+            discover_expr(value, pending, captures_by_fid, seen, reassigned, parent_fid);
         }
-        Stmt::ExprStmt(e) => discover_expr(e, pending, captures_by_fid, seen, reassigned),
+        Stmt::ExprStmt(e) => discover_expr(e, pending, captures_by_fid, seen, reassigned, parent_fid),
         Stmt::Return(e) => {
             if let Some(e) = e {
-                discover_expr(e, pending, captures_by_fid, seen, reassigned);
+                discover_expr(e, pending, captures_by_fid, seen, reassigned, parent_fid);
             }
         }
         Stmt::If {
@@ -393,7 +443,7 @@ fn discover_stmt<'a>(
             then_body,
             else_body,
         } => {
-            discover_expr(cond, pending, captures_by_fid, seen, reassigned);
+            discover_expr(cond, pending, captures_by_fid, seen, reassigned, parent_fid);
             // Inner-block bindings don't escape; clone seen so they
             // don't pollute the outer state.
             let mut inner_seen = seen.clone();
@@ -403,25 +453,47 @@ fn discover_stmt<'a>(
                 captures_by_fid,
                 &mut inner_seen,
                 reassigned,
+                parent_fid,
             );
             if let Some(eb) = else_body {
                 let mut inner_seen2 = seen.clone();
-                discover_stmts(eb, pending, captures_by_fid, &mut inner_seen2, reassigned);
+                discover_stmts(
+                    eb,
+                    pending,
+                    captures_by_fid,
+                    &mut inner_seen2,
+                    reassigned,
+                    parent_fid,
+                );
             }
         }
         Stmt::While { cond, body } => {
-            discover_expr(cond, pending, captures_by_fid, seen, reassigned);
+            discover_expr(cond, pending, captures_by_fid, seen, reassigned, parent_fid);
             let mut inner_seen = seen.clone();
-            discover_stmts(body, pending, captures_by_fid, &mut inner_seen, reassigned);
+            discover_stmts(
+                body,
+                pending,
+                captures_by_fid,
+                &mut inner_seen,
+                reassigned,
+                parent_fid,
+            );
         }
         Stmt::Block(ss) => {
             let mut inner_seen = seen.clone();
-            discover_stmts(ss, pending, captures_by_fid, &mut inner_seen, reassigned);
+            discover_stmts(
+                ss,
+                pending,
+                captures_by_fid,
+                &mut inner_seen,
+                reassigned,
+                parent_fid,
+            );
         }
         Stmt::FuncDecl(lit) => {
             // Function name is hoisted (already inserted in `seen` by
             // hoist_funcdecl_names).
-            discover_literal(lit, pending, captures_by_fid, seen, reassigned);
+            discover_literal(lit, pending, captures_by_fid, seen, reassigned, parent_fid);
         }
     }
 }
@@ -432,6 +504,7 @@ fn discover_expr<'a>(
     captures_by_fid: &mut HashMap<FuncId, Vec<String>>,
     seen: &mut HashSet<String>,
     reassigned: &HashSet<String>,
+    parent_fid: FuncId,
 ) {
     match e {
         Expr::Number(_)
@@ -441,24 +514,24 @@ fn discover_expr<'a>(
         | Expr::Undefined
         | Expr::Ident(_) => {}
         Expr::Binary { lhs, rhs, .. } => {
-            discover_expr(lhs, pending, captures_by_fid, seen, reassigned);
-            discover_expr(rhs, pending, captures_by_fid, seen, reassigned);
+            discover_expr(lhs, pending, captures_by_fid, seen, reassigned, parent_fid);
+            discover_expr(rhs, pending, captures_by_fid, seen, reassigned, parent_fid);
         }
         Expr::Unary { operand, .. } => {
-            discover_expr(operand, pending, captures_by_fid, seen, reassigned)
+            discover_expr(operand, pending, captures_by_fid, seen, reassigned, parent_fid)
         }
         Expr::Call { callee, args } => {
-            discover_expr(callee, pending, captures_by_fid, seen, reassigned);
+            discover_expr(callee, pending, captures_by_fid, seen, reassigned, parent_fid);
             for a in args {
-                discover_expr(a, pending, captures_by_fid, seen, reassigned);
+                discover_expr(a, pending, captures_by_fid, seen, reassigned, parent_fid);
             }
         }
-        Expr::Member { obj, .. } => discover_expr(obj, pending, captures_by_fid, seen, reassigned),
+        Expr::Member { obj, .. } => discover_expr(obj, pending, captures_by_fid, seen, reassigned, parent_fid),
         Expr::Index { obj, index } => {
-            discover_expr(obj, pending, captures_by_fid, seen, reassigned);
-            discover_expr(index, pending, captures_by_fid, seen, reassigned);
+            discover_expr(obj, pending, captures_by_fid, seen, reassigned, parent_fid);
+            discover_expr(index, pending, captures_by_fid, seen, reassigned, parent_fid);
         }
-        Expr::Func(lit) => discover_literal(lit, pending, captures_by_fid, seen, reassigned),
+        Expr::Func(lit) => discover_literal(lit, pending, captures_by_fid, seen, reassigned, parent_fid),
     }
 }
 
@@ -468,6 +541,7 @@ fn discover_literal<'a>(
     captures_by_fid: &mut HashMap<FuncId, Vec<String>>,
     outer_seen: &HashSet<String>,
     outer_reassigned: &HashSet<String>,
+    parent_fid: FuncId,
 ) {
     // Pre-order: stamp FuncId immediately so any sibling reference
     // discovered later (or parent's later post-order analysis) can read
@@ -478,6 +552,7 @@ fn discover_literal<'a>(
         fid,
         kind: PendingKind::InnerLiteral(lit),
         captures: Vec::new(),
+        parent: Some(parent_fid),
     });
 
     // Recurse into the body to discover deeper nested literals (and to
@@ -504,6 +579,7 @@ fn discover_literal<'a>(
                 captures_by_fid,
                 &mut inner_seen,
                 &inner_reassigned,
+                fid,
             );
         }
         FuncBody::Expression(e) => {
@@ -513,11 +589,12 @@ fn discover_literal<'a>(
                 captures_by_fid,
                 &mut inner_seen,
                 &inner_reassigned,
+                fid,
             );
         }
-        // PassThrough bodies are opaque: we cannot discover nested
-        // literals inside them, and free-var analysis treats them as
-        // capture-less. See `free_vars` module for the limitation.
+        // PassThrough bodies are walked separately by the
+        // `pt_free_vars` analysis (see free_vars.rs); they cannot host
+        // nested literals from this lowering's perspective.
         FuncBody::PassThrough(_) => {}
     }
 
@@ -580,6 +657,7 @@ fn push_passthrough_function(sm: &mut ssa::Module, lit: &tree::FuncLiteral) {
         capture_count: 0,
         captured_by_passthrough: Vec::new(),
         captures_pass_through_onward: Vec::new(),
+        forced_let_decls: Vec::new(),
         body: ssa::FunctionBody::PassThrough(ssa::PassThroughBody {
             source,
             param_names,
@@ -598,6 +676,7 @@ fn lower_top_level_function(
     func_names: &HashMap<String, FuncId>,
     inner_captures: &HashMap<FuncId, Vec<String>>,
     passthrough_fids: &HashSet<FuncId>,
+    pt_referenced_names: HashSet<String>,
 ) {
     let mut builder = FunctionBuilder::new(sm, f.name.clone(), f.params.len() as u32);
     {
@@ -607,6 +686,7 @@ fn lower_top_level_function(
             inner_captures,
             &[],
             passthrough_fids,
+            pt_referenced_names,
         );
         conv.lower_top_level(f);
     }
@@ -625,6 +705,7 @@ fn lower_inner_literal(
     func_names: &HashMap<String, FuncId>,
     inner_captures: &HashMap<FuncId, Vec<String>>,
     passthrough_fids: &HashSet<FuncId>,
+    pt_referenced_names: HashSet<String>,
 ) {
     let name = lit.name.clone().unwrap_or_default();
 
@@ -662,6 +743,7 @@ fn lower_inner_literal(
             inner_captures,
             captures,
             passthrough_fids,
+            pt_referenced_names,
         );
         conv.lower_inner_literal(lit);
     }
@@ -706,6 +788,7 @@ fn push_inner_passthrough_function_with_source(
         capture_count,
         captured_by_passthrough: Vec::new(),
         captures_pass_through_onward: Vec::new(),
+        forced_let_decls: Vec::new(),
         body: ssa::FunctionBody::PassThrough(ssa::PassThroughBody {
             source,
             param_names,
@@ -751,6 +834,15 @@ struct Converter<'b, 'm> {
     /// AllocClosure emission to flag captures flowing into a
     /// PassThrough body for pin wiring at SSA→tree time.
     passthrough_fids: &'b HashSet<FuncId>,
+    /// Names that any nested PassThrough descendant references and
+    /// that this function may bind. When a `Stmt::Assign` writes to
+    /// one of these names, the lowering MUST produce an instruction
+    /// that re-emits at lower_tree time as a textual reassignment —
+    /// otherwise const-to-const reassignments dissolve into Braun
+    /// bookkeeping (no Inst) and the PassThrough body's lexical
+    /// reference reads the snapshot value rather than the live one.
+    /// See module doc note at the top of `pt_free_vars`.
+    pt_referenced_names: HashSet<String>,
 
     // Symbol allocation
     next_symbol: u32,
@@ -788,6 +880,7 @@ impl<'b, 'm> Converter<'b, 'm> {
         inner_captures: &'b HashMap<FuncId, Vec<String>>,
         own_captures: &'b [String],
         passthrough_fids: &'b HashSet<FuncId>,
+        pt_referenced_names: HashSet<String>,
     ) -> Self {
         Self {
             builder,
@@ -795,6 +888,7 @@ impl<'b, 'm> Converter<'b, 'm> {
             inner_captures,
             own_captures,
             passthrough_fids,
+            pt_referenced_names,
             next_symbol: 0,
             scopes: Vec::new(),
             current_def: HashMap::new(),
@@ -1148,6 +1242,23 @@ impl<'b, 'm> Converter<'b, 'm> {
                 self.bind_in_top_scope(name.clone(), sym);
                 let cb = self.current_block();
                 self.write_variable(sym, cb, op);
+                // PT-referenced name: ensure a `let name;` declaration
+                // appears in the emit (so the synthesized assignment
+                // stays scoped to a local) and emit the initial-value
+                // assignment as a side-effect store. See `Stmt::Assign`
+                // arm and the `pt_referenced_names` doc.
+                if self.pt_referenced_names.contains(name) {
+                    self.builder.mark_forced_let_decl(name);
+                    if init.is_some() {
+                        let key = self.builder.intern(name);
+                        self.builder.add_inst(InstKind::StoreProp {
+                            obj: Operand::Const(Constant::GlobalThis),
+                            key,
+                            val: op,
+                            purity: Purity::Throws,
+                        });
+                    }
+                }
             }
             Stmt::Const { name, init } => {
                 let op = self.convert_expr(init);
@@ -1156,6 +1267,16 @@ impl<'b, 'm> Converter<'b, 'm> {
                 self.bind_in_top_scope(name.clone(), sym);
                 let cb = self.current_block();
                 self.write_variable(sym, cb, op);
+                if self.pt_referenced_names.contains(name) {
+                    self.builder.mark_forced_let_decl(name);
+                    let key = self.builder.intern(name);
+                    self.builder.add_inst(InstKind::StoreProp {
+                        obj: Operand::Const(Constant::GlobalThis),
+                        key,
+                        val: op,
+                        purity: Purity::Throws,
+                    });
+                }
             }
             Stmt::Assign { target, value } => {
                 let val_op = self.convert_expr(value);
@@ -1169,6 +1290,29 @@ impl<'b, 'm> Converter<'b, 'm> {
                             self.tag_binding_source_name(val_op, name);
                             let cb = self.current_block();
                             self.write_variable(sym, cb, val_op);
+
+                            // PassThrough closures referencing this name
+                            // resolve lexically at runtime — the live
+                            // value, not a snapshot. So the source-level
+                            // mutation MUST appear textually in the
+                            // emitted output, even when `val_op` is a
+                            // constant (which produces no Inst and would
+                            // otherwise vanish into Braun bookkeeping).
+                            // Synthesize a `StoreProp(GlobalThis, name,
+                            // val)` — lower_tree resugars stores rooted
+                            // at GlobalThis as bare `name = val`, which
+                            // resolves lexically to the local
+                            // let-binding at runtime. See
+                            // `pt_referenced_names` doc on the Converter.
+                            if self.pt_referenced_names.contains(name) {
+                                let key = self.builder.intern(name);
+                                self.builder.add_inst(InstKind::StoreProp {
+                                    obj: Operand::Const(Constant::GlobalThis),
+                                    key,
+                                    val: val_op,
+                                    purity: Purity::Throws,
+                                });
+                            }
                         } else {
                             // Sloppy-mode-equivalent unbound write: lowers to
                             // a property store on the global object. Strict
@@ -1445,38 +1589,39 @@ impl<'b, 'm> Converter<'b, 'm> {
             .get()
             .expect("inner FuncLiteral missing FuncId — pass 1 must have stamped it");
 
-        // PassThrough inner functions (or those re-classified to
-        // PassThrough by the forward-ref/reassigned rule) carry their
-        // capture references lexically in the preserved source text.
-        // The SSA AllocClosure does NOT need to thread captures
-        // through — they resolve at re-emit time by the surrounding
-        // scope. Emit an empty capture list and skip the lookup, which
-        // avoids a panic on names that aren't yet textually bound at
-        // this allocation site.
-        let is_passthrough =
-            lit.force_passthrough.get() || matches!(lit.body, FuncBody::PassThrough(_));
-
-        if is_passthrough {
-            return self.emit(InstKind::AllocClosure {
-                func: fid,
-                captures: Vec::new(),
-            });
-        }
-
         // Capture-name list is read from the shared `inner_captures`
         // map rather than re-derived here, so the inner converter and
         // this side agree on order.
         let names: Vec<String> = self.inner_captures.get(&fid).cloned().unwrap_or_default();
+        let target_is_passthrough = self.passthrough_fids.contains(&fid);
         let mut captures: Vec<Operand> = Vec::with_capacity(names.len());
         for name in &names {
-            let sym = self.lookup(name).unwrap_or_else(|| {
-                panic!(
-                    "AllocClosure capture `{}` for f{} is not in scope at allocation site",
-                    name, fid.0
-                )
-            });
-            let cb = self.current_block();
-            captures.push(self.read_variable(sym, cb));
+            match self.lookup(name) {
+                Some(sym) => {
+                    let cb = self.current_block();
+                    captures.push(self.read_variable(sym, cb));
+                }
+                None if target_is_passthrough => {
+                    // Forward reference into a PassThrough body —
+                    // the name will be bound later in the outer
+                    // (the closures-disposition-rule routes such
+                    // captures to PT precisely so the body re-emits
+                    // as text and resolves lexically at runtime).
+                    // Use an undefined placeholder for the SSA
+                    // capture slot; a `forced_let_decls` entry will
+                    // ensure the binding declaration exists, and
+                    // the synthesized StoreProp at the eventual
+                    // `Stmt::Let` site supplies the real value.
+                    self.builder.mark_forced_let_decl(name);
+                    captures.push(Operand::Const(Constant::Undefined));
+                }
+                None => {
+                    panic!(
+                        "AllocClosure capture `{}` for f{} is not in scope at allocation site",
+                        name, fid.0
+                    );
+                }
+            }
         }
         // If the AllocClosure target has a PassThrough body, every
         // non-Const capture must be pinned at emit time so the

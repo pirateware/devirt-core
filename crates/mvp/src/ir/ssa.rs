@@ -546,6 +546,16 @@ pub struct Function {
     /// into the calling function's `captured_by_passthrough` (if the
     /// operand was a Value) or onward set (if it was a Capture).
     pub captures_pass_through_onward: Vec<usize>,
+    /// Source-level names (interned StrId) that need an explicit
+    /// `let name;` declaration at the top of this function's emitted
+    /// body. Populated when the SSA lowering encounters a `Stmt::Let`
+    /// or `Stmt::Const` whose name is referenced by a nested
+    /// PassThrough body — the binding's value is also synthesized as
+    /// a `StoreProp(GlobalThis, name, val)` so the assignment surfaces
+    /// textually (lexical resolution then routes the write to this
+    /// local let, not a global). Without the declaration, the
+    /// synthesized assignment would silently become a global write.
+    pub forced_let_decls: Vec<StrId>,
 }
 
 pub enum FunctionBody {
@@ -653,6 +663,10 @@ pub struct FunctionBuilder<'m> {
     /// PassThrough captures. Drained at `finish()` into
     /// `Function.captures_pass_through_onward`.
     pub captures_pass_through_onward: Vec<usize>,
+    /// Side-table populated when the converter sees a `Stmt::Let` /
+    /// `Stmt::Const` whose name is referenced by a nested PassThrough
+    /// body. Drained at `finish()` into `Function.forced_let_decls`.
+    pub forced_let_decls: Vec<StrId>,
 }
 
 impl<'m> FunctionBuilder<'m> {
@@ -686,6 +700,7 @@ impl<'m> FunctionBuilder<'m> {
             current: None,
             captured_by_passthrough: Vec::new(),
             captures_pass_through_onward: Vec::new(),
+            forced_let_decls: Vec::new(),
         }
     }
 
@@ -706,6 +721,17 @@ impl<'m> FunctionBuilder<'m> {
     pub fn mark_capture_pass_through_onward(&mut self, idx: usize) {
         if !self.captures_pass_through_onward.contains(&idx) {
             self.captures_pass_through_onward.push(idx);
+        }
+    }
+
+    /// Reserve a top-of-function `let name;` declaration for a name
+    /// referenced lexically by a nested PassThrough body. Idempotent.
+    /// Caller passes the source-level name; we intern it here so the
+    /// converter doesn't have to.
+    pub fn mark_forced_let_decl(&mut self, name: &str) {
+        let id = self.intern(name);
+        if !self.forced_let_decls.contains(&id) {
+            self.forced_let_decls.push(id);
         }
     }
 
@@ -828,6 +854,7 @@ impl<'m> FunctionBuilder<'m> {
             body: FunctionBody::Lowered(self.body),
             captured_by_passthrough: self.captured_by_passthrough,
             captures_pass_through_onward: self.captures_pass_through_onward,
+            forced_let_decls: self.forced_let_decls,
         });
         fid
     }

@@ -215,12 +215,9 @@ fn mixed_lowered_and_passthrough_module() {
     assert_functional_equivalence(src, harness, "");
 }
 
-// === Stream B territory: closures emitted from OXC nested literals.
-// Stream A's lowering still rejects these from the OXC AST. Mark as
-// ignored so the suite is green pre-merge. ===
+// === Stream B / post-merge: nested closures from OXC ===
 
 #[test]
-#[ignore = "needs Stream B (nested closure emission from OXC)"]
 fn closure_capture_lowered() {
     let src = r#"
         function adder(x) {
@@ -232,7 +229,6 @@ fn closure_capture_lowered() {
 }
 
 #[test]
-#[ignore = "needs Stream B (nested closure emission from OXC)"]
 fn closure_capture_across_passthrough_boundary() {
     let src = r#"
         function outer(label) {
@@ -244,5 +240,96 @@ fn closure_capture_across_passthrough_boundary() {
         }
     "#;
     let harness = r#"console.log(outer("hello"));"#;
+    assert_functional_equivalence(src, harness, "");
+}
+
+// === Post-merge regression tests: nested PassThrough capture
+// propagation. These exercise the architectural rule that
+// PassThrough is opaque to passes but not to scope analysis. The
+// rule's load-bearing application: any name a nested PassThrough
+// body lexically references must (a) appear with its declaration
+// in the outer's emit, (b) preserve every source-level mutation
+// that affects the value the body will read at runtime. ===
+
+/// Two-level: Lowered → Lowered → PassThrough capturing from
+/// outermost. `c` is PassThrough (generator); `b` is Lowered;
+/// `a` binds `x`. Without the fix, `let x = 1` was silently DCE'd
+/// because Const-init lets produce no Inst; the PT body's `yield x`
+/// then dangled at runtime as ReferenceError.
+#[test]
+fn nested_passthrough_capture_via_lowered_intermediary() {
+    let src = r#"
+        function a() {
+            let x = 1;
+            function b() {
+                function* c() { yield x; }
+                return c;
+            }
+            return b;
+        }
+    "#;
+    let harness = "console.log(a()()().next().value);";
+    assert_functional_equivalence(src, harness, "");
+}
+
+/// Sibling + nested mix: one PassThrough sibling and one
+/// PassThrough grandchild via a Lowered intermediary, both
+/// capturing the same outer name. The single binding must serve
+/// both AllocClosure pin sites without double-renaming.
+#[test]
+fn nested_passthrough_capture_sibling_and_grandchild() {
+    let src = r#"
+        function a() {
+            let x = 1;
+            function* b() { yield x; }
+            function c() {
+                function* d() { yield x; }
+                return d;
+            }
+            let cgen = c();
+            return [b().next().value, cgen().next().value];
+        }
+    "#;
+    let harness = "console.log(JSON.stringify(a()));";
+    assert_functional_equivalence(src, harness, "");
+}
+
+/// Reassignment-in-outer + PassThrough capture. Inner generator
+/// `b` captures `x`; outer reassigns `x` after `b`'s allocation
+/// but before the iterator is consumed. PT semantics dictate that
+/// the body reads the live value (2), not the snapshot (1). The
+/// disposition rule may route `b` to PT (it already is, being a
+/// generator); the `x = 2` reassignment must survive the SSA
+/// round-trip — the synthesized `StoreProp(GlobalThis, "x", 2)`
+/// path does that.
+#[test]
+fn passthrough_capture_observes_outer_reassignment() {
+    let src = r#"
+        function a() {
+            let x = 1;
+            x = 2;
+            function* b() { yield x; }
+            return b;
+        }
+    "#;
+    let harness = "console.log(a()().next().value);";
+    assert_functional_equivalence(src, harness, "");
+}
+
+/// Reassign-after-Lowered-closure-allocation: forces the inner
+/// closure to PassThrough per closures-disposition-rule (capture
+/// is reassigned). The outer's `let y = 10; ... y = 20;` must
+/// both survive so the PT body reads 20 at f(1) time.
+#[test]
+fn passthrough_capture_reassign_forces_inner_passthrough() {
+    let src = r#"
+        function outer() {
+            let y = 10;
+            let f = function (x) { return x + y; };
+            y = 20;
+            return f(1);
+        }
+    "#;
+    let harness = "console.log(outer());";
     assert_functional_equivalence(src, harness, "");
 }
