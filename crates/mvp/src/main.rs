@@ -32,6 +32,7 @@ use std::fs;
 use std::process::ExitCode;
 
 use mvp::DEMO;
+use mvp::coverage;
 use mvp::emit::emit;
 use mvp::ir::pass::PassManager;
 use mvp::ir::{lower_ssa, lower_tree, ssa, tree};
@@ -40,6 +41,7 @@ use mvp::lower::parse_and_lower;
 fn main() -> ExitCode {
     let mut args: Vec<String> = env::args().skip(1).collect();
     let mut via_ssa = true;
+    let mut coverage_stats = false;
     args.retain(|a| match a.as_str() {
         "--via-ssa" => {
             via_ssa = true;
@@ -47,6 +49,10 @@ fn main() -> ExitCode {
         }
         "--no-ssa" => {
             via_ssa = false;
+            false
+        }
+        "--coverage-stats" => {
+            coverage_stats = true;
             false
         }
         _ => true,
@@ -77,6 +83,13 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    if coverage_stats {
+        let cov = coverage::analyze(&module);
+        println!("\n===== COVERAGE =====");
+        print!("{}", coverage::format_table(&cov));
+        return ExitCode::SUCCESS;
+    }
 
     println!("\n===== TREE-IR =====");
     print!("{}", tree::dump(&module));

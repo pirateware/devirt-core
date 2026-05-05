@@ -5,6 +5,7 @@
 //! external consumers) can drive the pipeline programmatically without
 //! shelling out to the binary.
 
+pub mod coverage;
 pub mod emit;
 pub mod error;
 pub mod ir;
@@ -14,10 +15,21 @@ pub mod lower;
 mod tests;
 
 pub const DEMO: &str = r#"
-function fibonacci(n) {
-        if (n <= 1) return n;
-        return fibonacci(n - 1) + fibonacci(n - 2);
-    }
+function asd() {
+    var numbers = [1, 2, 3, 4, 5];
+
+    var doubled = numbers.map(function(n) {
+        return n * 2;
+    });
+
+    var sum = numbers.reduce(function(acc, n) {
+        return acc + n;
+    }, 0);
+
+    console.log('Original:', numbers);
+    console.log('Doubled:', doubled);
+    console.log('Sum:', sum);
+}
 "#;
 
 /// Run the full default pipeline (parse → lower → SSA → out-of-SSA →
