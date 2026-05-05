@@ -609,13 +609,23 @@ impl Lowerer<'_> {
     }
 
     fn lower_for_stmt(&self, f: &js::ForStatement) -> Result<Stmt, Error> {
+        // For-init multi-declarator (`var` only — disposition keeps
+        // `let`/`const` blocked): keep the first declarator in the
+        // for-init slot, hoist the rest as preceding `var` statements,
+        // and wrap the whole thing in a Block. `var` is function-scoped
+        // so the hoist preserves all observable behavior.
+        let mut hoisted_prelude: Vec<Stmt> = Vec::new();
         let init = match &f.init {
             None => None,
             Some(js::ForStatementInit::VariableDeclaration(decl)) => {
-                // Disposition blocks multi-declarator for-init, so exactly one stmt here.
                 let mut stmts = self.lower_var_decl(decl)?;
-                debug_assert_eq!(stmts.len(), 1, "for-init must have single declarator");
-                Some(Box::new(stmts.remove(0)))
+                if stmts.is_empty() {
+                    None
+                } else {
+                    let kept = stmts.remove(0);
+                    hoisted_prelude = stmts;
+                    Some(Box::new(kept))
+                }
             }
             Some(other) => {
                 let e = other
@@ -633,12 +643,21 @@ impl Lowerer<'_> {
             None => None,
         };
         let body = self.stmts_from(&f.body)?;
-        Ok(Stmt::For {
+        let for_stmt = Stmt::For {
             init,
             cond,
             step,
             body,
-        })
+        };
+        if hoisted_prelude.is_empty() {
+            Ok(for_stmt)
+        } else {
+            // Wrap so the caller still gets a single Stmt back. Block
+            // re-emits as `{ ... }` which is correct since `var` ignores
+            // block scoping anyway.
+            hoisted_prelude.push(for_stmt);
+            Ok(Stmt::Block(hoisted_prelude))
+        }
     }
 
     fn lower_for_in_stmt(&self, f: &js::ForInStatement) -> Result<Stmt, Error> {

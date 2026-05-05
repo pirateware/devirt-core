@@ -299,12 +299,26 @@ fn for_in_destructuring_binding_still_blocked() {
 }
 
 #[test]
-fn multi_declarator_in_for_init_still_blocked() {
-    // For-init multi-declarator cannot be split into multiple statements, so
-    // it stays as a MultipleDeclarators blocker until the for-init ticket lands.
+fn multi_declarator_in_for_init_let_still_blocked() {
+    // `let`/`const` for-init multi-declarator stays blocked because
+    // hoisting all-but-the-first declarator out of the for-init would
+    // change per-iteration scoping.
     let b = blockers_of("function f() { for (let a = 1, b = 2; a < 10; a++) {} }");
     assert!(
         b.contains(&BlockerKind::MultipleDeclarators),
-        "expected MultipleDeclarators for for-init in {b:?}"
+        "expected MultipleDeclarators for `let` for-init in {b:?}"
+    );
+}
+
+#[test]
+fn multi_declarator_in_for_init_var_is_lowered() {
+    // `var` for-init multi-declarator lowers via keep-first-hoist-rest:
+    // the trailing declarators are emitted as preceding `var` statements
+    // (function-scoped, so the hoist is semantics-preserving).
+    assert_eq!(
+        decide_first_fn(
+            "function f() { for (var a = 1, b = 2; a < 10; a++) {} }"
+        ),
+        Disposition::Lowered
     );
 }
