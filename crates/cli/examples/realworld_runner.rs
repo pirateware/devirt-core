@@ -1,6 +1,6 @@
 //! Real-world stability test runner binary.
 //!
-//! Run with: cargo run --example realworld_runner -- ../../corpus/realworld
+//! Run with: cargo run --example realworld_runner -- ./corpus/realworld
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -28,17 +28,20 @@ fn main() {
         }
 
         println!("Testing {}...", tier_name);
-        
+
         for entry in fs::read_dir(&tier_dir).unwrap() {
             let entry = entry.unwrap();
             let path = entry.path();
             if path.extension().map(|e| e == "js").unwrap_or(false) {
                 let file_name = path.file_name().unwrap().to_string_lossy().to_string();
                 print!("  {}... ", file_name);
-                
+
                 let result = test_file_safely(&path);
                 let display_str = match &result {
-                    Ok(stats) => format!("OK (parse={}, fb_pt={:.1}%)", stats.parse_ok, stats.fb_pt_pct),
+                    Ok(stats) => format!(
+                        "OK (parse={}, fb_pt={:.1}%)",
+                        stats.parse_ok, stats.fb_pt_pct
+                    ),
                     Err(e) => format!("FAIL: {}", e),
                 };
                 println!("{}", display_str);
@@ -66,12 +69,10 @@ struct TestStats {
 
 fn test_file_safely(path: &Path) -> Result<TestStats, String> {
     let source = fs::read_to_string(path).map_err(|e| e.to_string())?;
-    
+
     // Use catch_unwind to handle panics gracefully
-    let result = std::panic::catch_unwind(|| {
-        test_file_inner(&source)
-    });
-    
+    let result = std::panic::catch_unwind(|| test_file_inner(&source));
+
     match result {
         Ok(Ok(stats)) => Ok(stats),
         Ok(Err(e)) => Err(e),
@@ -83,7 +84,7 @@ fn test_file_inner(source: &str) -> Result<TestStats, String> {
     use cli::coverage;
     use cli::emit;
     use cli::lower;
-    
+
     let mut stats = TestStats {
         parse_ok: false,
         validate_ok: false,
@@ -163,23 +164,44 @@ fn calculate_tl_pt_pct(cov: &cli::coverage::ModuleCoverage) -> f64 {
     cov.top_level_passthrough_bytes as f64
 }
 
-fn generate_and_write_report(results: &[(String, String, Result<TestStats, String>)], corpus_dir: &Path) {
+fn generate_and_write_report(
+    results: &[(String, String, Result<TestStats, String>)],
+    corpus_dir: &Path,
+) {
     let mut report = String::new();
     report.push_str("# Real-World Stability Test Report\n\n");
     report.push_str("Generated: 2025-01-05\n\n");
-    report.push_str("This report tests the Reify parse → IR → emit pipeline against real-world JavaScript.\n\n");
+    report.push_str(
+        "This report tests the Reify parse → IR → emit pipeline against real-world JavaScript.\n\n",
+    );
 
     // Summary
     report.push_str("## Summary\n\n");
-    
+
     let total = results.len();
-    let parse_ok = results.iter().filter(|(_, _, r)| r.as_ref().map(|s| s.parse_ok).unwrap_or(false)).count();
-    let roundtrip_ok = results.iter().filter(|(_, _, r)| r.as_ref().map(|s| s.roundtrip_ok).unwrap_or(false)).count();
+    let parse_ok = results
+        .iter()
+        .filter(|(_, _, r)| r.as_ref().map(|s| s.parse_ok).unwrap_or(false))
+        .count();
+    let roundtrip_ok = results
+        .iter()
+        .filter(|(_, _, r)| r.as_ref().map(|s| s.roundtrip_ok).unwrap_or(false))
+        .count();
     let panics = results.iter().filter(|(_, _, r)| r.is_err()).count();
-    
+
     report.push_str(&format!("- Total files tested: {}\n", total));
-    report.push_str(&format!("- Parse success: {}/{} ({:.1}%)\n", parse_ok, total, 100.0 * parse_ok as f64 / total as f64));
-    report.push_str(&format!("- Roundtrip success: {}/{} ({:.1}%)\n", roundtrip_ok, total, 100.0 * roundtrip_ok as f64 / total as f64));
+    report.push_str(&format!(
+        "- Parse success: {}/{} ({:.1}%)\n",
+        parse_ok,
+        total,
+        100.0 * parse_ok as f64 / total as f64
+    ));
+    report.push_str(&format!(
+        "- Roundtrip success: {}/{} ({:.1}%)\n",
+        roundtrip_ok,
+        total,
+        100.0 * roundtrip_ok as f64 / total as f64
+    ));
     report.push_str(&format!("- Panics/crashes: {}\n\n", panics));
 
     // Detailed results by tier
@@ -190,8 +212,12 @@ fn generate_and_write_report(results: &[(String, String, Result<TestStats, Strin
         }
 
         report.push_str(&format!("## {}\n\n", tier));
-        report.push_str("| File | Parse | Validate | Emit | Re-parse | Roundtrip | FB-PT% | TL-PT% | Notes |\n");
-        report.push_str("|------|-------|----------|------|----------|-----------|--------|--------|-------|\n");
+        report.push_str(
+            "| File | Parse | Validate | Emit | Re-parse | Roundtrip | FB-PT% | TL-PT% | Notes |\n",
+        );
+        report.push_str(
+            "|------|-------|----------|------|----------|-----------|--------|--------|-------|\n",
+        );
 
         for (_, file_name, result) in tier_results {
             match result {
@@ -203,7 +229,7 @@ fn generate_and_write_report(results: &[(String, String, Result<TestStats, Strin
                     } else {
                         String::new()
                     };
-                    
+
                     report.push_str(&format!(
                         "| {} | {} | {} | {} | {} | {} | {:.1}% | {:.1}% | {} |\n",
                         file_name,
@@ -220,8 +246,7 @@ fn generate_and_write_report(results: &[(String, String, Result<TestStats, Strin
                 Err(e) => {
                     report.push_str(&format!(
                         "| {} | ✗ | ✗ | ✗ | ✗ | ✗ | 0% | 0% | PANIC: {} |\n",
-                        file_name,
-                        e,
+                        file_name, e,
                     ));
                 }
             }
@@ -230,13 +255,20 @@ fn generate_and_write_report(results: &[(String, String, Result<TestStats, Strin
     }
 
     // Failures section
-    let failures: Vec<_> = results.iter()
-        .filter(|(_, _, r)| r.is_err() || (r.as_ref().map(|s| !s.roundtrip_ok && s.parse_ok).unwrap_or(false)))
+    let failures: Vec<_> = results
+        .iter()
+        .filter(|(_, _, r)| {
+            r.is_err()
+                || (r
+                    .as_ref()
+                    .map(|s| !s.roundtrip_ok && s.parse_ok)
+                    .unwrap_or(false))
+        })
         .collect();
-    
+
     if !failures.is_empty() {
         report.push_str("## Issues Found\n\n");
-        
+
         for (tier, file_name, result) in failures {
             report.push_str(&format!("### {} - {}\n\n", tier, file_name));
             match result {
@@ -255,23 +287,25 @@ fn generate_and_write_report(results: &[(String, String, Result<TestStats, Strin
     // Decision rules summary
     report.push_str("## Decision Rules Summary\n\n");
     report.push_str("Based on the test results:\n\n");
-    
+
     if panics > 0 {
         report.push_str("- ⚠️ **PANICS DETECTED**: {} file(s) caused panics. These are bugs that need to be fixed immediately.\n");
     }
-    
-    let tier1_parse_failures = results.iter()
+
+    let tier1_parse_failures = results
+        .iter()
         .filter(|(t, _, r)| t == "Tier 1" && r.as_ref().map(|s| !s.parse_ok).unwrap_or(true))
         .count();
-    
+
     if tier1_parse_failures > 0 {
         report.push_str(&format!("- ⚠️ **Tier 1 parse failures**: {} file(s) failed to parse. These are likely real bugs in the parser.\n", tier1_parse_failures));
     }
 
-    let high_pt = results.iter()
+    let high_pt = results
+        .iter()
         .filter(|(_, _, r)| r.as_ref().map(|s| s.fb_pt_pct > 20.0).unwrap_or(false))
         .count();
-    
+
     if high_pt > 0 {
         report.push_str(&format!("- ℹ️ **High passthrough**: {} file(s) have >20%% function-body passthrough. These should be investigated to identify dominant unlowered constructs.\n", high_pt));
     }
