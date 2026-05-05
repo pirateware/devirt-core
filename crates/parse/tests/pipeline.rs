@@ -1,14 +1,30 @@
-use crate::DEMO;
-use crate::emit::emit;
-use crate::ir::disposition::Disposition;
-use crate::ir::lower_ssa;
-use crate::ir::lower_tree;
-use crate::ir::lower_tree::{EmitConfig, lower_module_with_config};
-use crate::ir::ssa::{
+const DEMO: &str = r#"
+function asd() {
+    var numbers = [1, 2, 3, 4, 5];
+
+    var doubled = numbers.map(function(n) {
+        return n * 2;
+    });
+
+    var sum = numbers.reduce(function(acc, n) {
+        return acc + n;
+    }, 0);
+
+    console.log('Original:', numbers);
+    console.log('Doubled:', doubled);
+    console.log('Sum:', sum);
+}
+"#;
+use emit::emit;
+use parse::disposition::Disposition;
+use parse::lower_ssa;
+use parse::lower_tree;
+use parse::lower_tree::{EmitConfig, lower_module_with_config};
+use ir::ssa::{
     self, BasicBlock, BlockId, Constant, FuncId, Function, FunctionBody, FunctionBuilder, InstKind,
     LoweredBody, Operand, PassThroughBody, Terminator, Value, ValueDef,
 };
-use crate::lower::{parse_and_lower, parse_and_lower_with_decider};
+use parse::{parse_and_lower, parse_and_lower_with_decider};
 use oxc_ast::ast as js;
 
 fn roundtrip(src: &str) -> String {
@@ -61,7 +77,7 @@ fn for_loop_lowers_in_function_body() {
     let src = "function f() { let s = 0; for (let i = 0; i < 3; i++) { if (i === 1) continue; s += i; } return s; }";
     let m = parse_and_lower(src).expect("for-loop body must lower");
     // The function must be Lowered (not PassThrough).
-    use crate::ir::tree::Item;
+    use ir::tree::Item;
     assert!(
         matches!(m.items[0], Item::Function(_)),
         "for-loop function body must lower, not PassThrough; got {:?}",
@@ -75,7 +91,7 @@ fn for_loop_lowers_in_function_body() {
 fn ternary_lowers_in_function_body() {
     let src = "function pick(c) { return c ? 1 : 2; }";
     let m = parse_and_lower(src).expect("ternary body must lower");
-    use crate::ir::tree::Item;
+    use ir::tree::Item;
     assert!(matches!(m.items[0], Item::Function(_)));
     let _ = roundtrip(src);
 }
@@ -84,7 +100,7 @@ fn ternary_lowers_in_function_body() {
 fn update_lowers_in_function_body() {
     let src = "function inc(x) { return x++; }";
     let m = parse_and_lower(src).expect("update body must lower");
-    use crate::ir::tree::Item;
+    use ir::tree::Item;
     assert!(matches!(m.items[0], Item::Function(_)));
     let _ = roundtrip(src);
 }

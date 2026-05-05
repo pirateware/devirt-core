@@ -8,11 +8,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use mvp::coverage::{self, ModuleCoverage};
-use mvp::emit;
-use mvp::error::Error;
-use mvp::ir::tree::Module as TreeModule;
-use mvp::lower;
+use cli::coverage::{self, ModuleCoverage};
+use cli::emit;
+use cli::error::Error;
+use cli::ir::tree::Module as TreeModule;
+use cli::lower;
 
 /// Test result for a single file
 #[derive(Debug, Clone)]
@@ -129,7 +129,7 @@ fn test_file(path: &Path, tier: Tier) -> TestResult {
     result.tl_pt_pct = calculate_tl_pt_pct(&cov);
 
     // Step 2: Lower to SSA and validate
-    let mut ssa_module = mvp::ir::lower_ssa::lower_module(&tree_module);
+    let mut ssa_module = cli::ir::lower_ssa::lower_module(&tree_module);
     result.validate_ok = match ssa_module.validate() {
         Ok(()) => true,
         Err(e) => {
@@ -139,7 +139,7 @@ fn test_file(path: &Path, tier: Tier) -> TestResult {
     };
 
     // Step 3: Emit back to JS
-    let tree_back = mvp::ir::lower_tree::lower_module(&ssa_module);
+    let tree_back = cli::ir::lower_tree::lower_module(&ssa_module);
     let emitted = emit::emit(&tree_back);
     result.emit_ok = true;
 

@@ -2,3 +2,14 @@
 name = "cli"
 version = "0.1.0"
 edition = "2024"
+
+[dependencies]
+ir            = { path = "../ir" }
+parse         = { path = "../parse" }
+emit          = { path = "../emit" }
+pass          = { path = "../pass" }
+
+[features]
+# Behavior-preservation tests that shell out to `node`. Off by default
+# so plain `cargo test` runs without a Node runtime installed.
+node-tests = ["parse/node-tests"]

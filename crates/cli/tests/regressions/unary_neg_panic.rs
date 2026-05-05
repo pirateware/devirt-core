@@ -18,11 +18,11 @@ function testNegation() {
 
     // Should not panic
     let result = std::panic::catch_unwind(|| {
-        let tree_module = mvp::lower::parse_and_lower(source).expect("Parse should succeed");
-        let mut ssa_module = mvp::ir::lower_ssa::lower_module(&tree_module);
+        let tree_module = cli::lower::parse_and_lower(source).expect("Parse should succeed");
+        let mut ssa_module = cli::ir::lower_ssa::lower_module(&tree_module);
         ssa_module.validate().expect("Validation should succeed");
-        let tree_back = mvp::ir::lower_tree::lower_module(&ssa_module);
-        mvp::emit::emit(&tree_back)
+        let tree_back = cli::ir::lower_tree::lower_module(&ssa_module);
+        cli::emit::emit(&tree_back)
     });
 
     // Currently this will panic - when fixed, it should succeed
@@ -50,14 +50,14 @@ function negate(x) {
 "#;
 
     let result = std::panic::catch_unwind(|| {
-        let tree_module = mvp::lower::parse_and_lower(source).expect("Parse should succeed");
-        let mut ssa_module = mvp::ir::lower_ssa::lower_module(&tree_module);
+        let tree_module = cli::lower::parse_and_lower(source).expect("Parse should succeed");
+        let mut ssa_module = cli::ir::lower_ssa::lower_module(&tree_module);
         ssa_module.validate().expect("Validation should succeed");
-        let tree_back = mvp::ir::lower_tree::lower_module(&ssa_module);
-        let emitted = mvp::emit::emit(&tree_back);
+        let tree_back = cli::ir::lower_tree::lower_module(&ssa_module);
+        let emitted = cli::emit::emit(&tree_back);
         
         // Re-parse and verify
-        let tree_module2 = mvp::lower::parse_and_lower(&emitted).expect("Re-parse should succeed");
+        let tree_module2 = cli::lower::parse_and_lower(&emitted).expect("Re-parse should succeed");
         (emitted, tree_module2)
     });
 

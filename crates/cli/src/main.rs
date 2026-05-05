@@ -31,12 +31,12 @@ use std::env;
 use std::fs;
 use std::process::ExitCode;
 
-use mvp::DEMO;
-use mvp::coverage;
-use mvp::emit::emit;
-use mvp::ir::pass::PassManager;
-use mvp::ir::{lower_ssa, lower_tree, ssa, tree};
-use mvp::lower::parse_and_lower;
+use cli::DEMO;
+use cli::coverage;
+use cli::emit::emit;
+use cli::ir::pass::PassManager;
+use cli::ir::{lower_ssa, lower_tree, ssa, tree};
+use cli::lower::parse_and_lower;
 
 fn main() -> ExitCode {
     let mut args: Vec<String> = env::args().skip(1).collect();

@@ -69,7 +69,7 @@ fn run_node(source: &str, stdin: &str) -> (String, String, Option<i32>) {
 /// the test driver after pipeline execution rather than baked into
 /// the source.
 fn assert_functional_equivalence(input: &str, harness: &str, stdin: &str) {
-    let output = mvp::process(input).expect("pipeline must produce output");
+    let output = cli::process(input).expect("pipeline must produce output");
     let in_full = format!("{input}\n{harness}");
     let out_full = format!("{output}\n{harness}");
     let (in_stdout, in_stderr, in_code) = run_node(&in_full, stdin);

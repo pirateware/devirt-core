@@ -80,9 +80,9 @@ fn test_file_safely(path: &Path) -> Result<TestStats, String> {
 }
 
 fn test_file_inner(source: &str) -> Result<TestStats, String> {
-    use mvp::coverage;
-    use mvp::emit;
-    use mvp::lower;
+    use cli::coverage;
+    use cli::emit;
+    use cli::lower;
     
     let mut stats = TestStats {
         parse_ok: false,
@@ -113,7 +113,7 @@ fn test_file_inner(source: &str) -> Result<TestStats, String> {
     stats.tl_pt_pct = calculate_tl_pt_pct(&cov);
 
     // Step 2: Lower to SSA and validate
-    let mut ssa_module = mvp::ir::lower_ssa::lower_module(&tree_module);
+    let mut ssa_module = cli::ir::lower_ssa::lower_module(&tree_module);
     match ssa_module.validate() {
         Ok(()) => stats.validate_ok = true,
         Err(e) => {
@@ -123,7 +123,7 @@ fn test_file_inner(source: &str) -> Result<TestStats, String> {
     }
 
     // Step 3: Emit
-    let tree_back = mvp::ir::lower_tree::lower_module(&ssa_module);
+    let tree_back = cli::ir::lower_tree::lower_module(&ssa_module);
     let emitted = emit::emit(&tree_back);
     stats.emit_ok = true;
 
@@ -142,7 +142,7 @@ fn test_file_inner(source: &str) -> Result<TestStats, String> {
     Ok(stats)
 }
 
-fn calculate_fb_pt_pct(cov: &mvp::coverage::ModuleCoverage) -> f64 {
+fn calculate_fb_pt_pct(cov: &cli::coverage::ModuleCoverage) -> f64 {
     let mut total_lowered_stmts = 0usize;
     let mut total_pt_bytes = 0usize;
 
@@ -159,7 +159,7 @@ fn calculate_fb_pt_pct(cov: &mvp::coverage::ModuleCoverage) -> f64 {
     }
 }
 
-fn calculate_tl_pt_pct(cov: &mvp::coverage::ModuleCoverage) -> f64 {
+fn calculate_tl_pt_pct(cov: &cli::coverage::ModuleCoverage) -> f64 {
     cov.top_level_passthrough_bytes as f64
 }
 
