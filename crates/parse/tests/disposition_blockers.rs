@@ -188,6 +188,62 @@ fn multi_declarator_destructuring_reports_destructuring_not_multiple() {
 }
 
 #[test]
+fn nested_assignment_expr_blocked() {
+    // Assignment in expression position (call argument) → AssignmentExpr.
+    // Statement-level assignments are still lowered, so this should NOT
+    // appear when the assignment is the whole statement.
+    let b = blockers_of("function f(x) { g(x = 1); }");
+    assert!(b.contains(&BlockerKind::AssignmentExpr), "{b:?}");
+    assert!(
+        !b.contains(&BlockerKind::UnsupportedExpr),
+        "AssignmentExpr should replace UnsupportedExpr fallback: {b:?}"
+    );
+}
+
+#[test]
+fn nested_assignment_expr_in_if_test_blocked() {
+    let b = blockers_of("function f(a, b) { if (a = b) { return a; } }");
+    assert!(b.contains(&BlockerKind::AssignmentExpr), "{b:?}");
+}
+
+#[test]
+fn statement_level_assignment_is_lowered() {
+    // Top-level `x = 1;` is a statement, not a nested expression — no blocker.
+    assert_eq!(
+        decide_first_fn("function f(x) { x = 1; return x; }"),
+        Disposition::Lowered
+    );
+}
+
+#[test]
+fn nested_compound_assignment_blocked() {
+    // `f(x += 1)` is a compound assignment in expression position.
+    let b = blockers_of("function f(x) { g(x += 1); }");
+    assert!(b.contains(&BlockerKind::CompoundAssignmentExpr), "{b:?}");
+    assert!(
+        !b.contains(&BlockerKind::AssignmentExpr),
+        "compound should not also report plain AssignmentExpr: {b:?}"
+    );
+}
+
+#[test]
+fn nested_logical_assignment_reports_logical_op_only() {
+    // `f(x ||= 1)` reports LogicalAssignOp (already its own variant) and
+    // does NOT additionally report AssignmentExpr — the operator-class split
+    // is exclusive so the table doesn't double-count.
+    let b = blockers_of("function f(x) { g(x ||= 1); }");
+    assert!(b.contains(&BlockerKind::LogicalAssignOp), "{b:?}");
+    assert!(
+        !b.contains(&BlockerKind::AssignmentExpr),
+        "should not double-count: {b:?}"
+    );
+    assert!(
+        !b.contains(&BlockerKind::CompoundAssignmentExpr),
+        "should not double-count: {b:?}"
+    );
+}
+
+#[test]
 fn multi_declarator_in_for_init_still_blocked() {
     // For-init multi-declarator cannot be split into multiple statements, so
     // it stays as a MultipleDeclarators blocker until the for-init ticket lands.

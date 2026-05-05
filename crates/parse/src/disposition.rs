@@ -562,6 +562,20 @@ fn collect_expr_blockers(expr: &js::Expression, blockers: &mut BTreeSet<BlockerK
         ThisExpression(_) => {
             blockers.insert(BlockerKind::ThisExpr);
         }
+        AssignmentExpression(a) => {
+            // Split by operator class — plain `=`, compound (+=, -=, ...),
+            // and logical-assign (||=, ??=, &&=) lower differently. Logical-assign
+            // already has its own variant; emit only that one for those operators.
+            if !assignment_op_lowerable(a.operator) {
+                blockers.insert(BlockerKind::LogicalAssignOp);
+            } else if matches!(a.operator, js::AssignmentOperator::Assign) {
+                blockers.insert(BlockerKind::AssignmentExpr);
+            } else {
+                blockers.insert(BlockerKind::CompoundAssignmentExpr);
+            }
+            collect_assignment_target_blockers(&a.left, blockers);
+            collect_expr_blockers(&a.right, blockers);
+        }
         _ => {
             blockers.insert(BlockerKind::UnsupportedExpr);
         }

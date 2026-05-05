@@ -53,6 +53,13 @@ pub enum BlockerKind {
     // --- Expression blockers ---
     /// Comma operator: `a, b`
     SequenceExpr,
+    /// Plain `=` assignment in expression position: `f(x = 1)`, `if (a = b) {}`.
+    /// Distinct from statement-level assignment, which is lowerable.
+    AssignmentExpr,
+    /// Compound `+=`, `-=`, etc. in expression position. Lowering must
+    /// desugar to `x = x op e` while preserving target side-effects, so
+    /// it's a different decision from plain `AssignmentExpr`.
+    CompoundAssignmentExpr,
     /// Nullish coalescing: `a ?? b`
     NullishCoalescing,
     /// Logical-assign: `&&=`, `||=`, `??=`
@@ -122,6 +129,8 @@ impl fmt::Display for BlockerKind {
             Self::ForOfBareReturn => "ForOfBareReturn",
             Self::TryCatchDestructuringParam => "TryCatchDestructuringParam",
             Self::SequenceExpr => "SequenceExpr",
+            Self::AssignmentExpr => "AssignmentExpr",
+            Self::CompoundAssignmentExpr => "CompoundAssignmentExpr",
             Self::NullishCoalescing => "NullishCoalescing",
             Self::LogicalAssignOp => "LogicalAssignOp",
             Self::TaggedTemplateExpr => "TaggedTemplateExpr",
