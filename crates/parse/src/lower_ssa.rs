@@ -544,6 +544,14 @@ fn walk_reassigned_in_expr(e: &Expr, out: &mut HashSet<String>) {
             walk_reassigned_in_expr(target, out);
             walk_reassigned_in_expr(value, out);
         }
+        Expr::CompoundAssign { target, value, .. } => {
+            // `x op= rhs` writes to `x` (when target is an identifier).
+            if let Expr::Ident(n) = target.as_ref() {
+                out.insert(n.clone());
+            }
+            walk_reassigned_in_expr(target, out);
+            walk_reassigned_in_expr(value, out);
+        }
     }
 }
 
@@ -844,6 +852,10 @@ fn discover_expr<'a>(
             discover_expr(target, pending, captures_by_fid, seen, reassigned, parent_fid);
             discover_expr(value, pending, captures_by_fid, seen, reassigned, parent_fid);
         }
+        Expr::CompoundAssign { target, value, .. } => {
+            discover_expr(target, pending, captures_by_fid, seen, reassigned, parent_fid);
+            discover_expr(value, pending, captures_by_fid, seen, reassigned, parent_fid);
+        }
     }
 }
 
@@ -1071,6 +1083,13 @@ fn collect_assign_expr_target_names(stmts: &[Stmt]) -> std::collections::HashSet
     fn visit_expr(e: &Expr, out: &mut std::collections::HashSet<String>) {
         match e {
             Expr::Assign { target, value } => {
+                if let Expr::Ident(n) = target.as_ref() {
+                    out.insert(n.clone());
+                }
+                visit_expr(target, out);
+                visit_expr(value, out);
+            }
+            Expr::CompoundAssign { target, value, .. } => {
                 if let Expr::Ident(n) = target.as_ref() {
                     out.insert(n.clone());
                 }
@@ -2665,6 +2684,94 @@ impl<'b, 'm> Converter<'b, 'm> {
                 }
                 val_op
             }
+            Expr::CompoundAssign { op, target, value } => {
+                // `lhs op= rhs` in expression position. Decompose into
+                // a single LHS evaluation, a load, the binary op, a
+                // store, and yield the computed value. Mirrors
+                // `convert_update` but uses the requested binary op.
+                // Spec ordering: evaluate receiver, evaluate key,
+                // load, evaluate rhs, op, store.
+                match target.as_ref() {
+                    Expr::Ident(name) => {
+                        if let Some(sym) = self.lookup(name) {
+                            let cb0 = self.current_block();
+                            let old = self.read_variable(sym, cb0);
+                            let rhs_op = self.convert_expr(value);
+                            let new = self.emit_binop_for_compound(*op, old, rhs_op);
+                            self.tag_binding_source_name(new.clone(), name);
+                            let cb = self.current_block();
+                            self.write_variable(sym, cb, new.clone());
+                            self.builder.mark_forced_let_decl(name);
+                            let key = self.builder.intern(name);
+                            self.builder.add_inst(InstKind::StoreProp {
+                                obj: Operand::Const(Constant::GlobalThis),
+                                key,
+                                val: new.clone(),
+                                purity: Purity::Throws,
+                            });
+                            new
+                        } else {
+                            // Unbound: read+write through globalThis.
+                            let key = self.builder.intern(name);
+                            let old = self.emit(InstKind::LoadProp {
+                                obj: Operand::Const(Constant::GlobalThis),
+                                key,
+                                purity: Purity::Throws,
+                            });
+                            let rhs_op = self.convert_expr(value);
+                            let new = self.emit_binop_for_compound(*op, old, rhs_op);
+                            self.builder.add_inst(InstKind::StoreProp {
+                                obj: Operand::Const(Constant::GlobalThis),
+                                key,
+                                val: new.clone(),
+                                purity: Purity::Throws,
+                            });
+                            new
+                        }
+                    }
+                    Expr::Member { obj, prop } => {
+                        let obj_op = self.convert_expr(obj);
+                        let key = self.builder.intern(prop);
+                        let purity = property_access_purity(&obj_op);
+                        let old = self.emit(InstKind::LoadProp {
+                            obj: obj_op.clone(),
+                            key,
+                            purity,
+                        });
+                        let rhs_op = self.convert_expr(value);
+                        let new = self.emit_binop_for_compound(*op, old, rhs_op);
+                        self.builder.add_inst(InstKind::StoreProp {
+                            obj: obj_op,
+                            key,
+                            val: new.clone(),
+                            purity,
+                        });
+                        new
+                    }
+                    Expr::Index { obj, index } => {
+                        let obj_op = self.convert_expr(obj);
+                        let idx_op = self.convert_expr(index);
+                        let purity = property_access_purity(&obj_op);
+                        let old = self.emit(InstKind::LoadIndex {
+                            obj: obj_op.clone(),
+                            index: idx_op.clone(),
+                            purity,
+                        });
+                        let rhs_op = self.convert_expr(value);
+                        let new = self.emit_binop_for_compound(*op, old, rhs_op);
+                        self.builder.add_inst(InstKind::StoreIndex {
+                            obj: obj_op,
+                            index: idx_op,
+                            val: new.clone(),
+                            purity,
+                        });
+                        new
+                    }
+                    _ => panic!(
+                        "Expr::CompoundAssign with unsupported target: {target:?}"
+                    ),
+                }
+            }
             Expr::Template { quasis, exprs } => {
                 // Desugar `` `a${x}b${y}c` `` to a chain of AddGeneric:
                 //   "a" + x -> ("a" + x) + "b" -> (("a" + x) + "b") + y -> ...
@@ -2763,6 +2870,38 @@ impl<'b, 'm> Converter<'b, 'm> {
     /// Returns the old value for postfix, the new value for prefix —
     /// matching JS semantics for numeric inputs (non-numeric inputs
     /// diverge on `ToNumber` coercion; see docs/DECISIONS.md).
+    /// Emit the binary instruction backing a compound assignment's
+    /// op (e.g. `BinOp::Add` for `+=`). Centralised so the SSA op
+    /// mapping stays in one place; `convert_binary` already handles
+    /// the same set for plain binary expressions, but compound never
+    /// wants the comparison/logical/short-circuit branches and a
+    /// few of those would be ill-formed (`=== `, `&&` etc. are not
+    /// valid compound ops at parse time, but enumerating only the
+    /// arithmetic/bitwise subset keeps the panic helpful).
+    fn emit_binop_for_compound(
+        &mut self,
+        op: BinOp,
+        lhs: Operand,
+        rhs: Operand,
+    ) -> Operand {
+        let kind = match op {
+            BinOp::Add => InstKind::AddGeneric { lhs, rhs },
+            BinOp::Sub => InstKind::SubGeneric { lhs, rhs },
+            BinOp::Mul => InstKind::MulGeneric { lhs, rhs },
+            BinOp::Div => InstKind::DivGeneric { lhs, rhs },
+            BinOp::Mod => InstKind::ModGeneric { lhs, rhs },
+            BinOp::Pow => InstKind::PowGeneric { lhs, rhs },
+            BinOp::BitAnd => InstKind::BitAnd { lhs, rhs },
+            BinOp::BitOr => InstKind::BitOr { lhs, rhs },
+            BinOp::BitXor => InstKind::BitXor { lhs, rhs },
+            BinOp::Shl => InstKind::Shl { lhs, rhs },
+            BinOp::Shr => InstKind::Shr { lhs, rhs },
+            BinOp::UShr => InstKind::UShr { lhs, rhs },
+            other => panic!("invalid compound-assignment operator: {other:?}"),
+        };
+        self.emit(kind)
+    }
+
     fn convert_update(&mut self, op: UpdateOp, target: &Expr, prefix: bool) -> Operand {
         match target {
             Expr::Ident(name) => {
@@ -3001,12 +3140,34 @@ impl<'b, 'm> Converter<'b, 'm> {
                 rhs: lhs_op,
             },
             BinOp::LogAnd | BinOp::LogOr => unreachable!("handled above"),
-            BinOp::BitAnd
-            | BinOp::BitOr
-            | BinOp::BitXor
-            | BinOp::Shl
-            | BinOp::Shr
-            | BinOp::UShr => unimplemented!("bitwise operators not yet lowered"),
+            BinOp::Pow => InstKind::PowGeneric {
+                lhs: lhs_op,
+                rhs: rhs_op,
+            },
+            BinOp::BitAnd => InstKind::BitAnd {
+                lhs: lhs_op,
+                rhs: rhs_op,
+            },
+            BinOp::BitOr => InstKind::BitOr {
+                lhs: lhs_op,
+                rhs: rhs_op,
+            },
+            BinOp::BitXor => InstKind::BitXor {
+                lhs: lhs_op,
+                rhs: rhs_op,
+            },
+            BinOp::Shl => InstKind::Shl {
+                lhs: lhs_op,
+                rhs: rhs_op,
+            },
+            BinOp::Shr => InstKind::Shr {
+                lhs: lhs_op,
+                rhs: rhs_op,
+            },
+            BinOp::UShr => InstKind::UShr {
+                lhs: lhs_op,
+                rhs: rhs_op,
+            },
         };
         self.emit(kind)
     }
@@ -3408,6 +3569,13 @@ fn walk_inst_operands_mut(kind: &mut InstKind, f: &mut impl FnMut(&mut Operand))
         | MulGeneric { lhs, rhs }
         | DivGeneric { lhs, rhs }
         | ModGeneric { lhs, rhs }
+        | PowGeneric { lhs, rhs }
+        | BitAnd { lhs, rhs }
+        | BitOr { lhs, rhs }
+        | BitXor { lhs, rhs }
+        | Shl { lhs, rhs }
+        | Shr { lhs, rhs }
+        | UShr { lhs, rhs }
         | AddNumber { lhs, rhs }
         | SubNumber { lhs, rhs }
         | MulNumber { lhs, rhs }

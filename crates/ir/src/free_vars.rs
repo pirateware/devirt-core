@@ -320,6 +320,10 @@ impl Ctx<'_> {
                 self.walk_expr(target);
                 self.walk_expr(value);
             }
+            Expr::CompoundAssign { target, value, .. } => {
+                self.walk_expr(target);
+                self.walk_expr(value);
+            }
         }
     }
 

@@ -1046,3 +1046,136 @@ fn template_literal_tostring_vs_toprimitive_roundtrip() {
         "SSA round-trip currently degrades to + concat (known gap): {ssa_out}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Compound assignment in expression position. Covers each of the 12 lowerable
+// operators across the three LHS forms (ident, static-property, computed-
+// property) and the three positions where the assignment's value flows into
+// surrounding code (call argument, while condition, for-update).
+//
+// Behavioral correctness rests on the SSA decomposition emitting LHS reads
+// and writes in spec order: receiver, key, load, rhs, op, store. The tests
+// here check that each shape survives both the tree-only and full SSA
+// round-trips and that the emitted output re-parses.
+// ---------------------------------------------------------------------------
+
+const COMPOUND_OPS: &[&str] = &[
+    "+=", "-=", "*=", "/=", "%=", "**=", "&=", "|=", "^=", "<<=", ">>=", ">>>=",
+];
+
+fn assert_ssa_roundtrip(src: &str) {
+    let _ = ssa_roundtrip(src);
+}
+
+#[test]
+fn compound_assign_ident_in_call_arg_all_ops() {
+    for op in COMPOUND_OPS {
+        let src = format!("function f(x) {{ g(x {op} 1); return x; }}");
+        assert_ssa_roundtrip(&src);
+    }
+}
+
+#[test]
+fn compound_assign_static_property_in_call_arg_all_ops() {
+    for op in COMPOUND_OPS {
+        let src = format!("function f(o) {{ g(o.x {op} 1); return o.x; }}");
+        assert_ssa_roundtrip(&src);
+    }
+}
+
+#[test]
+fn compound_assign_computed_property_in_call_arg_all_ops() {
+    for op in COMPOUND_OPS {
+        let src = format!(
+            "function f(o, k) {{ g(o[k] {op} 1); return o[k]; }}"
+        );
+        assert_ssa_roundtrip(&src);
+    }
+}
+
+#[test]
+fn compound_assign_in_while_condition() {
+    let src = "function f(n) { while (n -= 1) { g(n); } return n; }";
+    let out = ssa_roundtrip(src);
+    assert!(out.contains("while"), "must keep while loop: {out}");
+}
+
+#[test]
+fn compound_assign_in_for_update() {
+    let src = "
+        function f(n) {
+            let s = 0;
+            for (let i = 0; i < n; i += 2) { s = s + i; }
+            return s;
+        }
+    ";
+    assert_ssa_roundtrip(src);
+}
+
+#[test]
+fn compound_assign_chained_nested() {
+    // a += (b += 1): inner evaluates first, contributes its computed
+    // value to the outer add. SSA decomposition emits two read-modify
+    // -write sequences in source order.
+    let src = "function f(a, b) { return a += (b += 1); }";
+    assert_ssa_roundtrip(src);
+}
+
+#[test]
+fn compound_assign_with_side_effecting_lhs_index() {
+    // arr[i++] += 1 — the index expression must be evaluated exactly
+    // once. The SSA convert reads `i++` as a single Update instruction
+    // that emits one increment; the result is bound to a fresh value
+    // and reused for both load and store.
+    let src = "
+        function f(arr, i) {
+            arr[i++] += 1;
+            return [arr, i];
+        }
+    ";
+    assert_ssa_roundtrip(src);
+}
+
+#[test]
+fn compound_assign_with_call_lhs_obj_and_key() {
+    // obj()[k()] += rhs — receiver and key are each side-effecting
+    // calls. Both must be evaluated exactly once before the load.
+    let src = "
+        function f(obj, k, rhs) {
+            return obj()[k()] += rhs;
+        }
+    ";
+    assert_ssa_roundtrip(src);
+}
+
+#[test]
+fn compound_assign_string_plus_eq() {
+    // `+=` does ToPrimitive (string concat path).
+    let src = "function f(s, t) { s += t; return s; }";
+    assert_ssa_roundtrip(src);
+}
+
+#[test]
+fn pow_binary_in_expression_position() {
+    // The Pow lowering also unblocks plain `**`.
+    let src = "function f(x, y) { return x ** y; }";
+    assert_ssa_roundtrip(src);
+}
+
+#[test]
+fn bitwise_binary_in_expression_position() {
+    for op in ["&", "|", "^", "<<", ">>", ">>>"] {
+        let src = format!("function f(x, y) {{ return x {op} y; }}");
+        assert_ssa_roundtrip(&src);
+    }
+}
+
+#[test]
+fn compound_assign_ident_statement_position_still_lowers() {
+    // Statement-position compound stays on the existing decomposition
+    // path (lib.rs:lower_compound_assign). Covered here to pin it.
+    for op in COMPOUND_OPS {
+        let src = format!("function f(x) {{ x {op} 1; return x; }}");
+        assert_ssa_roundtrip(&src);
+    }
+}

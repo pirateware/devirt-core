@@ -193,6 +193,39 @@ pub enum InstKind {
         lhs: Operand,
         rhs: Operand,
     },
+    /// `lhs ** rhs`. Calls ToNumber on both operands; throws on
+    /// BigInt/Number mixing. No typed fast-path yet.
+    PowGeneric {
+        lhs: Operand,
+        rhs: Operand,
+    },
+
+    // Bitwise binary ops. All call ToInt32 (or ToUint32 for UShr)
+    // on both operands and may throw on Symbol/BigInt coercion.
+    BitAnd {
+        lhs: Operand,
+        rhs: Operand,
+    },
+    BitOr {
+        lhs: Operand,
+        rhs: Operand,
+    },
+    BitXor {
+        lhs: Operand,
+        rhs: Operand,
+    },
+    Shl {
+        lhs: Operand,
+        rhs: Operand,
+    },
+    Shr {
+        lhs: Operand,
+        rhs: Operand,
+    },
+    UShr {
+        lhs: Operand,
+        rhs: Operand,
+    },
 
     // Typed fast-paths — emitted only by the typed-specializer pass.
     AddNumber {
@@ -422,6 +455,13 @@ impl InstKind {
             | MulGeneric { .. }
             | DivGeneric { .. }
             | ModGeneric { .. }
+            | PowGeneric { .. }
+            | BitAnd { .. }
+            | BitOr { .. }
+            | BitXor { .. }
+            | Shl { .. }
+            | Shr { .. }
+            | UShr { .. }
             | Eq { .. }
             | Lt { .. }
             | Le { .. }
@@ -1254,6 +1294,13 @@ fn walk_inst_operands(kind: &InstKind, mut f: impl FnMut(&Operand)) {
         | MulGeneric { lhs, rhs }
         | DivGeneric { lhs, rhs }
         | ModGeneric { lhs, rhs }
+        | PowGeneric { lhs, rhs }
+        | BitAnd { lhs, rhs }
+        | BitOr { lhs, rhs }
+        | BitXor { lhs, rhs }
+        | Shl { lhs, rhs }
+        | Shr { lhs, rhs }
+        | UShr { lhs, rhs }
         | AddNumber { lhs, rhs }
         | SubNumber { lhs, rhs }
         | MulNumber { lhs, rhs }
@@ -1539,6 +1586,13 @@ fn write_inst_kind(out: &mut String, kind: &InstKind, m: &Module) {
         MulGeneric { lhs, rhs } => write_binop(out, "mul_generic", lhs, rhs, m),
         DivGeneric { lhs, rhs } => write_binop(out, "div_generic", lhs, rhs, m),
         ModGeneric { lhs, rhs } => write_binop(out, "mod_generic", lhs, rhs, m),
+        PowGeneric { lhs, rhs } => write_binop(out, "pow_generic", lhs, rhs, m),
+        BitAnd { lhs, rhs } => write_binop(out, "bit_and", lhs, rhs, m),
+        BitOr { lhs, rhs } => write_binop(out, "bit_or", lhs, rhs, m),
+        BitXor { lhs, rhs } => write_binop(out, "bit_xor", lhs, rhs, m),
+        Shl { lhs, rhs } => write_binop(out, "shl", lhs, rhs, m),
+        Shr { lhs, rhs } => write_binop(out, "shr", lhs, rhs, m),
+        UShr { lhs, rhs } => write_binop(out, "ushr", lhs, rhs, m),
         AddNumber { lhs, rhs } => write_binop(out, "add_number", lhs, rhs, m),
         SubNumber { lhs, rhs } => write_binop(out, "sub_number", lhs, rhs, m),
         MulNumber { lhs, rhs } => write_binop(out, "mul_number", lhs, rhs, m),

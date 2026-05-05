@@ -230,13 +230,31 @@ fn statement_level_assignment_is_lowered() {
 }
 
 #[test]
-fn nested_compound_assignment_blocked() {
-    // `f(x += 1)` is a compound assignment in expression position.
-    let b = blockers_of("function f(x) { g(x += 1); }");
-    assert!(b.contains(&BlockerKind::CompoundAssignmentExpr), "{b:?}");
-    assert!(
-        !b.contains(&BlockerKind::AssignmentExpr),
-        "compound should not also report plain AssignmentExpr: {b:?}"
+fn nested_compound_assignment_is_lowered() {
+    // `f(x += 1)` lowers to `Expr::CompoundAssign` in expression
+    // position; SSA convert decomposes into Load + AddGeneric + Store
+    // and yields the new value.
+    assert_eq!(
+        decide_first_fn("function f(x) { g(x += 1); }"),
+        Disposition::Lowered
+    );
+}
+
+#[test]
+fn nested_compound_bitwise_assignment_is_lowered() {
+    // Bitwise compound goes through the same path now that the SSA
+    // layer has BitAnd / BitOr / etc. instructions.
+    assert_eq!(
+        decide_first_fn("function f(x) { g(x |= 1); }"),
+        Disposition::Lowered
+    );
+}
+
+#[test]
+fn nested_pow_assignment_is_lowered() {
+    assert_eq!(
+        decide_first_fn("function f(x) { g(x **= 2); }"),
+        Disposition::Lowered
     );
 }
 

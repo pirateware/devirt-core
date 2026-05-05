@@ -588,13 +588,12 @@ fn collect_expr_blockers(expr: &js::Expression, blockers: &mut BTreeSet<BlockerK
             blockers.insert(BlockerKind::ThisExpr);
         }
         AssignmentExpression(a) => {
-            // Plain `=` in expression position is now lowered to
-            // `Expr::Assign`. Compound (+=, -=, ...) and logical-assign
-            // (||=, ??=, &&=) remain blocked by their own variants.
+            // Plain `=` and arithmetic/bitwise compound (+=, -=, *=,
+            // /=, %=, **=, &=, |=, ^=, <<=, >>=, >>>=) are all lowered
+            // in expression position. Only logical-assign (`||=`,
+            // `&&=`, `??=`) remains blocked.
             if !assignment_op_lowerable(a.operator) {
                 blockers.insert(BlockerKind::LogicalAssignOp);
-            } else if !matches!(a.operator, js::AssignmentOperator::Assign) {
-                blockers.insert(BlockerKind::CompoundAssignmentExpr);
             }
             // Walk children so blockers inside target/value are surfaced.
             collect_assignment_target_blockers(&a.left, blockers);
@@ -649,6 +648,7 @@ fn binop_lowerable(op: js::BinaryOperator) -> bool {
             | ShiftLeft
             | ShiftRight
             | ShiftRightZeroFill
+            | Exponential
     )
 }
 
