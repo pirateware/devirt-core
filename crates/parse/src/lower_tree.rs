@@ -883,6 +883,9 @@ impl LowerCtx<'_> {
                 callee: Box::new(Expr::Ident("Array".to_string())),
                 args: vec![],
             },
+            AllocRegExp { source } => {
+                Expr::RegExp(self.sm.strings.resolve(source).to_string())
+            }
             ArrayWithSpread { elements, spread_mask } => {
                 use ir::tree::Expr as TreeExpr;
                 let elems: Vec<TreeExpr> = elements.iter().zip(spread_mask.iter()).map(|(e, &is_spread)| {
@@ -1620,6 +1623,7 @@ fn render_expr_to_string(e: &Expr) -> String {
         Expr::Undefined => "undefined".to_string(),
         Expr::Ident(n) => n.clone(),
         Expr::This => "this".to_string(),
+        Expr::RegExp(s) => s.clone(),
         Expr::Binary { op, lhs, rhs } => format!(
             "({}{}{})",
             render_expr_to_string(lhs),

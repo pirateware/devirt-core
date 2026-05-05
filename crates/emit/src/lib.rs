@@ -510,6 +510,7 @@ impl Printer<'_> {
             Expr::Undefined => self.buf.push_str("undefined"),
             Expr::Ident(name) => self.buf.push_str(name),
             Expr::This => self.buf.push_str("this"),
+            Expr::RegExp(s) => self.buf.push_str(s),
             Expr::Binary { op, lhs, rhs } => {
                 // Always parenthesize. Not pretty, but trivially correct.
                 self.buf.push('(');

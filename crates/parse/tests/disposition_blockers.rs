@@ -153,9 +153,13 @@ fn this_expr_is_lowered() {
 }
 
 #[test]
-fn regex_literal_blocked() {
-    let b = blockers_of("function f() { return /abc/g; }");
-    assert!(b.contains(&BlockerKind::RegExpLiteral), "{b:?}");
+fn regex_literal_is_lowered() {
+    // Regex literal lowers to `Expr::RegExp(<raw>)`; SSA maps to
+    // `InstKind::AllocRegExp` (PURE per-evaluation allocation).
+    assert_eq!(
+        decide_first_fn("function f() { return /abc/g; }"),
+        Disposition::Lowered
+    );
 }
 
 #[test]

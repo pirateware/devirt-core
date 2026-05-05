@@ -260,6 +260,7 @@ impl Ctx<'_> {
         match e {
             Expr::Number(_) | Expr::String(_) | Expr::Bool(_) | Expr::Null | Expr::Undefined => {}
             Expr::This => {}
+            Expr::RegExp(_) => {}
             Expr::Ident(name) => self.use_name(name),
             Expr::Binary { lhs, rhs, .. } => {
                 self.walk_expr(lhs);

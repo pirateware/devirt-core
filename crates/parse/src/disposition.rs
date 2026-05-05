@@ -589,7 +589,8 @@ fn collect_expr_blockers(expr: &js::Expression, blockers: &mut BTreeSet<BlockerK
             blockers.insert(BlockerKind::MetaProperty);
         }
         RegExpLiteral(_) => {
-            blockers.insert(BlockerKind::RegExpLiteral);
+            // Lowers to `Expr::RegExp(<raw source>)`; SSA maps to
+            // `InstKind::AllocRegExp` (PURE allocation per evaluation).
         }
         BigIntLiteral(_) => {
             blockers.insert(BlockerKind::BigIntLiteral);

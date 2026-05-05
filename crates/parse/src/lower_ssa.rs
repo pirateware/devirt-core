@@ -542,7 +542,8 @@ fn walk_reassigned_in_expr(e: &Expr, out: &mut HashSet<String>) {
         | Expr::Null
         | Expr::Undefined
         | Expr::Ident(_)
-        | Expr::This => {}
+        | Expr::This
+        | Expr::RegExp(_) => {}
         Expr::Sequence { exprs } => {
             for e in exprs {
                 walk_reassigned_in_expr(e, out);
@@ -802,7 +803,8 @@ fn discover_expr<'a>(
         | Expr::Null
         | Expr::Undefined
         | Expr::Ident(_)
-        | Expr::This => {}
+        | Expr::This
+        | Expr::RegExp(_) => {}
         Expr::Binary { lhs, rhs, .. } => {
             discover_expr(lhs, pending, captures_by_fid, seen, reassigned, parent_fid);
             discover_expr(rhs, pending, captures_by_fid, seen, reassigned, parent_fid);
@@ -1193,7 +1195,7 @@ fn collect_assign_expr_target_names(stmts: &[Stmt]) -> std::collections::HashSet
             // Stop at function literals — nested scope.
             Expr::Func(_) => {}
             Expr::Number(_) | Expr::String(_) | Expr::Bool(_) | Expr::Null
-            | Expr::Undefined | Expr::Ident(_) | Expr::This => {}
+            | Expr::Undefined | Expr::Ident(_) | Expr::This | Expr::RegExp(_) => {}
         }
     }
     let mut out = std::collections::HashSet::new();
@@ -2419,6 +2421,10 @@ impl<'b, 'm> Converter<'b, 'm> {
             Expr::Null => Operand::Const(Constant::Null),
             Expr::Undefined => Operand::Const(Constant::Undefined),
             Expr::This => Operand::Const(Constant::This),
+            Expr::RegExp(s) => {
+                let id = self.builder.intern(s);
+                self.emit(InstKind::AllocRegExp { source: id })
+            }
             Expr::Ident(name) => {
                 if let Some(sym) = self.lookup(name) {
                     let cb = self.current_block();
@@ -3684,7 +3690,7 @@ fn walk_inst_operands_mut(kind: &mut InstKind, f: &mut impl FnMut(&mut Operand))
             f(index);
             f(val);
         }
-        AllocObject | AllocArray { .. } => {}
+        AllocObject | AllocArray { .. } | AllocRegExp { .. } => {}
         AllocClosure { captures, .. } => {
             for c in captures {
                 f(c);

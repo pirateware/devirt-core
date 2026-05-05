@@ -337,6 +337,14 @@ pub enum InstKind {
         func: FuncId,
         captures: Vec<Operand>,
     },
+    /// Regex literal `/pattern/flags`. Allocates a fresh RegExp
+    /// object on each evaluation (literals are not constants per
+    /// ES2015+). `source` is the verbatim raw source slice
+    /// including delimiters, e.g. `/abc/gi`. PURE: allocation has
+    /// fresh identity but no side effects.
+    AllocRegExp {
+        source: StrId,
+    },
 
     // Calls
     Call {
@@ -461,6 +469,7 @@ impl InstKind {
             | AllocObject
             | AllocArray { .. }
             | AllocClosure { .. }
+            | AllocRegExp { .. }
             | ToBool { .. }
             | Typeof { .. } => Effect::PURE,
 
@@ -1351,7 +1360,7 @@ fn walk_inst_operands(kind: &InstKind, mut f: impl FnMut(&Operand)) {
             f(index);
             f(val);
         }
-        AllocObject | AllocArray { .. } => {}
+        AllocObject | AllocArray { .. } | AllocRegExp { .. } => {}
         AllocClosure { captures, .. } => {
             for c in captures {
                 f(c);
@@ -1675,6 +1684,10 @@ fn write_inst_kind(out: &mut String, kind: &InstKind, m: &Module) {
             Some(n) => write!(out, "alloc_array len={}", n).unwrap(),
             None => out.push_str("alloc_array len=?"),
         },
+        AllocRegExp { source } => {
+            write!(out, "alloc_regexp ").unwrap();
+            write_string_literal(out, m.strings.resolve(source));
+        }
         AllocClosure { func, captures } => {
             write!(out, "alloc_closure @{}, [", func_label(m, *func)).unwrap();
             for (i, c) in captures.iter().enumerate() {

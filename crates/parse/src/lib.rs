@@ -974,6 +974,20 @@ impl Lowerer<'_> {
                 }
             }
             js::Expression::ThisExpression(_) => Ok(Expr::This),
+            js::Expression::RegExpLiteral(r) => {
+                // Prefer the raw source slice (`/pattern/flags`) when
+                // OXC stamped one — that's the only path the parser
+                // exercises. Fall back to reconstructing from
+                // pattern + flags for hand-built test ASTs (the
+                // `raw: Option` documents this case).
+                // OXC always stamps `raw` for parsed source. Reach
+                // the Err branch only for hand-built test ASTs.
+                let raw = r
+                    .raw
+                    .as_ref()
+                    .ok_or(Error::Unsupported("RegExpLiteral without raw slice"))?;
+                Ok(Expr::RegExp(raw.to_string()))
+            }
             js::Expression::ParenthesizedExpression(p) => self.lower_expr(&p.expression),
 
             js::Expression::BinaryExpression(b) => Ok(Expr::Binary {
