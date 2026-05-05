@@ -1,0 +1,5 @@
+Source: Synthetic obfuscated code with control flow flattening
+License: Public domain (synthetic)
+Created: 2025-01-05
+Description: Control flow flattening pattern with dispatcher
+WARNING: DO NOT EXECUTE - For analysis only

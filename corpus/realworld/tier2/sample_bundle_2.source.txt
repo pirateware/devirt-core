@@ -1,0 +1,4 @@
+Source: Synthetic minified bundle with arrow functions
+License: Public domain (synthetic)
+Created: 2025-01-05
+Description: Minified bundle featuring ES6 arrow functions

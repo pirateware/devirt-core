@@ -1,6 +1,5 @@
 use crate::DEMO;
 use crate::emit::emit;
-use crate::error::Error;
 use crate::ir::disposition::Disposition;
 use crate::ir::lower_ssa;
 use crate::ir::lower_tree;
@@ -521,7 +520,10 @@ fn stream_b_nested_decl_through_ssa() {
 fn top_level_iife_survives_ssa_roundtrip() {
     let src = "(function(){ var x = 1; })();";
     let out = ssa_roundtrip(src);
-    assert!(!out.trim().is_empty(), "SSA round-trip dropped IIFE entirely");
+    assert!(
+        !out.trim().is_empty(),
+        "SSA round-trip dropped IIFE entirely"
+    );
     assert!(
         out.contains("function") && out.contains("var x"),
         "IIFE body must survive: {out}"
@@ -533,7 +535,10 @@ fn top_level_iife_survives_ssa_roundtrip() {
 fn top_level_function_expression_statement_survives() {
     let src = "(function foo(){ return 1; });";
     let out = ssa_roundtrip(src);
-    assert!(!out.trim().is_empty(), "function-expression statement dropped");
+    assert!(
+        !out.trim().is_empty(),
+        "function-expression statement dropped"
+    );
     assert!(out.contains("foo"), "function name must survive: {out}");
 }
 
@@ -562,7 +567,10 @@ fn top_level_named_funcexpr_iife_survives() {
     let src = "(function foo(){ return 1; })();";
     let out = ssa_roundtrip(src);
     assert!(!out.trim().is_empty(), "named funcexpr IIFE dropped");
-    assert!(out.contains("foo"), "named funcexpr name must survive: {out}");
+    assert!(
+        out.contains("foo"),
+        "named funcexpr name must survive: {out}"
+    );
 }
 
 /// IIFE as an argument to another call.
