@@ -176,6 +176,13 @@ pub struct FuncLiteral {
     /// that omit `passthrough_source` will not re-classify even if this
     /// flag is set; the violation is logged via debug_assert in that case.
     pub force_passthrough: Cell<bool>,
+    /// Construct kinds that prevented this function from being lowered.
+    /// Non-empty only when `body` is `FuncBody::PassThrough` and the
+    /// PassThrough was caused by AST-level disposition (not SSA-level
+    /// capture reclassification via `force_passthrough`). Populated at
+    /// initial-lowering time; SSA and tree-reconstruction layers leave
+    /// this empty.
+    pub blockers: std::collections::BTreeSet<crate::blocker::BlockerKind>,
 }
 
 #[derive(Debug, Clone)]

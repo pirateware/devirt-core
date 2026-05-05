@@ -3670,6 +3670,7 @@ mod tests {
             func_id: Cell::new(None),
             passthrough_source: None,
             force_passthrough: Cell::new(false),
+            blockers: std::collections::BTreeSet::new(),
         }
     }
 

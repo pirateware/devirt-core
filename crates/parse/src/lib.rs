@@ -24,6 +24,9 @@ use oxc_ast::ast as js;
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
 
+use std::collections::BTreeSet;
+
+use ir::blocker::BlockerKind;
 use ir::error::Error;
 use crate::disposition::{Disposition, decide, decide_arrow};
 use ir::tree::*;
@@ -168,12 +171,10 @@ impl Lowerer<'_> {
 
         let disposition = decider(&f.params, body);
 
-        if disposition == Disposition::PassThrough {
-            return Ok(Item::PassThroughFunction(self.passthrough_literal(
-                Some(name),
-                f,
-                body,
-            )?));
+        if let Disposition::PassThrough(blockers) = disposition {
+            return Ok(Item::PassThroughFunction(
+                self.passthrough_literal(Some(name), f, body, blockers)?,
+            ));
         }
 
         // Lowered: same path as before T2.
@@ -266,6 +267,7 @@ impl Lowerer<'_> {
         name: Option<String>,
         f: &js::Function,
         body: &js::FunctionBody,
+        blockers: BTreeSet<BlockerKind>,
     ) -> Result<FuncLiteral, Error> {
         // Param names: use the binding identifier when present;
         // otherwise emit a synthetic placeholder. The body source is
@@ -310,6 +312,7 @@ impl Lowerer<'_> {
             func_id: std::cell::Cell::new(None),
             passthrough_source: Some(inner),
             force_passthrough: std::cell::Cell::new(false),
+            blockers,
         })
     }
 
@@ -373,8 +376,8 @@ impl Lowerer<'_> {
         }
 
         let disposition = decide(&f.params, body);
-        if disposition == Disposition::PassThrough {
-            return self.passthrough_literal(name, f, body);
+        if let Disposition::PassThrough(blockers) = disposition {
+            return self.passthrough_literal(name, f, body, blockers);
         }
 
         let mut params = Vec::with_capacity(f.params.items.len());
@@ -410,6 +413,7 @@ impl Lowerer<'_> {
             func_id: std::cell::Cell::new(None),
             passthrough_source,
             force_passthrough: std::cell::Cell::new(false),
+            blockers: BTreeSet::new(),
         })
     }
 
@@ -419,8 +423,8 @@ impl Lowerer<'_> {
     /// `FuncBody::PassThrough`.
     fn lower_arrow_literal(&self, a: &js::ArrowFunctionExpression) -> Result<FuncLiteral, Error> {
         let disposition = decide_arrow(a);
-        if disposition == Disposition::PassThrough {
-            return self.passthrough_arrow(a);
+        if let Disposition::PassThrough(blockers) = disposition {
+            return self.passthrough_arrow(a, blockers);
         }
 
         let mut params = Vec::with_capacity(a.params.items.len());
@@ -481,6 +485,7 @@ impl Lowerer<'_> {
             func_id: std::cell::Cell::new(None),
             passthrough_source,
             force_passthrough: std::cell::Cell::new(false),
+            blockers: BTreeSet::new(),
         })
     }
 
@@ -489,7 +494,7 @@ impl Lowerer<'_> {
     /// the expression text in `return ...;` so the re-emit (which uses
     /// `=> { <slice> }`) parses as a block-body arrow with the same
     /// observable behavior.
-    fn passthrough_arrow(&self, a: &js::ArrowFunctionExpression) -> Result<FuncLiteral, Error> {
+    fn passthrough_arrow(&self, a: &js::ArrowFunctionExpression, blockers: BTreeSet<BlockerKind>) -> Result<FuncLiteral, Error> {
         let mut param_names = Vec::with_capacity(a.params.items.len());
         for (i, p) in a.params.items.iter().enumerate() {
             match &p.pattern.kind {
@@ -546,6 +551,7 @@ impl Lowerer<'_> {
             func_id: std::cell::Cell::new(None),
             passthrough_source: Some(inner),
             force_passthrough: std::cell::Cell::new(false),
+            blockers,
         })
     }
 

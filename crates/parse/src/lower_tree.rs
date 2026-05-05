@@ -157,6 +157,7 @@ fn passthrough_to_literal(
         func_id: std::cell::Cell::new(None),
         passthrough_source: Some(pt.source.clone()),
         force_passthrough: std::cell::Cell::new(false),
+        blockers: std::collections::BTreeSet::new(),
     }
     // `func.name` and `pt.function_name` agree by construction (the OXC
     // lowerer populates both); we trust pt.function_name here.
@@ -795,6 +796,7 @@ impl LowerCtx<'_> {
                 func_id: std::cell::Cell::new(None),
                 passthrough_source: Some(pt.source.clone()),
                 force_passthrough: std::cell::Cell::new(false),
+                blockers: std::collections::BTreeSet::new(),
             },
             ssa::FunctionBody::Lowered(_) => {
                 // Recursively lower the inner body. We use the default
@@ -843,6 +845,7 @@ impl LowerCtx<'_> {
                     func_id: std::cell::Cell::new(None),
                     passthrough_source: None,
                     force_passthrough: std::cell::Cell::new(false),
+                    blockers: std::collections::BTreeSet::new(),
                 }
             }
         }

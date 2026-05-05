@@ -345,7 +345,7 @@ fn always_lowered(_p: &js::FormalParameters, _b: &js::FunctionBody) -> Dispositi
 /// source text. The cross-check intentionally does NOT catch this
 /// direction — see the comment in `lower.rs` and T2_PLAN.md Stream D.
 fn always_passthrough(_p: &js::FormalParameters, _b: &js::FunctionBody) -> Disposition {
-    Disposition::PassThrough
+    Disposition::PassThrough(std::collections::BTreeSet::new())
 }
 
 /// Walker too permissive: it claims `class Foo {}` is lowerable. The
