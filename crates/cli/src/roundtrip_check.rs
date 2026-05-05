@@ -13,8 +13,7 @@
 //! - Numeric literals compared by `f64` value (hex/octal normalize).
 //! - Strings compared kind-only (escape-sequence normalization).
 //!
-//! Known emit/parse asymmetries (accepted as no-op divergence; see
-//! follow-up tickets for IR-shape stabilization):
+//! Known emit/parse asymmetries (accepted as no-op divergence):
 //!
 //! 1. **PassThroughFunction ↔ Function** when name and params match.
 //!    A function whose body went through SSA-fallback is encoded as
@@ -23,14 +22,13 @@
 //!    when the disposition no longer blocks (e.g. throw/this after
 //!    those tickets). Same source, different label.
 //!
-//! 2. **Number(-0) ↔ Unary(Neg, Number(0))**. The emit writes `(-0)`
-//!    for IEEE -0.0; the JS parser models that as a UnaryExpression
-//!    over a positive 0 literal. Documented in project memory.
-//!
-//! 3. **Number(NaN/Infinity) ↔ Ident("NaN"/"Infinity")**. `NaN` and
-//!    `Infinity` are identifiers in JS, not numeric literals. SSA
-//!    converts them through `Constant::Number` and the emit writes
-//!    the bare token, which the parser sees as `Expr::Ident`.
+//! Two further asymmetries — `Number(-0) ↔ Unary(Neg, Number(0))`
+//! and `Number(NaN/Infinity) ↔ Ident("NaN"/"Infinity")` — were
+//! removed by the parser-side identifier/unary fold in
+//! `parse::lower_expr`. Both sides now converge on the canonical
+//! `Expr::Number` shape, so no tolerance is required and a
+//! regression of either fold will surface as a structural diff
+//! (the desired loud-failure mode).
 
 use ir::tree::{Expr, Item, Module, Stmt};
 
@@ -234,14 +232,6 @@ fn opt_expr_diff(a: Option<&Expr>, b: Option<&Expr>, path: &str) -> Option<Strin
 }
 
 fn expr_diff(a: &Expr, b: &Expr, path: &str) -> Option<String> {
-    // Tolerance #2: Number(-0) ↔ Unary(Neg, Number(0)).
-    if matches_neg_zero(a, b) || matches_neg_zero(b, a) {
-        return None;
-    }
-    // Tolerance #3: Number(NaN/Infinity) ↔ Ident("NaN"/"Infinity").
-    if matches_nan_or_inf_ident(a, b) || matches_nan_or_inf_ident(b, a) {
-        return None;
-    }
     match (a, b) {
         (Expr::Number(x), Expr::Number(y)) => {
             if (x.is_nan() && y.is_nan()) || x == y {
@@ -344,37 +334,6 @@ fn expr_diff(a: &Expr, b: &Expr, path: &str) -> Option<String> {
     }
 }
 
-fn matches_neg_zero(a: &Expr, b: &Expr) -> bool {
-    use ir::tree::UnOp;
-    if let Expr::Number(n) = a {
-        if *n == 0.0 && n.is_sign_negative() {
-            if let Expr::Unary { op: UnOp::Neg, operand } = b {
-                if let Expr::Number(m) = operand.as_ref() {
-                    return *m == 0.0;
-                }
-            }
-        }
-    }
-    false
-}
-
-fn matches_nan_or_inf_ident(a: &Expr, b: &Expr) -> bool {
-    if let Expr::Number(n) = a {
-        if let Expr::Ident(name) = b {
-            if n.is_nan() && name == "NaN" {
-                return true;
-            }
-            if *n == f64::INFINITY && name == "Infinity" {
-                return true;
-            }
-            // -Infinity reparse goes through Unary(Neg, Ident("Infinity")),
-            // not a bare ident, so the unary tolerance handles that case
-            // separately via expr_diff recursion.
-        }
-    }
-    false
-}
-
 fn args_diff(a: &[Expr], b: &[Expr], path: &str) -> Option<String> {
     if a.len() != b.len() {
         return Some(format!(
@@ -459,8 +418,12 @@ mod tests {
     }
 
     #[test]
-    fn negative_zero_tolerance() {
-        // Number(-0) ≡ Unary(Neg, Number(0))
+    fn negative_zero_unary_shape_caught() {
+        // The parser-side fold in `parse::lower_expr` rewrites
+        // `Unary(Neg, NumericLiteral(0))` to `Number(-0.0)` so this
+        // shape divergence shouldn't appear in practice. If it does
+        // (a fold regression), the structural check must catch it
+        // loudly rather than silently accept it.
         use ir::tree::UnOp;
         let m1 = Module {
             items: vec![fn_item(
@@ -479,14 +442,15 @@ mod tests {
                 }))],
             )],
         };
-        assert!(
-            structural_diff(&m1, &m2).is_none(),
-            "neg-zero tolerance should accept Number(-0) ≡ Unary(Neg, 0)"
-        );
+        let diff = structural_diff(&m1, &m2).expect("must catch -0 shape diff");
+        assert!(diff.contains("kind mismatch"), "got: {diff}");
     }
 
     #[test]
-    fn nan_ident_tolerance() {
+    fn nan_ident_shape_caught() {
+        // Same story for `NaN`/`Infinity` — folded at lower-time, so
+        // a bare Ident("NaN") on one side and Number(NaN) on the
+        // other should now flag, not silently accept.
         let m1 = Module {
             items: vec![fn_item(
                 "f",
@@ -501,10 +465,8 @@ mod tests {
                 vec![Stmt::Return(Some(Expr::Ident("NaN".into())))],
             )],
         };
-        assert!(
-            structural_diff(&m1, &m2).is_none(),
-            "NaN tolerance should accept Number(NaN) ≡ Ident(\"NaN\")"
-        );
+        let diff = structural_diff(&m1, &m2).expect("must catch NaN shape diff");
+        assert!(diff.contains("kind mismatch"), "got: {diff}");
     }
 
     #[test]

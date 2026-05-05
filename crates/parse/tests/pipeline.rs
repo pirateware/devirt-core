@@ -1313,3 +1313,114 @@ fn for_init_let_multi_declarator_stays_blocked() {
         m.items[0]
     );
 }
+
+// ---------------------------------------------------------------------------
+// IR-shape canonicalization. The parser folds `Unary(Neg, NumericLiteral(0))`
+// to `Number(-0.0)` and bare `Identifier("NaN" / "Infinity")` to the
+// corresponding `Number` literal so the post-SSA tree-IR and re-parsed emit
+// converge on the same canonical form. Without these folds the structural
+// roundtrip check reports Number-vs-Unary / Number-vs-Ident divergences
+// (33 cases across the corpus before the fix landed).
+// ---------------------------------------------------------------------------
+
+fn ret_expr(m: &ir::tree::Module) -> &ir::tree::Expr {
+    use ir::tree::{Item, Stmt};
+    let f = match &m.items[0] {
+        Item::Function(f) => f,
+        other => panic!("expected Item::Function, got {other:?}"),
+    };
+    match f.body.last().expect("non-empty body") {
+        Stmt::Return(Some(e)) => e,
+        other => panic!("expected Stmt::Return(Some), got {other:?}"),
+    }
+}
+
+#[test]
+fn negative_zero_folds_to_number_literal() {
+    use ir::tree::Expr;
+    let m = parse_and_lower("function f() { return -0; }").expect("must lower");
+    match ret_expr(&m) {
+        Expr::Number(n) => {
+            assert_eq!(*n, 0.0, "value must be zero");
+            assert!(
+                n.is_sign_negative(),
+                "must preserve IEEE -0 sign bit, got {}",
+                n
+            );
+        }
+        other => panic!("expected Expr::Number(-0.0), got {other:?}"),
+    }
+}
+
+#[test]
+fn positive_zero_does_not_fold_to_negative_zero() {
+    // Sanity: the fold only triggers under UnaryNegation, not over a
+    // bare positive zero.
+    use ir::tree::Expr;
+    let m = parse_and_lower("function f() { return 0; }").expect("must lower");
+    match ret_expr(&m) {
+        Expr::Number(n) => {
+            assert_eq!(*n, 0.0);
+            assert!(!n.is_sign_negative(), "must be +0, got {}", n);
+        }
+        other => panic!("expected Expr::Number(0.0), got {other:?}"),
+    }
+}
+
+#[test]
+fn nan_identifier_folds_to_number_nan() {
+    use ir::tree::Expr;
+    let m = parse_and_lower("function f() { return NaN; }").expect("must lower");
+    match ret_expr(&m) {
+        Expr::Number(n) => assert!(n.is_nan(), "expected NaN, got {n}"),
+        other => panic!("expected Expr::Number(NaN), got {other:?}"),
+    }
+}
+
+#[test]
+fn infinity_identifier_folds_to_number_infinity() {
+    use ir::tree::Expr;
+    let m = parse_and_lower("function f() { return Infinity; }").expect("must lower");
+    match ret_expr(&m) {
+        Expr::Number(n) => assert_eq!(*n, f64::INFINITY),
+        other => panic!("expected Expr::Number(Infinity), got {other:?}"),
+    }
+}
+
+#[test]
+fn negative_infinity_folds_through_unary() {
+    // `-Infinity` is `UnaryExpression(Neg, Identifier("Infinity"))`.
+    // The identifier folds to `Number(INFINITY)`, then the surrounding
+    // unary preserves shape — same on both sides of the roundtrip.
+    use ir::tree::{Expr, UnOp};
+    let m = parse_and_lower("function f() { return -Infinity; }").expect("must lower");
+    match ret_expr(&m) {
+        Expr::Unary { op: UnOp::Neg, operand } => match operand.as_ref() {
+            Expr::Number(n) => assert_eq!(*n, f64::INFINITY),
+            other => panic!("expected Number(Infinity) inside unary, got {other:?}"),
+        },
+        other => panic!("expected Unary(Neg, Number(Infinity)), got {other:?}"),
+    }
+}
+
+#[test]
+fn negative_zero_roundtrip_preserves_sign() {
+    // End-to-end: source `-0` survives parse → SSA → emit → re-parse
+    // with the negative-zero bit pattern intact.
+    let src = "function f() { return -0; }";
+    let _ = ssa_roundtrip(src);
+    // Tree-IR direct path also folds correctly.
+    let m = parse_and_lower(src).expect("must lower");
+    let m2 = parse_and_lower(&emit(&m)).expect("emit must re-parse");
+    use ir::tree::Expr;
+    match (ret_expr(&m), ret_expr(&m2)) {
+        (Expr::Number(a), Expr::Number(b)) => {
+            assert!(a.is_sign_negative());
+            assert!(
+                b.is_sign_negative(),
+                "re-parsed -0 must preserve sign, got {b}"
+            );
+        }
+        (a, b) => panic!("expected matching Number(-0), got {a:?} vs {b:?}"),
+    }
+}
