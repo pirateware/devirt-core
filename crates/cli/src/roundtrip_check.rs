@@ -252,6 +252,11 @@ fn expr_diff(a: &Expr, b: &Expr, path: &str) -> Option<String> {
             }
         }
         (Expr::This, Expr::This) => None,
+        // RegExp source slices are stored verbatim. The roundtrip
+        // emit/reparse path may normalize escape forms, so accept
+        // them as kind-equal without comparing the slice itself —
+        // analogous to how `String` is compared kind-only.
+        (Expr::RegExp(_), Expr::RegExp(_)) => None,
         (Expr::Binary { lhs: la, rhs: ra, .. }, Expr::Binary { lhs: lb, rhs: rb, .. }) => {
             expr_diff(la, lb, &format!("{path}.lhs"))
                 .or_else(|| expr_diff(ra, rb, &format!("{path}.rhs")))
@@ -499,6 +504,7 @@ fn expr_kind(e: &Expr) -> &'static str {
         Expr::Undefined => "Undefined",
         Expr::Ident(_) => "Ident",
         Expr::This => "This",
+        Expr::RegExp(_) => "RegExp",
         Expr::Binary { .. } => "Binary",
         Expr::Unary { .. } => "Unary",
         Expr::Call { .. } => "Call",

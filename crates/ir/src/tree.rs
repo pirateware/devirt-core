@@ -240,6 +240,12 @@ pub enum Expr {
     Null,
     Undefined,
     Ident(String),
+    /// Regex literal, stored as the raw source slice including the
+    /// surrounding slashes and flags (e.g. `"/abc/gi"`). Preserved
+    /// as text — the SSA layer maps to `InstKind::AllocRegExp`,
+    /// which yields a fresh `RegExp` object on each evaluation
+    /// (regex literals are not constants per ES2015+).
+    RegExp(String),
     /// `this`. Preserved as a leaf and rendered as the literal `this`
     /// token. Correctness depends on the function-boundary invariant:
     /// every expression stays inside the function body that produced
@@ -684,6 +690,7 @@ fn dump_expr(e: &Expr) -> String {
         Expr::Undefined => "undefined".to_string(),
         Expr::Ident(n) => n.clone(),
         Expr::This => "this".to_string(),
+        Expr::RegExp(s) => s.clone(),
         Expr::Binary { op, lhs, rhs } => {
             format!("({} {} {})", dump_expr(lhs), binop_str(*op), dump_expr(rhs))
         }

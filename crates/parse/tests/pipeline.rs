@@ -1479,6 +1479,38 @@ fn instanceof_operator_in_branch_condition_lowers() {
     let _ = ssa_roundtrip(src);
 }
 
+// ---------------------------------------------------------------------------
+// RegExp literal. Preserved as the verbatim source slice (`/pattern/flags`);
+// SSA maps to `InstKind::AllocRegExp` (PURE allocation, fresh identity per
+// evaluation per ES2015+).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn regex_literal_lowers_and_roundtrips() {
+    let src = r#"function f() { return /abc/g; }"#;
+    let m = parse_and_lower(src).expect("must lower");
+    use ir::tree::Item;
+    assert!(
+        matches!(m.items[0], Item::Function(_)),
+        "regex literal must lower, got {:?}",
+        m.items[0]
+    );
+    let out = ssa_roundtrip(src);
+    assert!(out.contains("/abc/g"), "regex slice must survive: {out}");
+}
+
+#[test]
+fn regex_literal_with_no_flags_roundtrips() {
+    let src = r#"function f() { return /\d+/.exec("hi42"); }"#;
+    let _ = ssa_roundtrip(src);
+}
+
+#[test]
+fn regex_literal_in_call_arg_roundtrips() {
+    let src = r#"function f(s) { return s.replace(/[\s]/g, ""); }"#;
+    let _ = ssa_roundtrip(src);
+}
+
 #[test]
 fn in_and_instanceof_combined_lower() {
     // The lodash_isPlainObject shape: nested instanceof inside a

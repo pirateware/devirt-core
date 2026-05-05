@@ -36,7 +36,7 @@ This report tests the parse → IR → emit pipeline against real-world JavaScri
 | lodash_debounce.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 20.3% |  |
 | lodash_camelCase.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 100.0% |  |
 | lodash_compact.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 8.5% |  |
-| datefns_parseISO.js | ✓ | ✓ | ✓ | ✓ | ✓ | 24.0% | 18.0% | High PT% |
+| datefns_parseISO.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 19.4% |  |
 | lodash_flow.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 100.0% |  |
 | datefns_isAfter.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 75.1% |  |
 | lodash_startCase.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 100.0% |  |
@@ -100,7 +100,7 @@ This report tests the parse → IR → emit pipeline against real-world JavaScri
 | lodash_snakeCase.terser.min.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 100.0% |  |
 | rxjs.min.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 100.0% |  |
 | lodash_set.terser.min.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 63.9% |  |
-| datefns_parseISO.terser.min.js | ✓ | ✓ | ✓ | ✓ | ✓ | 13.3% | 22.4% |  |
+| datefns_parseISO.terser.min.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 22.9% |  |
 | lodash_curry.terser.min.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 62.5% |  |
 | lodash_capitalize.terser.min.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 76.2% |  |
 | react.min.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 100.0% |  |
@@ -195,7 +195,7 @@ This report tests the parse → IR → emit pipeline against real-world JavaScri
 | lodash_noop.low.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 72.5% |  |
 | lodash_orderBy.high.js | ✓ | ✓ | ✓ | ✓ | ✓ | 46.4% | 27.4% | High PT% |
 | lodash_compact.medium.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 37.4% |  |
-| lodash_cloneDeep.high.js | ✓ | ✓ | ✓ | ✓ | ✓ | 12.2% | 27.2% |  |
+| lodash_cloneDeep.high.js | ✓ | ✓ | ✓ | ✓ | ✓ | 21.1% | 31.7% | High PT% |
 | lodash_keyBy.low.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 78.7% |  |
 | lodash_zip.low.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 75.4% |  |
 | lodash_partial.low.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 81.4% |  |
@@ -218,7 +218,7 @@ This report tests the parse → IR → emit pipeline against real-world JavaScri
 | datefns_addDays.low.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 67.6% |  |
 | lodash_sortBy.high.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 63.5% |  |
 | datefns_differenceInDays.medium.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 43.0% |  |
-| datefns_parseISO.low.js | ✓ | ✓ | ✓ | ✓ | ✓ | 19.0% | 26.6% |  |
+| datefns_parseISO.low.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 28.8% |  |
 | lodash_union.medium.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 50.7% |  |
 | lodash_set.low.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 69.3% |  |
 | lodash_compact.high.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 32.3% |  |
@@ -247,7 +247,7 @@ This report tests the parse → IR → emit pipeline against real-world JavaScri
 | datefns_differenceInDays.high.js | ✓ | ✓ | ✓ | ✓ | ✓ | 55.8% | 29.5% | High PT% |
 | lodash_has.high.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 35.1% |  |
 | lodash_times.medium.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 40.7% |  |
-| lodash_zip.high.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 43.1% |  |
+| lodash_zip.high.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 51.3% |  |
 | lodash_get.high.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 35.6% |  |
 | lodash_times.high.js | ✓ | ✓ | ✓ | ✓ | ✓ | 53.7% | 26.0% | High PT% |
 | datefns_isAfter.high.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 46.8% |  |
@@ -283,7 +283,7 @@ This report tests the parse → IR → emit pipeline against real-world JavaScri
 | lodash_invert.high.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 56.6% |  |
 | datefns_isBefore.high.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 42.9% |  |
 | lodash_mapValues.medium.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 44.3% |  |
-| datefns_parseISO.medium.js | ✓ | ✓ | ✓ | ✓ | ✓ | 17.6% | 22.5% |  |
+| datefns_parseISO.medium.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 24.4% |  |
 | datefns_format.low.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 46.3% |  |
 | lodash_set.high.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 39.0% |  |
 | lodash_orderBy.medium.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 43.5% |  |
@@ -300,7 +300,7 @@ This report tests the parse → IR → emit pipeline against real-world JavaScri
 | lodash_mapKeys.low.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 72.6% |  |
 | lodash_uniqBy.medium.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 43.9% |  |
 | datefns_startOfDay.high.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 47.9% |  |
-| datefns_addMonths.high.js | ✓ | ✓ | ✓ | ✓ | ✓ | 55.3% | 31.2% | High PT% |
+| datefns_addMonths.high.js | ✓ | ✓ | ✓ | ✓ | ✓ | 70.2% | 29.0% | High PT% |
 | lodash_constant.high.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 34.8% |  |
 | lodash_sortBy.low.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 82.5% |  |
 | lodash_startCase.medium.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 49.0% |  |
@@ -339,11 +339,10 @@ Based on the test results:
 - ℹ️ **High passthrough**: 13 file(s) have >20% function-body passthrough. These should be investigated to identify dominant unlowered constructs.
 
 
-## Blocker Analysis (23 passthrough function(s))
+## Blocker Analysis (19 passthrough function(s))
 
 blocker_kind                       occurrences counterfactual
 ---------------------------------------------------------------
-RegExpLiteral                                5              4
 BreakStmt                                   19              0
 SwitchStmt                                  19              0
 ---------------------------------------------------------------
