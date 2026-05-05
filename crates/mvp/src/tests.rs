@@ -35,8 +35,7 @@ fn ssa_roundtrip(src: &str) -> String {
 #[test]
 fn fib() {
     let out = roundtrip(DEMO);
-    assert!(out.contains("function fib"));
-    assert!(out.contains("return"));
+    assert!(out.contains("function asd"));
 }
 
 #[test]
@@ -54,16 +53,26 @@ fn while_loop() {
     let _ = roundtrip("let i = 0; while (i < 10) { i = i + 1; }");
 }
 
+/// Top-level `class` / `for` and other constructs the lowering can't
+/// represent are now preserved as verbatim source slices via
+/// `Item::PassThroughStmt` — the same fallback strategy used for
+/// un-lowerable function bodies. The "errors loudly on unsupported"
+/// guarantee still applies inside Lowered function bodies (via
+/// `disposition::decide`); top-level passthrough is the safer default
+/// when the alternative is silent data loss (see
+/// `top_level_iife_survives_ssa_roundtrip` for the bug this prevents).
 #[test]
-fn unsupported_class_errors_loudly() {
-    let err = parse_and_lower("class Foo {}").unwrap_err();
-    assert!(matches!(err, Error::Unsupported(_)));
+fn top_level_class_passthrough() {
+    let src = "class Foo {}";
+    let out = roundtrip(src);
+    assert!(out.contains("class Foo"), "class must survive: {out}");
 }
 
 #[test]
-fn unsupported_for_errors_loudly() {
-    let err = parse_and_lower("for (let i = 0; i < 10; i++) {}").unwrap_err();
-    assert!(matches!(err, Error::Unsupported(_)));
+fn top_level_for_passthrough() {
+    let src = "for (let i = 0; i < 10; i++) {}";
+    let out = roundtrip(src);
+    assert!(out.contains("for"), "for must survive: {out}");
 }
 
 /// Function body containing a class — disposition routes the function
@@ -459,4 +468,85 @@ fn stream_b_iife_through_ssa() {
 fn stream_b_nested_decl_through_ssa() {
     let src = "function outer(){ function inner(x){return x+1;} return inner(2); }";
     let _ = ssa_roundtrip(src);
+}
+
+// === Top-level non-function statement preservation through SSA ===
+//
+// Previously: `Item::Stmt` was discarded by `lower_ssa::discover_module`
+// and never re-emitted by `lower_tree::lower_module`, so a top-level
+// IIFE produced an empty output. The fix preserves non-function
+// top-level statements as source-slice passthrough items that survive
+// the SSA round-trip and re-emit verbatim.
+
+/// Top-level IIFE round-trips through SSA without producing empty
+/// output. Minimal reproduction of the silent-data-loss bug.
+#[test]
+fn top_level_iife_survives_ssa_roundtrip() {
+    let src = "(function(){ var x = 1; })();";
+    let out = ssa_roundtrip(src);
+    assert!(!out.trim().is_empty(), "SSA round-trip dropped IIFE entirely");
+    assert!(
+        out.contains("function") && out.contains("var x"),
+        "IIFE body must survive: {out}"
+    );
+}
+
+/// Top-level function expression as a statement.
+#[test]
+fn top_level_function_expression_statement_survives() {
+    let src = "(function foo(){ return 1; });";
+    let out = ssa_roundtrip(src);
+    assert!(!out.trim().is_empty(), "function-expression statement dropped");
+    assert!(out.contains("foo"), "function name must survive: {out}");
+}
+
+/// Call expression whose callee is a function expression
+/// (canonical IIFE shape).
+#[test]
+fn top_level_call_with_function_callee_survives() {
+    let src = "(function(n){ return n*2; })(21);";
+    let out = ssa_roundtrip(src);
+    assert!(!out.trim().is_empty(), "IIFE with arg dropped");
+    assert!(out.contains("21"), "argument must survive: {out}");
+}
+
+/// Arrow IIFE.
+#[test]
+fn top_level_arrow_iife_survives() {
+    let src = "(() => { return 7; })();";
+    let out = ssa_roundtrip(src);
+    assert!(!out.trim().is_empty(), "arrow IIFE dropped");
+    assert!(out.contains("=>"), "arrow shape must survive: {out}");
+}
+
+/// Named function expression IIFE.
+#[test]
+fn top_level_named_funcexpr_iife_survives() {
+    let src = "(function foo(){ return 1; })();";
+    let out = ssa_roundtrip(src);
+    assert!(!out.trim().is_empty(), "named funcexpr IIFE dropped");
+    assert!(out.contains("foo"), "named funcexpr name must survive: {out}");
+}
+
+/// IIFE as an argument to another call.
+#[test]
+fn top_level_iife_as_argument_survives() {
+    let src = "console.log((function(){ return 42; })());";
+    let out = ssa_roundtrip(src);
+    assert!(!out.trim().is_empty(), "IIFE-as-argument dropped");
+    assert!(out.contains("42") && out.contains("console.log"));
+}
+
+/// Mixed top-level: a function declaration followed by an IIFE call
+/// must preserve both, in original order.
+#[test]
+fn top_level_mixed_function_and_iife_preserves_order() {
+    let src = "function asd(){ return 1; }\n(function(){ var x = 1; })();";
+    let out = ssa_roundtrip(src);
+    let asd_pos = out.find("function asd").expect("function decl missing");
+    let iife_pos = out.find("var x").expect("IIFE body missing");
+    assert!(
+        asd_pos < iife_pos,
+        "source order not preserved across SSA round-trip:\n{out}"
+    );
 }

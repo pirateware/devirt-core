@@ -624,6 +624,26 @@ impl Function {
 pub struct Module {
     pub functions: Vec<Function>,
     pub strings: Rodeo,
+    /// Module-level item order, preserved across the SSA round-trip.
+    /// `lower_ssa` populates this from the tree-IR; `lower_tree` walks
+    /// it to interleave functions with passthrough top-level
+    /// statements in the original source order. Empty layout means
+    /// "fall back to functions-only emission" (used by hand-built
+    /// tests that don't go through the frontend).
+    pub top_level_layout: Vec<TopLevelEntry>,
+}
+
+#[derive(Clone, Debug)]
+pub enum TopLevelEntry {
+    /// References a function by its `FuncId`. The `lower_tree`
+    /// emitter looks up `module.functions[id.0]` and chooses
+    /// `Item::Function` or `Item::PassThroughFunction` based on the
+    /// function body kind.
+    Function(FuncId),
+    /// Verbatim source text for a non-function top-level statement
+    /// (IIFE, expression statement, top-level `for` / `class`, etc.).
+    /// Re-emitted as `Item::PassThroughStmt` without modification.
+    PassThroughStmt(String),
 }
 
 impl Module {
@@ -631,6 +651,7 @@ impl Module {
         Self {
             functions: Vec::new(),
             strings: Rodeo::new(),
+            top_level_layout: Vec::new(),
         }
     }
 

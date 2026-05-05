@@ -59,21 +59,13 @@ pub fn lower_module_with_config(sm: &ssa::Module, cfg: &EmitConfig) -> tree::Mod
     // module doesn't double-emit.
     let inner_targets = collect_inner_targets(sm);
 
-    let mut items = Vec::with_capacity(sm.functions.len());
-    for (i, func) in sm.functions.iter().enumerate() {
-        if inner_targets.contains(&FuncId(i as u32)) {
-            continue;
+    let lower_one = |fid: FuncId, sm: &ssa::Module, cfg: &EmitConfig| -> Option<Item> {
+        if inner_targets.contains(&fid) {
+            return None;
         }
-        match &func.body {
+        let func = &sm.functions[fid.0 as usize];
+        Some(match &func.body {
             ssa::FunctionBody::Lowered(_) => {
-                // Augment the caller-supplied EmitConfig with this
-                // function's own captured-by-passthrough pins. Each
-                // Value in that set must keep its source_name
-                // unchanged in the emitted output, because some inner
-                // PassThrough body refers to it lexically. The
-                // `unwrap` here is the constraint enforced at
-                // SSA-build time: an unnamed Value cannot reach this
-                // set.
                 let mut local_cfg = cfg.clone();
                 for &vi in &func.captured_by_passthrough {
                     let def = &func.lowered().values[vi as usize];
@@ -84,20 +76,45 @@ pub fn lower_module_with_config(sm: &ssa::Module, cfg: &EmitConfig) -> tree::Mod
                     let name = sm.strings.resolve(&strid).to_string();
                     local_cfg.immovable_names.insert(vi, name);
                 }
-                items.push(Item::Function(lower_function(
-                    sm,
-                    FuncId(i as u32),
-                    func,
-                    &local_cfg,
-                )));
+                Item::Function(lower_function(sm, fid, func, &local_cfg))
             }
             ssa::FunctionBody::PassThrough(pt) => {
-                items.push(Item::PassThroughFunction(passthrough_to_literal(
-                    sm, func, pt,
-                )));
+                Item::PassThroughFunction(passthrough_to_literal(sm, func, pt))
+            }
+        })
+    };
+
+    // When the caller populated `top_level_layout` (the OXC frontend
+    // does this for every program), walk it in source order so
+    // top-level passthrough statements interleave correctly with
+    // functions. Otherwise (hand-built tests that construct
+    // `ssa::Module` directly) fall back to functions-only emission
+    // in FuncId order, which preserves the historical behavior.
+    let items = if !sm.top_level_layout.is_empty() {
+        let mut items = Vec::with_capacity(sm.top_level_layout.len());
+        for entry in &sm.top_level_layout {
+            match entry {
+                ssa::TopLevelEntry::Function(fid) => {
+                    if let Some(item) = lower_one(*fid, sm, cfg) {
+                        items.push(item);
+                    }
+                }
+                ssa::TopLevelEntry::PassThroughStmt(src) => {
+                    items.push(Item::PassThroughStmt(src.clone()));
+                }
             }
         }
-    }
+        items
+    } else {
+        let mut items = Vec::with_capacity(sm.functions.len());
+        for i in 0..sm.functions.len() {
+            if let Some(item) = lower_one(FuncId(i as u32), sm, cfg) {
+                items.push(item);
+            }
+        }
+        items
+    };
+
     tree::Module { items }
 }
 

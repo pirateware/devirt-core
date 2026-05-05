@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ir::free_vars;
 use crate::ir::ssa::{
     self, BasicBlock, BlockId, Constant, FuncId, FunctionBuilder, InstKind, Operand, Purity, StrId,
-    Terminator, Value, ValueDef, ValueDefKind,
+    Terminator, TopLevelEntry, Value, ValueDef, ValueDefKind,
 };
 use crate::ir::tree::{self, BinOp, Expr, FuncBody, FuncLiteral, Stmt, UnOp};
 
@@ -158,6 +158,13 @@ pub fn lower_module(tm: &tree::Module) -> ssa::Module {
         }
     }
 
+    // Top-level layout: walk `tm.items` in source order, assigning
+    // FuncId references to top-level function items in the same order
+    // `discover_module` did, and copying PassThrough source slices for
+    // non-function statements. Mirrors source order so emit reproduces
+    // the original interleaving.
+    sm.top_level_layout = build_top_level_layout(tm);
+
     // Fixed-point propagation: for every Lowered function whose
     // `captures_pass_through_onward` set is non-empty, walk every
     // AllocClosure in any other function targeting this function and
@@ -282,6 +289,36 @@ enum PendingKind<'a> {
     InnerLiteral(&'a tree::FuncLiteral),
 }
 
+/// Walk `tm.items` in source order and produce the layout that the
+/// out-of-SSA emitter will use to interleave functions with passthrough
+/// statements. FuncId assignment must match `discover_module`: top-level
+/// functions get FuncId(0), FuncId(1), ... in source order — the same
+/// order they were pushed onto `pending`.
+fn build_top_level_layout(tm: &tree::Module) -> Vec<TopLevelEntry> {
+    let mut out = Vec::with_capacity(tm.items.len());
+    let mut next_top_fid: u32 = 0;
+    for it in &tm.items {
+        match it {
+            tree::Item::Function(_) | tree::Item::PassThroughFunction(_) => {
+                out.push(TopLevelEntry::Function(FuncId(next_top_fid)));
+                next_top_fid += 1;
+            }
+            tree::Item::PassThroughStmt(src) => {
+                out.push(TopLevelEntry::PassThroughStmt(src.clone()));
+            }
+            tree::Item::Stmt(_) => {
+                // Hand-built tests may construct Item::Stmt directly;
+                // the OXC frontend never does. We have no source slice
+                // for these, so skip — the caller is expected to set
+                // `top_level_layout` themselves if they need a custom
+                // layout. Functions-only emission (the historical
+                // behavior) handles this case naturally.
+            }
+        }
+    }
+    out
+}
+
 fn discover_module<'a>(tm: &'a tree::Module) -> Vec<PendingFunction<'a>> {
     let mut pending: Vec<PendingFunction<'a>> = Vec::new();
     let mut captures_by_fid: HashMap<FuncId, Vec<String>> = HashMap::new();
@@ -332,7 +369,12 @@ fn discover_module<'a>(tm: &'a tree::Module) -> Vec<PendingFunction<'a>> {
                 });
                 captures_by_fid.insert(fid, Vec::new());
             }
-            tree::Item::Stmt(_) => {}
+            tree::Item::Stmt(_) | tree::Item::PassThroughStmt(_) => {
+                // Top-level non-function statements have no per-function
+                // SSA representation. The source-order layout is
+                // reconstructed by `build_top_level_layout` after
+                // discovery; here we just skip them.
+            }
         }
     }
     // Apply captures back into the pending list.

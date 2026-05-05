@@ -140,6 +140,15 @@ impl Printer<'_> {
                 self.stmt(s);
                 self.buf.push('\n');
             }
+            Item::PassThroughStmt(src) => {
+                // Verbatim source slice from `lower.rs::lower_top_stmt`.
+                // Trailing newline is appended to keep one statement
+                // per line in the emitted output, matching the other
+                // arms.
+                self.pad();
+                self.buf.push_str(src);
+                self.buf.push('\n');
+            }
         }
     }
 

@@ -27,6 +27,17 @@ pub enum Item {
     /// (modulo the wrapper) at the final emit step.
     PassThroughFunction(FuncLiteral),
     Stmt(Stmt),
+    /// Top-level non-function statement preserved as a verbatim source
+    /// slice. The SSA pipeline is function-centric — top-level
+    /// statements have no per-instruction representation in SSA — so
+    /// any such statement (IIFE, top-level expression, top-level `for`
+    /// / `class`, etc.) round-trips as opaque text, mirroring how
+    /// un-lowerable function bodies use `FuncBody::PassThrough`. This
+    /// is what `lower.rs::lower_top_stmt` produces for everything that
+    /// is not a `FunctionDeclaration`; the structured `Item::Stmt`
+    /// variant is retained for hand-built tests but not produced by
+    /// the OXC frontend.
+    PassThroughStmt(String),
 }
 
 #[derive(Debug, Clone)]
@@ -248,6 +259,13 @@ pub fn dump(module: &Module) -> String {
             }
             Item::Stmt(s) => {
                 dump_stmt(&mut out, s, 0);
+            }
+            Item::PassThroughStmt(src) => {
+                out.push_str("passthrough_stmt {\n");
+                for line in src.lines() {
+                    writeln!(&mut out, "  {line}").unwrap();
+                }
+                out.push_str("}\n\n");
             }
         }
     }

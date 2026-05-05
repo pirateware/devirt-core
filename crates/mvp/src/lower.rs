@@ -81,7 +81,23 @@ impl Lowerer<'_> {
             js::Statement::FunctionDeclaration(f) => {
                 self.lower_top_function_with_decider(f, decider)
             }
-            _ => Ok(Item::Stmt(self.lower_stmt(stmt)?)),
+            other => {
+                // Top-level non-function statements have no SSA
+                // representation (the SSA model is function-centric).
+                // Preserve them as verbatim source slices so the
+                // round-trip survives any construct OXC can parse —
+                // including IIFEs, top-level expressions, classes,
+                // `for`, etc. This is the top-level analogue of the
+                // per-function PassThrough fallback.
+                let span = other.span();
+                let src = self
+                    .slice_span(span)
+                    .ok_or(Error::Malformed(
+                        "top-level stmt source span out of range".into(),
+                    ))?
+                    .to_string();
+                Ok(Item::PassThroughStmt(src))
+            }
         }
     }
 
