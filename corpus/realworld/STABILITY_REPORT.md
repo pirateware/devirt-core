@@ -344,11 +344,12 @@ Based on the test results:
 blocker_kind                       occurrences counterfactual +unlocked  cumulative
 ----------------------------------------------------------------------------------
 SequenceExpr                              247             52        52          52
-UnsupportedExpr                           214             16       172         224
-ForInStmt                                  10             10        10         234
-ThisExpr                                   11             10        11         245
-UnsupportedBinOp                            6              4         4         249
-MultipleDeclarators                         5              2         5         254
+AssignmentExpr                            212             13       166         218
+ForInStmt                                  10             10        10         228
+ThisExpr                                   11             10        11         239
+UnsupportedBinOp                           12              4         4         243
+MultipleDeclarators                         5              2         4         247
+CompoundAssignmentExpr                      8              1         7         254
 RegExpLiteral                               5              1         4         258
 ThrowStmt                                  31              1        29         287
 BreakStmt                                  18              0         0         287
