@@ -38,11 +38,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ir::ssa::{
+use ir::ssa::{
     self, BlockId, Constant, FuncId, Function, InstId, InstKind, Operand, Terminator, Value,
     ValueDefKind,
 };
-use crate::ir::tree::{self, BinOp, Expr, IrFunction, Item, Stmt, UnOp};
+use ir::tree::{self, BinOp, Expr, IrFunction, Item, Stmt, UnOp};
 
 // ============================================================================
 // Public entry points
@@ -713,7 +713,7 @@ impl LowerCtx<'_> {
         let name = pt
             .function_name
             .map(|s| self.sm.strings.resolve(&s).to_string());
-        crate::ir::pt_free_vars::analyze_passthrough(
+        ir::pt_free_vars::analyze_passthrough(
             &pt.source,
             &params,
             name.as_deref(),
@@ -1303,7 +1303,7 @@ fn pick_name(
 /// fallback; a more rigorous approach would extract the capture into a
 /// `let` before the FuncLiteral.
 fn render_expr_to_string(e: &Expr) -> String {
-    use crate::ir::tree::{binop_str, unop_str};
+    use ir::tree::{binop_str, unop_str};
     match e {
         Expr::Number(n) => format!("{n}"),
         Expr::String(s) => format!("{s:?}"),
@@ -1350,8 +1350,8 @@ fn render_expr_to_string(e: &Expr) -> String {
                 .iter()
                 .map(|p| {
                     let k = match &p.key {
-                        crate::ir::tree::ObjectKey::Static(s) => format!("\"{s}\""),
-                        crate::ir::tree::ObjectKey::Computed(e) => {
+                        ir::tree::ObjectKey::Static(s) => format!("\"{s}\""),
+                        ir::tree::ObjectKey::Computed(e) => {
                             format!("[{}]", render_expr_to_string(e))
                         }
                     };
@@ -1380,8 +1380,8 @@ fn render_expr_to_string(e: &Expr) -> String {
         ),
         Expr::Update { op, target, prefix } => {
             let s = match op {
-                crate::ir::tree::UpdateOp::Inc => "++",
-                crate::ir::tree::UpdateOp::Dec => "--",
+                ir::tree::UpdateOp::Inc => "++",
+                ir::tree::UpdateOp::Dec => "--",
             };
             if *prefix {
                 format!("({}{})", s, render_expr_to_string(target))
@@ -1440,9 +1440,9 @@ fn find_value_for_inst(func: &Function, iid: InstId) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::emit::emit;
-    use crate::ir::lower_ssa;
-    use crate::lower::parse_and_lower;
+    use emit::emit;
+    use crate::lower_ssa;
+    use crate::parse_and_lower;
 
     /// Full pipeline: source → tree-IR → SSA-IR → tree-IR → emit. Returns
     /// the final emitted JS string. Asserts that the resulting JS re-parses
@@ -1915,7 +1915,7 @@ mod tests {
     /// though it would otherwise win the bare slot by walk order.
     #[test]
     fn emit_config_pin_routes_other_value_around() {
-        use crate::ir::ssa::{
+        use ir::ssa::{
             Constant, FunctionBuilder, InstKind, Module as SsaModule, Operand, Terminator,
         };
         let mut module = SsaModule::new();
@@ -1947,7 +1947,7 @@ mod tests {
         let mut cfg = EmitConfig::default();
         cfg.immovable_names.insert(v_b.0, "y".to_string());
         let tm_out = lower_module_with_config(&module, &cfg);
-        let out = crate::emit::emit(&tm_out);
+        let out = emit::emit(&tm_out);
         assert!(
             out.contains("let y_1"),
             "v_a should be routed to y_1 because v_b is pinned:\n{out}"
@@ -1962,7 +1962,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "two distinct Values cannot share an immovable name")]
     fn emit_config_pin_conflict_panics() {
-        use crate::ir::ssa::{
+        use ir::ssa::{
             Constant, FunctionBuilder, InstKind, Module as SsaModule, Operand, Terminator,
         };
         let mut module = SsaModule::new();

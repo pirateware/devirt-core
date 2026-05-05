@@ -13,6 +13,7 @@ bitflags      = "2"
 lasso         = "0.7"
 ir            = { path = "../ir" }
 emit          = { path = "../emit" }
+parse         = { path = "../parse" }
 
 [dev-dependencies]
 insta         = "1"
@@ -21,4 +22,4 @@ insta         = "1"
 # Behavior-preservation tests shell out to `node`. Enabled with
 # `cargo test --features node-tests`. Off by default so CI can run without
 # a Node runtime installed.
-node-tests = []
+node-tests = ["parse/node-tests"]

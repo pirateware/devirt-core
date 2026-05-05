@@ -7,9 +7,9 @@
 
 pub mod coverage;
 pub use ::emit;
-pub mod error;
+pub use ::ir::error;
 pub mod ir;
-pub mod lower;
+pub use ::parse as lower;
 
 #[cfg(test)]
 mod tests;

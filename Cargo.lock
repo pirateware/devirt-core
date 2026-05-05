@@ -326,6 +326,7 @@ dependencies = [
  "oxc_codegen",
  "oxc_parser",
  "oxc_span",
+ "parse",
 ]
 
 [[package]]
@@ -637,6 +638,15 @@ dependencies = [
 [[package]]
 name = "parse"
 version = "0.1.0"
+dependencies = [
+ "emit",
+ "insta",
+ "ir",
+ "oxc_allocator",
+ "oxc_ast",
+ "oxc_parser",
+ "oxc_span",
+]
 
 [[package]]
 name = "pass"

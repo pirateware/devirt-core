@@ -15,12 +15,12 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ir::free_vars;
-use crate::ir::ssa::{
+use ir::free_vars;
+use ir::ssa::{
     self, BasicBlock, BlockId, Constant, FuncId, FunctionBuilder, InstKind, Operand, Purity, StrId,
     Terminator, TopLevelEntry, Value, ValueDef, ValueDefKind,
 };
-use crate::ir::tree::{self, BinOp, Expr, FuncBody, FuncLiteral, Stmt, UnOp, UpdateOp};
+use ir::tree::{self, BinOp, Expr, FuncBody, FuncLiteral, Stmt, UnOp, UpdateOp};
 
 // ============================================================================
 // Public entry points
@@ -481,7 +481,7 @@ fn walk_reassigned_in_expr(e: &Expr, out: &mut HashSet<String>) {
         }
         Expr::Object { props } => {
             for p in props {
-                if let crate::ir::tree::ObjectKey::Computed(e) = &p.key {
+                if let ir::tree::ObjectKey::Computed(e) = &p.key {
                     walk_reassigned_in_expr(e, out);
                 }
                 walk_reassigned_in_expr(&p.value, out);
@@ -711,7 +711,7 @@ fn discover_expr<'a>(
         }
         Expr::Object { props } => {
             for p in props {
-                if let crate::ir::tree::ObjectKey::Computed(e) = &p.key {
+                if let ir::tree::ObjectKey::Computed(e) = &p.key {
                     discover_expr(e, pending, captures_by_fid, seen, reassigned, parent_fid);
                 }
                 discover_expr(&p.value, pending, captures_by_fid, seen, reassigned, parent_fid);
@@ -1969,7 +1969,7 @@ impl<'b, 'm> Converter<'b, 'm> {
                 // unobservable. We pre-evaluate everything so element
                 // effects are sequenced before the alloc, then alloc,
                 // then store. Pure stores: target has not escaped.
-                use crate::ir::tree::ObjectKey;
+                use ir::tree::ObjectKey;
                 enum EvalKey {
                     Static(StrId),
                     Computed(Operand),
@@ -2837,8 +2837,8 @@ fn _unused_basic_block(_: &BasicBlock) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::ssa::{Terminator, pretty_module};
-    use crate::lower::parse_and_lower;
+    use ir::ssa::{Terminator, pretty_module};
+    use crate::parse_and_lower;
 
     fn lower_js(src: &str) -> ssa::Module {
         let tm = parse_and_lower(src).expect("tree-IR lowering must succeed");
@@ -3267,7 +3267,7 @@ mod tests {
     // FuncId is stamped on its `Cell` at discovery time.
     // ====================================================================
 
-    use crate::ir::tree::{FuncBody, FuncLiteral, Item, Module};
+    use ir::tree::{FuncBody, FuncLiteral, Item, Module};
     use std::cell::Cell;
 
     fn fresh_lit(name: Option<&str>, params: Vec<&str>, body: FuncBody) -> FuncLiteral {
