@@ -396,12 +396,55 @@ pub fn format_table(cov: &ModuleCoverage) -> String {
     out
 }
 
-/// Format three blocker-analysis views for PassThrough functions:
+/// Format two blocker-analysis views for PassThrough functions:
 ///
 /// 1. **Occurrence count** — how many PT functions contain each `BlockerKind`
 /// 2. **Counterfactual unlock** — how many PT functions have this as their *sole* blocker
-/// 3. **Cumulative unlock projection** — running total if we fix kinds greedily
-///    (ordered by counterfactual count descending)
+///
+/// A previous version of this table also reported a greedy cumulative
+/// unlock projection: "if we fix kinds in counterfactual-descending order,
+/// how many PT functions become fully unblocked at each step?" That
+/// projection was removed because it was systematically optimistic for
+/// any non-trivial round of lowering work. The formula itself was sound,
+/// but its input — the per-function blocker set as the disposition walker
+/// sees it *today* — is not stable across lowerings, so projecting future
+/// outcomes against today's blocker sets miscounts.
+///
+/// Two structural reasons:
+///
+/// 1. **Walker recursion changes when a construct is lowered.** Most
+///    "node-with-children" blockers (AssignmentExpr, SequenceExpr, etc.)
+///    are emitted at a node where the walker stops descending. Lowering
+///    the kind requires the walker to start recursing into the node's
+///    children, which surfaces blockers that were previously invisible.
+///    Functions the projection counted as "single-blocker, will unlock"
+///    can be revealed to have additional nested blockers post-lowering,
+///    so they stay PT.
+/// 2. **Coarse blocker buckets get split.** A blocker like the old
+///    `UnsupportedExpr` covered several distinct constructs (plain `=`,
+///    `+=`, `&&=`, ...). The projection treated the bucket atomically;
+///    lowering one of its constituent constructs only partially drains
+///    it. Round 3 (SequenceExpr + AssignmentExpr + ForInStmt, PR #2)
+///    demonstrated this: 228 functions projected to unlock, ~117 actually
+///    moved out of PT. Most of the gap was the 176 occurrences of what
+///    is now `CompoundAssignmentExpr`, previously hidden inside
+///    `UnsupportedExpr`.
+///
+/// Round 1's `MultipleDeclarators` projection held empirically because
+/// MultipleDeclarators is a *property* of a declaration, not a node with
+/// children — the walker's traversal didn't change when it was lowered,
+/// so the pre-projection blocker sets matched the post-outcome blocker
+/// sets.
+///
+/// Counterfactual is preserved because a function blocked by exactly one
+/// kind *today* is robust to future walker refinements on other kinds:
+/// either we lower its sole blocker (it unlocks) or we don't (it stays
+/// PT). It can over-predict if walker refinement later splits its sole
+/// blocker, but the failure mode is bounded by that single kind, not by
+/// a multi-step greedy chain. For multi-step planning, prefer per-PR
+/// validation against actual outcomes over projection-from-a-snapshot.
+///
+/// See `docs/COVERAGE_AUDIT.md` for the full investigation.
 pub fn format_blocker_table(cov: &ModuleCoverage) -> String {
     let pt_fns: Vec<&FunctionCoverage> = cov
         .functions
@@ -444,27 +487,7 @@ pub fn format_blocker_table(cov: &ModuleCoverage) -> String {
             .cmp(&counterfactuals[a])
             .then_with(|| a.to_string().cmp(&b.to_string()))
     });
-
-    // Greedy cumulative simulation: fix kinds in `ranked` order and track
-    // how many additional PT functions become fully unlocked at each step.
-    let mut fixed: BTreeSet<BlockerKind> = BTreeSet::new();
-    let mut prev_unlocked = 0usize;
     let total_pt = pt_fns.len();
-
-    // Collect rows for the table.
-    let rows: Vec<(String, usize, usize, usize, usize)> = ranked
-        .iter()
-        .map(|k| {
-            fixed.insert(k.clone());
-            let cumulative = pt_fns
-                .iter()
-                .filter(|f| f.blockers.iter().all(|b| fixed.contains(b)))
-                .count();
-            let additional = cumulative - prev_unlocked;
-            prev_unlocked = cumulative;
-            (k.to_string(), occurrences[k], counterfactuals[k], additional, cumulative)
-        })
-        .collect();
 
     let mut out = String::new();
     writeln!(
@@ -474,23 +497,28 @@ pub fn format_blocker_table(cov: &ModuleCoverage) -> String {
     .unwrap();
     writeln!(
         &mut out,
-        "{:<34} {:>10} {:>14} {:>9} {:>11}",
-        "blocker_kind", "occurrences", "counterfactual", "+unlocked", "cumulative"
+        "{:<34} {:>11} {:>14}",
+        "blocker_kind", "occurrences", "counterfactual"
     )
     .unwrap();
-    writeln!(&mut out, "{}", "-".repeat(82)).unwrap();
-    for (name, occ, cf, additional, cumulative) in &rows {
+    writeln!(&mut out, "{}", "-".repeat(63)).unwrap();
+    for k in &ranked {
         writeln!(
             &mut out,
-            "{:<34} {:>10} {:>14} {:>9} {:>11}",
-            name, occ, cf, additional, cumulative
+            "{:<34} {:>11} {:>14}",
+            k.to_string(),
+            occurrences[k],
+            counterfactuals[k],
         )
         .unwrap();
     }
-    writeln!(&mut out, "{}", "-".repeat(82)).unwrap();
+    writeln!(&mut out, "{}", "-".repeat(63)).unwrap();
     writeln!(
         &mut out,
-        "Fixing all listed blockers would unlock {prev_unlocked}/{total_pt} passthrough function(s)."
+        "occurrences: PT functions containing this kind. \
+         counterfactual: PT functions where this is the sole blocker. \
+         Cumulative greedy projection removed — see format_blocker_table doc \
+         and docs/COVERAGE_AUDIT.md."
     )
     .unwrap();
     out

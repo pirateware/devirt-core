@@ -341,15 +341,15 @@ Based on the test results:
 
 ## Blocker Analysis (246 passthrough function(s))
 
-blocker_kind                       occurrences counterfactual +unlocked  cumulative
-----------------------------------------------------------------------------------
-CompoundAssignmentExpr                    176             62        62          62
-ThrowStmt                                  31             21        21          83
-ThisExpr                                   11             11        11          94
-UnsupportedBinOp                           13              5        13         107
-MultipleDeclarators                       117              4       117         224
-RegExpLiteral                               5              4         4         228
-BreakStmt                                  18              0         0         228
-SwitchStmt                                 18              0        18         246
-----------------------------------------------------------------------------------
-Fixing all listed blockers would unlock 246/246 passthrough function(s).
+blocker_kind                       occurrences counterfactual
+---------------------------------------------------------------
+CompoundAssignmentExpr                     176             62
+ThrowStmt                                   31             21
+ThisExpr                                    11             11
+UnsupportedBinOp                            13              5
+MultipleDeclarators                        117              4
+RegExpLiteral                                5              4
+BreakStmt                                   18              0
+SwitchStmt                                  18              0
+---------------------------------------------------------------
+occurrences: PT functions containing this kind. counterfactual: PT functions where this is the sole blocker. Cumulative greedy projection removed — see format_blocker_table doc and docs/COVERAGE_AUDIT.md.
