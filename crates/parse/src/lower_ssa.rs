@@ -428,9 +428,19 @@ fn walk_reassigned_stmts(stmts: &[Stmt], out: &mut HashSet<String>) {
                     walk_reassigned_in_expr(step, out);
                 }
             }
+            Stmt::ForOf { body, .. } => walk_reassigned_stmts(body, out),
             Stmt::Continue => {}
             Stmt::Block(ss) => walk_reassigned_stmts(ss, out),
             Stmt::FuncDecl(_) => {} // nested literal: own scope
+            Stmt::Try { body, catch, finally } => {
+                walk_reassigned_stmts(body, out);
+                if let Some((_, catch_body)) = catch {
+                    walk_reassigned_stmts(catch_body, out);
+                }
+                if let Some(finally_body) = finally {
+                    walk_reassigned_stmts(finally_body, out);
+                }
+            }
         }
     }
 }
@@ -495,6 +505,12 @@ fn walk_reassigned_in_expr(e: &Expr, out: &mut HashSet<String>) {
         }
         // Stop at function literals — nested scope.
         Expr::Func(_) => {}
+        Expr::Spread(inner) => walk_reassigned_in_expr(inner, out),
+        Expr::Template { exprs, .. } => {
+            for e in exprs {
+                walk_reassigned_in_expr(e, out);
+            }
+        }
         Expr::Number(_)
         | Expr::String(_)
         | Expr::Bool(_)
@@ -650,6 +666,24 @@ fn discover_stmt<'a>(
                 );
             }
         }
+        Stmt::ForOf {
+            iterable,
+            body,
+            ..
+        } => {
+            discover_expr(iterable, pending, captures_by_fid, seen, reassigned, parent_fid);
+            // The binding variable is introduced in a fresh inner scope;
+            // it doesn't affect the outer scope's seen set.
+            let mut inner_seen = seen.clone();
+            discover_stmts(
+                body,
+                pending,
+                captures_by_fid,
+                &mut inner_seen,
+                reassigned,
+                parent_fid,
+            );
+        }
         Stmt::Continue => {}
         Stmt::Block(ss) => {
             let mut inner_seen = seen.clone();
@@ -666,6 +700,21 @@ fn discover_stmt<'a>(
             // Function name is hoisted (already inserted in `seen` by
             // hoist_funcdecl_names).
             discover_literal(lit, pending, captures_by_fid, seen, reassigned, parent_fid);
+        }
+        Stmt::Try { body, catch, finally } => {
+            let mut inner_seen = seen.clone();
+            discover_stmts(body, pending, captures_by_fid, &mut inner_seen, reassigned, parent_fid);
+            if let Some((param, catch_body)) = catch {
+                let mut catch_seen = seen.clone();
+                if let Some(p) = param {
+                    catch_seen.insert(p.clone());
+                }
+                discover_stmts(catch_body, pending, captures_by_fid, &mut catch_seen, reassigned, parent_fid);
+            }
+            if let Some(finally_body) = finally {
+                let mut finally_seen = seen.clone();
+                discover_stmts(finally_body, pending, captures_by_fid, &mut finally_seen, reassigned, parent_fid);
+            }
         }
     }
 }
@@ -734,6 +783,14 @@ fn discover_expr<'a>(
         }
         Expr::Update { target, .. } => {
             discover_expr(target, pending, captures_by_fid, seen, reassigned, parent_fid);
+        }
+        Expr::Spread(inner) => {
+            discover_expr(inner, pending, captures_by_fid, seen, reassigned, parent_fid);
+        }
+        Expr::Template { exprs, .. } => {
+            for e in exprs {
+                discover_expr(e, pending, captures_by_fid, seen, reassigned, parent_fid);
+            }
         }
     }
 }
@@ -1594,6 +1651,12 @@ impl<'b, 'm> Converter<'b, 'm> {
                 step,
                 body,
             } => self.lower_for(init.as_deref(), cond.as_ref(), step.as_ref(), body),
+            Stmt::ForOf {
+                kind,
+                binding,
+                iterable,
+                body,
+            } => self.lower_for_of(kind, binding, iterable, body),
             Stmt::Continue => {
                 let (cont, _brk) = *self
                     .loop_targets
@@ -1626,6 +1689,12 @@ impl<'b, 'm> Converter<'b, 'm> {
                 self.bind_in_top_scope(name.clone(), sym);
                 let cb = self.current_block();
                 self.write_variable(sym, cb, alloc);
+            }
+            Stmt::Try { .. } => {
+                // try/catch/finally is not lowerable to SSA in this pipeline.
+                // disposition.rs should have routed functions containing try
+                // to PassThrough; encountering this here is a bug.
+                panic!("Stmt::Try reached SSA lowering — disposition should have routed to PassThrough");
             }
         }
     }
@@ -1846,6 +1915,159 @@ impl<'b, 'm> Converter<'b, 'm> {
         self.pop_scope();
     }
 
+    /// Lower `for (kind binding of iterable) body`. Desugars to:
+    ///
+    /// ```js
+    /// const __iter = iterable[Symbol.iterator]();
+    /// while (true) {
+    ///   const __step = __iter.next();
+    ///   if (__step.done) break;   // exit_b
+    ///   const binding = __step.value;
+    ///   // body
+    /// }
+    /// ```
+    ///
+    /// The CFG shape matches the standard while-loop pattern that the
+    /// SSA→tree reconstructor recognises (header cbr → body or exit).
+    fn lower_for_of(&mut self, _kind: &str, binding: &str, iterable: &Expr, body: &[Stmt]) {
+        self.push_scope();
+
+        // Evaluate the iterable once before entering the loop.
+        let iterable_op = self.convert_expr(iterable);
+
+        // `iterable[Symbol.iterator]()` via:
+        //   sym_global  = LoadProp(GlobalThis, "Symbol")
+        //   sym_iter    = LoadProp(sym_global, "iterator")
+        //   get_iter_fn = LoadIndex(iterable, sym_iter)
+        //   iter        = Call(get_iter_fn, [iterable])
+        let symbol_key = self.builder.intern("Symbol");
+        let sym_global = self.emit(InstKind::LoadProp {
+            obj: Operand::Const(Constant::GlobalThis),
+            key: symbol_key,
+            purity: Purity::Throws,
+        });
+        let iter_key = self.builder.intern("iterator");
+        let sym_iter_prop = self.emit(InstKind::LoadProp {
+            obj: sym_global,
+            key: iter_key,
+            purity: Purity::Opaque,
+        });
+        let get_iter_fn = self.emit(InstKind::LoadIndex {
+            obj: iterable_op,
+            index: sym_iter_prop,
+            purity: Purity::Opaque,
+        });
+        let iter_val = self.emit(InstKind::Call {
+            callee: get_iter_fn,
+            args: vec![iterable_op],
+        });
+
+        // Bind the iterator to a symbol so the header block can read it.
+        let iter_name = format!("__foriter_{}__", binding);
+        let iter_sym = self.fresh_symbol();
+        let iter_strid = self.builder.intern(&iter_name);
+        if let Operand::Value(v) = iter_val {
+            self.builder.set_source_name(v, iter_strid);
+        }
+        self.bind_in_top_scope(iter_name.clone(), iter_sym);
+        let cb = self.current_block();
+        self.write_variable(iter_sym, cb, iter_val);
+
+        // CFG: pre → header → (body | exit). Same shape as while.
+        let header_b = self.builder.new_block();
+        let body_b = self.builder.new_block();
+        let exit_b = self.builder.new_block();
+
+        self.builder.set_terminator(Terminator::Branch {
+            target: header_b,
+            args: vec![],
+        });
+        self.sealed.insert(body_b);
+        self.sealed.insert(exit_b);
+
+        // Header: call `__iter.next()`, check `done`, branch.
+        self.builder.switch_to_block(header_b);
+        let cb = self.current_block();
+        let iter_op = self.read_variable(iter_sym, cb);
+        // `__iter.next()` — use CallMethod so `this = iter_op`.
+        let next_key = self.builder.intern("next");
+        let step_result = self.emit(InstKind::CallMethod {
+            obj: iter_op,
+            method: next_key,
+            args: vec![],
+        });
+
+        // `__step.done`
+        let done_key = self.builder.intern("done");
+        let done_val = self.emit(InstKind::LoadProp {
+            obj: step_result,
+            key: done_key,
+            purity: Purity::Opaque,
+        });
+        // `!done_val`
+        let not_done = self.emit(InstKind::Not { operand: done_val });
+
+        // Stash step_result in a symbol so body_b can read it.
+        let step_name = format!("__forstep_{}__", binding);
+        let step_sym = self.fresh_symbol();
+        let step_strid = self.builder.intern(&step_name);
+        if let Operand::Value(v) = step_result {
+            self.builder.set_source_name(v, step_strid);
+        }
+        self.bind_in_top_scope(step_name.clone(), step_sym);
+        let cb = self.current_block();
+        self.write_variable(step_sym, cb, step_result);
+
+        self.builder.set_terminator(Terminator::CondBranch {
+            cond: not_done,
+            then_b: body_b,
+            then_args: vec![],
+            else_b: exit_b,
+            else_args: vec![],
+        });
+
+        // Body.
+        self.builder.switch_to_block(body_b);
+        self.loop_targets.push((header_b, exit_b));
+        self.push_scope();
+
+        // `const binding = __step.value`
+        let cb = self.current_block();
+        let step_op = self.read_variable(step_sym, cb);
+        let value_key = self.builder.intern("value");
+        let binding_val = self.emit(InstKind::LoadProp {
+            obj: step_op,
+            key: value_key,
+            purity: Purity::Opaque,
+        });
+        let binding_sym = self.fresh_symbol();
+        let binding_strid = self.builder.intern(binding);
+        if let Operand::Value(v) = binding_val {
+            self.builder.set_source_name(v, binding_strid);
+        }
+        self.bind_in_top_scope(binding.to_string(), binding_sym);
+        let cb = self.current_block();
+        self.write_variable(binding_sym, cb, binding_val);
+
+        for s in body {
+            self.lower_stmt(s);
+        }
+
+        self.pop_scope();
+        self.loop_targets.pop();
+        let body_end = self.current_block();
+        if !self.is_terminated(body_end) {
+            self.builder.set_terminator(Terminator::Branch {
+                target: header_b,
+                args: vec![],
+            });
+        }
+
+        self.seal_block(header_b);
+        self.builder.switch_to_block(exit_b);
+        self.pop_scope();
+    }
+
     // ------------------------------------------------------------------
     // Expression lowering
     // ------------------------------------------------------------------
@@ -1885,6 +2107,8 @@ impl<'b, 'm> Converter<'b, 'm> {
             Expr::Binary { op, lhs, rhs } => self.convert_binary(*op, lhs, rhs),
             Expr::Unary { op, operand } => self.convert_unary(*op, operand),
             Expr::Call { callee, args } => {
+                // Check if any argument is a spread.
+                let has_spread = args.iter().any(|a| matches!(a, Expr::Spread(_)));
                 // Method-call discrimination: `obj.foo(args)` must be
                 // emitted as CallMethod so `this` binds to `obj` at
                 // call time. Lowering as separate LoadProp + Call
@@ -1897,20 +2121,56 @@ impl<'b, 'm> Converter<'b, 'm> {
                 if let Expr::Member { obj, prop } = callee.as_ref() {
                     let obj_op = self.convert_expr(obj);
                     let method = self.builder.intern(prop);
-                    let arg_ops: Vec<Operand> =
-                        args.iter().map(|a| self.convert_expr(a)).collect();
-                    return self.emit(InstKind::CallMethod {
-                        obj: obj_op,
-                        method,
-                        args: arg_ops,
-                    });
+                    let mut arg_ops = Vec::with_capacity(args.len());
+                    let mut spread_mask = Vec::with_capacity(args.len());
+                    for a in args {
+                        if let Expr::Spread(inner) = a {
+                            arg_ops.push(self.convert_expr(inner));
+                            spread_mask.push(true);
+                        } else {
+                            arg_ops.push(self.convert_expr(a));
+                            spread_mask.push(false);
+                        }
+                    }
+                    if has_spread {
+                        return self.emit(InstKind::CallMethodSpread {
+                            obj: obj_op,
+                            method,
+                            args: arg_ops,
+                            spread_mask,
+                        });
+                    } else {
+                        return self.emit(InstKind::CallMethod {
+                            obj: obj_op,
+                            method,
+                            args: arg_ops,
+                        });
+                    }
                 }
                 let callee_op = self.convert_expr(callee);
-                let arg_ops: Vec<Operand> = args.iter().map(|a| self.convert_expr(a)).collect();
-                self.emit(InstKind::Call {
-                    callee: callee_op,
-                    args: arg_ops,
-                })
+                let mut arg_ops = Vec::with_capacity(args.len());
+                let mut spread_mask = Vec::with_capacity(args.len());
+                for a in args {
+                    if let Expr::Spread(inner) = a {
+                        arg_ops.push(self.convert_expr(inner));
+                        spread_mask.push(true);
+                    } else {
+                        arg_ops.push(self.convert_expr(a));
+                        spread_mask.push(false);
+                    }
+                }
+                if has_spread {
+                    self.emit(InstKind::CallSpread {
+                        callee: callee_op,
+                        args: arg_ops,
+                        spread_mask,
+                    })
+                } else {
+                    self.emit(InstKind::Call {
+                        callee: callee_op,
+                        args: arg_ops,
+                    })
+                }
             }
             Expr::Member { obj, prop } => {
                 let obj_op = self.convert_expr(obj);
@@ -1934,25 +2194,46 @@ impl<'b, 'm> Converter<'b, 'm> {
             }
             Expr::Func(lit) => self.alloc_closure_operand(lit),
             Expr::Array { elements } => {
-                // Evaluate elements left-to-right, then allocate, then
-                // store. AllocArray is PURE; the StoreIndex chain on a
-                // freshly-allocated array can use Purity::Pure since
-                // the target hasn't escaped between alloc and stores.
-                let element_ops: Vec<Operand> =
-                    elements.iter().map(|e| self.convert_expr(e)).collect();
-                let arr = self.emit(InstKind::AllocArray {
-                    length: Some(elements.len() as u32),
-                });
-                for (i, op) in element_ops.into_iter().enumerate() {
-                    let idx = Operand::Const(Constant::Number(i as f64));
-                    self.builder.add_inst(InstKind::StoreIndex {
-                        obj: arr.clone(),
-                        index: idx,
-                        val: op,
-                        purity: Purity::Pure,
+                // Check if any element is a spread.
+                let has_spread = elements.iter().any(|e| matches!(e, Expr::Spread(_)));
+                if has_spread {
+                    // Evaluate left-to-right, tracking which are spread.
+                    let mut elem_ops = Vec::with_capacity(elements.len());
+                    let mut spread_mask = Vec::with_capacity(elements.len());
+                    for e in elements {
+                        if let Expr::Spread(inner) = e {
+                            elem_ops.push(self.convert_expr(inner));
+                            spread_mask.push(true);
+                        } else {
+                            elem_ops.push(self.convert_expr(e));
+                            spread_mask.push(false);
+                        }
+                    }
+                    self.emit(InstKind::ArrayWithSpread {
+                        elements: elem_ops,
+                        spread_mask,
+                    })
+                } else {
+                    // Evaluate elements left-to-right, then allocate, then
+                    // store. AllocArray is PURE; the StoreIndex chain on a
+                    // freshly-allocated array can use Purity::Pure since
+                    // the target hasn't escaped between alloc and stores.
+                    let element_ops: Vec<Operand> =
+                        elements.iter().map(|e| self.convert_expr(e)).collect();
+                    let arr = self.emit(InstKind::AllocArray {
+                        length: Some(elements.len() as u32),
                     });
+                    for (i, op) in element_ops.into_iter().enumerate() {
+                        let idx = Operand::Const(Constant::Number(i as f64));
+                        self.builder.add_inst(InstKind::StoreIndex {
+                            obj: arr.clone(),
+                            index: idx,
+                            val: op,
+                            purity: Purity::Pure,
+                        });
+                    }
+                    arr
                 }
-                arr
             }
             Expr::New { callee, args } => {
                 let ctor = self.convert_expr(callee);
@@ -1964,49 +2245,78 @@ impl<'b, 'm> Converter<'b, 'm> {
                 })
             }
             Expr::Object { props } => {
-                // Per JS spec: for each prop, key is evaluated before
-                // value (computed keys); for static keys the order is
-                // unobservable. We pre-evaluate everything so element
-                // effects are sequenced before the alloc, then alloc,
-                // then store. Pure stores: target has not escaped.
                 use ir::tree::ObjectKey;
-                enum EvalKey {
-                    Static(StrId),
-                    Computed(Operand),
-                }
-                let evaluated: Vec<(EvalKey, Operand)> = props
-                    .iter()
-                    .map(|p| {
-                        let k = match &p.key {
-                            ObjectKey::Static(s) => EvalKey::Static(self.builder.intern(s)),
-                            ObjectKey::Computed(e) => EvalKey::Computed(self.convert_expr(e)),
-                        };
-                        let v = self.convert_expr(&p.value);
-                        (k, v)
-                    })
-                    .collect();
-                let obj = self.emit(InstKind::AllocObject);
-                for (k, v) in evaluated {
-                    match k {
-                        EvalKey::Static(key) => {
-                            self.builder.add_inst(InstKind::StoreProp {
-                                obj: obj.clone(),
-                                key,
-                                val: v,
-                                purity: Purity::Pure,
-                            });
-                        }
-                        EvalKey::Computed(idx) => {
-                            self.builder.add_inst(InstKind::StoreIndex {
-                                obj: obj.clone(),
-                                index: idx,
-                                val: v,
-                                purity: Purity::Pure,
-                            });
+                // Check if any prop is a spread.
+                let has_spread = props.iter().any(|p| matches!(p.key, ObjectKey::Spread));
+                if has_spread {
+                    use ir::ssa::SpreadObjectKey;
+                    // Evaluate all keys and values left-to-right.
+                    let mut keys: Vec<Option<SpreadObjectKey>> = Vec::with_capacity(props.len());
+                    let mut vals: Vec<Operand> = Vec::with_capacity(props.len());
+                    for p in props {
+                        match &p.key {
+                            ObjectKey::Spread => {
+                                keys.push(None);
+                                vals.push(self.convert_expr(&p.value));
+                            }
+                            ObjectKey::Static(s) => {
+                                let sid = self.builder.intern(s);
+                                keys.push(Some(SpreadObjectKey::Static(sid)));
+                                vals.push(self.convert_expr(&p.value));
+                            }
+                            ObjectKey::Computed(e) => {
+                                let key_op = self.convert_expr(e);
+                                keys.push(Some(SpreadObjectKey::Computed(key_op)));
+                                vals.push(self.convert_expr(&p.value));
+                            }
                         }
                     }
+                    self.emit(InstKind::ObjectWithSpread { keys, vals })
+                } else {
+                    // Per JS spec: for each prop, key is evaluated before
+                    // value (computed keys); for static keys the order is
+                    // unobservable. We pre-evaluate everything so element
+                    // effects are sequenced before the alloc, then alloc,
+                    // then store. Pure stores: target has not escaped.
+                    enum EvalKey {
+                        Static(StrId),
+                        Computed(Operand),
+                    }
+                    let evaluated: Vec<(EvalKey, Operand)> = props
+                        .iter()
+                        .map(|p| {
+                            let k = match &p.key {
+                                ObjectKey::Static(s) => EvalKey::Static(self.builder.intern(s)),
+                                ObjectKey::Computed(e) => EvalKey::Computed(self.convert_expr(e)),
+                                ObjectKey::Spread => unreachable!("no spread in this branch"),
+                            };
+                            let v = self.convert_expr(&p.value);
+                            (k, v)
+                        })
+                        .collect();
+                    let obj = self.emit(InstKind::AllocObject);
+                    for (k, v) in evaluated {
+                        match k {
+                            EvalKey::Static(key) => {
+                                self.builder.add_inst(InstKind::StoreProp {
+                                    obj: obj.clone(),
+                                    key,
+                                    val: v,
+                                    purity: Purity::Pure,
+                                });
+                            }
+                            EvalKey::Computed(idx) => {
+                                self.builder.add_inst(InstKind::StoreIndex {
+                                    obj: obj.clone(),
+                                    index: idx,
+                                    val: v,
+                                    purity: Purity::Pure,
+                                });
+                            }
+                        }
+                    }
+                    obj
                 }
-                obj
             }
             Expr::Ternary {
                 cond,
@@ -2014,6 +2324,49 @@ impl<'b, 'm> Converter<'b, 'm> {
                 else_branch,
             } => self.convert_ternary(cond, then_branch, else_branch),
             Expr::Update { op, target, prefix } => self.convert_update(*op, target, *prefix),
+            Expr::Spread(_) => {
+                // Spread is handled by the enclosing Call/Array/Object arm; a
+                // bare Spread at the expression level is a lowering bug.
+                panic!("Expr::Spread encountered outside of a Call/Array/Object context — lowering bug");
+            }
+            Expr::Template { quasis, exprs } => {
+                // Desugar `` `a${x}b${y}c` `` to a chain of AddGeneric:
+                //   "a" + x -> ("a" + x) + "b" -> (("a" + x) + "b") + y -> ...
+                // An empty template `` `hello` `` (no expressions) becomes
+                // Const(String("hello")) directly.
+                debug_assert_eq!(
+                    quasis.len(),
+                    exprs.len() + 1,
+                    "template literal invariant: quasis.len() == exprs.len() + 1"
+                );
+                // Start with the first quasi.
+                let first_id = self.builder.intern(&quasis[0]);
+                let mut acc = Operand::Const(Constant::String(first_id));
+                for (i, expr) in exprs.iter().enumerate() {
+                    // Concatenate the expression.
+                    let expr_op = self.convert_expr(expr);
+                    acc = self.emit(InstKind::AddGeneric {
+                        lhs: acc,
+                        rhs: expr_op,
+                    });
+                    // Concatenate the following quasi (may be empty string).
+                    let next_id = self.builder.intern(&quasis[i + 1]);
+                    let next_op = Operand::Const(Constant::String(next_id));
+                    // Skip adding empty trailing quasis to avoid redundant
+                    // `+ ""` at the end — but only for the last position
+                    // and only if the quasi is truly empty, because
+                    // `something + ""` has the same value but adds an
+                    // instruction. Always include non-empty quasis and the
+                    // intermediate ones (they affect string splitting).
+                    if !quasis[i + 1].is_empty() || i + 1 < exprs.len() {
+                        acc = self.emit(InstKind::AddGeneric {
+                            lhs: acc,
+                            rhs: next_op,
+                        });
+                    }
+                }
+                acc
+            }
         }
     }
 
@@ -2764,10 +3117,37 @@ fn walk_inst_operands_mut(kind: &mut InstKind, f: &mut impl FnMut(&mut Operand))
                 f(a);
             }
         }
+        CallSpread { callee, args, .. } => {
+            f(callee);
+            for a in args {
+                f(a);
+            }
+        }
         CallMethod { obj, args, .. } => {
             f(obj);
             for a in args {
                 f(a);
+            }
+        }
+        CallMethodSpread { obj, args, .. } => {
+            f(obj);
+            for a in args {
+                f(a);
+            }
+        }
+        ArrayWithSpread { elements, .. } => {
+            for e in elements {
+                f(e);
+            }
+        }
+        ObjectWithSpread { keys, vals } => {
+            for k in keys {
+                if let Some(ir::ssa::SpreadObjectKey::Computed(op)) = k {
+                    f(op);
+                }
+            }
+            for v in vals {
+                f(v);
             }
         }
         Construct { ctor, args } => {

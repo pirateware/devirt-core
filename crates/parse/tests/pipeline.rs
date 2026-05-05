@@ -598,6 +598,126 @@ fn top_level_iife_as_argument_survives() {
     assert!(out.contains("42") && out.contains("console.log"));
 }
 
+// === for-of loop tests ===
+
+/// Basic `for (const x of arr)` — the function must be Lowered (not
+/// PassThrough) and survive the full SSA round-trip.
+#[test]
+fn for_of_basic() {
+    let src = "function f(arr) { for (const x of arr) { use(x); } }";
+    let m = parse_and_lower(src).expect("for-of must lower");
+    use ir::tree::Item;
+    assert!(
+        matches!(m.items[0], Item::Function(_)),
+        "for-of function must be Lowered, got: {:?}",
+        m.items[0]
+    );
+    // Tree-IR emit: the for-of form is preserved.
+    let out = emit(&m);
+    assert!(out.contains("function f"), "function survives: {out}");
+    // SSA round-trip: desugars to while.
+    let out2 = ssa_roundtrip(src);
+    assert!(out2.contains("while"), "SSA round-trip emits while: {out2}");
+    parse_and_lower(&out2).expect("SSA-roundtrip emit must re-parse");
+}
+
+/// `for (let x of arr)` binding — let is also accepted.
+#[test]
+fn for_of_let_binding() {
+    let src = "function f(arr) { for (let x of arr) { use(x); } }";
+    let m = parse_and_lower(src).expect("for-of let must lower");
+    use ir::tree::Item;
+    assert!(matches!(m.items[0], Item::Function(_)));
+    let _ = ssa_roundtrip(src);
+}
+
+/// `for (var x of arr)` binding — var is also accepted.
+#[test]
+fn for_of_var_binding() {
+    let src = "function f(arr) { for (var x of arr) { use(x); } }";
+    let m = parse_and_lower(src).expect("for-of var must lower");
+    use ir::tree::Item;
+    assert!(matches!(m.items[0], Item::Function(_)));
+    let _ = ssa_roundtrip(src);
+}
+
+/// `for await...of` must remain PassThrough (not supported).
+#[test]
+fn for_of_await_passthrough() {
+    let src = "async function f(arr) { for await (const x of arr) { use(x); } }";
+    let m = parse_and_lower(src).expect("for-await-of must not error");
+    use ir::tree::Item;
+    // async function is already PassThrough due to the `async` flag,
+    // but the for-await-of check should also trigger PassThrough.
+    assert!(
+        matches!(m.items[0], Item::PassThroughFunction(_)),
+        "for-await-of must be PassThrough"
+    );
+}
+
+/// Destructuring binding in for-of — must remain PassThrough.
+#[test]
+fn for_of_destructuring_passthrough() {
+    let src = "function f(arr) { for (const {x} of arr) { use(x); } }";
+    let m = parse_and_lower(src).expect("for-of destructuring must not error");
+    use ir::tree::Item;
+    assert!(
+        matches!(m.items[0], Item::PassThroughFunction(_)),
+        "for-of destructuring must be PassThrough"
+    );
+}
+
+/// for-of loop accessing the bound variable in the body.
+#[test]
+fn for_of_uses_binding_in_body() {
+    let src = "function f(arr) { let sum = 0; for (const x of arr) { sum = sum + x; } return sum; }";
+    let m = parse_and_lower(src).expect("for-of with body use must lower");
+    use ir::tree::Item;
+    assert!(matches!(m.items[0], Item::Function(_)));
+    let out = ssa_roundtrip(src);
+    parse_and_lower(&out).expect("round-trip must re-parse");
+}
+
+/// for-of with `return` inside must stay PassThrough.
+/// The desugared iterator protocol does not call iterator.return() on abrupt
+/// completion, so we conservatively reject these to avoid leaking resources.
+#[test]
+fn for_of_with_return_is_passthrough() {
+    let src = "function f(arr) { for (const x of arr) { if (x > 5) return x; } }";
+    let m = parse_and_lower(src).expect("must not error");
+    use ir::tree::Item;
+    assert!(
+        matches!(m.items[0], Item::PassThroughFunction(_)),
+        "for-of with bare return must be PassThrough (iterator.return() not called on desugaring)"
+    );
+}
+
+// === Spread operator tests ===
+
+/// Spread in a call argument position.
+#[test]
+fn spread_in_call() {
+    roundtrip("function f(a, b) { return foo(...a); }");
+}
+
+/// Spread in array literal.
+#[test]
+fn spread_in_array() {
+    roundtrip("function f(a) { return [...a, 1, 2]; }");
+}
+
+/// Mixed spread and non-spread arguments in a call.
+#[test]
+fn spread_mixed_args() {
+    roundtrip("function f(a, b) { return foo(1, ...a, b); }");
+}
+
+/// Spread in object literal.
+#[test]
+fn object_spread() {
+    roundtrip("function f(a) { return {...a, x: 1}; }");
+}
+
 /// Mixed top-level: a function declaration followed by an IIFE call
 /// must preserve both, in original order.
 #[test]
@@ -609,5 +729,128 @@ fn top_level_mixed_function_and_iife_preserves_order() {
     assert!(
         asd_pos < iife_pos,
         "source order not preserved across SSA round-trip:\n{out}"
+    );
+}
+
+/// try/catch basic — function with a try/catch block should be Lowered
+/// (not PassThrough) and round-trip through the full pipeline.
+#[test]
+fn try_catch_basic() {
+    roundtrip("function f() { try { use(); } catch (e) { handle(e); } }");
+}
+
+/// try/finally — function with a try/finally block (no catch clause).
+#[test]
+fn try_finally() {
+    roundtrip("function f() { try { use(); } finally { cleanup(); } }");
+}
+
+/// try/catch/finally — all three clauses present.
+#[test]
+fn try_catch_finally() {
+    roundtrip("function f() { try { use(); } catch (e) { handle(e); } finally { cleanup(); } }");
+}
+
+/// try/catch without a catch parameter binding (`catch { }` — ES2019+).
+#[test]
+fn try_catch_no_param() {
+    roundtrip("function f() { try { use(); } catch { handle(); } }");
+}
+
+// === Template literal tests ===
+
+/// Simple template literal with one interpolation is lowered (not PassThrough).
+#[test]
+fn template_literal_simple() {
+    use ir::tree::Item;
+    let src = r#"function f(name) { return `Hello ${name}`; }"#;
+    let m = parse_and_lower(src).expect("parse_and_lower failed");
+    assert!(
+        matches!(m.items[0], Item::Function(_)),
+        "template literal function must be Lowered, not PassThrough"
+    );
+    let out = roundtrip(src);
+    parse_and_lower(&out).expect("emitted JS must re-parse");
+}
+
+/// Template literal with no interpolations (pure string) is lowered.
+#[test]
+fn template_literal_no_interp() {
+    use ir::tree::Item;
+    let src = r#"function f() { return `hello world`; }"#;
+    let m = parse_and_lower(src).expect("parse_and_lower failed");
+    assert!(
+        matches!(m.items[0], Item::Function(_)),
+        "no-interp template literal function must be Lowered"
+    );
+    let out = roundtrip(src);
+    parse_and_lower(&out).expect("emitted JS must re-parse");
+}
+
+/// Template literal with multiple interpolations is lowered.
+#[test]
+fn template_literal_multi_expr() {
+    use ir::tree::Item;
+    let src = r#"function f(a, b) { return `${a} and ${b}`; }"#;
+    let m = parse_and_lower(src).expect("parse_and_lower failed");
+    assert!(
+        matches!(m.items[0], Item::Function(_)),
+        "multi-expr template literal function must be Lowered"
+    );
+    let out = roundtrip(src);
+    parse_and_lower(&out).expect("emitted JS must re-parse");
+}
+
+/// Tagged template literals must remain PassThrough (not panic).
+#[test]
+fn tagged_template_passthrough() {
+    use ir::tree::Item;
+    let src = r#"function f(content) { return html`<div>${content}</div>`; }"#;
+    let m = parse_and_lower(src).expect("tagged template must not error");
+    assert!(
+        matches!(m.items[0], Item::PassThroughFunction(_)),
+        "tagged template must be PassThrough"
+    );
+}
+
+/// Template literal SSA round-trip: semantics survive the full pipeline.
+#[test]
+fn template_literal_ssa_roundtrip() {
+    let src = r#"function f(name, age) { return `Hello ${name}, you are ${age} years old`; }"#;
+    let out = ssa_roundtrip(src);
+    parse_and_lower(&out).expect("SSA-roundtrip emit must re-parse");
+}
+
+/// Regression: template literal uses ToString (not ToPrimitive) for interpolated
+/// values. For an object with both toString and valueOf, `${x}` must call
+/// toString, not valueOf. The SSA desugaring through AddGeneric uses the `+`
+/// operator which calls ToPrimitive (preferring valueOf), so this test documents
+/// the known semantic gap.
+///
+/// TODO: Fix by introducing a dedicated `TemplateConcat` SSA instruction (or a
+/// `ToString` coercion node) so template interpolation uses ToString rather than
+/// the ToPrimitive path that `+` follows. Until then, functions whose templates
+/// interpolate objects with custom valueOf (a rare obfuscation pattern) may
+/// produce incorrect output after the SSA round-trip.
+#[test]
+fn template_literal_tostring_vs_toprimitive_roundtrip() {
+    // After SSA roundtrip, `${x}` becomes `"" + x` which uses ToPrimitive.
+    // The tree-IR direct path emits backtick syntax (correct ToString).
+    // This test documents that the tree-IR path preserves the template form.
+    let src = r#"function f(x) { return `value:${x}`; }"#;
+    let m = parse_and_lower(src).expect("must lower");
+    let tree_out = emit(&m);
+    // Tree-IR emit must preserve backtick syntax (spec-correct path).
+    assert!(
+        tree_out.contains('`'),
+        "tree-IR emit must preserve template literal backtick syntax, got: {tree_out}"
+    );
+    // SSA round-trip: documents that the form degrades to string concat.
+    let ssa_out = ssa_roundtrip(src);
+    // SSA path loses backtick form — this is the known ToString/ToPrimitive gap.
+    // When TemplateConcat is implemented, update this assertion to expect backticks.
+    assert!(
+        !ssa_out.contains('`'),
+        "SSA round-trip currently degrades to + concat (known gap): {ssa_out}"
     );
 }

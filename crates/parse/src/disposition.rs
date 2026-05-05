@@ -110,7 +110,9 @@ fn stmt_lowerable(stmt: &js::Statement) -> bool {
         BlockStatement(b) => b.body.iter().all(stmt_lowerable),
         FunctionDeclaration(f) => function_decl_lowerable(f),
         ForStatement(f) => for_stmt_lowerable(f),
+        ForOfStatement(f) => for_of_stmt_lowerable(f),
         ContinueStatement(c) => c.label.is_none(),
+        TryStatement(t) => try_stmt_lowerable(t),
         // Anything else: not currently lowered. (BreakStatement is
         // unsupported this round — see docs/DECISIONS.md.)
         _ => false,
@@ -121,6 +123,32 @@ fn stmt_lowerable(stmt: &js::Statement) -> bool {
 /// optional; we accept all three optional and require the body and any
 /// present part to be lowerable. `for-in` / `for-of` are different AST
 /// nodes and stay unsupported.
+fn try_stmt_lowerable(t: &js::TryStatement) -> bool {
+    // Try body must be lowerable.
+    if !t.block.body.iter().all(stmt_lowerable) {
+        return false;
+    }
+    // Catch clause (optional): param must be absent or a plain identifier;
+    // destructuring catch (`catch ({message})`) is rejected.
+    if let Some(handler) = &t.handler {
+        if let Some(param) = &handler.param {
+            if !matches!(param.pattern.kind, js::BindingPatternKind::BindingIdentifier(_)) {
+                return false;
+            }
+        }
+        if !handler.body.body.iter().all(stmt_lowerable) {
+            return false;
+        }
+    }
+    // Finally block (optional).
+    if let Some(finalizer) = &t.finalizer {
+        if !finalizer.body.iter().all(stmt_lowerable) {
+            return false;
+        }
+    }
+    true
+}
+
 fn for_stmt_lowerable(f: &js::ForStatement) -> bool {
     if let Some(init) = &f.init {
         if !for_init_lowerable(init) {
@@ -138,6 +166,86 @@ fn for_stmt_lowerable(f: &js::ForStatement) -> bool {
         return false;
     }
     stmt_lowerable(&f.body)
+}
+
+/// `for (kind x of iterable) body`. Accepts plain identifier bindings only;
+/// destructuring and `for await...of` stay PassThrough.
+fn for_of_stmt_lowerable(f: &js::ForOfStatement) -> bool {
+    // `for await...of` is a different construct we don't support.
+    if f.r#await {
+        return false;
+    }
+    // Only plain identifier bindings: `for (const x of ...)` etc.
+    let binding_ok = match &f.left {
+        js::ForStatementLeft::VariableDeclaration(decl) => {
+            decl.declarations.len() == 1
+                && matches!(
+                    decl.declarations[0].id.kind,
+                    js::BindingPatternKind::BindingIdentifier(_)
+                )
+                // Reject `using` and any future exotic kinds.
+                && matches!(
+                    decl.kind,
+                    js::VariableDeclarationKind::Const
+                        | js::VariableDeclarationKind::Let
+                        | js::VariableDeclarationKind::Var
+                )
+        }
+        _ => false,
+    };
+    if !binding_ok {
+        return false;
+    }
+    // Reject if the body contains a bare return. The desugared iterator
+    // protocol (while + .next()) does not call iterator.return() on abrupt
+    // completion, which the spec requires so iterators can release resources.
+    // break/throw already cause PassThrough via stmt_lowerable, but return
+    // is otherwise lowerable and slips through.
+    if stmt_has_bare_return(&f.body) {
+        return false;
+    }
+    expr_lowerable(&f.right) && stmt_lowerable(&f.body)
+}
+
+/// Returns true if `stmt` contains a ReturnStatement that is not inside a
+/// nested function boundary (those have their own iterator context).
+fn stmt_has_bare_return(stmt: &js::Statement) -> bool {
+    use js::Statement::*;
+    match stmt {
+        ReturnStatement(_) => true,
+        BlockStatement(b) => b.body.iter().any(stmt_has_bare_return),
+        IfStatement(s) => {
+            stmt_has_bare_return(&s.consequent)
+                || s.alternate.as_ref().is_some_and(|a| stmt_has_bare_return(a))
+        }
+        WhileStatement(s) => stmt_has_bare_return(&s.body),
+        ForStatement(s) => stmt_has_bare_return(&s.body),
+        ForOfStatement(s) => stmt_has_bare_return(&s.body),
+        TryStatement(t) => {
+            t.block.body.iter().any(stmt_has_bare_return)
+                || t.handler
+                    .as_ref()
+                    .is_some_and(|h| h.body.body.iter().any(stmt_has_bare_return))
+                || t.finalizer
+                    .as_ref()
+                    .is_some_and(|f| f.body.iter().any(stmt_has_bare_return))
+        }
+        // Nested function declarations have their own scope — returns inside
+        // them don't exit the for-of loop.
+        FunctionDeclaration(_) => false,
+        ExpressionStatement(_)
+        | VariableDeclaration(_)
+        | ContinueStatement(_)
+        | BreakStatement(_)
+        | LabeledStatement(_)
+        | SwitchStatement(_)
+        | ThrowStatement(_)
+        | DoWhileStatement(_)
+        | ForInStatement(_)
+        | EmptyStatement(_)
+        | DebuggerStatement(_) => false,
+        _ => false,
+    }
 }
 
 fn for_init_lowerable(init: &js::ForStatementInit) -> bool {
@@ -308,7 +416,11 @@ fn expr_lowerable(expr: &js::Expression) -> bool {
             }
             for a in &c.arguments {
                 match a {
-                    js::Argument::SpreadElement(_) => return false,
+                    js::Argument::SpreadElement(s) => {
+                        if !expr_lowerable(&s.argument) {
+                            return false;
+                        }
+                    }
                     other => match other.as_expression() {
                         Some(e) => {
                             if !expr_lowerable(e) {
@@ -337,7 +449,11 @@ fn expr_lowerable(expr: &js::Expression) -> bool {
             }
             for a in &n.arguments {
                 match a {
-                    js::Argument::SpreadElement(_) => return false,
+                    js::Argument::SpreadElement(s) => {
+                        if !expr_lowerable(&s.argument) {
+                            return false;
+                        }
+                    }
                     other => match other.as_expression() {
                         Some(e) => {
                             if !expr_lowerable(e) {
@@ -379,7 +495,11 @@ fn expr_lowerable(expr: &js::Expression) -> bool {
                             }
                         }
                     }
-                    js::ObjectPropertyKind::SpreadProperty(_) => return false,
+                    js::ObjectPropertyKind::SpreadProperty(s) => {
+                        if !expr_lowerable(&s.argument) {
+                            return false;
+                        }
+                    }
                 }
             }
             true
@@ -393,10 +513,20 @@ fn expr_lowerable(expr: &js::Expression) -> bool {
 
         UpdateExpression(u) => update_target_lowerable(&u.argument),
 
+        // Simple template literals (no tag): `` `a${x}b` ``
+        // Allowed when all interpolated expressions are lowerable.
+        // Tagged templates (TaggedTemplateExpression) stay PassThrough
+        // (handled by the `_ => false` arm below).
+        TemplateLiteral(tpl) => tpl.expressions.iter().all(expr_lowerable),
+
         ArrayExpression(arr) => {
             for el in &arr.elements {
                 match el {
-                    js::ArrayExpressionElement::SpreadElement(_) => return false,
+                    js::ArrayExpressionElement::SpreadElement(s) => {
+                        if !expr_lowerable(&s.argument) {
+                            return false;
+                        }
+                    }
                     js::ArrayExpressionElement::Elision(_) => return false,
                     other => match other.as_expression() {
                         Some(e) => {

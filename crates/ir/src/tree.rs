@@ -85,6 +85,20 @@ pub enum Stmt {
         step: Option<Expr>,
         body: Vec<Stmt>,
     },
+    /// `for (kind binding of iterable) body`. Desugared to the iterator
+    /// protocol in the SSA layer; reconstructed as a `while` loop by
+    /// `lower_tree`. Emit is direct so the tree-IR round-trip preserves
+    /// the for-of form when no SSA pass is run.
+    ForOf {
+        /// `const`, `let`, or `var` — stored as a string for simplicity.
+        kind: String,
+        /// Plain identifier binding (e.g. `x` in `for (const x of arr)`).
+        binding: String,
+        /// The iterable expression.
+        iterable: Box<Expr>,
+        /// The loop body.
+        body: Vec<Stmt>,
+    },
     /// `continue` inside the nearest enclosing loop. Lowered as a jump
     /// to the loop's continue-target (header for `While`, step block
     /// for `For`). `break` is not supported (see docs/DECISIONS.md).
@@ -96,6 +110,35 @@ pub enum Stmt {
     /// the lowering emits at their textual position (we do not hoist
     /// — see project memory: closures-disposition-rule).
     FuncDecl(FuncLiteral),
+    /// `try { body } catch (param) { catch_body } finally { finally_body }`.
+    /// All three forms are supported:
+    /// - try/catch: `catch` is `Some(...)`, `finally` is `None`
+    /// - try/finally: `catch` is `None`, `finally` is `Some(...)`
+    /// - try/catch/finally: both present
+    /// The catch param is `None` for `catch { }` (no binding) or
+    /// `Some(name)` for `catch (e) { }`.
+    ///
+    /// Design decision: `Stmt::Try` does NOT enter SSA. Functions containing
+    /// try/catch are lowered through tree-IR only; `lower_ssa` panics if it
+    /// reaches a Try node. This means SSA-level passes (dead code, constant
+    /// prop, escape analysis) cannot reason across try boundaries or see the
+    /// catch binding. For a deobfuscator with local-only analysis this is
+    /// acceptable, but any future global pass will need exception edges in the
+    /// SSA CFG — a substantial retrofit.
+    ///
+    /// Catch binding scope: the catch param (if present) is block-scoped to
+    /// the catch clause per ES2015+. SSA passes don't see the try at all, so
+    /// they also don't see the catch binding. This is safe as long as no pass
+    /// assumes flat lexical scope across the whole function body — if such a
+    /// pass is added, it must be made Try-aware or restricted to non-try
+    /// functions.
+    Try {
+        body: Vec<Stmt>,
+        /// Optional catch clause: `(Option<catch_param_name>, catch_body)`.
+        catch: Option<(Option<String>, Vec<Stmt>)>,
+        /// Optional finally block.
+        finally: Option<Vec<Stmt>>,
+    },
 }
 
 /// Shared shape for function expressions, arrow functions, and nested
@@ -184,6 +227,11 @@ pub enum Expr {
     Object {
         props: Vec<ObjectProp>,
     },
+    /// Spread element `...expr`. Valid only inside `Expr::Call` args,
+    /// `Expr::Array` elements, and `Expr::Object` props (as a spread
+    /// property represented via a special `ObjectProp` with a
+    /// `ObjectKey::Spread` key). The emitter renders it as `...inner`.
+    Spread(Box<Expr>),
     New {
         callee: Box<Expr>,
         args: Vec<Expr>,
@@ -210,6 +258,14 @@ pub enum Expr {
         target: Box<Expr>,
         prefix: bool,
     },
+    /// Template literal: `` `quasi0${expr0}quasi1${expr1}quasi2` ``.
+    /// `quasis` holds the raw string parts between `${...}` delimiters;
+    /// there is always one more quasi than expressions
+    /// (`quasis.len() == exprs.len() + 1`).
+    Template {
+        quasis: Vec<String>,
+        exprs: Vec<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,6 +281,9 @@ pub enum ObjectKey {
     Static(String),
     /// `{[expr]: v}` — key computed at runtime.
     Computed(Box<Expr>),
+    /// Spread property marker: `{...expr}`. When this key is used, the
+    /// associated `ObjectProp.value` holds the expression being spread.
+    Spread,
 }
 
 #[derive(Debug, Clone)]
@@ -403,6 +462,23 @@ fn dump_stmt(out: &mut String, s: &Stmt, depth: usize) {
             }
             writeln!(out, "{pad}}}").unwrap();
         }
+        Stmt::ForOf {
+            kind,
+            binding,
+            iterable,
+            body,
+        } => {
+            writeln!(
+                out,
+                "{pad}for ({kind} {binding} of {}) {{",
+                dump_expr(iterable)
+            )
+            .unwrap();
+            for s in body {
+                dump_stmt(out, s, depth + 1);
+            }
+            writeln!(out, "{pad}}}").unwrap();
+        }
         Stmt::Continue => writeln!(out, "{pad}continue").unwrap(),
         Stmt::Block(stmts) => {
             writeln!(out, "{pad}{{").unwrap();
@@ -413,6 +489,32 @@ fn dump_stmt(out: &mut String, s: &Stmt, depth: usize) {
         }
         Stmt::FuncDecl(lit) => {
             dump_func_literal(out, lit, depth);
+        }
+        Stmt::Try {
+            body,
+            catch,
+            finally,
+        } => {
+            writeln!(out, "{pad}try {{").unwrap();
+            for s in body {
+                dump_stmt(out, s, depth + 1);
+            }
+            if let Some((param, catch_body)) = catch {
+                match param {
+                    Some(p) => writeln!(out, "{pad}}} catch ({p}) {{").unwrap(),
+                    None => writeln!(out, "{pad}}} catch {{").unwrap(),
+                }
+                for s in catch_body {
+                    dump_stmt(out, s, depth + 1);
+                }
+            }
+            if let Some(finally_body) = finally {
+                writeln!(out, "{pad}}} finally {{").unwrap();
+                for s in finally_body {
+                    dump_stmt(out, s, depth + 1);
+                }
+            }
+            writeln!(out, "{pad}}}").unwrap();
         }
     }
 }
@@ -482,11 +584,11 @@ fn dump_expr(e: &Expr) -> String {
             let parts: Vec<String> = props
                 .iter()
                 .map(|p| {
-                    let k = match &p.key {
-                        ObjectKey::Static(s) => s.clone(),
-                        ObjectKey::Computed(e) => format!("[{}]", dump_expr(e)),
-                    };
-                    format!("{k}: {}", dump_expr(&p.value))
+                    match &p.key {
+                        ObjectKey::Spread => format!("...{}", dump_expr(&p.value)),
+                        ObjectKey::Static(s) => format!("{s}: {}", dump_expr(&p.value)),
+                        ObjectKey::Computed(e) => format!("[{}]: {}", dump_expr(e), dump_expr(&p.value)),
+                    }
                 })
                 .collect();
             format!("{{{}}}", parts.join(", "))
@@ -506,6 +608,7 @@ fn dump_expr(e: &Expr) -> String {
             dump_expr(then_branch),
             dump_expr(else_branch)
         ),
+        Expr::Spread(inner) => format!("...{}", dump_expr(inner)),
         Expr::Update { op, target, prefix } => {
             let s = match op {
                 UpdateOp::Inc => "++",
@@ -536,6 +639,19 @@ fn dump_expr(e: &Expr) -> String {
                 "{modifiers}{kw} {name}({}) {body_marker}",
                 lit.params.join(", ")
             )
+        }
+        Expr::Template { quasis, exprs } => {
+            let mut s = String::from("`");
+            for (i, q) in quasis.iter().enumerate() {
+                s.push_str(q);
+                if i < exprs.len() {
+                    s.push_str("${");
+                    s.push_str(&dump_expr(&exprs[i]));
+                    s.push('}');
+                }
+            }
+            s.push('`');
+            s
         }
     }
 }

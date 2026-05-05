@@ -289,6 +289,25 @@ impl Printer<'_> {
                 self.pad();
                 self.buf.push('}');
             }
+            Stmt::ForOf {
+                kind,
+                binding,
+                iterable,
+                body,
+            } => {
+                write!(self.buf, "for ({kind} {binding} of ").unwrap();
+                self.expr(iterable);
+                self.buf.push_str(") {\n");
+                self.indent += 1;
+                for s in body {
+                    self.pad();
+                    self.stmt(s);
+                    self.buf.push('\n');
+                }
+                self.indent -= 1;
+                self.pad();
+                self.buf.push('}');
+            }
             Stmt::Continue => {
                 self.buf.push_str("continue;");
             }
@@ -311,6 +330,50 @@ impl Printer<'_> {
                 let name = lit.name.as_deref().expect("Stmt::FuncDecl requires a name");
                 self.write_func_header(lit, Some(name));
                 self.write_func_body(lit);
+            }
+            Stmt::Try {
+                body,
+                catch,
+                finally,
+            } => {
+                self.buf.push_str("try {\n");
+                self.indent += 1;
+                for s in body {
+                    self.pad();
+                    self.stmt(s);
+                    self.buf.push('\n');
+                }
+                self.indent -= 1;
+                self.pad();
+                self.buf.push('}');
+                if let Some((param, catch_body)) = catch {
+                    self.buf.push_str(" catch");
+                    if let Some(p) = param {
+                        write!(self.buf, " ({p})").unwrap();
+                    }
+                    self.buf.push_str(" {\n");
+                    self.indent += 1;
+                    for s in catch_body {
+                        self.pad();
+                        self.stmt(s);
+                        self.buf.push('\n');
+                    }
+                    self.indent -= 1;
+                    self.pad();
+                    self.buf.push('}');
+                }
+                if let Some(finally_body) = finally {
+                    self.buf.push_str(" finally {\n");
+                    self.indent += 1;
+                    for s in finally_body {
+                        self.pad();
+                        self.stmt(s);
+                        self.buf.push('\n');
+                    }
+                    self.indent -= 1;
+                    self.pad();
+                    self.buf.push('}');
+                }
             }
         }
     }
@@ -477,6 +540,13 @@ impl Printer<'_> {
                         self.buf.push_str(", ");
                     }
                     match &p.key {
+                        ObjectKey::Spread => {
+                            // Spread property: `...expr`
+                            self.buf.push_str("...");
+                            self.expr(&p.value);
+                            // No `: value` suffix — spread has no separate value.
+                            continue;
+                        }
                         ObjectKey::Static(s) => {
                             // Always emit a quoted string key — safe for
                             // identifiers, numerics, and arbitrary text.
@@ -552,6 +622,28 @@ impl Printer<'_> {
                 if !lit.is_arrow {
                     self.buf.push(')');
                 }
+            }
+            Expr::Spread(inner) => {
+                self.buf.push_str("...");
+                self.expr(inner);
+            }
+            Expr::Template { quasis, exprs } => {
+                self.buf.push('`');
+                let mut quasis_iter = quasis.iter();
+                let mut exprs_iter = exprs.iter();
+                if let Some(first) = quasis_iter.next() {
+                    self.buf.push_str(first);
+                }
+                loop {
+                    let Some(expr) = exprs_iter.next() else { break };
+                    self.buf.push_str("${");
+                    self.expr(expr);
+                    self.buf.push('}');
+                    if let Some(q) = quasis_iter.next() {
+                        self.buf.push_str(q);
+                    }
+                }
+                self.buf.push('`');
             }
         }
     }

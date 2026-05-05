@@ -189,6 +189,21 @@ impl Ctx<'_> {
                 }
                 self.leave_scope();
             }
+            Stmt::ForOf {
+                binding,
+                iterable,
+                body,
+                ..
+            } => {
+                // Iterable is evaluated in the enclosing scope.
+                self.walk_expr(iterable);
+                // The binding variable is introduced in a fresh scope
+                // that covers the body.
+                self.enter_block_scope();
+                self.bind(binding.clone());
+                self.walk_stmts(body);
+                self.leave_scope();
+            }
             Stmt::Continue => {}
             Stmt::Block(stmts) => {
                 self.enter_block_scope();
@@ -202,6 +217,28 @@ impl Ctx<'_> {
                 // captures that isn't bound in the enclosing scopes
                 // becomes a free var of the current function.
                 self.absorb_inner_captures(lit);
+            }
+            Stmt::Try {
+                body,
+                catch,
+                finally,
+            } => {
+                self.enter_block_scope();
+                self.walk_stmts(body);
+                self.leave_scope();
+                if let Some((param, catch_body)) = catch {
+                    self.enter_block_scope();
+                    if let Some(name) = param {
+                        self.bind(name.clone());
+                    }
+                    self.walk_stmts(catch_body);
+                    self.leave_scope();
+                }
+                if let Some(finally_body) = finally {
+                    self.enter_block_scope();
+                    self.walk_stmts(finally_body);
+                    self.leave_scope();
+                }
             }
         }
     }
@@ -256,6 +293,12 @@ impl Ctx<'_> {
                 self.walk_expr(else_branch);
             }
             Expr::Update { target, .. } => self.walk_expr(target),
+            Expr::Spread(inner) => self.walk_expr(inner),
+            Expr::Template { exprs, .. } => {
+                for e in exprs {
+                    self.walk_expr(e);
+                }
+            }
         }
     }
 

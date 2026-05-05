@@ -163,6 +163,10 @@ fn walk_stmts(stmts: &[Stmt], parent: &str, rows: &mut Vec<FunctionCoverage>) {
                     walk_expr(s, parent, rows);
                 }
             }
+            Stmt::ForOf { iterable, body, .. } => {
+                walk_expr(iterable, parent, rows);
+                walk_stmts(body, parent, rows);
+            }
             Stmt::Continue => {}
             Stmt::Block(b) => walk_stmts(b, parent, rows),
             Stmt::Let { init: Some(e), .. } | Stmt::ExprStmt(e) | Stmt::Return(Some(e)) => {
@@ -174,6 +178,15 @@ fn walk_stmts(stmts: &[Stmt], parent: &str, rows: &mut Vec<FunctionCoverage>) {
                 walk_expr(value, parent, rows);
             }
             Stmt::Let { init: None, .. } | Stmt::Return(None) => {}
+            Stmt::Try { body, catch, finally } => {
+                walk_stmts(body, parent, rows);
+                if let Some((_, catch_body)) = catch {
+                    walk_stmts(catch_body, parent, rows);
+                }
+                if let Some(finally_body) = finally {
+                    walk_stmts(finally_body, parent, rows);
+                }
+            }
         }
     }
 }

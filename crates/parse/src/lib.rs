@@ -588,12 +588,14 @@ impl Lowerer<'_> {
                 Ok(Stmt::FuncDecl(self.lower_function_literal(f, true)?))
             }
             js::Statement::ForStatement(f) => self.lower_for_stmt(f),
+            js::Statement::ForOfStatement(f) => self.lower_for_of_stmt(f),
             js::Statement::ContinueStatement(c) => {
                 if c.label.is_some() {
                     return Err(Error::Unsupported("labeled continue"));
                 }
                 Ok(Stmt::Continue)
             }
+            js::Statement::TryStatement(t) => self.lower_try_stmt(t),
             _ => Err(Error::Unsupported(stmt_kind(stmt))),
         }
     }
@@ -626,6 +628,84 @@ impl Lowerer<'_> {
             step,
             body,
         })
+    }
+
+    fn lower_for_of_stmt(&self, f: &js::ForOfStatement) -> Result<Stmt, Error> {
+        if f.r#await {
+            return Err(Error::Unsupported("for-await-of statement"));
+        }
+        let (kind, binding) = match &f.left {
+            js::ForStatementLeft::VariableDeclaration(decl) => {
+                if decl.declarations.len() != 1 {
+                    return Err(Error::Unsupported("for-of with multiple declarators"));
+                }
+                let d = &decl.declarations[0];
+                let name = match &d.id.kind {
+                    js::BindingPatternKind::BindingIdentifier(id) => id.name.to_string(),
+                    _ => return Err(Error::Unsupported("for-of with destructuring binding")),
+                };
+                let kind = match decl.kind {
+                    js::VariableDeclarationKind::Const => "const".to_string(),
+                    js::VariableDeclarationKind::Let => "let".to_string(),
+                    js::VariableDeclarationKind::Var => "var".to_string(),
+                    _ => return Err(Error::Unsupported("for-of with exotic binding kind")),
+                };
+                (kind, name)
+            }
+            _ => return Err(Error::Unsupported("for-of with non-declaration left side")),
+        };
+        let iterable = self.lower_expr(&f.right)?;
+        let body = self.stmts_from(&f.body)?;
+        Ok(Stmt::ForOf {
+            kind,
+            binding,
+            iterable: Box::new(iterable),
+            body,
+        })
+    }
+
+    fn lower_try_stmt(&self, t: &js::TryStatement) -> Result<Stmt, Error> {
+        let body = t
+            .block
+            .body
+            .iter()
+            .map(|s| self.lower_stmt(s))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let catch = match &t.handler {
+            None => None,
+            Some(handler) => {
+                // Extract the catch parameter name if present (plain identifier only;
+                // disposition already rejected destructuring).
+                let param_name = handler.param.as_ref().map(|p| {
+                    match &p.pattern.kind {
+                        js::BindingPatternKind::BindingIdentifier(id) => id.name.to_string(),
+                        _ => unreachable!("disposition rejected non-identifier catch param"),
+                    }
+                });
+                let catch_body = handler
+                    .body
+                    .body
+                    .iter()
+                    .map(|s| self.lower_stmt(s))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Some((param_name, catch_body))
+            }
+        };
+
+        let finally = match &t.finalizer {
+            None => None,
+            Some(finalizer) => {
+                let finally_body = finalizer
+                    .body
+                    .iter()
+                    .map(|s| self.lower_stmt(s))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Some(finally_body)
+            }
+        };
+
+        Ok(Stmt::Try { body, catch, finally })
     }
 
     fn lower_var_decl(&self, decl: &js::VariableDeclaration) -> Result<Stmt, Error> {
@@ -849,8 +929,8 @@ impl Lowerer<'_> {
                 let mut args = Vec::with_capacity(c.arguments.len());
                 for a in &c.arguments {
                     match a {
-                        js::Argument::SpreadElement(_) => {
-                            return Err(Error::Unsupported("spread argument"));
+                        js::Argument::SpreadElement(s) => {
+                            args.push(Expr::Spread(Box::new(self.lower_expr(&s.argument)?)));
                         }
                         other => {
                             let e = other
@@ -887,8 +967,8 @@ impl Lowerer<'_> {
                 let mut args = Vec::with_capacity(n.arguments.len());
                 for a in &n.arguments {
                     match a {
-                        js::Argument::SpreadElement(_) => {
-                            return Err(Error::Unsupported("spread in new args"));
+                        js::Argument::SpreadElement(s) => {
+                            args.push(Expr::Spread(Box::new(self.lower_expr(&s.argument)?)));
                         }
                         other => {
                             let e = other
@@ -938,8 +1018,12 @@ impl Lowerer<'_> {
                             };
                             props.push(ObjectProp { key, value });
                         }
-                        js::ObjectPropertyKind::SpreadProperty(_) => {
-                            return Err(Error::Unsupported("spread in object literal"));
+                        js::ObjectPropertyKind::SpreadProperty(s) => {
+                            let value = self.lower_expr(&s.argument)?;
+                            props.push(ObjectProp {
+                                key: ObjectKey::Spread,
+                                value,
+                            });
                         }
                     }
                 }
@@ -969,8 +1053,8 @@ impl Lowerer<'_> {
                 let mut elements = Vec::with_capacity(arr.elements.len());
                 for el in &arr.elements {
                     match el {
-                        js::ArrayExpressionElement::SpreadElement(_) => {
-                            return Err(Error::Unsupported("spread in array literal"));
+                        js::ArrayExpressionElement::SpreadElement(s) => {
+                            elements.push(Expr::Spread(Box::new(self.lower_expr(&s.argument)?)));
                         }
                         js::ArrayExpressionElement::Elision(_) => {
                             return Err(Error::Unsupported("elision in array literal"));
@@ -984,6 +1068,23 @@ impl Lowerer<'_> {
                     }
                 }
                 Ok(Expr::Array { elements })
+            }
+
+            js::Expression::TemplateLiteral(tpl) => {
+                // Untagged template literal: `` `a${x}b${y}c` ``.
+                // quasis and expressions interleave:
+                //   quasis[0], exprs[0], quasis[1], exprs[1], ..., quasis[n]
+                // with quasis.len() == exprs.len() + 1.
+                let quasis: Vec<String> = tpl
+                    .quasis
+                    .iter()
+                    .map(|q| q.value.raw.to_string())
+                    .collect();
+                let mut exprs = Vec::with_capacity(tpl.expressions.len());
+                for e in &tpl.expressions {
+                    exprs.push(self.lower_expr(e)?);
+                }
+                Ok(Expr::Template { quasis, exprs })
             }
 
             _ => Err(Error::Unsupported("expression kind")),

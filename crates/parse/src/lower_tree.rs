@@ -588,6 +588,13 @@ impl LowerCtx<'_> {
                 callee: Box::new(self.operand_to_expr(callee)),
                 args: args.iter().map(|a| self.operand_to_expr(a)).collect(),
             },
+            CallSpread { callee, args, spread_mask } => Expr::Call {
+                callee: Box::new(self.operand_to_expr(callee)),
+                args: args.iter().zip(spread_mask.iter()).map(|(a, &is_spread)| {
+                    let e = self.operand_to_expr(a);
+                    if is_spread { Expr::Spread(Box::new(e)) } else { e }
+                }).collect(),
+            },
             CallMethod { obj, method, args } => {
                 let callee = Expr::Member {
                     obj: Box::new(self.operand_to_expr(obj)),
@@ -596,6 +603,19 @@ impl LowerCtx<'_> {
                 Expr::Call {
                     callee: Box::new(callee),
                     args: args.iter().map(|a| self.operand_to_expr(a)).collect(),
+                }
+            }
+            CallMethodSpread { obj, method, args, spread_mask } => {
+                let callee = Expr::Member {
+                    obj: Box::new(self.operand_to_expr(obj)),
+                    prop: self.sm.strings.resolve(method).to_string(),
+                };
+                Expr::Call {
+                    callee: Box::new(callee),
+                    args: args.iter().zip(spread_mask.iter()).map(|(a, &is_spread)| {
+                        let e = self.operand_to_expr(a);
+                        if is_spread { Expr::Spread(Box::new(e)) } else { e }
+                    }).collect(),
                 }
             }
             ToNumber { val } => Expr::Unary {
@@ -620,6 +640,33 @@ impl LowerCtx<'_> {
                 callee: Box::new(Expr::Ident("Array".to_string())),
                 args: vec![],
             },
+            ArrayWithSpread { elements, spread_mask } => {
+                use ir::tree::Expr as TreeExpr;
+                let elems: Vec<TreeExpr> = elements.iter().zip(spread_mask.iter()).map(|(e, &is_spread)| {
+                    let te = self.operand_to_expr(e);
+                    if is_spread { TreeExpr::Spread(Box::new(te)) } else { te }
+                }).collect();
+                TreeExpr::Array { elements: elems }
+            }
+            ObjectWithSpread { keys, vals } => {
+                use ir::tree::{Expr as TreeExpr, ObjectKey, ObjectProp};
+                use ir::ssa::SpreadObjectKey;
+                let props: Vec<ObjectProp> = keys.iter().zip(vals.iter()).map(|(k, v)| {
+                    let val = self.operand_to_expr(v);
+                    match k {
+                        None => ObjectProp { key: ObjectKey::Spread, value: val },
+                        Some(SpreadObjectKey::Static(sid)) => ObjectProp {
+                            key: ObjectKey::Static(self.sm.strings.resolve(sid).to_string()),
+                            value: val,
+                        },
+                        Some(SpreadObjectKey::Computed(key_op)) => ObjectProp {
+                            key: ObjectKey::Computed(Box::new(self.operand_to_expr(key_op))),
+                            value: val,
+                        },
+                    }
+                }).collect();
+                TreeExpr::Object { props }
+            }
             AllocClosure { func, captures } => {
                 self.alloc_closure_to_expr(*func, captures, pre_stmts)
             }
@@ -1353,13 +1400,17 @@ fn render_expr_to_string(e: &Expr) -> String {
             let parts: Vec<String> = props
                 .iter()
                 .map(|p| {
-                    let k = match &p.key {
-                        ir::tree::ObjectKey::Static(s) => format!("\"{s}\""),
-                        ir::tree::ObjectKey::Computed(e) => {
-                            format!("[{}]", render_expr_to_string(e))
+                    match &p.key {
+                        ir::tree::ObjectKey::Spread => {
+                            format!("...{}", render_expr_to_string(&p.value))
                         }
-                    };
-                    format!("{k}:{}", render_expr_to_string(&p.value))
+                        ir::tree::ObjectKey::Static(s) => {
+                            format!("\"{s}\":{}", render_expr_to_string(&p.value))
+                        }
+                        ir::tree::ObjectKey::Computed(e) => {
+                            format!("[{}]:{}", render_expr_to_string(e), render_expr_to_string(&p.value))
+                        }
+                    }
                 })
                 .collect();
             format!("{{{}}}", parts.join(","))
@@ -1392,6 +1443,25 @@ fn render_expr_to_string(e: &Expr) -> String {
             } else {
                 format!("({}{})", render_expr_to_string(target), s)
             }
+        }
+        Expr::Spread(inner) => format!("...{}", render_expr_to_string(inner)),
+        Expr::Template { quasis, exprs } => {
+            let mut out = String::from("`");
+            let mut q_iter = quasis.iter();
+            let mut e_iter = exprs.iter();
+            if let Some(q) = q_iter.next() {
+                out.push_str(q);
+            }
+            while let Some(expr) = e_iter.next() {
+                out.push_str("${");
+                out.push_str(&render_expr_to_string(expr));
+                out.push('}');
+                if let Some(q) = q_iter.next() {
+                    out.push_str(q);
+                }
+            }
+            out.push('`');
+            out
         }
     }
 }

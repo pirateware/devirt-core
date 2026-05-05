@@ -154,6 +154,17 @@ impl Purity {
 // Instructions
 // ============================================================================
 
+/// Key in an `ObjectWithSpread` entry. Static keys are string IDs;
+/// computed keys are operands; spread entries have no key (represented
+/// by `None` in the `keys` vec of `ObjectWithSpread`).
+#[derive(Clone, Debug)]
+pub enum SpreadObjectKey {
+    /// `{ foo: val }` — string-interned static key.
+    Static(StrId),
+    /// `{ [expr]: val }` — computed key whose value is an operand.
+    Computed(Operand),
+}
+
 #[derive(Clone, Debug)]
 pub struct Instruction {
     pub kind: InstKind,
@@ -292,14 +303,66 @@ pub enum InstKind {
         callee: Operand,
         args: Vec<Operand>,
     },
+    /// Call with at least one spread argument. `args` mirrors the
+    /// argument list; `spread_mask` is a bitmask where bit `i` set
+    /// means `args[i]` is a spread (`...expr`). Semantics-preserving:
+    /// the emitter reconstructs the spread syntax from the mask.
+    ///
+    /// TODO(analyzability): This node is opaque to passes. Any pass that
+    /// wants to reason about argument arity or which args are positional
+    /// must give up at CallSpread boundaries. To expand analyzability, the
+    /// spread operand would need to be lowered to an iterator protocol
+    /// invocation (Symbol.iterator + .next() loop) so each argument slot
+    /// becomes a concrete SSA value. Until then, FB-PT% improvements from
+    /// spread coverage don't translate to proportional analysis quality gains.
+    CallSpread {
+        callee: Operand,
+        args: Vec<Operand>,
+        spread_mask: Vec<bool>,
+    },
     CallMethod {
         obj: Operand,
         method: StrId,
         args: Vec<Operand>,
     },
+    /// Method call with spread arguments.
+    ///
+    /// TODO(analyzability): Same opacity caveat as CallSpread — argument
+    /// arity is unknown to passes. See CallSpread for the expansion path.
+    CallMethodSpread {
+        obj: Operand,
+        method: StrId,
+        args: Vec<Operand>,
+        spread_mask: Vec<bool>,
+    },
     Construct {
         ctor: Operand,
         args: Vec<Operand>,
+    },
+    /// Array literal with at least one spread element. `elements` and
+    /// `spread_mask` have the same length; bit `i` set means element `i`
+    /// is a spread.
+    ///
+    /// TODO(analyzability): Opaque to passes — array contents and length are
+    /// unknown at spread positions. To make array shape analyzable, spread
+    /// elements would need to be lowered to iterator protocol calls producing
+    /// concrete element slots. Until then, passes must conservatively assume
+    /// unknown length and contents when ArrayWithSpread is present.
+    ArrayWithSpread {
+        elements: Vec<Operand>,
+        spread_mask: Vec<bool>,
+    },
+    /// Object literal with at least one spread property. `keys` and
+    /// `vals` have the same length; a `None` key means the entry is a
+    /// spread property (`...val`).
+    ///
+    /// TODO(analyzability): Opaque to passes — object shape is unknown at
+    /// spread positions. To make shape analyzable, each spread entry would
+    /// need to be expanded via Object.assign or equivalent so each property
+    /// becomes a concrete key/value pair in the IR.
+    ObjectWithSpread {
+        keys: Vec<Option<SpreadObjectKey>>,
+        vals: Vec<Operand>,
     },
 
     // Coercions (explicit — no implicit JS coercions inside the IR).
@@ -377,9 +440,15 @@ impl InstKind {
             StoreProp { purity, .. } | StoreIndex { purity, .. } => purity.store_effect(),
 
             // Calls: opaque by default. A future analysis can refine specific calls.
-            Call { .. } | CallMethod { .. } | Construct { .. } | OpaqueEval { .. } => {
-                Effect::OPAQUE
-            }
+            Call { .. }
+            | CallSpread { .. }
+            | CallMethod { .. }
+            | CallMethodSpread { .. }
+            | Construct { .. }
+            | OpaqueEval { .. } => Effect::OPAQUE,
+
+            // Spread collections: opaque (iterator protocol can throw and mutate heap).
+            ArrayWithSpread { .. } | ObjectWithSpread { .. } => Effect::OPAQUE,
         }
     }
 
@@ -1230,7 +1299,19 @@ fn walk_inst_operands(kind: &InstKind, mut f: impl FnMut(&Operand)) {
                 f(a);
             }
         }
+        CallSpread { callee, args, .. } => {
+            f(callee);
+            for a in args {
+                f(a);
+            }
+        }
         CallMethod { obj, args, .. } => {
+            f(obj);
+            for a in args {
+                f(a);
+            }
+        }
+        CallMethodSpread { obj, args, .. } => {
             f(obj);
             for a in args {
                 f(a);
@@ -1240,6 +1321,21 @@ fn walk_inst_operands(kind: &InstKind, mut f: impl FnMut(&Operand)) {
             f(ctor);
             for a in args {
                 f(a);
+            }
+        }
+        ArrayWithSpread { elements, .. } => {
+            for e in elements {
+                f(e);
+            }
+        }
+        ObjectWithSpread { keys, vals } => {
+            for k in keys {
+                if let Some(SpreadObjectKey::Computed(op)) = k {
+                    f(op);
+                }
+            }
+            for v in vals {
+                f(v);
             }
         }
         ToNumber { val }
@@ -1519,6 +1615,17 @@ fn write_inst_kind(out: &mut String, kind: &InstKind, m: &Module) {
             write_callee(out, callee, m);
             write_arg_list(out, args, m);
         }
+        CallSpread { callee, args, spread_mask } => {
+            out.push_str("call_spread ");
+            write_callee(out, callee, m);
+            out.push('(');
+            for (i, (a, &is_spread)) in args.iter().zip(spread_mask.iter()).enumerate() {
+                if i > 0 { out.push_str(", "); }
+                if is_spread { out.push_str("..."); }
+                write_operand(out, a, m);
+            }
+            out.push(')');
+        }
         CallMethod { obj, method, args } => {
             out.push_str("call_method ");
             write_operand(out, obj, m);
@@ -1527,10 +1634,53 @@ fn write_inst_kind(out: &mut String, kind: &InstKind, m: &Module) {
             out.push_str(", ");
             write_arg_list(out, args, m);
         }
+        CallMethodSpread { obj, method, args, spread_mask } => {
+            out.push_str("call_method_spread ");
+            write_operand(out, obj, m);
+            out.push_str(", ");
+            write_string_literal(out, m.strings.resolve(method));
+            out.push_str(", (");
+            for (i, (a, &is_spread)) in args.iter().zip(spread_mask.iter()).enumerate() {
+                if i > 0 { out.push_str(", "); }
+                if is_spread { out.push_str("..."); }
+                write_operand(out, a, m);
+            }
+            out.push(')');
+        }
         Construct { ctor, args } => {
             out.push_str("construct ");
             write_callee(out, ctor, m);
             write_arg_list(out, args, m);
+        }
+        ArrayWithSpread { elements, spread_mask } => {
+            out.push_str("array_with_spread [");
+            for (i, (e, &is_spread)) in elements.iter().zip(spread_mask.iter()).enumerate() {
+                if i > 0 { out.push_str(", "); }
+                if is_spread { out.push_str("..."); }
+                write_operand(out, e, m);
+            }
+            out.push(']');
+        }
+        ObjectWithSpread { keys, vals } => {
+            out.push_str("object_with_spread {");
+            for (i, (k, v)) in keys.iter().zip(vals.iter()).enumerate() {
+                if i > 0 { out.push_str(", "); }
+                match k {
+                    None => { out.push_str("..."); write_operand(out, v, m); }
+                    Some(SpreadObjectKey::Static(s)) => {
+                        write_string_literal(out, m.strings.resolve(s));
+                        out.push_str(": ");
+                        write_operand(out, v, m);
+                    }
+                    Some(SpreadObjectKey::Computed(key_op)) => {
+                        out.push('[');
+                        write_operand(out, key_op, m);
+                        out.push_str("]: ");
+                        write_operand(out, v, m);
+                    }
+                }
+            }
+            out.push('}');
         }
         ToNumber { val } => unop(out, "to_number", val, m),
         ToString { val } => unop(out, "to_string", val, m),
