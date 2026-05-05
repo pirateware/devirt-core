@@ -574,6 +574,25 @@ fn discover_expr<'a>(
             discover_expr(index, pending, captures_by_fid, seen, reassigned, parent_fid);
         }
         Expr::Func(lit) => discover_literal(lit, pending, captures_by_fid, seen, reassigned, parent_fid),
+        Expr::Array { elements } => {
+            for el in elements {
+                discover_expr(el, pending, captures_by_fid, seen, reassigned, parent_fid);
+            }
+        }
+        Expr::Object { props } => {
+            for p in props {
+                if let crate::ir::tree::ObjectKey::Computed(e) = &p.key {
+                    discover_expr(e, pending, captures_by_fid, seen, reassigned, parent_fid);
+                }
+                discover_expr(&p.value, pending, captures_by_fid, seen, reassigned, parent_fid);
+            }
+        }
+        Expr::New { callee, args } => {
+            discover_expr(callee, pending, captures_by_fid, seen, reassigned, parent_fid);
+            for a in args {
+                discover_expr(a, pending, captures_by_fid, seen, reassigned, parent_fid);
+            }
+        }
     }
 }
 
@@ -1589,6 +1608,26 @@ impl<'b, 'm> Converter<'b, 'm> {
             Expr::Binary { op, lhs, rhs } => self.convert_binary(*op, lhs, rhs),
             Expr::Unary { op, operand } => self.convert_unary(*op, operand),
             Expr::Call { callee, args } => {
+                // Method-call discrimination: `obj.foo(args)` must be
+                // emitted as CallMethod so `this` binds to `obj` at
+                // call time. Lowering as separate LoadProp + Call
+                // produces a freestanding function value with `this`
+                // = undefined, which silently miscompiles instance
+                // method calls. Static-member calls only — computed
+                // member calls don't have a CallMethod analogue and
+                // fall back to LoadIndex + Call (correctness gap; the
+                // disposition walker permits them).
+                if let Expr::Member { obj, prop } = callee.as_ref() {
+                    let obj_op = self.convert_expr(obj);
+                    let method = self.builder.intern(prop);
+                    let arg_ops: Vec<Operand> =
+                        args.iter().map(|a| self.convert_expr(a)).collect();
+                    return self.emit(InstKind::CallMethod {
+                        obj: obj_op,
+                        method,
+                        args: arg_ops,
+                    });
+                }
                 let callee_op = self.convert_expr(callee);
                 let arg_ops: Vec<Operand> = args.iter().map(|a| self.convert_expr(a)).collect();
                 self.emit(InstKind::Call {
@@ -1617,6 +1656,81 @@ impl<'b, 'm> Converter<'b, 'm> {
                 })
             }
             Expr::Func(lit) => self.alloc_closure_operand(lit),
+            Expr::Array { elements } => {
+                // Evaluate elements left-to-right, then allocate, then
+                // store. AllocArray is PURE; the StoreIndex chain on a
+                // freshly-allocated array can use Purity::Pure since
+                // the target hasn't escaped between alloc and stores.
+                let element_ops: Vec<Operand> =
+                    elements.iter().map(|e| self.convert_expr(e)).collect();
+                let arr = self.emit(InstKind::AllocArray {
+                    length: Some(elements.len() as u32),
+                });
+                for (i, op) in element_ops.into_iter().enumerate() {
+                    let idx = Operand::Const(Constant::Number(i as f64));
+                    self.builder.add_inst(InstKind::StoreIndex {
+                        obj: arr.clone(),
+                        index: idx,
+                        val: op,
+                        purity: Purity::Pure,
+                    });
+                }
+                arr
+            }
+            Expr::New { callee, args } => {
+                let ctor = self.convert_expr(callee);
+                let arg_ops: Vec<Operand> =
+                    args.iter().map(|a| self.convert_expr(a)).collect();
+                self.emit(InstKind::Construct {
+                    ctor,
+                    args: arg_ops,
+                })
+            }
+            Expr::Object { props } => {
+                // Per JS spec: for each prop, key is evaluated before
+                // value (computed keys); for static keys the order is
+                // unobservable. We pre-evaluate everything so element
+                // effects are sequenced before the alloc, then alloc,
+                // then store. Pure stores: target has not escaped.
+                use crate::ir::tree::ObjectKey;
+                enum EvalKey {
+                    Static(StrId),
+                    Computed(Operand),
+                }
+                let evaluated: Vec<(EvalKey, Operand)> = props
+                    .iter()
+                    .map(|p| {
+                        let k = match &p.key {
+                            ObjectKey::Static(s) => EvalKey::Static(self.builder.intern(s)),
+                            ObjectKey::Computed(e) => EvalKey::Computed(self.convert_expr(e)),
+                        };
+                        let v = self.convert_expr(&p.value);
+                        (k, v)
+                    })
+                    .collect();
+                let obj = self.emit(InstKind::AllocObject);
+                for (k, v) in evaluated {
+                    match k {
+                        EvalKey::Static(key) => {
+                            self.builder.add_inst(InstKind::StoreProp {
+                                obj: obj.clone(),
+                                key,
+                                val: v,
+                                purity: Purity::Pure,
+                            });
+                        }
+                        EvalKey::Computed(idx) => {
+                            self.builder.add_inst(InstKind::StoreIndex {
+                                obj: obj.clone(),
+                                index: idx,
+                                val: v,
+                                purity: Purity::Pure,
+                            });
+                        }
+                    }
+                }
+                obj
+            }
         }
     }
 

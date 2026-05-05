@@ -1,11 +1,11 @@
 ---
 source: src/ir/lower_ssa.rs
+assertion_line: 2669
 expression: pretty_module(&m)
 ---
 fn @f(%0["x"]) {
   bb0:                                  ; preds: <none>
     %1 = load_prop_throws globalThis, "Math" ; reads_heap, may_throw
-    %2 = load_prop %1, "floor"          ; opaque
-    %3 = call %2(%0)                    ; opaque
-    ret %3
+    %2 = call_method %1, "floor", (%0)  ; opaque
+    ret %2
 }

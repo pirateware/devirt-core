@@ -472,9 +472,16 @@ impl LowerCtx<'_> {
                     // introduced by the unbound-write lowering.
                     let target = match obj {
                         Operand::Const(Constant::GlobalThis) => Expr::Ident(prop),
-                        _ => Expr::Member {
+                        _ if is_valid_js_ident(&prop) => Expr::Member {
                             obj: Box::new(self.operand_to_expr(obj)),
                             prop,
+                        },
+                        // Non-identifier key (e.g. "3", "foo bar") would
+                        // be a syntax error as `obj.<key>`. Emit as
+                        // computed access with the key as a string literal.
+                        _ => Expr::Index {
+                            obj: Box::new(self.operand_to_expr(obj)),
+                            index: Box::new(Expr::String(prop)),
                         },
                     };
                     out.push(Stmt::Assign {
@@ -559,9 +566,13 @@ impl LowerCtx<'_> {
                 // unbound-read lowering.
                 match obj {
                     Operand::Const(Constant::GlobalThis) => Expr::Ident(prop),
-                    _ => Expr::Member {
+                    _ if is_valid_js_ident(&prop) => Expr::Member {
                         obj: Box::new(self.operand_to_expr(obj)),
                         prop,
+                    },
+                    _ => Expr::Index {
+                        obj: Box::new(self.operand_to_expr(obj)),
+                        index: Box::new(Expr::String(prop)),
                     },
                 }
             }
@@ -608,7 +619,7 @@ impl LowerCtx<'_> {
             AllocClosure { func, captures } => {
                 self.alloc_closure_to_expr(*func, captures, pre_stmts)
             }
-            Construct { ctor, args } => Expr::Call {
+            Construct { ctor, args } => Expr::New {
                 callee: Box::new(self.operand_to_expr(ctor)),
                 args: args.iter().map(|a| self.operand_to_expr(a)).collect(),
             },
@@ -1314,7 +1325,68 @@ fn render_expr_to_string(e: &Expr) -> String {
                 .join(",")
         ),
         Expr::Func(_) => "/*func*/".to_string(),
+        Expr::Array { elements } => format!(
+            "[{}]",
+            elements
+                .iter()
+                .map(render_expr_to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Expr::Object { props } => {
+            let parts: Vec<String> = props
+                .iter()
+                .map(|p| {
+                    let k = match &p.key {
+                        crate::ir::tree::ObjectKey::Static(s) => format!("\"{s}\""),
+                        crate::ir::tree::ObjectKey::Computed(e) => {
+                            format!("[{}]", render_expr_to_string(e))
+                        }
+                    };
+                    format!("{k}:{}", render_expr_to_string(&p.value))
+                })
+                .collect();
+            format!("{{{}}}", parts.join(","))
+        }
+        Expr::New { callee, args } => format!(
+            "new {}({})",
+            render_expr_to_string(callee),
+            args.iter()
+                .map(render_expr_to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
     }
+}
+
+/// Conservative check: true iff `s` is a syntactically valid JS
+/// identifier (ASCII identifier-start followed by identifier-continue,
+/// not a reserved word). Used at emit time to decide between
+/// `obj.key` and `obj["key"]` for arbitrary string keys interned
+/// through StoreProp/LoadProp — keys whose source form is a numeric
+/// literal or string literal containing non-ident characters would
+/// otherwise round-trip as syntactically invalid JS.
+fn is_valid_js_ident(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let mut chars = s.chars();
+    let first = chars.next().unwrap();
+    if !(first == '_' || first == '$' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    for c in chars {
+        if !(c == '_' || c == '$' || c.is_ascii_alphanumeric()) {
+            return false;
+        }
+    }
+    // Conservative: don't bother filtering reserved words — using
+    // `obj["if"]` for a key named "if" is always safe even though
+    // `obj.if` is also legal in modern JS.
+    !matches!(
+        s,
+        "true" | "false" | "null" | "undefined" | "this" | "function" | "return"
+    )
 }
 
 fn find_value_for_inst(func: &Function, iid: InstId) -> Value {

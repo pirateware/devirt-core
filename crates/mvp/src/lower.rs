@@ -698,6 +698,91 @@ impl Lowerer<'_> {
                 Ok(Expr::Func(Box::new(self.lower_arrow_literal(a)?)))
             }
 
+            js::Expression::NewExpression(n) => {
+                let callee = self.lower_expr(&n.callee)?;
+                let mut args = Vec::with_capacity(n.arguments.len());
+                for a in &n.arguments {
+                    match a {
+                        js::Argument::SpreadElement(_) => {
+                            return Err(Error::Unsupported("spread in new args"));
+                        }
+                        other => {
+                            let e = other
+                                .as_expression()
+                                .ok_or(Error::Unsupported("non-expression new arg"))?;
+                            args.push(self.lower_expr(e)?);
+                        }
+                    }
+                }
+                Ok(Expr::New {
+                    callee: Box::new(callee),
+                    args,
+                })
+            }
+
+            js::Expression::ObjectExpression(obj) => {
+                let mut props = Vec::with_capacity(obj.properties.len());
+                for prop in &obj.properties {
+                    match prop {
+                        js::ObjectPropertyKind::ObjectProperty(p) => {
+                            if p.method || p.kind != js::PropertyKind::Init {
+                                return Err(Error::Unsupported(
+                                    "object method/getter/setter",
+                                ));
+                            }
+                            let value = self.lower_expr(&p.value)?;
+                            let key = if p.computed {
+                                let e = p.key.as_expression().ok_or(Error::Unsupported(
+                                    "non-expression computed key",
+                                ))?;
+                                ObjectKey::Computed(Box::new(self.lower_expr(e)?))
+                            } else {
+                                match &p.key {
+                                    js::PropertyKey::StaticIdentifier(id) => {
+                                        ObjectKey::Static(id.name.to_string())
+                                    }
+                                    js::PropertyKey::StringLiteral(s) => {
+                                        ObjectKey::Static(s.value.to_string())
+                                    }
+                                    js::PropertyKey::NumericLiteral(n) => {
+                                        ObjectKey::Static(n.value.to_string())
+                                    }
+                                    _ => {
+                                        return Err(Error::Unsupported("object key kind"));
+                                    }
+                                }
+                            };
+                            props.push(ObjectProp { key, value });
+                        }
+                        js::ObjectPropertyKind::SpreadProperty(_) => {
+                            return Err(Error::Unsupported("spread in object literal"));
+                        }
+                    }
+                }
+                Ok(Expr::Object { props })
+            }
+
+            js::Expression::ArrayExpression(arr) => {
+                let mut elements = Vec::with_capacity(arr.elements.len());
+                for el in &arr.elements {
+                    match el {
+                        js::ArrayExpressionElement::SpreadElement(_) => {
+                            return Err(Error::Unsupported("spread in array literal"));
+                        }
+                        js::ArrayExpressionElement::Elision(_) => {
+                            return Err(Error::Unsupported("elision in array literal"));
+                        }
+                        other => {
+                            let e = other
+                                .as_expression()
+                                .ok_or(Error::Unsupported("non-expression array element"))?;
+                            elements.push(self.lower_expr(e)?);
+                        }
+                    }
+                }
+                Ok(Expr::Array { elements })
+            }
+
             _ => Err(Error::Unsupported("expression kind")),
         }
     }

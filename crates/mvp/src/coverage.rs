@@ -172,6 +172,25 @@ fn walk_expr(e: &Expr, parent: &str, rows: &mut Vec<FunctionCoverage>) {
             walk_expr(obj, parent, rows);
             walk_expr(index, parent, rows);
         }
+        Expr::Array { elements } => {
+            for el in elements {
+                walk_expr(el, parent, rows);
+            }
+        }
+        Expr::Object { props } => {
+            for p in props {
+                if let crate::ir::tree::ObjectKey::Computed(e) = &p.key {
+                    walk_expr(e, parent, rows);
+                }
+                walk_expr(&p.value, parent, rows);
+            }
+        }
+        Expr::New { callee, args } => {
+            walk_expr(callee, parent, rows);
+            for a in args {
+                walk_expr(a, parent, rows);
+            }
+        }
         _ => {}
     }
 }

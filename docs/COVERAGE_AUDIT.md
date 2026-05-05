@@ -159,3 +159,66 @@ fully lowered. Items 4-6 are mop-up for the rest.
 Per the user's brief on this task, the audit stops at the
 recommendation. Implementation of items 1-6 is a follow-up ticket;
 direction depends on user approval.
+
+---
+
+## Round 2 (2026-05-05): array / object / `new` lowered
+
+Implemented items 1–3 from the recommendation: array literals, object
+literals (static / string / numeric / computed / shorthand keys), and
+`new` expressions. Method-call discrimination was also added (`obj.f(x)`
+now lowers to `CallMethod` instead of `LoadProp` + `Call`) — the latter
+silently broke `this`-binding for any instance method call inside a
+lowered body and was a prerequisite for the new functional tests to
+pass.
+
+### Handwritten corpus (after)
+
+| program | lowered fns | PT fns | top-level PT stmts | PT share | Δ |
+|---|---:|---:|---:|---:|---:|
+| 01_array_map | 0 | 0 | 3 | 100% | — |
+| 02_object_literal | 1 | 0 | 1 | **34%** | −66 pp |
+| 03_arithmetic_only | 3 | 0 | 0 | 0% | — |
+| 04_while_loop | 1 | 0 | 0 | 0% | — |
+| 05_member_chain | 1 | 0 | 0 | 0% | — |
+| 06_callback | 1 | 0 | 1 | 32% | — |
+| 07_for_loop | 0 | 0 | 4 | 100% | — |
+| 08_recursive | 1 | 0 | 1 | 19% | — |
+| 09_iife | 0 | 0 | 2 | 100% | — |
+| 10_closure | 2 | 0 | 3 | 32% | — |
+
+**Handwritten average passthrough share: ~42%** (was 58%).
+
+The single big win was 02_object_literal — `describe()` is now fully
+lowered. The other programs were either already at 0% or are dominated
+by *top-level driver statements* (`var x = ...; foo(x); console.log(x)`),
+which the metric counts as passthrough regardless of expression form.
+01_array_map, 07_for_loop, and 09_iife are entirely top-level — they
+don't have a function whose disposition could change. Lowering helped
+where it could; the rest is gated on different work.
+
+### Functional_equivalence corpus (after)
+
+The 14-program functional_equivalence corpus is unchanged: those
+programs don't use array/object literals or `new` in their bodies.
+Average passthrough share remains ~49% (most weight on the four
+inherently-PT cases: class, generator, try/catch, and the listify
+mixed test).
+
+### Verdict
+
+42% > 35% — per the spec's decision rule, **recommend implementing
+items 4–6 (C-style `for`, compound assignment, `++`/`--`, ternary)
+before Milestone 4**. The audit makes clear that `for` is the next
+single biggest lever: 07_for_loop and 09_iife both stay at 100%
+purely because of `for` constructs in their top-level driver code,
+and 06/08/10 each carry a top-level driver line that today is
+forced to PassThrough but would lower trivially under either (a)
+top-level statement lowering or (b) a `for` desugar.
+
+The new entry-point bug fixed in this round (Construct → bare `Call`
+in ssa-back) means `new Date()` etc. now actually round-trip
+correctly; this was latent because nothing emitted Construct before.
+
+**Decision pending:** the user's brief instructs Round 2 to stop
+here and surface the result. No further implementation.

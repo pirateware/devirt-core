@@ -162,6 +162,31 @@ pub enum Expr {
         index: Box<Expr>,
     },
     Func(Box<FuncLiteral>),
+    Array {
+        elements: Vec<Expr>,
+    },
+    Object {
+        props: Vec<ObjectProp>,
+    },
+    New {
+        callee: Box<Expr>,
+        args: Vec<Expr>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum ObjectKey {
+    /// Identifier or string-literal key. Stored as the string value;
+    /// emit decides quoting.
+    Static(String),
+    /// `{[expr]: v}` — key computed at runtime.
+    Computed(Box<Expr>),
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjectProp {
+    pub key: ObjectKey,
+    pub value: Expr,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -387,6 +412,28 @@ fn dump_expr(e: &Expr) -> String {
         ),
         Expr::Member { obj, prop } => format!("{}.{}", dump_expr(obj), prop),
         Expr::Index { obj, index } => format!("{}[{}]", dump_expr(obj), dump_expr(index)),
+        Expr::Array { elements } => format!(
+            "[{}]",
+            elements.iter().map(dump_expr).collect::<Vec<_>>().join(", ")
+        ),
+        Expr::Object { props } => {
+            let parts: Vec<String> = props
+                .iter()
+                .map(|p| {
+                    let k = match &p.key {
+                        ObjectKey::Static(s) => s.clone(),
+                        ObjectKey::Computed(e) => format!("[{}]", dump_expr(e)),
+                    };
+                    format!("{k}: {}", dump_expr(&p.value))
+                })
+                .collect();
+            format!("{{{}}}", parts.join(", "))
+        }
+        Expr::New { callee, args } => format!(
+            "new {}({})",
+            dump_expr(callee),
+            args.iter().map(dump_expr).collect::<Vec<_>>().join(", ")
+        ),
         Expr::Func(lit) => {
             let name = lit.name.as_deref().unwrap_or("<anon>");
             let kw = if lit.is_arrow {

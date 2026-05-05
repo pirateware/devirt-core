@@ -205,6 +205,25 @@ impl Ctx<'_> {
                 self.walk_expr(index);
             }
             Expr::Func(lit) => self.absorb_inner_captures(lit),
+            Expr::Array { elements } => {
+                for el in elements {
+                    self.walk_expr(el);
+                }
+            }
+            Expr::Object { props } => {
+                for p in props {
+                    if let crate::ir::tree::ObjectKey::Computed(e) = &p.key {
+                        self.walk_expr(e);
+                    }
+                    self.walk_expr(&p.value);
+                }
+            }
+            Expr::New { callee, args } => {
+                self.walk_expr(callee);
+                for a in args {
+                    self.walk_expr(a);
+                }
+            }
         }
     }
 

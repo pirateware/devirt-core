@@ -6,7 +6,8 @@
 use std::fmt::Write as _;
 
 use crate::ir::tree::{
-    Expr, FuncBody, FuncLiteral, IrFunction, Item, Module, Stmt, UnOp, binop_str, unop_str,
+    Expr, FuncBody, FuncLiteral, IrFunction, Item, Module, ObjectKey, Stmt, UnOp, binop_str,
+    unop_str,
 };
 
 /// Re-parse a PassThrough body via `oxc_parser` and serialize it back
@@ -412,6 +413,59 @@ impl Printer<'_> {
                 self.buf.push('[');
                 self.expr(index);
                 self.buf.push(']');
+            }
+            Expr::Array { elements } => {
+                self.buf.push('[');
+                for (i, el) in elements.iter().enumerate() {
+                    if i > 0 {
+                        self.buf.push_str(", ");
+                    }
+                    self.expr(el);
+                }
+                self.buf.push(']');
+            }
+            Expr::Object { props } => {
+                self.buf.push('{');
+                for (i, p) in props.iter().enumerate() {
+                    if i > 0 {
+                        self.buf.push_str(", ");
+                    }
+                    match &p.key {
+                        ObjectKey::Static(s) => {
+                            // Always emit a quoted string key — safe for
+                            // identifiers, numerics, and arbitrary text.
+                            self.buf.push('"');
+                            for c in s.chars() {
+                                match c {
+                                    '\\' => self.buf.push_str("\\\\"),
+                                    '"' => self.buf.push_str("\\\""),
+                                    c => self.buf.push(c),
+                                }
+                            }
+                            self.buf.push('"');
+                        }
+                        ObjectKey::Computed(e) => {
+                            self.buf.push('[');
+                            self.expr(e);
+                            self.buf.push(']');
+                        }
+                    }
+                    self.buf.push_str(": ");
+                    self.expr(&p.value);
+                }
+                self.buf.push('}');
+            }
+            Expr::New { callee, args } => {
+                self.buf.push_str("new ");
+                self.expr(callee);
+                self.buf.push('(');
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 {
+                        self.buf.push_str(", ");
+                    }
+                    self.expr(a);
+                }
+                self.buf.push(')');
             }
             Expr::Func(lit) => {
                 // Function expressions: parenthesize so the caller can

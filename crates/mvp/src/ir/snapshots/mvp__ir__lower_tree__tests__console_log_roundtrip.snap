@@ -1,14 +1,12 @@
 ---
 source: src/ir/lower_tree.rs
-assertion_line: 1011
+assertion_line: 1594
 expression: out
 ---
 function f() {
   let _t0;
   let _t1;
-  let _t2;
   _t0 = console;
-  _t1 = _t0.log;
-  _t2 = _t1("hi");
+  _t1 = _t0.log("hi");
   return;
 }

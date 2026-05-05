@@ -257,6 +257,78 @@ fn expr_lowerable(expr: &js::Expression) -> bool {
         FunctionExpression(f) => function_expr_lowerable(f),
         ArrowFunctionExpression(a) => arrow_lowerable(a),
 
+        NewExpression(n) => {
+            if !expr_lowerable(&n.callee) {
+                return false;
+            }
+            for a in &n.arguments {
+                match a {
+                    js::Argument::SpreadElement(_) => return false,
+                    other => match other.as_expression() {
+                        Some(e) => {
+                            if !expr_lowerable(e) {
+                                return false;
+                            }
+                        }
+                        None => return false,
+                    },
+                }
+            }
+            true
+        }
+
+        ObjectExpression(obj) => {
+            for prop in &obj.properties {
+                match prop {
+                    js::ObjectPropertyKind::ObjectProperty(p) => {
+                        if p.method || p.kind != js::PropertyKind::Init {
+                            return false;
+                        }
+                        if !expr_lowerable(&p.value) {
+                            return false;
+                        }
+                        if p.computed {
+                            match p.key.as_expression() {
+                                Some(e) => {
+                                    if !expr_lowerable(e) {
+                                        return false;
+                                    }
+                                }
+                                None => return false,
+                            }
+                        } else {
+                            match &p.key {
+                                js::PropertyKey::StaticIdentifier(_)
+                                | js::PropertyKey::StringLiteral(_)
+                                | js::PropertyKey::NumericLiteral(_) => {}
+                                _ => return false,
+                            }
+                        }
+                    }
+                    js::ObjectPropertyKind::SpreadProperty(_) => return false,
+                }
+            }
+            true
+        }
+
+        ArrayExpression(arr) => {
+            for el in &arr.elements {
+                match el {
+                    js::ArrayExpressionElement::SpreadElement(_) => return false,
+                    js::ArrayExpressionElement::Elision(_) => return false,
+                    other => match other.as_expression() {
+                        Some(e) => {
+                            if !expr_lowerable(e) {
+                                return false;
+                            }
+                        }
+                        None => return false,
+                    },
+                }
+            }
+            true
+        }
+
         _ => false,
     }
 }

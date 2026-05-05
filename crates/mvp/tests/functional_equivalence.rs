@@ -333,3 +333,79 @@ fn passthrough_capture_reassign_forces_inner_passthrough() {
     let harness = "console.log(outer());";
     assert_functional_equivalence(src, harness, "");
 }
+
+// === Round 2: array literals, object literals, new expression ===
+
+#[test]
+fn array_literal_returned() {
+    let src = "function make() { return [1, 2, 3]; }";
+    let harness = "console.log(make().join(',')); console.log(make().length);";
+    assert_functional_equivalence(src, harness, "");
+}
+
+#[test]
+fn nested_array_literal() {
+    let src = "function make() { return [[1, 2], [3, 4]]; }";
+    let harness = "var x = make(); console.log(x[0][1] + x[1][0]);";
+    assert_functional_equivalence(src, harness, "");
+}
+
+#[test]
+fn object_literal_property_forms() {
+    // Static identifier, string literal, numeric, computed, shorthand keys.
+    let src = r#"
+        function build(x) {
+            var k = "dyn";
+            return { a: 1, "b": 2, 3: "three", [k]: "d", x };
+        }
+    "#;
+    let harness = r#"
+        var o = build("sh");
+        console.log(o.a, o.b, o[3], o.dyn, o.x);
+    "#;
+    assert_functional_equivalence(src, harness, "");
+}
+
+#[test]
+fn new_expression_user_ctor() {
+    // Foo's body uses `this.v`, so Foo itself goes to PassThrough; the
+    // `make` body lowers and should emit `new Foo(42)` — the lowered
+    // round-trip is the path under test here.
+    let src = r#"
+        function Foo(v) { this.v = v; }
+        function make() { var f = new Foo(42); return f.v; }
+    "#;
+    let harness = "console.log(make());";
+    assert_functional_equivalence(src, harness, "");
+}
+
+#[test]
+fn new_with_builtin_constructors() {
+    // `new Date(2026, 0, 1)` and `new Array(3)`: confirms `new` vs
+    // bare-call distinction round-trips intact (`Array()` and `Array(3)`
+    // produce different results from `new Array(3)`).
+    let src = r#"
+        function years() { var d = new Date(2026, 0, 1); return d.getFullYear(); }
+        function alen() { var a = new Array(3); return a.length; }
+    "#;
+    let harness = "console.log(years()); console.log(alen());";
+    assert_functional_equivalence(src, harness, "");
+}
+
+#[test]
+fn mixed_array_object_new() {
+    // The spec's combined test: array literal, object literals (mixed
+    // keys), and `new` in one function.
+    let src = r#"
+        function make() {
+            var pairs = [{ k: 1, v: "a" }, { k: 2, v: "b" }];
+            var d = new Date(2026, 0, 1);
+            return [pairs, d.getFullYear()];
+        }
+    "#;
+    let harness = r#"
+        var r = make();
+        console.log(r[0][0].k, r[0][1].v, r[1]);
+    "#;
+    assert_functional_equivalence(src, harness, "");
+}
