@@ -253,7 +253,20 @@ fn collect_for_of_stmt_blockers(f: &js::ForOfStatement, blockers: &mut BTreeSet<
 
 fn collect_for_init_blockers(init: &js::ForStatementInit, blockers: &mut BTreeSet<BlockerKind>) {
     match init {
-        js::ForStatementInit::VariableDeclaration(decl) => collect_var_decl_blockers(decl, blockers),
+        js::ForStatementInit::VariableDeclaration(decl) => {
+            // For-init multi-declarator can't be split into separate statements
+            // (for-init expects a single declaration node), so it stays blocked.
+            if decl.declarations.len() != 1 {
+                blockers.insert(BlockerKind::MultipleDeclarators);
+                for d in &decl.declarations {
+                    if let Some(e) = &d.init {
+                        collect_expr_blockers(e, blockers);
+                    }
+                }
+                return;
+            }
+            collect_var_decl_blockers(decl, blockers);
+        }
         other => match other.as_expression() {
             Some(e) => collect_expr_blockers(e, blockers),
             None => {
@@ -264,32 +277,23 @@ fn collect_for_init_blockers(init: &js::ForStatementInit, blockers: &mut BTreeSe
 }
 
 fn collect_var_decl_blockers(decl: &js::VariableDeclaration, blockers: &mut BTreeSet<BlockerKind>) {
-    if decl.declarations.len() != 1 {
-        blockers.insert(BlockerKind::MultipleDeclarators);
-        for d in &decl.declarations {
-            if let Some(e) = &d.init {
-                collect_expr_blockers(e, blockers);
-            }
-        }
-        return;
-    }
-    let d = &decl.declarations[0];
-    if !matches!(d.id.kind, js::BindingPatternKind::BindingIdentifier(_)) {
-        blockers.insert(BlockerKind::DestructuringBinding);
-    }
+    // Statement-level multi-declarator declarations are lowered by splitting into N
+    // separate single-declarator statements, so they are no longer a blocker.
+    // Check each declarator independently.
     match decl.kind {
-        js::VariableDeclarationKind::Let | js::VariableDeclarationKind::Var => {
-            if let Some(e) = &d.init {
-                collect_expr_blockers(e, blockers);
-            }
-        }
-        js::VariableDeclarationKind::Const => {
-            if let Some(e) = &d.init {
-                collect_expr_blockers(e, blockers);
-            }
-        }
+        js::VariableDeclarationKind::Let
+        | js::VariableDeclarationKind::Var
+        | js::VariableDeclarationKind::Const => {}
         _ => {
             blockers.insert(BlockerKind::UnsupportedVarKind);
+        }
+    }
+    for d in &decl.declarations {
+        if !matches!(d.id.kind, js::BindingPatternKind::BindingIdentifier(_)) {
+            blockers.insert(BlockerKind::DestructuringBinding);
+        }
+        if let Some(e) = &d.init {
+            collect_expr_blockers(e, blockers);
         }
     }
 }

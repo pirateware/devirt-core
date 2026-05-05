@@ -105,6 +105,39 @@ fn update_lowers_in_function_body() {
     let _ = roundtrip(src);
 }
 
+/// Regression: previously caused infinite recursion in `lower_tree::walk`.
+///
+/// Shape: a `while`/`for` loop whose body contains a nested if whose
+/// branches return on one side and continue (back-edge) on the other.
+/// `find_diamond_join` would pick a non-header join (an early-return
+/// block) as `inner_stop`, the recursive `walk` on the back-edge branch
+/// would then re-enter the loop header *without* the header being its
+/// `stop`, hit the cached `loop_info`, and recursively re-emit the loop
+/// — eating the stack. Fixed by tracking `loop_headers_open` and
+/// emitting `continue` when re-entering an open header.
+///
+/// Discovered on `lodash_cloneDeep.high.js` (assocIndexOf). This is the
+/// minimal hand-written reproducer.
+#[test]
+fn nested_if_with_continue_in_loop_does_not_recurse_forever() {
+    let src = r#"
+        function find(arr, target) {
+            for (var i = 0; i < arr.length; i++) {
+                if (arr[i] === target) {
+                    if (i > 10) {
+                        return i;
+                    } else {
+                        return -1;
+                    }
+                }
+            }
+            return -1;
+        }
+    "#;
+    let out = ssa_roundtrip(src);
+    assert!(out.contains("while"), "SSA round-trip must emit a loop: {out}");
+}
+
 /// Top-level `class` / `for` and other constructs the lowering can't
 /// represent are now preserved as verbatim source slices via
 /// `Item::PassThroughStmt` — the same fallback strategy used for
@@ -163,6 +196,165 @@ fn passthrough_try_catch() {
     assert!(out.contains("try"), "try should survive: {out}");
     assert!(out.contains("catch"), "catch should survive: {out}");
     parse_and_lower(&out).expect("emitted JS must re-parse");
+}
+
+// === Corpus parse-only regression check ===
+
+#[test]
+fn tier1_corpus_parse_and_lower_no_overflow() {
+    // Check that the full pipeline doesn't overflow for any tier1 corpus file.
+    // This catches regressions where newly-Lowered functions overflow the
+    // recursive descent in either the parse or SSA lowering phase.
+    const FILES: &[(&str, &str)] = &[
+        ("datefns_addDays", include_str!("../../../corpus/realworld/tier1/datefns_addDays.js")),
+        ("datefns_addMonths", include_str!("../../../corpus/realworld/tier1/datefns_addMonths.js")),
+        ("datefns_differenceInDays", include_str!("../../../corpus/realworld/tier1/datefns_differenceInDays.js")),
+        ("datefns_endOfMonth", include_str!("../../../corpus/realworld/tier1/datefns_endOfMonth.js")),
+        ("datefns_format", include_str!("../../../corpus/realworld/tier1/datefns_format.js")),
+        ("datefns_formatDistance", include_str!("../../../corpus/realworld/tier1/datefns_formatDistance.js")),
+        ("datefns_getDay", include_str!("../../../corpus/realworld/tier1/datefns_getDay.js")),
+        ("datefns_isAfter", include_str!("../../../corpus/realworld/tier1/datefns_isAfter.js")),
+        ("datefns_isBefore", include_str!("../../../corpus/realworld/tier1/datefns_isBefore.js")),
+        ("datefns_parseISO", include_str!("../../../corpus/realworld/tier1/datefns_parseISO.js")),
+        ("datefns_startOfDay", include_str!("../../../corpus/realworld/tier1/datefns_startOfDay.js")),
+        ("datefns_subDays", include_str!("../../../corpus/realworld/tier1/datefns_subDays.js")),
+        ("lodash_camelCase", include_str!("../../../corpus/realworld/tier1/lodash_camelCase.js")),
+        ("lodash_capitalize", include_str!("../../../corpus/realworld/tier1/lodash_capitalize.js")),
+        ("lodash_chunk", include_str!("../../../corpus/realworld/tier1/lodash_chunk.js")),
+        ("lodash_cloneDeep", include_str!("../../../corpus/realworld/tier1/lodash_cloneDeep.js")),
+        ("lodash_compact", include_str!("../../../corpus/realworld/tier1/lodash_compact.js")),
+        ("lodash_constant", include_str!("../../../corpus/realworld/tier1/lodash_constant.js")),
+        ("lodash_curry", include_str!("../../../corpus/realworld/tier1/lodash_curry.js")),
+        ("lodash_debounce", include_str!("../../../corpus/realworld/tier1/lodash_debounce.js")),
+        ("lodash_difference", include_str!("../../../corpus/realworld/tier1/lodash_difference.js")),
+        ("lodash_escape", include_str!("../../../corpus/realworld/tier1/lodash_escape.js")),
+        ("lodash_flatten", include_str!("../../../corpus/realworld/tier1/lodash_flatten.js")),
+        ("lodash_flow", include_str!("../../../corpus/realworld/tier1/lodash_flow.js")),
+        ("lodash_get", include_str!("../../../corpus/realworld/tier1/lodash_get.js")),
+        ("lodash_groupBy", include_str!("../../../corpus/realworld/tier1/lodash_groupBy.js")),
+        ("lodash_has", include_str!("../../../corpus/realworld/tier1/lodash_has.js")),
+        ("lodash_identity", include_str!("../../../corpus/realworld/tier1/lodash_identity.js")),
+        ("lodash_intersection", include_str!("../../../corpus/realworld/tier1/lodash_intersection.js")),
+        ("lodash_invert", include_str!("../../../corpus/realworld/tier1/lodash_invert.js")),
+        ("lodash_isEqual", include_str!("../../../corpus/realworld/tier1/lodash_isEqual.js")),
+        ("lodash_isPlainObject", include_str!("../../../corpus/realworld/tier1/lodash_isPlainObject.js")),
+        ("lodash_kebabCase", include_str!("../../../corpus/realworld/tier1/lodash_kebabCase.js")),
+        ("lodash_keyBy", include_str!("../../../corpus/realworld/tier1/lodash_keyBy.js")),
+        ("lodash_mapKeys", include_str!("../../../corpus/realworld/tier1/lodash_mapKeys.js")),
+        ("lodash_mapValues", include_str!("../../../corpus/realworld/tier1/lodash_mapValues.js")),
+        ("lodash_memoize", include_str!("../../../corpus/realworld/tier1/lodash_memoize.js")),
+        ("lodash_merge", include_str!("../../../corpus/realworld/tier1/lodash_merge.js")),
+        ("lodash_noop", include_str!("../../../corpus/realworld/tier1/lodash_noop.js")),
+        ("lodash_omit", include_str!("../../../corpus/realworld/tier1/lodash_omit.js")),
+        ("lodash_orderBy", include_str!("../../../corpus/realworld/tier1/lodash_orderBy.js")),
+        ("lodash_partial", include_str!("../../../corpus/realworld/tier1/lodash_partial.js")),
+        ("lodash_partition", include_str!("../../../corpus/realworld/tier1/lodash_partition.js")),
+        ("lodash_pick", include_str!("../../../corpus/realworld/tier1/lodash_pick.js")),
+        ("lodash_range", include_str!("../../../corpus/realworld/tier1/lodash_range.js")),
+        ("lodash_set", include_str!("../../../corpus/realworld/tier1/lodash_set.js")),
+        ("lodash_snakeCase", include_str!("../../../corpus/realworld/tier1/lodash_snakeCase.js")),
+        ("lodash_sortBy", include_str!("../../../corpus/realworld/tier1/lodash_sortBy.js")),
+        ("lodash_startCase", include_str!("../../../corpus/realworld/tier1/lodash_startCase.js")),
+        ("lodash_throttle", include_str!("../../../corpus/realworld/tier1/lodash_throttle.js")),
+        ("lodash_times", include_str!("../../../corpus/realworld/tier1/lodash_times.js")),
+        ("lodash_union", include_str!("../../../corpus/realworld/tier1/lodash_union.js")),
+        ("lodash_uniq", include_str!("../../../corpus/realworld/tier1/lodash_uniq.js")),
+        ("lodash_uniqBy", include_str!("../../../corpus/realworld/tier1/lodash_uniqBy.js")),
+        ("lodash_without", include_str!("../../../corpus/realworld/tier1/lodash_without.js")),
+        ("lodash_zip", include_str!("../../../corpus/realworld/tier1/lodash_zip.js")),
+    ];
+    for (name, src) in FILES {
+        let tm = parse_and_lower(src).unwrap_or_else(|e| panic!("{name}: parse_and_lower failed: {e:?}"));
+        let sm = lower_ssa::lower_module(&tm);
+        sm.validate().unwrap_or_else(|e| panic!("{name}: SSA validation failed: {e:?}"));
+        let tm2 = lower_tree::lower_module(&sm);
+        let out = emit::emit(&tm2);
+        parse_and_lower(&out).unwrap_or_else(|e| panic!("{name}: re-parse failed: {e:?}"));
+    }
+}
+
+// === MultipleDeclarators lowering tests ===
+
+#[test]
+fn multi_declarator_var_lowers_to_separate_stmts() {
+    let src = "function f() { var a = 1, b = 2; return a + b; }";
+    let m = parse_and_lower(src).expect("multi-declarator var must lower");
+    assert!(
+        matches!(m.items[0], ir::tree::Item::Function(_)),
+        "multi-declarator var function must be Lowered: {:?}",
+        m.items[0]
+    );
+    let out = roundtrip(src);
+    assert!(out.contains("let a"), "expected `let a` in: {out}");
+    assert!(out.contains("let b"), "expected `let b` in: {out}");
+}
+
+#[test]
+fn multi_declarator_let_no_init_no_spurious_assignment() {
+    // `let x, y = 1;` — x has no initializer. The lowering must NOT emit
+    // `x = undefined`, which would be observable via property descriptors.
+    let src = "function f() { let x, y = 1; return y; }";
+    let m = parse_and_lower(src).expect("multi-declarator let must lower");
+    assert!(matches!(m.items[0], ir::tree::Item::Function(_)));
+    let out = roundtrip(src);
+    assert!(
+        !out.contains("x = undefined"),
+        "spurious `x = undefined` found in: {out}"
+    );
+    assert!(out.contains("let x"), "expected bare `let x` in: {out}");
+    assert!(out.contains("let y"), "expected `let y` in: {out}");
+}
+
+#[test]
+fn multi_declarator_let_second_can_reference_first() {
+    // `let x = 1, y = x + 1;` — after splitting into two separate `let` statements,
+    // the second initializer still sees `x` because it's evaluated left-to-right.
+    let src = "function f() { let x = 1, y = x + 1; return y; }";
+    let m = parse_and_lower(src).expect("must lower");
+    assert!(matches!(m.items[0], ir::tree::Item::Function(_)));
+    let out = roundtrip(src);
+    // Both bindings must appear as separate let statements in declaration order.
+    let x_pos = out.find("let x").expect("`let x` missing in: {out}");
+    let y_pos = out.find("let y").expect("`let y` missing in: {out}");
+    assert!(x_pos < y_pos, "`let x` must precede `let y` in: {out}");
+}
+
+#[test]
+fn multi_declarator_const_lowers() {
+    let src = "function f() { const p = 1, q = 2; return p + q; }";
+    let m = parse_and_lower(src).expect("multi-declarator const must lower");
+    assert!(matches!(m.items[0], ir::tree::Item::Function(_)));
+    let out = roundtrip(src);
+    assert!(out.contains("const p"), "expected `const p` in: {out}");
+    assert!(out.contains("const q"), "expected `const q` in: {out}");
+}
+
+#[test]
+fn multi_declarator_destructuring_stays_pass_through() {
+    // Each declarator with a destructuring pattern is still a blocker (DestructuringBinding).
+    // The function must be PassThrough, but the source must survive verbatim.
+    let src = "function f(x, y) { let {a} = x, [b] = y; return a + b; }";
+    let m = parse_and_lower(src).expect("PassThrough must not error");
+    assert!(
+        matches!(m.items[0], ir::tree::Item::PassThroughFunction(_)),
+        "destructuring multi-declarator must remain PassThrough: {:?}",
+        m.items[0]
+    );
+    let out = emit(&m);
+    assert!(out.contains("let {a}") || out.contains("let {"), "source must survive: {out}");
+    parse_and_lower(&out).expect("emitted JS must re-parse");
+}
+
+#[test]
+fn multi_declarator_sole_blocker_becomes_lowered() {
+    // A function whose only blocker was MultipleDeclarators is now fully Lowered.
+    let src = "function onlyMultiDecl() { var a = 1, b = 2, c = 3; return a + b + c; }";
+    let m = parse_and_lower(src).expect("sole-blocker function must lower");
+    assert!(
+        matches!(m.items[0], ir::tree::Item::Function(_)),
+        "sole-MultipleDeclarators function must become Lowered: {:?}",
+        m.items[0]
+    );
 }
 
 // === T2 Stream C pin + oxc_codegen tests ===

@@ -145,3 +145,55 @@ fn async_function_expr_inside_function_blocked() {
     let b = blockers_of("function f() { let g = async function() {}; }");
     assert!(b.contains(&BlockerKind::AsyncFunction), "{b:?}");
 }
+
+// --- MultipleDeclarators: no longer a blocker for statement-level declarations ---
+
+#[test]
+fn multi_declarator_var_is_lowered() {
+    assert_eq!(
+        decide_first_fn("function f() { var a = 1, b = 2; return a + b; }"),
+        Disposition::Lowered
+    );
+}
+
+#[test]
+fn multi_declarator_let_no_init_is_lowered() {
+    assert_eq!(
+        decide_first_fn("function f() { let x, y = 1; return y; }"),
+        Disposition::Lowered
+    );
+}
+
+#[test]
+fn multi_declarator_const_is_lowered() {
+    assert_eq!(
+        decide_first_fn("function f() { const p = 1, q = 2; return p + q; }"),
+        Disposition::Lowered
+    );
+}
+
+#[test]
+fn multi_declarator_destructuring_reports_destructuring_not_multiple() {
+    // Each declarator with a destructuring pattern should report DestructuringBinding,
+    // not MultipleDeclarators on the whole declaration.
+    let b = blockers_of("function f(x, y) { let {a} = x, [b] = y; return a + b; }");
+    assert!(
+        b.contains(&BlockerKind::DestructuringBinding),
+        "expected DestructuringBinding in {b:?}"
+    );
+    assert!(
+        !b.contains(&BlockerKind::MultipleDeclarators),
+        "MultipleDeclarators should not appear for destructuring split: {b:?}"
+    );
+}
+
+#[test]
+fn multi_declarator_in_for_init_still_blocked() {
+    // For-init multi-declarator cannot be split into multiple statements, so
+    // it stays as a MultipleDeclarators blocker until the for-init ticket lands.
+    let b = blockers_of("function f() { for (let a = 1, b = 2; a < 10; a++) {} }");
+    assert!(
+        b.contains(&BlockerKind::MultipleDeclarators),
+        "expected MultipleDeclarators for for-init in {b:?}"
+    );
+}

@@ -245,11 +245,7 @@ impl Lowerer<'_> {
             }
         }
 
-        let stmts = body
-            .statements
-            .iter()
-            .map(|s| self.lower_stmt(s))
-            .collect::<Result<Vec<_>, _>>()?;
+        let stmts = self.lower_stmts_list(&body.statements)?;
 
         Ok(Item::Function(IrFunction {
             name: name.to_string(),
@@ -392,11 +388,7 @@ impl Lowerer<'_> {
             }
         }
 
-        let stmts = body
-            .statements
-            .iter()
-            .map(|s| self.lower_stmt(s))
-            .collect::<Result<Vec<_>, _>>()?;
+        let stmts = self.lower_stmts_list(&body.statements)?;
 
         // Stash the body's source slice so pass 1 of SSA lowering can
         // re-classify this literal to PassThrough cheaply if the
@@ -465,12 +457,7 @@ impl Lowerer<'_> {
                 pt,
             )
         } else {
-            let stmts = a
-                .body
-                .statements
-                .iter()
-                .map(|s| self.lower_stmt(s))
-                .collect::<Result<Vec<_>, _>>()?;
+            let stmts = self.lower_stmts_list(&a.body.statements)?;
             let pt = self.slice_body_inner(a.body.span()).map(|s| s.to_string());
             (FuncBody::Stmts(stmts), pt)
         };
@@ -561,7 +548,14 @@ impl Lowerer<'_> {
 
     fn lower_stmt(&self, stmt: &js::Statement) -> Result<Stmt, Error> {
         match stmt {
-            js::Statement::VariableDeclaration(decl) => self.lower_var_decl(decl),
+            js::Statement::VariableDeclaration(decl) => {
+                // Single-declarator path only — multi-declarator is handled by
+                // lower_stmts_list / stmts_from which expand the decl in-place.
+                // Disposition guarantees single-declarator in for-init contexts.
+                let mut stmts = self.lower_var_decl(decl)?;
+                debug_assert_eq!(stmts.len(), 1, "lower_stmt called for multi-declarator decl");
+                stmts.into_iter().next().ok_or_else(|| Error::Malformed("empty var decl".into()))
+            }
             js::Statement::ExpressionStatement(es) => self.lower_expr_stmt(&es.expression),
             js::Statement::ReturnStatement(r) => {
                 let v = match &r.argument {
@@ -583,12 +577,7 @@ impl Lowerer<'_> {
                 body: self.stmts_from(&s.body)?,
             }),
             js::Statement::BlockStatement(b) => {
-                let stmts = b
-                    .body
-                    .iter()
-                    .map(|s| self.lower_stmt(s))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(Stmt::Block(stmts))
+                Ok(Stmt::Block(self.lower_stmts_list(&b.body)?))
             }
             js::Statement::FunctionDeclaration(f) => {
                 Ok(Stmt::FuncDecl(self.lower_function_literal(f, true)?))
@@ -610,7 +599,10 @@ impl Lowerer<'_> {
         let init = match &f.init {
             None => None,
             Some(js::ForStatementInit::VariableDeclaration(decl)) => {
-                Some(Box::new(self.lower_var_decl(decl)?))
+                // Disposition blocks multi-declarator for-init, so exactly one stmt here.
+                let mut stmts = self.lower_var_decl(decl)?;
+                debug_assert_eq!(stmts.len(), 1, "for-init must have single declarator");
+                Some(Box::new(stmts.remove(0)))
             }
             Some(other) => {
                 let e = other
@@ -671,12 +663,7 @@ impl Lowerer<'_> {
     }
 
     fn lower_try_stmt(&self, t: &js::TryStatement) -> Result<Stmt, Error> {
-        let body = t
-            .block
-            .body
-            .iter()
-            .map(|s| self.lower_stmt(s))
-            .collect::<Result<Vec<_>, _>>()?;
+        let body = self.lower_stmts_list(&t.block.body)?;
 
         let catch = match &t.handler {
             None => None,
@@ -689,55 +676,65 @@ impl Lowerer<'_> {
                         _ => unreachable!("disposition rejected non-identifier catch param"),
                     }
                 });
-                let catch_body = handler
-                    .body
-                    .body
-                    .iter()
-                    .map(|s| self.lower_stmt(s))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let catch_body = self.lower_stmts_list(&handler.body.body)?;
                 Some((param_name, catch_body))
             }
         };
 
         let finally = match &t.finalizer {
             None => None,
-            Some(finalizer) => {
-                let finally_body = finalizer
-                    .body
-                    .iter()
-                    .map(|s| self.lower_stmt(s))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Some(finally_body)
-            }
+            Some(finalizer) => Some(self.lower_stmts_list(&finalizer.body)?),
         };
 
         Ok(Stmt::Try { body, catch, finally })
     }
 
-    fn lower_var_decl(&self, decl: &js::VariableDeclaration) -> Result<Stmt, Error> {
-        if decl.declarations.len() != 1 {
-            return Err(Error::Unsupported("multi-declarator variable declaration"));
+    /// Lower a variable declaration, returning one `Stmt` per declarator.
+    ///
+    /// Returning a `Vec` lets the caller flat-map multi-declarator declarations
+    /// into the surrounding statement list without creating a new block scope.
+    /// Disposition ensures that for-init declarations always have exactly one
+    /// declarator (multi-declarator for-init stays blocked), so callers in
+    /// for-init position can safely unwrap the single element.
+    fn lower_var_decl(&self, decl: &js::VariableDeclaration) -> Result<Vec<Stmt>, Error> {
+        let mut stmts = Vec::with_capacity(decl.declarations.len());
+        for d in &decl.declarations {
+            let name = match &d.id.kind {
+                js::BindingPatternKind::BindingIdentifier(id) => id.name.to_string(),
+                _ => return Err(Error::Unsupported("destructuring binding")),
+            };
+            let init = match &d.init {
+                Some(e) => Some(self.lower_expr(e)?),
+                None => None,
+            };
+            let stmt = match decl.kind {
+                js::VariableDeclarationKind::Let | js::VariableDeclarationKind::Var => {
+                    Stmt::Let { name, init }
+                }
+                js::VariableDeclarationKind::Const => {
+                    let init = init
+                        .ok_or_else(|| Error::Malformed("const without initializer".into()))?;
+                    Stmt::Const { name, init }
+                }
+                _ => return Err(Error::Unsupported("`using` declaration")),
+            };
+            stmts.push(stmt);
         }
-        let d = &decl.declarations[0];
-        let name = match &d.id.kind {
-            js::BindingPatternKind::BindingIdentifier(id) => id.name.to_string(),
-            _ => return Err(Error::Unsupported("destructuring binding")),
-        };
-        let init = match &d.init {
-            Some(e) => Some(self.lower_expr(e)?),
-            None => None,
-        };
-        match decl.kind {
-            js::VariableDeclarationKind::Let | js::VariableDeclarationKind::Var => {
-                Ok(Stmt::Let { name, init })
+        Ok(stmts)
+    }
+
+    /// Lower a slice of JS statements, expanding multi-declarator declarations
+    /// in-place so the result is a flat IR statement list.
+    fn lower_stmts_list(&self, stmts: &[js::Statement]) -> Result<Vec<Stmt>, Error> {
+        let mut out = Vec::with_capacity(stmts.len());
+        for s in stmts {
+            if let js::Statement::VariableDeclaration(decl) = s {
+                out.extend(self.lower_var_decl(decl)?);
+            } else {
+                out.push(self.lower_stmt(s)?);
             }
-            js::VariableDeclarationKind::Const => {
-                let init =
-                    init.ok_or_else(|| Error::Malformed("const without initializer".into()))?;
-                Ok(Stmt::Const { name, init })
-            }
-            _ => Err(Error::Unsupported("`using` declaration")),
         }
+        Ok(out)
     }
 
     fn lower_expr_stmt(&self, expr: &js::Expression) -> Result<Stmt, Error> {
@@ -842,7 +839,9 @@ impl Lowerer<'_> {
 
     fn stmts_from(&self, stmt: &js::Statement) -> Result<Vec<Stmt>, Error> {
         if let js::Statement::BlockStatement(b) = stmt {
-            b.body.iter().map(|s| self.lower_stmt(s)).collect()
+            self.lower_stmts_list(&b.body)
+        } else if let js::Statement::VariableDeclaration(decl) = stmt {
+            self.lower_var_decl(decl)
         } else {
             Ok(vec![self.lower_stmt(stmt)?])
         }

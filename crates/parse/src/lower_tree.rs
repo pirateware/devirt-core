@@ -52,7 +52,31 @@ pub fn lower_module(sm: &ssa::Module) -> tree::Module {
     lower_module_with_config(sm, &EmitConfig::default())
 }
 
+/// Lowering walks structured CFG via recursion proportional to the deepest
+/// nested conditional in the source. Heavily-obfuscated minified inputs
+/// (e.g. tier-3 lodash bundles) routinely nest 10⁴–10⁵ levels and overflow
+/// the default 2–8 MB thread stack. Run lowering on a dedicated 64 MB
+/// stack so real-world inputs don't crash the host. Any deeper input
+/// indicates a genuine bug — fail loud rather than silently grow.
+const LOWER_STACK_SIZE: usize = 64 * 1024 * 1024;
+
 pub fn lower_module_with_config(sm: &ssa::Module, cfg: &EmitConfig) -> tree::Module {
+    std::thread::scope(|s| {
+        let handle = std::thread::Builder::new()
+            .stack_size(LOWER_STACK_SIZE)
+            .spawn_scoped(s, || lower_module_inner(sm, cfg))
+            .expect("failed to spawn lower_tree worker thread");
+        match handle.join() {
+            Ok(m) => m,
+            // Propagate the original panic so `#[should_panic(expected = ...)]`
+            // and any caller-side panic-message inspection still see the
+            // unwrapped payload.
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    })
+}
+
+fn lower_module_inner(sm: &ssa::Module, cfg: &EmitConfig) -> tree::Module {
     // Functions that are the target of an `AllocClosure` are NOT
     // top-level — they're emitted inline as `Expr::Func` / `Stmt::FuncDecl`
     // by their containing function's lowering. Skip them here so the
@@ -265,7 +289,31 @@ struct LowerCtx<'a> {
     /// lowers an inner Lowered body — each entry is the source-level
     /// expression text the outer scope uses for that capture slot.
     capture_names: Vec<String>,
+
+    // ----- runaway-recursion diagnostics --------------------------------
+    // Active call-stack of `walk` invocations and per-block visit counter.
+    // Three failure modes we want to distinguish:
+    //   1. true deep nesting — `walk_stack.len()` huge, all entries distinct
+    //   2. cycle / re-traversal — same BlockId appears at multiple stack depths
+    //   3. exponential re-traversal without cycles — total `visit_counts` blow
+    //      up while `walk_stack` stays modest (missing memoization)
+    walk_stack: Vec<BlockId>,
+    visit_counts: HashMap<BlockId, u64>,
+    walk_total_visits: u64,
+
+    /// Loop headers whose bodies are currently being emitted. Innermost
+    /// last. When `walk` re-enters one of these (e.g. from a back-edge
+    /// nested inside an if/else inside the body), the header has already
+    /// been emitted as a `Stmt::While`; the right thing is to emit
+    /// `continue` and return rather than recursively re-emitting the
+    /// loop. Without this, `pass_through_stop` from a sibling diamond
+    /// shadows the loop's header-stop and walk recurses through the
+    /// back-edge forever.
+    loop_headers_open: Vec<BlockId>,
 }
+
+const WALK_STACK_LIMIT: usize = 50_000;
+const WALK_TOTAL_VISIT_LIMIT: u64 = 5_000_000;
 
 #[derive(Clone, Copy, Debug)]
 struct LoopInfo {
@@ -290,7 +338,126 @@ impl<'a> LowerCtx<'a> {
             loop_info_cache: HashMap::new(),
             dom_cache: HashMap::new(),
             capture_names,
+            walk_stack: Vec::new(),
+            visit_counts: HashMap::new(),
+            walk_total_visits: 0,
+            loop_headers_open: Vec::new(),
         }
+    }
+
+    fn diagnose_walk_runaway(&self, reason: &str) -> ! {
+        let stack_len = self.walk_stack.len();
+        let distinct: HashSet<BlockId> = self.walk_stack.iter().copied().collect();
+        let distinct_len = distinct.len();
+        let total_visits: u64 = self.walk_total_visits;
+
+        // Repeats currently on the active call-stack — case 2 signal.
+        let mut on_stack_counts: HashMap<BlockId, u32> = HashMap::new();
+        for &b in &self.walk_stack {
+            *on_stack_counts.entry(b).or_insert(0) += 1;
+        }
+        let mut repeats: Vec<(BlockId, u32)> = on_stack_counts
+            .into_iter()
+            .filter(|(_, n)| *n > 1)
+            .collect();
+        repeats.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        let top_repeats: Vec<String> = repeats
+            .iter()
+            .take(10)
+            .map(|(b, n)| format!("bb{}×{}", b.0, n))
+            .collect();
+
+        // Most-visited blocks across the whole walk — case 3 signal.
+        let mut by_visits: Vec<(BlockId, u64)> =
+            self.visit_counts.iter().map(|(b, n)| (*b, *n)).collect();
+        by_visits.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        let top_visited: Vec<String> = by_visits
+            .iter()
+            .take(10)
+            .map(|(b, n)| format!("bb{}={}", b.0, n))
+            .collect();
+
+        // CFG dump for the offending function: each block, terminator kind,
+        // successors. Bounded to the visited blocks so output stays small.
+        let mut visited_blocks: Vec<BlockId> = self.visit_counts.keys().copied().collect();
+        visited_blocks.sort_by_key(|b| b.0);
+        let mut cfg_dump = String::new();
+        for b in &visited_blocks {
+            let term = &self.func.lowered().blocks[b.0 as usize].terminator;
+            let succs: Vec<String> = term
+                .successors()
+                .into_iter()
+                .map(|(s, _)| format!("bb{}", s.0))
+                .collect();
+            let kind = match term {
+                Terminator::Branch { .. } => "Branch",
+                Terminator::CondBranch { .. } => "CondBranch",
+                Terminator::Switch { .. } => "Switch",
+                Terminator::Return { .. } => "Return",
+                Terminator::Throw { .. } => "Throw",
+                Terminator::Unreachable => "Unreachable",
+            };
+            let preds: Vec<String> = self.func.lowered().blocks[b.0 as usize]
+                .predecessors
+                .iter()
+                .map(|p| format!("bb{}", p.0))
+                .collect();
+            cfg_dump.push_str(&format!(
+                "\n    bb{}: {} preds=[{}] -> [{}]",
+                b.0,
+                kind,
+                preds.join(", "),
+                succs.join(", ")
+            ));
+            // For CondBranches, show why loop_info decided what it did:
+            // back-edge dominator-check + reachability of each successor
+            // back to the candidate header.
+            if matches!(term, Terminator::CondBranch { .. }) {
+                let preds_list = self.func.lowered().blocks[b.0 as usize].predecessors.clone();
+                let dominated_preds: Vec<String> = preds_list
+                    .iter()
+                    .filter_map(|&p| {
+                        // Cheap hack: read cached dom result without &mut
+                        // (compute_loop_info populated it for visited
+                        // headers). If absent, mark "?" so we know.
+                        match self.dom_cache.get(&(*b, p)).copied() {
+                            Some(true) => Some(format!("bb{}=dom", p.0)),
+                            Some(false) => Some(format!("bb{}=NOTdom", p.0)),
+                            None => Some(format!("bb{}=uncached", p.0)),
+                        }
+                    })
+                    .collect();
+                cfg_dump.push_str(&format!(
+                    "\n        cbr-dom-check: [{}]",
+                    dominated_preds.join(", ")
+                ));
+            }
+        }
+
+        let case = if !repeats.is_empty() {
+            "CASE 2 (cycle: BlockId repeats on active stack)"
+        } else if total_visits > (distinct_len.saturating_mul(50)) as u64 && distinct_len > 0 {
+            "CASE 3 (exponential re-traversal: total_visits >> distinct_blocks)"
+        } else {
+            "CASE 1 (true deep nesting)"
+        };
+
+        panic!(
+            "lower_tree::walk runaway recursion ({reason})\n  \
+             func = {:?} (entry bb{})\n  \
+             likely: {case}\n  \
+             active_stack_len = {stack_len}, distinct_on_stack = {distinct_len}\n  \
+             total_visits = {total_visits}, distinct_blocks_visited = {}\n  \
+             top_repeats_on_stack = [{}]\n  \
+             top_visited_overall = [{}]\n  \
+             cfg (visited blocks):{}",
+            self.func.name,
+            self.func.lowered().entry.0,
+            self.visit_counts.len(),
+            top_repeats.join(", "),
+            top_visited.join(", "),
+            cfg_dump,
+        );
     }
 
     fn hoisted_names_in_decl_order(&self) -> Vec<String> {
@@ -357,10 +524,46 @@ impl LowerCtx<'_> {
     /// when reaching `stop` (after emitting any required edge copies into
     /// `stop`) or when the path terminates internally.
     fn walk(&mut self, start: BlockId, stop: Option<BlockId>, out: &mut Vec<Stmt>) {
+        self.walk_stack.push(start);
+        if self.walk_stack.len() > WALK_STACK_LIMIT {
+            self.diagnose_walk_runaway("active stack exceeded limit");
+        }
+        self.walk_inner(start, stop, out);
+        self.walk_stack.pop();
+    }
+
+    fn walk_inner(&mut self, start: BlockId, stop: Option<BlockId>, out: &mut Vec<Stmt>) {
         let mut cur = start;
         loop {
             if Some(cur) == stop {
                 return;
+            }
+            // Hit an open loop's header from a non-stop path (typically
+            // a back-edge nested inside an if/else inside the loop
+            // body): emit `continue` and return. Only the innermost open
+            // loop is supported — the tree-IR has no `break` and no
+            // labelled `continue`, so an outer-loop continue would need
+            // a bigger feature.
+            if let Some(idx) = self.loop_headers_open.iter().position(|h| *h == cur) {
+                let innermost = self.loop_headers_open.len() - 1;
+                if idx != innermost {
+                    panic!(
+                        "lower_tree: back-edge to non-innermost open loop \
+                         header bb{} (innermost = bb{}) — outer-loop continue \
+                         not supported by tree-IR",
+                        cur.0, self.loop_headers_open[innermost].0
+                    );
+                }
+                out.push(Stmt::Continue);
+                return;
+            }
+            // Count every block-iteration the walker visits. Bumping per
+            // iteration (not per recursive entry) catches case 3 where the
+            // linear loop re-walks shared tails through repeated diamonds.
+            *self.visit_counts.entry(cur).or_insert(0) += 1;
+            self.walk_total_visits += 1;
+            if self.walk_total_visits > WALK_TOTAL_VISIT_LIMIT {
+                self.diagnose_walk_runaway("total visits exceeded limit");
             }
 
             // Loop header check happens BEFORE emitting instructions: the
@@ -948,7 +1151,13 @@ impl LowerCtx<'_> {
         // Inside the loop body: emit copies for the body-edge from header,
         // then walk body until reaching the header (back-edge stop).
         self.emit_edge_copies(info.body_b, &body_args, &mut body_stmts);
+        // Mark this header as an open loop so nested if/else branches whose
+        // back-edge re-enters the header emit `continue` instead of
+        // recursing into a fresh loop emission.
+        self.loop_headers_open.push(header);
         self.walk(info.body_b, Some(header), &mut body_stmts);
+        let popped = self.loop_headers_open.pop();
+        debug_assert_eq!(popped, Some(header));
 
         // If we couldn't inline the cond, the header's instructions need to
         // re-evaluate at the end of the body so the next iteration's check

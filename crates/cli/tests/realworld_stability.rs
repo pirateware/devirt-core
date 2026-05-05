@@ -369,3 +369,116 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod per_file_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn corpus_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("corpus")
+            .join("realworld")
+    }
+
+    fn test_one(name: &str) {
+        let path = corpus_dir().join("tier2").join(name);
+        if !path.exists() { return; }
+        let r = test_file(&path, Tier::Tier2);
+        if let Some(ref e) = r.error {
+            eprintln!("{name}: {e}");
+        }
+    }
+
+    #[test] fn t_zod() { test_one("zod.min.js"); }
+    #[test] fn t_three() { test_one("three.min.js"); }
+    #[test] fn t_vue() { test_one("vue.min.js"); }
+    #[test] fn t_d3() { test_one("d3.min.js"); }
+    #[test] fn t_react_dom() { test_one("react_dom.min.js"); }
+    #[test] fn t_rxjs() { test_one("rxjs.min.js"); }
+    #[test] fn t_lodash() { test_one("lodash.min.js"); }
+    #[test] fn t_axios() { test_one("axios.min.js"); }
+    #[test] fn t_chart_js() { test_one("chart_js.min.js"); }
+    #[test] fn t_core_js() { test_one("core_js_bundle.min.js"); }
+    #[test] fn t_immer() { test_one("immer.min.js"); }
+    #[test] fn t_jquery() { test_one("jquery.min.js"); }
+    #[test] fn t_luxon() { test_one("luxon.min.js"); }
+    #[test] fn t_marked() { test_one("marked.min.js"); }
+    #[test] fn t_mobx() { test_one("mobx.min.js"); }
+    #[test] fn t_moment() { test_one("moment.min.js"); }
+    #[test] fn t_preact() { test_one("preact.min.js"); }
+    #[test] fn t_ramda() { test_one("ramda.min.js"); }
+    #[test] fn t_react() { test_one("react.min.js"); }
+    #[test] fn t_redux() { test_one("redux.min.js"); }
+    #[test] fn t_tslib() { test_one("tslib.min.js"); }
+    #[test] fn t_underscore() { test_one("underscore.min.js"); }
+
+    fn test_tier1(name: &str) {
+        let path = corpus_dir().join("tier1").join(name);
+        if !path.exists() { return; }
+        let r = test_file(&path, Tier::Tier1);
+        if let Some(ref e) = r.error {
+            eprintln!("{name}: {e}");
+        }
+    }
+    #[test] fn t1_datefns_format() { test_tier1("datefns_format.js"); }
+    #[test] fn t1_lodash_debounce() { test_tier1("lodash_debounce.js"); }
+    #[test] fn t1_lodash_cloneDeep() { test_tier1("lodash_cloneDeep.js"); }
+
+    #[test]
+    fn t_all_tier3() {
+        let dir = corpus_dir().join("tier3");
+        if !dir.exists() { return; }
+        let mut entries: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|x| x == "js").unwrap_or(false))
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            eprintln!("Testing tier3/{name}...");
+            let r = test_file(&path, Tier::Tier3);
+            if let Some(ref e) = r.error {
+                eprintln!("  {name}: {e}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod overflow_debug {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn corpus_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("corpus")
+            .join("realworld")
+    }
+
+    #[test]
+    fn debug_clonedeep_high() {
+        let path = corpus_dir().join("tier3").join("lodash_cloneDeep.high.js");
+        if !path.exists() { return; }
+        let source = std::fs::read_to_string(&path).unwrap();
+        eprintln!("Step 1: parse_and_lower...");
+        let tree = cli::lower::parse_and_lower(&source).unwrap();
+        eprintln!("Step 2: lower_ssa...");
+        let ssa = cli::ir::lower_ssa::lower_module(&tree);
+        eprintln!("Step 3: validate...");
+        ssa.validate().unwrap();
+        eprintln!("Step 4: lower_tree...");
+        let tree2 = cli::ir::lower_tree::lower_module(&ssa);
+        eprintln!("Step 5: emit...");
+        let out = cli::emit::emit(&tree2);
+        eprintln!("Step 6: re-parse...");
+        cli::lower::parse_and_lower(&out).unwrap();
+        eprintln!("Done!");
+    }
+}
