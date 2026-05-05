@@ -239,7 +239,10 @@ fn lower_function(sm: &ssa::Module, _id: FuncId, func: &Function, cfg: &EmitConf
     // bodies are visible in subsequent code: a `let` declared inside a JS
     // block scope is invisible after the block. Cosmetic ugliness; later
     // passes can sink lets back to first-use.
-    for name in ctx.hoisted_names_in_decl_order() {
+    let hoisted: Vec<String> = ctx.hoisted_names_in_decl_order();
+    let already_declared: std::collections::HashSet<String> =
+        hoisted.iter().cloned().collect();
+    for name in hoisted {
         body.push(Stmt::Let { name, init: None });
     }
 
@@ -249,8 +252,16 @@ fn lower_function(sm: &ssa::Module, _id: FuncId, func: &Function, cfg: &EmitConf
     // emits the assignment; without the explicit `let` here, the
     // assignment would silently target the global. See
     // `Function.forced_let_decls` doc.
+    //
+    // Skip names that already have an `Stmt::Let` from
+    // `hoisted_names_in_decl_order` (e.g. the source-level `var x;`
+    // declaration of an `Expr::Assign`-targeted name) — re-declaring
+    // a let in the same block is a JS SyntaxError.
     for &sid in &func.forced_let_decls {
         let n = ctx.sm.strings.resolve(&sid).to_string();
+        if already_declared.contains(&n) {
+            continue;
+        }
         body.push(Stmt::Let {
             name: n,
             init: None,
@@ -263,6 +274,10 @@ fn lower_function(sm: &ssa::Module, _id: FuncId, func: &Function, cfg: &EmitConf
         name: func.name.clone(),
         params: param_names,
         body,
+        // Source slice is meaningless for tree-IR reconstructed from
+        // SSA — the SSA round-trip is lossy and the original slice no
+        // longer corresponds to `body`.
+        source: None,
     }
 }
 
@@ -1657,6 +1672,19 @@ fn render_expr_to_string(e: &Expr) -> String {
             }
         }
         Expr::Spread(inner) => format!("...{}", render_expr_to_string(inner)),
+        Expr::Sequence { exprs } => format!(
+            "({})",
+            exprs
+                .iter()
+                .map(render_expr_to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Expr::Assign { target, value } => format!(
+            "({}={})",
+            render_expr_to_string(target),
+            render_expr_to_string(value)
+        ),
         Expr::Template { quasis, exprs } => {
             let mut out = String::from("`");
             let mut q_iter = quasis.iter();

@@ -204,6 +204,18 @@ impl Ctx<'_> {
                 self.walk_stmts(body);
                 self.leave_scope();
             }
+            Stmt::ForIn {
+                binding,
+                obj,
+                body,
+                ..
+            } => {
+                self.walk_expr(obj);
+                self.enter_block_scope();
+                self.bind(binding.clone());
+                self.walk_stmts(body);
+                self.leave_scope();
+            }
             Stmt::Continue => {}
             Stmt::Block(stmts) => {
                 self.enter_block_scope();
@@ -298,6 +310,15 @@ impl Ctx<'_> {
                 for e in exprs {
                     self.walk_expr(e);
                 }
+            }
+            Expr::Sequence { exprs } => {
+                for e in exprs {
+                    self.walk_expr(e);
+                }
+            }
+            Expr::Assign { target, value } => {
+                self.walk_expr(target);
+                self.walk_expr(value);
             }
         }
     }
