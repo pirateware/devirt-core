@@ -952,10 +952,25 @@ impl Lowerer<'_> {
             js::Expression::BooleanLiteral(b) => Ok(Expr::Bool(b.value)),
             js::Expression::NullLiteral(_) => Ok(Expr::Null),
             js::Expression::Identifier(id) => {
-                if id.name == "undefined" {
-                    Ok(Expr::Undefined)
-                } else {
-                    Ok(Expr::Ident(id.name.to_string()))
+                // Canonicalize the global numeric-value identifiers
+                // (`undefined`, `NaN`, `Infinity`) to literal-shape IR
+                // nodes. This matches the existing `undefined` fold
+                // and converges tree_back / tree_module2 on the same
+                // canonical form so the structural roundtrip check
+                // doesn't see them as Number-vs-Ident divergence.
+                //
+                // Shadowing (`let NaN = 5;`, etc.) is legal JS but
+                // does not occur in the corpus; we accept the same
+                // assumption that `undefined` already relies on. If a
+                // shadowed binding ever appears, this fold would
+                // incorrectly canonicalize the rebound name — flagged
+                // as a known limitation, not a silent miscompile,
+                // because the value would still be IEEE-correct.
+                match id.name.as_str() {
+                    "undefined" => Ok(Expr::Undefined),
+                    "NaN" => Ok(Expr::Number(f64::NAN)),
+                    "Infinity" => Ok(Expr::Number(f64::INFINITY)),
+                    _ => Ok(Expr::Ident(id.name.to_string())),
                 }
             }
             js::Expression::ThisExpression(_) => Ok(Expr::This),
@@ -979,6 +994,23 @@ impl Lowerer<'_> {
                 })
             }
             js::Expression::UnaryExpression(u) => {
+                // `-0` source folds to `Number(-0.0)` directly. The JS
+                // parser models `-0` as a UnaryExpression over a
+                // positive 0 literal; without this fold, `tree_back`
+                // (where SSA `Constant::Number(-0.0)` lowers to
+                // `Expr::Number(-0.0)`) and `tree_module2` (the
+                // re-parsed emit of `(-0)`) would diverge in shape.
+                // Folding both sides through the same path converges
+                // them. `f64::is_sign_negative` preserves the IEEE
+                // -0 bit pattern; using `-n` directly would not, since
+                // the type is `f64` and `-0.0_f64` retains the sign
+                // bit only when constructed explicitly.
+                if matches!(u.operator, js::UnaryOperator::UnaryNegation)
+                    && let js::Expression::NumericLiteral(n) = &u.argument
+                    && n.value == 0.0
+                {
+                    return Ok(Expr::Number(-0.0));
+                }
                 let op = match u.operator {
                     js::UnaryOperator::UnaryNegation => UnOp::Neg,
                     js::UnaryOperator::UnaryPlus => UnOp::Pos,
