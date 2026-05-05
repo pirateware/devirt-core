@@ -1083,10 +1083,15 @@ impl LowerCtx<'_> {
             return None;
         }
         // Filter out the parent's stop — if both branches reach it, that's
-        // the parent's responsibility, not an if-internal join.
+        // the parent's responsibility, not an if-internal join. Also
+        // exclude `b1` and `b2` themselves: a block reaches itself
+        // trivially (distance=0), which would make a branch block win
+        // over the actual join. This case fires when an `if/continue`
+        // body sits inside a loop — both branches eventually reach
+        // both each other and the join through the back-edge.
         let candidates: Vec<BlockId> = common
             .into_iter()
-            .filter(|b| Some(*b) != parent_stop)
+            .filter(|b| Some(*b) != parent_stop && *b != b1 && *b != b2)
             .collect();
         if candidates.is_empty() {
             return None;
@@ -1097,16 +1102,23 @@ impl LowerCtx<'_> {
         // diverging again). For the shapes our converter produces this is
         // unambiguous and equal to the explicit join_b in lower_if.
         //
-        // Implementation: pick the candidate dominated-from-b1 by no other
-        // candidate. Equivalent: the one closest to b1 among those that all
-        // other candidates reach. Naive O(n^2) loop is fine — n is the
-        // diamond's interior size, which is small in practice.
+        // Score by (distance(b1, c) + distance(b2, c)). The true join
+        // is the closest block both branches BOTH reach; a block on
+        // only one branch's path scores worse because the other
+        // branch's distance includes a long loop detour. `min` would
+        // tie when both arms are "1 hop from one branch, far from the
+        // other" (e.g. inside a loop, `c` is bb_then-tail's successor
+        // and `c'` is bb_else-tail's successor — both score min=1 but
+        // only one is the true post-dominator). Sum disambiguates.
+        // Naive O(n²) is fine — n is the diamond interior, small in
+        // practice.
+        let saturating = |a: usize, b: usize| a.checked_add(b).unwrap_or(usize::MAX);
         let mut best = candidates[0];
-        let mut best_dist = usize::MAX;
+        let mut best_score = usize::MAX;
         for &c in &candidates {
-            let d = self.distance(b1, c).min(self.distance(b2, c));
-            if d < best_dist {
-                best_dist = d;
+            let score = saturating(self.distance(b1, c), self.distance(b2, c));
+            if score < best_score {
+                best_score = score;
                 best = c;
             }
         }
@@ -1356,6 +1368,27 @@ fn render_expr_to_string(e: &Expr) -> String {
                 .collect::<Vec<_>>()
                 .join(",")
         ),
+        Expr::Ternary {
+            cond,
+            then_branch,
+            else_branch,
+        } => format!(
+            "({}?{}:{})",
+            render_expr_to_string(cond),
+            render_expr_to_string(then_branch),
+            render_expr_to_string(else_branch)
+        ),
+        Expr::Update { op, target, prefix } => {
+            let s = match op {
+                crate::ir::tree::UpdateOp::Inc => "++",
+                crate::ir::tree::UpdateOp::Dec => "--",
+            };
+            if *prefix {
+                format!("({}{})", s, render_expr_to_string(target))
+            } else {
+                format!("({}{})", render_expr_to_string(target), s)
+            }
+        }
     }
 }
 

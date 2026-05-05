@@ -222,3 +222,110 @@ correctly; this was latent because nothing emitted Construct before.
 
 **Decision pending:** the user's brief instructs Round 2 to stop
 here and surface the result. No further implementation.
+
+---
+
+## Round 3 (2026-05-05): C-style for, compound/update, ternary lowered
+
+Implemented items 4–6 from the recommendation: C-style `for` loops
+with `continue` semantics (break is intentionally deferred — see
+`docs/DECISIONS.md`), compound assignment (`+=`, `-=`, `*=`, etc.)
+including the single-evaluation rule for property targets, prefix /
+postfix `++` and `--` in both statement and expression position, and
+ternary `?:` lowered as a control-flow diamond.
+
+The desugar choices and a small set of correctness divergences are
+recorded in `docs/DECISIONS.md` (continue jumps to a per-loop step
+block; break unsupported; `++`/`--` use generic `+`/`-` so non-numeric
+inputs diverge from strict `ToNumber` coercion).
+
+Side-bug fixed during this round: `find_diamond_join` in
+`lower_tree.rs` could pick a diamond branch as its own join when
+both branches transitively reach themselves through a surrounding
+loop's back-edge, leading to infinite recursion at SSA→tree time.
+Two fixes: exclude `b1`/`b2` from candidates (a block trivially
+reaches itself but is not a join), and score by SUM of distances
+rather than MIN so a true post-dominator beats per-branch tails on
+ties. The bug was latent — pre-Round-3 corpus had no for/while body
+that exercised the shape.
+
+### Refined metric
+
+`--coverage-stats` now reports two new lines:
+
+- `function_body_passthrough_pct` — passthrough bytes from
+  function bodies (top-level `Item::PassThroughFunction` and nested
+  PT inner literals) over the function-body byte budget. This is
+  the input to the milestone-decision rule. Top-level driver
+  statements are excluded entirely so a program dominated by `var x
+  = ...; foo(x);` doesn't drag the score down.
+- `top_level_passthrough_pct` — informational only, top-level PT
+  statement bytes over total-byte proxy.
+
+The total `passthrough share` line is unchanged (sum of both, over
+total proxy) and is retained for compatibility with Rounds 1–2.
+
+### Handwritten corpus (after)
+
+| program | lowered fns | PT fns | top-level PT stmts | fn-body PT% | top-level PT% |
+|---|---:|---:|---:|---:|---:|
+| 01_array_map | 0 | 0 | 3 | — (no fns) | 100% |
+| 02_object_literal | 1 | 0 | 1 | 0% | 34% |
+| 03_arithmetic_only | 3 | 0 | 0 | 0% | 0% |
+| 04_while_loop | 1 | 0 | 0 | 0% | 0% |
+| 05_member_chain | 1 | 0 | 0 | 0% | 0% |
+| 06_callback | 1 | 0 | 1 | 0% | 32% |
+| 07_for_loop | 0 | 0 | 4 | — (no fns) | 100% |
+| 08_recursive | 1 | 0 | 1 | 0% | 19% |
+| 09_iife | 0 | 0 | 2 | — (no fns) | 100% |
+| 10_closure | 2 | 0 | 3 | 0% | 32% |
+
+**Handwritten `function_body_passthrough_pct` average: 0%** across
+the 7 programs that have at least one function. Every function in
+the handwritten corpus now lowers its body fully. The 01 / 07 / 09
+programs are pure top-level driver code with no function to measure
+— they contribute only to `top_level_passthrough_pct`.
+
+### functional_equivalence corpus (after)
+
+| program | fn-body PT% |
+|---|---:|
+| 01_arithmetic_and_log | 0% |
+| 02_while_loop_sum | 0% |
+| 03_recursive_fibonacci | 0% |
+| 04_if_else_branches | 0% |
+| 05_class_in_body (PT by design) | 100% |
+| 06_generator_in_body (PT by design) | 100% |
+| 07_try_catch_in_body (PT by design) | 100% |
+| 08_mixed_lowered_passthrough (PT listify by design) | 88% |
+| 09_closure_capture | 0% |
+| 10_capture_across_passthrough (PT inner by design) | 61% |
+| 11_nested_pt_via_lowered (PT b by design) | 39% |
+| 12_nested_pt_sibling_grandchild (PT by design) | 100% |
+| 13_pt_observes_reassignment (PT by design) | 100% |
+| 14_pt_capture_reassign | 0% |
+
+The functional corpus is unchanged — every nonzero entry is a
+program authored specifically to exercise the PT pipeline (class,
+generator, try/catch, or a deliberately-PT inner literal). The PT%
+on those entries is part of the test's specification, not a
+coverage gap.
+
+### Verdict
+
+Decision rule: `function_body_passthrough_pct` averages **0% across
+the handwritten corpus**, well under the 25% bar. **Recommend
+proceeding to Milestone 4.** Remaining passthrough on the
+functional corpus is by-design (class / generator / try-catch /
+nested-PT cases authored to validate the PT pipeline) — not a
+missing coverage feature.
+
+Top-level passthrough remains 100% on the three pure-driver
+programs (01, 07, 09) — informational only per the spec. Top-level
+lowering would require routing non-function statements through a
+synthesized module body, which is out of scope and orthogonal to
+the optimization work that Milestone 4 enables.
+
+The audit stops here. Implementation of Milestone 4 (first
+optimization pass) is a follow-up ticket; direction depends on user
+approval.

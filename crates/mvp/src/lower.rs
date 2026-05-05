@@ -24,6 +24,28 @@ use crate::error::Error;
 use crate::ir::disposition::{Disposition, decide, decide_arrow};
 use crate::ir::tree::*;
 
+/// Convert a source-level compound assignment operator into the
+/// underlying binary operator.
+fn compound_to_binop(op: js::AssignmentOperator) -> Result<BinOp, Error> {
+    use js::AssignmentOperator as A;
+    Ok(match op {
+        A::Addition => BinOp::Add,
+        A::Subtraction => BinOp::Sub,
+        A::Multiplication => BinOp::Mul,
+        A::Division => BinOp::Div,
+        A::Remainder => BinOp::Mod,
+        A::ShiftLeft => BinOp::Shl,
+        A::ShiftRight => BinOp::Shr,
+        A::ShiftRightZeroFill => BinOp::UShr,
+        A::BitwiseAnd => BinOp::BitAnd,
+        A::BitwiseOR => BinOp::BitOr,
+        A::BitwiseXOR => BinOp::BitXor,
+        // Exponential and logical/nullish-assign are rejected at the
+        // walker; reaching here is a walker bug.
+        _ => return Err(Error::Unsupported("compound assignment operator")),
+    })
+}
+
 pub fn parse_and_lower(source: &str) -> Result<Module, Error> {
     parse_and_lower_with_decider(source, decide)
 }
@@ -47,7 +69,10 @@ pub(crate) fn parse_and_lower_with_decider(
             .join("\n");
         return Err(Error::Parse(msg));
     }
-    let lowerer = Lowerer { source };
+    let lowerer = Lowerer {
+        source,
+        temp_counter: std::cell::Cell::new(0),
+    };
     lowerer.lower_program_with_decider(&ret.program, decider)
 }
 
@@ -57,6 +82,19 @@ pub(crate) fn parse_and_lower_with_decider(
 /// time, so the lifetime is bounded by this struct.
 struct Lowerer<'src> {
     source: &'src str,
+    /// Counter for synthesized temporaries (compound-assignment
+    /// receivers/keys). The names use a `__t<n>__` shape that's
+    /// reserved for this pass; collisions with user code are
+    /// theoretically possible but vanishingly unlikely.
+    temp_counter: std::cell::Cell<usize>,
+}
+
+impl<'src> Lowerer<'src> {
+    fn fresh_temp(&self) -> String {
+        let n = self.temp_counter.get();
+        self.temp_counter.set(n + 1);
+        format!("__t{n}__")
+    }
 }
 
 impl Lowerer<'_> {
@@ -545,8 +583,45 @@ impl Lowerer<'_> {
             js::Statement::FunctionDeclaration(f) => {
                 Ok(Stmt::FuncDecl(self.lower_function_literal(f, true)?))
             }
+            js::Statement::ForStatement(f) => self.lower_for_stmt(f),
+            js::Statement::ContinueStatement(c) => {
+                if c.label.is_some() {
+                    return Err(Error::Unsupported("labeled continue"));
+                }
+                Ok(Stmt::Continue)
+            }
             _ => Err(Error::Unsupported(stmt_kind(stmt))),
         }
+    }
+
+    fn lower_for_stmt(&self, f: &js::ForStatement) -> Result<Stmt, Error> {
+        let init = match &f.init {
+            None => None,
+            Some(js::ForStatementInit::VariableDeclaration(decl)) => {
+                Some(Box::new(self.lower_var_decl(decl)?))
+            }
+            Some(other) => {
+                let e = other
+                    .as_expression()
+                    .ok_or(Error::Unsupported("non-expression for-init"))?;
+                Some(Box::new(Stmt::ExprStmt(self.lower_expr(e)?)))
+            }
+        };
+        let cond = match &f.test {
+            Some(e) => Some(self.lower_expr(e)?),
+            None => None,
+        };
+        let step = match &f.update {
+            Some(e) => Some(self.lower_expr(e)?),
+            None => None,
+        };
+        let body = self.stmts_from(&f.body)?;
+        Ok(Stmt::For {
+            init,
+            cond,
+            step,
+            body,
+        })
     }
 
     fn lower_var_decl(&self, decl: &js::VariableDeclaration) -> Result<Stmt, Error> {
@@ -582,9 +657,97 @@ impl Lowerer<'_> {
                 let value = self.lower_expr(&a.right)?;
                 return Ok(Stmt::Assign { target, value });
             }
-            return Err(Error::Unsupported("compound assignment (+=, -=, etc.)"));
+            // Compound assignment: x op= rhs
+            // For an identifier target, the equivalent is `x = x op rhs`.
+            // For property targets, the receiver and key must each be
+            // evaluated exactly once — the read and write share them.
+            // We desugar to a Block whose let-bindings name the receiver
+            // (and key, for computed access) in temporaries before
+            // performing the read+write.
+            let op = compound_to_binop(a.operator)?;
+            let rhs = self.lower_expr(&a.right)?;
+            return self.lower_compound_assign(&a.left, op, rhs);
         }
         Ok(Stmt::ExprStmt(self.lower_expr(expr)?))
+    }
+
+    fn lower_compound_assign(
+        &self,
+        target: &js::AssignmentTarget,
+        op: BinOp,
+        rhs: Expr,
+    ) -> Result<Stmt, Error> {
+        match target {
+            js::AssignmentTarget::AssignmentTargetIdentifier(id) => {
+                let name = id.name.to_string();
+                Ok(Stmt::Assign {
+                    target: Expr::Ident(name.clone()),
+                    value: Expr::Binary {
+                        op,
+                        lhs: Box::new(Expr::Ident(name)),
+                        rhs: Box::new(rhs),
+                    },
+                })
+            }
+            js::AssignmentTarget::StaticMemberExpression(m) => {
+                let obj = self.lower_expr(&m.object)?;
+                let prop = m.property.name.to_string();
+                let t = self.fresh_temp();
+                let read = Expr::Member {
+                    obj: Box::new(Expr::Ident(t.clone())),
+                    prop: prop.clone(),
+                };
+                Ok(Stmt::Block(vec![
+                    Stmt::Let {
+                        name: t.clone(),
+                        init: Some(obj),
+                    },
+                    Stmt::Assign {
+                        target: Expr::Member {
+                            obj: Box::new(Expr::Ident(t)),
+                            prop,
+                        },
+                        value: Expr::Binary {
+                            op,
+                            lhs: Box::new(read),
+                            rhs: Box::new(rhs),
+                        },
+                    },
+                ]))
+            }
+            js::AssignmentTarget::ComputedMemberExpression(m) => {
+                let obj = self.lower_expr(&m.object)?;
+                let key = self.lower_expr(&m.expression)?;
+                let to = self.fresh_temp();
+                let tk = self.fresh_temp();
+                let read = Expr::Index {
+                    obj: Box::new(Expr::Ident(to.clone())),
+                    index: Box::new(Expr::Ident(tk.clone())),
+                };
+                Ok(Stmt::Block(vec![
+                    Stmt::Let {
+                        name: to.clone(),
+                        init: Some(obj),
+                    },
+                    Stmt::Let {
+                        name: tk.clone(),
+                        init: Some(key),
+                    },
+                    Stmt::Assign {
+                        target: Expr::Index {
+                            obj: Box::new(Expr::Ident(to)),
+                            index: Box::new(Expr::Ident(tk)),
+                        },
+                        value: Expr::Binary {
+                            op,
+                            lhs: Box::new(read),
+                            rhs: Box::new(rhs),
+                        },
+                    },
+                ]))
+            }
+            _ => Err(Error::Unsupported("complex compound-assignment target")),
+        }
     }
 
     fn stmts_from(&self, stmt: &js::Statement) -> Result<Vec<Stmt>, Error> {
@@ -592,6 +755,23 @@ impl Lowerer<'_> {
             b.body.iter().map(|s| self.lower_stmt(s)).collect()
         } else {
             Ok(vec![self.lower_stmt(stmt)?])
+        }
+    }
+
+    fn lower_update_target(&self, t: &js::SimpleAssignmentTarget) -> Result<Expr, Error> {
+        match t {
+            js::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
+                Ok(Expr::Ident(id.name.to_string()))
+            }
+            js::SimpleAssignmentTarget::StaticMemberExpression(m) => Ok(Expr::Member {
+                obj: Box::new(self.lower_expr(&m.object)?),
+                prop: m.property.name.to_string(),
+            }),
+            js::SimpleAssignmentTarget::ComputedMemberExpression(m) => Ok(Expr::Index {
+                obj: Box::new(self.lower_expr(&m.object)?),
+                index: Box::new(self.lower_expr(&m.expression)?),
+            }),
+            _ => Err(Error::Unsupported("complex update target")),
         }
     }
 
@@ -762,6 +942,25 @@ impl Lowerer<'_> {
                 Ok(Expr::Object { props })
             }
 
+            js::Expression::ConditionalExpression(c) => Ok(Expr::Ternary {
+                cond: Box::new(self.lower_expr(&c.test)?),
+                then_branch: Box::new(self.lower_expr(&c.consequent)?),
+                else_branch: Box::new(self.lower_expr(&c.alternate)?),
+            }),
+
+            js::Expression::UpdateExpression(u) => {
+                let op = match u.operator {
+                    js::UpdateOperator::Increment => UpdateOp::Inc,
+                    js::UpdateOperator::Decrement => UpdateOp::Dec,
+                };
+                let target = self.lower_update_target(&u.argument)?;
+                Ok(Expr::Update {
+                    op,
+                    target: Box::new(target),
+                    prefix: u.prefix,
+                })
+            }
+
             js::Expression::ArrayExpression(arr) => {
                 let mut elements = Vec::with_capacity(arr.elements.len());
                 for el in &arr.elements {
@@ -816,7 +1015,6 @@ fn lower_binop(op: js::BinaryOperator) -> Result<BinOp, Error> {
 
 fn stmt_kind(s: &js::Statement) -> &'static str {
     match s {
-        js::Statement::ForStatement(_) => "for statement",
         js::Statement::ForInStatement(_) => "for-in statement",
         js::Statement::ForOfStatement(_) => "for-of statement",
         js::Statement::DoWhileStatement(_) => "do-while statement",

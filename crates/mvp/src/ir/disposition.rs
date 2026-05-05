@@ -109,8 +109,44 @@ fn stmt_lowerable(stmt: &js::Statement) -> bool {
         WhileStatement(s) => expr_lowerable(&s.test) && stmt_lowerable(&s.body),
         BlockStatement(b) => b.body.iter().all(stmt_lowerable),
         FunctionDeclaration(f) => function_decl_lowerable(f),
-        // Anything else: not currently lowered.
+        ForStatement(f) => for_stmt_lowerable(f),
+        ContinueStatement(c) => c.label.is_none(),
+        // Anything else: not currently lowered. (BreakStatement is
+        // unsupported this round — see docs/DECISIONS.md.)
         _ => false,
+    }
+}
+
+/// C-style `for (init; cond; step) body`. Each header part is
+/// optional; we accept all three optional and require the body and any
+/// present part to be lowerable. `for-in` / `for-of` are different AST
+/// nodes and stay unsupported.
+fn for_stmt_lowerable(f: &js::ForStatement) -> bool {
+    if let Some(init) = &f.init {
+        if !for_init_lowerable(init) {
+            return false;
+        }
+    }
+    if let Some(test) = &f.test
+        && !expr_lowerable(test)
+    {
+        return false;
+    }
+    if let Some(update) = &f.update
+        && !expr_lowerable(update)
+    {
+        return false;
+    }
+    stmt_lowerable(&f.body)
+}
+
+fn for_init_lowerable(init: &js::ForStatementInit) -> bool {
+    match init {
+        js::ForStatementInit::VariableDeclaration(decl) => var_decl_lowerable(decl),
+        other => match other.as_expression() {
+            Some(e) => expr_lowerable(e),
+            None => false,
+        },
     }
 }
 
@@ -142,7 +178,12 @@ fn var_decl_lowerable(decl: &js::VariableDeclaration) -> bool {
 
 fn expr_stmt_lowerable(expr: &js::Expression) -> bool {
     if let js::Expression::AssignmentExpression(a) = expr {
-        if !matches!(a.operator, js::AssignmentOperator::Assign) {
+        // Plain `=` and compound (`+=`, `-=`, etc.) accepted; the
+        // unsupported set is the logical-assignment family (`&&=`,
+        // `||=`, `??=`) and any operator without a corresponding
+        // BinOp. Compound assignment desugars at lower.rs time to a
+        // sequence of let-tempos + binary + plain assign.
+        if !assignment_op_lowerable(a.operator) {
             return false;
         }
         return assignment_target_lowerable(&a.left) && expr_lowerable(&a.right);
@@ -150,9 +191,42 @@ fn expr_stmt_lowerable(expr: &js::Expression) -> bool {
     expr_lowerable(expr)
 }
 
+fn assignment_op_lowerable(op: js::AssignmentOperator) -> bool {
+    use js::AssignmentOperator::*;
+    matches!(
+        op,
+        Assign
+            | Addition
+            | Subtraction
+            | Multiplication
+            | Division
+            | Remainder
+            | Exponential
+            | ShiftLeft
+            | ShiftRight
+            | ShiftRightZeroFill
+            | BitwiseAnd
+            | BitwiseOR
+            | BitwiseXOR
+    )
+}
+
 fn assignment_target_lowerable(t: &js::AssignmentTarget) -> bool {
     use js::AssignmentTarget::*;
     match t {
+        AssignmentTargetIdentifier(_) => true,
+        StaticMemberExpression(m) => expr_lowerable(&m.object),
+        ComputedMemberExpression(m) => expr_lowerable(&m.object) && expr_lowerable(&m.expression),
+        _ => false,
+    }
+}
+
+/// `++`/`--` apply to a SimpleAssignmentTarget — identifier, static
+/// member, or computed member. Same shape as a plain assignment
+/// target.
+fn update_target_lowerable(target: &js::SimpleAssignmentTarget) -> bool {
+    use js::SimpleAssignmentTarget::*;
+    match target {
         AssignmentTargetIdentifier(_) => true,
         StaticMemberExpression(m) => expr_lowerable(&m.object),
         ComputedMemberExpression(m) => expr_lowerable(&m.object) && expr_lowerable(&m.expression),
@@ -310,6 +384,14 @@ fn expr_lowerable(expr: &js::Expression) -> bool {
             }
             true
         }
+
+        ConditionalExpression(c) => {
+            expr_lowerable(&c.test)
+                && expr_lowerable(&c.consequent)
+                && expr_lowerable(&c.alternate)
+        }
+
+        UpdateExpression(u) => update_target_lowerable(&u.argument),
 
         ArrayExpression(arr) => {
             for el in &arr.elements {

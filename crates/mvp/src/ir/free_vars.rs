@@ -168,6 +168,28 @@ impl Ctx<'_> {
                 self.walk_stmts(body);
                 self.leave_scope();
             }
+            Stmt::For {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                // Init's bindings (e.g. `let i = 0`) live for the whole
+                // for-loop region and are visible to cond/step/body.
+                self.enter_block_scope();
+                if let Some(init) = init {
+                    self.walk_stmt(init);
+                }
+                if let Some(cond) = cond {
+                    self.walk_expr(cond);
+                }
+                self.walk_stmts(body);
+                if let Some(step) = step {
+                    self.walk_expr(step);
+                }
+                self.leave_scope();
+            }
+            Stmt::Continue => {}
             Stmt::Block(stmts) => {
                 self.enter_block_scope();
                 self.walk_stmts(stmts);
@@ -224,6 +246,16 @@ impl Ctx<'_> {
                     self.walk_expr(a);
                 }
             }
+            Expr::Ternary {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                self.walk_expr(cond);
+                self.walk_expr(then_branch);
+                self.walk_expr(else_branch);
+            }
+            Expr::Update { target, .. } => self.walk_expr(target),
         }
     }
 

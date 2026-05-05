@@ -108,6 +108,13 @@ fn count_stmts(stmts: &[Stmt]) -> usize {
                 }
             }
             Stmt::While { body, .. } => n += count_stmts(body),
+            Stmt::For { init, body, .. } => {
+                if init.is_some() {
+                    n += 1;
+                }
+                n += count_stmts(body);
+            }
+            Stmt::Continue => {}
             Stmt::Block(b) => n += count_stmts(b),
             // Stmt::FuncDecl / nested Expr::Func bodies are separate
             // coverage rows, not part of this function's own stmt count.
@@ -139,6 +146,24 @@ fn walk_stmts(stmts: &[Stmt], parent: &str, rows: &mut Vec<FunctionCoverage>) {
                 walk_expr(cond, parent, rows);
                 walk_stmts(body, parent, rows);
             }
+            Stmt::For {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                if let Some(init) = init {
+                    walk_stmts(std::slice::from_ref(init.as_ref()), parent, rows);
+                }
+                if let Some(c) = cond {
+                    walk_expr(c, parent, rows);
+                }
+                walk_stmts(body, parent, rows);
+                if let Some(s) = step {
+                    walk_expr(s, parent, rows);
+                }
+            }
+            Stmt::Continue => {}
             Stmt::Block(b) => walk_stmts(b, parent, rows),
             Stmt::Let { init: Some(e), .. } | Stmt::ExprStmt(e) | Stmt::Return(Some(e)) => {
                 walk_expr(e, parent, rows);
@@ -191,6 +216,16 @@ fn walk_expr(e: &Expr, parent: &str, rows: &mut Vec<FunctionCoverage>) {
                 walk_expr(a, parent, rows);
             }
         }
+        Expr::Ternary {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            walk_expr(cond, parent, rows);
+            walk_expr(then_branch, parent, rows);
+            walk_expr(else_branch, parent, rows);
+        }
+        Expr::Update { target, .. } => walk_expr(target, parent, rows),
         _ => {}
     }
 }
@@ -277,16 +312,57 @@ pub fn format_table(cov: &ModuleCoverage) -> String {
     )
     .unwrap();
 
+    // Refined metric (Round 3): split function-body passthrough from
+    // top-level passthrough. Function-body passthrough = bytes from
+    // `Item::PassThroughFunction` and from PT inner literals only;
+    // top-level passthrough = bytes from `Item::PassThroughStmt`.
+    // Total passthrough share (numerator = sum of both PT byte
+    // counts) is reported for compatibility with prior rounds. The
+    // decision rule in docs/COVERAGE_AUDIT.md uses the function-body
+    // figure exclusively.
     let total_bytes_proxy = total_lowered_stmts as f64 * 30.0
         + total_pt_bytes as f64
         + cov.top_level_passthrough_bytes as f64;
     if total_bytes_proxy > 0.0 {
         let pt_share =
             (total_pt_bytes as f64 + cov.top_level_passthrough_bytes as f64) / total_bytes_proxy;
+        // Function-body share: relative only to function-side bytes
+        // (lowered + function PT). Excludes top-level entirely so a
+        // program dominated by a top-level driver line doesn't drag
+        // the score down.
+        let fn_denom = total_lowered_stmts as f64 * 30.0 + total_pt_bytes as f64;
+        let fn_pt_share = if fn_denom > 0.0 {
+            total_pt_bytes as f64 / fn_denom
+        } else {
+            0.0
+        };
+        // Top-level share: relative to top-level bytes only
+        // (informational — driver lines are usually pre-existing
+        // ergonomics, not target-of-optimization).
+        let tl_denom = cov.top_level_passthrough_bytes as f64
+            + total_lowered_stmts as f64 * 30.0
+            + total_pt_bytes as f64;
+        let tl_pt_share = if tl_denom > 0.0 {
+            cov.top_level_passthrough_bytes as f64 / tl_denom
+        } else {
+            0.0
+        };
         writeln!(
             &mut out,
             "passthrough share (byte-weighted, ~30B/stmt proxy for lowered): {:.1}%",
             pt_share * 100.0
+        )
+        .unwrap();
+        writeln!(
+            &mut out,
+            "  function_body_passthrough_pct: {:.1}%  (decision rule input)",
+            fn_pt_share * 100.0
+        )
+        .unwrap();
+        writeln!(
+            &mut out,
+            "  top_level_passthrough_pct:     {:.1}%  (informational)",
+            tl_pt_share * 100.0
         )
         .unwrap();
     }

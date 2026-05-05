@@ -251,6 +251,47 @@ impl Printer<'_> {
                 self.pad();
                 self.buf.push('}');
             }
+            Stmt::For {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                self.buf.push_str("for (");
+                if let Some(init) = init {
+                    // Init can be a `let`/`var`/`const` decl or an expr
+                    // statement; both kinds emit with a trailing
+                    // semicolon. We strip that semicolon and add the
+                    // `for`'s own separator instead.
+                    let mark = self.buf.len();
+                    self.stmt(init);
+                    if self.buf.ends_with(';') {
+                        self.buf.truncate(self.buf.len() - 1);
+                    }
+                    let _ = mark;
+                }
+                self.buf.push_str("; ");
+                if let Some(c) = cond {
+                    self.expr(c);
+                }
+                self.buf.push_str("; ");
+                if let Some(s) = step {
+                    self.expr(s);
+                }
+                self.buf.push_str(") {\n");
+                self.indent += 1;
+                for s in body {
+                    self.pad();
+                    self.stmt(s);
+                    self.buf.push('\n');
+                }
+                self.indent -= 1;
+                self.pad();
+                self.buf.push('}');
+            }
+            Stmt::Continue => {
+                self.buf.push_str("continue;");
+            }
             Stmt::Block(stmts) => {
                 self.buf.push_str("{\n");
                 self.indent += 1;
@@ -466,6 +507,32 @@ impl Printer<'_> {
                     self.expr(a);
                 }
                 self.buf.push(')');
+            }
+            Expr::Ternary {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                self.buf.push('(');
+                self.expr(cond);
+                self.buf.push_str(" ? ");
+                self.expr(then_branch);
+                self.buf.push_str(" : ");
+                self.expr(else_branch);
+                self.buf.push(')');
+            }
+            Expr::Update { op, target, prefix } => {
+                let s = match op {
+                    crate::ir::tree::UpdateOp::Inc => "++",
+                    crate::ir::tree::UpdateOp::Dec => "--",
+                };
+                if *prefix {
+                    self.buf.push_str(s);
+                    self.expr(target);
+                } else {
+                    self.expr(target);
+                    self.buf.push_str(s);
+                }
             }
             Expr::Func(lit) => {
                 // Function expressions: parenthesize so the caller can

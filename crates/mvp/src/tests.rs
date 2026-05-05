@@ -53,6 +53,43 @@ fn while_loop() {
     let _ = roundtrip("let i = 0; while (i < 10) { i = i + 1; }");
 }
 
+#[test]
+fn for_loop_lowers_in_function_body() {
+    // Body uses `for` + `continue` + compound assignment + `++` —
+    // exercises items 4-6 together. Walker accepts; SSA round-trip
+    // must produce a `while`-shaped emit (we don't reconstruct
+    // `for` from SSA).
+    let src = "function f() { let s = 0; for (let i = 0; i < 3; i++) { if (i === 1) continue; s += i; } return s; }";
+    let m = parse_and_lower(src).expect("for-loop body must lower");
+    // The function must be Lowered (not PassThrough).
+    use crate::ir::tree::Item;
+    assert!(
+        matches!(m.items[0], Item::Function(_)),
+        "for-loop function body must lower, not PassThrough; got {:?}",
+        m.items[0]
+    );
+    let out = ssa_roundtrip(src);
+    assert!(out.contains("while"), "SSA round-trip emits while: {out}");
+}
+
+#[test]
+fn ternary_lowers_in_function_body() {
+    let src = "function pick(c) { return c ? 1 : 2; }";
+    let m = parse_and_lower(src).expect("ternary body must lower");
+    use crate::ir::tree::Item;
+    assert!(matches!(m.items[0], Item::Function(_)));
+    let _ = roundtrip(src);
+}
+
+#[test]
+fn update_lowers_in_function_body() {
+    let src = "function inc(x) { return x++; }";
+    let m = parse_and_lower(src).expect("update body must lower");
+    use crate::ir::tree::Item;
+    assert!(matches!(m.items[0], Item::Function(_)));
+    let _ = roundtrip(src);
+}
+
 /// Top-level `class` / `for` and other constructs the lowering can't
 /// represent are now preserved as verbatim source slices via
 /// `Item::PassThroughStmt` — the same fallback strategy used for

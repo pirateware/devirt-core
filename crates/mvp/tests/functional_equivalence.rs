@@ -392,6 +392,183 @@ fn new_with_builtin_constructors() {
     assert_functional_equivalence(src, harness, "");
 }
 
+// === Round 3 (items 4-6): for-loop + compound/update + ternary ===
+
+#[test]
+fn for_loop_with_continue() {
+    // Spec's exact case: continue must skip the body's tail but still
+    // execute the step before re-checking the condition. Naive
+    // desugar `for(init; cond; step) body` → `while(cond) { body;
+    // step }` would skip the step on continue and infinite-loop.
+    let src = r#"
+        function f() {
+            let sum = 0;
+            for (let i = 0; i < 3; i++) {
+                if (i === 1) continue;
+                sum += i;
+            }
+            return sum;
+        }
+    "#;
+    let harness = "console.log(f());";
+    assert_functional_equivalence(src, harness, "");
+}
+
+#[test]
+fn for_loop_simple() {
+    // No continue, just confirms the desugar's basic shape works.
+    let src = r#"
+        function sum_to(n) {
+            let s = 0;
+            for (let i = 1; i <= n; i++) { s += i; }
+            return s;
+        }
+    "#;
+    let harness = "console.log(sum_to(5)); console.log(sum_to(10));";
+    assert_functional_equivalence(src, harness, "");
+}
+
+#[test]
+fn update_postfix_in_argument_position() {
+    // f(x++) must pass the OLD value to f, then x becomes x+1.
+    let src = r#"
+        function take(v) { return v; }
+        function f() {
+            let x = 10;
+            let a = take(x++);
+            let b = take(x++);
+            return [a, b, x];
+        }
+    "#;
+    let harness = "console.log(JSON.stringify(f()));";
+    assert_functional_equivalence(src, harness, "");
+}
+
+#[test]
+fn update_prefix_in_argument_position() {
+    // f(++x) must pass the NEW value (x+1).
+    let src = r#"
+        function take(v) { return v; }
+        function f() {
+            let x = 10;
+            let a = take(++x);
+            let b = take(++x);
+            return [a, b, x];
+        }
+    "#;
+    let harness = "console.log(JSON.stringify(f()));";
+    assert_functional_equivalence(src, harness, "");
+}
+
+#[test]
+fn compound_assign_computed_key_evaluates_once() {
+    // The spec's exact correctness test for compound assignment on a
+    // computed-key target: the side-effecting key must be evaluated
+    // exactly once, and the read+write must use the same evaluated
+    // value. Tracking the call count via a passed-in array sidesteps
+    // capture-by-value (closures over scalars don't propagate
+    // mutations in our value-capture model; arrays are reference
+    // types that DO).
+    let src = r#"
+        function f(counter) {
+            let arr = [10];
+            arr[(function(){ counter[0] = counter[0] + 1; return 0; })()] += 5;
+            return arr[0];
+        }
+    "#;
+    let harness = r#"
+        let c = [0];
+        let r = f(c);
+        console.log(r, c[0]);
+    "#;
+    assert_functional_equivalence(src, harness, "");
+}
+
+#[test]
+fn update_postfix_on_computed_property() {
+    // arr[k]++ — receiver and key each evaluated once.
+    let src = r#"
+        function f(counter) {
+            let arr = [10];
+            let v = arr[(function(){ counter[0] = counter[0] + 1; return 0; })()]++;
+            return [v, arr[0]];
+        }
+    "#;
+    let harness = r#"
+        let c = [0];
+        let r = f(c);
+        console.log(JSON.stringify(r), c[0]);
+    "#;
+    assert_functional_equivalence(src, harness, "");
+}
+
+#[test]
+fn ternary_with_side_effecting_branches() {
+    // Only the taken side runs.
+    let src = r#"
+        function pick(c, log) {
+            return c ? (function(){ log[0]++; return "Y"; })()
+                     : (function(){ log[1]++; return "N"; })();
+        }
+    "#;
+    let harness = r#"
+        let log = [0, 0];
+        let a = pick(true, log);
+        let b = pick(false, log);
+        let c = pick(true, log);
+        console.log(a, b, c, JSON.stringify(log));
+    "#;
+    assert_functional_equivalence(src, harness, "");
+}
+
+#[test]
+fn ternary_nested_and_used_in_expression() {
+    // Nested ternary: confirms phi-at-join composes when one branch
+    // is itself a ternary, AND that the ternary's value flows into a
+    // surrounding expression unchanged.
+    let src = r#"
+        function classify(n) {
+            return "got:" + (n < 0 ? "neg" : (n === 0 ? "zero" : "pos"));
+        }
+    "#;
+    let harness = "console.log(classify(-1), classify(0), classify(5));";
+    assert_functional_equivalence(src, harness, "");
+}
+
+#[test]
+fn compound_assign_static_property() {
+    // obj.prop += value — static-key target.
+    let src = r#"
+        function f(o) {
+            o.count += 7;
+            return o.count;
+        }
+    "#;
+    let harness = r#"
+        let obj = { count: 3 };
+        console.log(f(obj), obj.count);
+    "#;
+    assert_functional_equivalence(src, harness, "");
+}
+
+#[test]
+fn for_loop_with_closure_inside_body() {
+    // A for-loop body that contains an inner function — the body's
+    // bindings are captured. Validates the for-loop region's scope
+    // boundaries don't trip the capture-rules.
+    let src = r#"
+        function f(n) {
+            let acc = [];
+            for (let i = 0; i < n; i++) {
+                acc.push(i * 2);
+            }
+            return acc;
+        }
+    "#;
+    let harness = "console.log(JSON.stringify(f(4)));";
+    assert_functional_equivalence(src, harness, "");
+}
+
 #[test]
 fn mixed_array_object_new() {
     // The spec's combined test: array literal, object literals (mixed

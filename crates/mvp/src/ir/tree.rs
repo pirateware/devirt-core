@@ -73,6 +73,22 @@ pub enum Stmt {
         cond: Expr,
         body: Vec<Stmt>,
     },
+    /// C-style `for (init; cond; step) body`. Each header part is
+    /// optional in JS source; an absent `cond` is treated as the
+    /// constant `true`. SSA lowering routes `Stmt::Continue` inside
+    /// `body` to a synthesized step block that runs `step` before
+    /// branching back to the loop header — distinct from `While`, where
+    /// continue jumps directly to the header.
+    For {
+        init: Option<Box<Stmt>>,
+        cond: Option<Expr>,
+        step: Option<Expr>,
+        body: Vec<Stmt>,
+    },
+    /// `continue` inside the nearest enclosing loop. Lowered as a jump
+    /// to the loop's continue-target (header for `While`, step block
+    /// for `For`). `break` is not supported (see docs/DECISIONS.md).
+    Continue,
     Block(Vec<Stmt>),
     /// Nested function declaration (`function name(...) { ... }` inside
     /// another function body). Top-level declarations stay as
@@ -172,6 +188,34 @@ pub enum Expr {
         callee: Box<Expr>,
         args: Vec<Expr>,
     },
+    /// `cond ? then : else`. SSA lowering produces a control-flow
+    /// diamond: writes the value into a synthesized symbol on each side
+    /// and reads it after the join, so Braun's algorithm inserts the
+    /// phi automatically (matching the existing if/else convention).
+    Ternary {
+        cond: Box<Expr>,
+        then_branch: Box<Expr>,
+        else_branch: Box<Expr>,
+    },
+    /// `++x`, `x++`, `--x`, `x--`. Carries its target and prefix flag.
+    /// SSA lowering evaluates the receiver/key of property targets
+    /// exactly once before the read+write, then yields the old or new
+    /// value depending on `prefix`. The read-modify-write is `x = x +
+    /// 1` (or `- 1`) — JS's `ToNumber` coercion is approximated as the
+    /// `+`/`-` operator's coercion. Numeric inputs match strict
+    /// semantics; non-numeric inputs diverge (documented in
+    /// docs/DECISIONS.md).
+    Update {
+        op: UpdateOp,
+        target: Box<Expr>,
+        prefix: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateOp {
+    Inc,
+    Dec,
 }
 
 #[derive(Debug, Clone)]
@@ -342,6 +386,24 @@ fn dump_stmt(out: &mut String, s: &Stmt, depth: usize) {
             }
             writeln!(out, "{pad}}}").unwrap();
         }
+        Stmt::For {
+            init,
+            cond,
+            step,
+            body,
+        } => {
+            let cond_s = cond.as_ref().map(dump_expr).unwrap_or_else(|| "_".into());
+            let step_s = step.as_ref().map(dump_expr).unwrap_or_else(|| "_".into());
+            writeln!(out, "{pad}for (_; {}; {}) {{", cond_s, step_s).unwrap();
+            if let Some(init) = init {
+                dump_stmt(out, init, depth + 1);
+            }
+            for s in body {
+                dump_stmt(out, s, depth + 1);
+            }
+            writeln!(out, "{pad}}}").unwrap();
+        }
+        Stmt::Continue => writeln!(out, "{pad}continue").unwrap(),
         Stmt::Block(stmts) => {
             writeln!(out, "{pad}{{").unwrap();
             for s in stmts {
@@ -434,6 +496,27 @@ fn dump_expr(e: &Expr) -> String {
             dump_expr(callee),
             args.iter().map(dump_expr).collect::<Vec<_>>().join(", ")
         ),
+        Expr::Ternary {
+            cond,
+            then_branch,
+            else_branch,
+        } => format!(
+            "({} ? {} : {})",
+            dump_expr(cond),
+            dump_expr(then_branch),
+            dump_expr(else_branch)
+        ),
+        Expr::Update { op, target, prefix } => {
+            let s = match op {
+                UpdateOp::Inc => "++",
+                UpdateOp::Dec => "--",
+            };
+            if *prefix {
+                format!("({}{})", s, dump_expr(target))
+            } else {
+                format!("({}{})", dump_expr(target), s)
+            }
+        }
         Expr::Func(lit) => {
             let name = lit.name.as_deref().unwrap_or("<anon>");
             let kw = if lit.is_arrow {

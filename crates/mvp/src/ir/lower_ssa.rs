@@ -20,7 +20,7 @@ use crate::ir::ssa::{
     self, BasicBlock, BlockId, Constant, FuncId, FunctionBuilder, InstKind, Operand, Purity, StrId,
     Terminator, TopLevelEntry, Value, ValueDef, ValueDefKind,
 };
-use crate::ir::tree::{self, BinOp, Expr, FuncBody, FuncLiteral, Stmt, UnOp};
+use crate::ir::tree::{self, BinOp, Expr, FuncBody, FuncLiteral, Stmt, UnOp, UpdateOp};
 
 // ============================================================================
 // Public entry points
@@ -417,9 +417,90 @@ fn walk_reassigned_stmts(stmts: &[Stmt], out: &mut HashSet<String>) {
                 }
             }
             Stmt::While { body, .. } => walk_reassigned_stmts(body, out),
+            Stmt::For { init, body, step, .. } => {
+                if let Some(init) = init {
+                    walk_reassigned_stmts(std::slice::from_ref(init.as_ref()), out);
+                }
+                walk_reassigned_stmts(body, out);
+                // Step is an Expr (typically `i++` / `i = i+1`); update
+                // expressions to identifier targets are reassignments.
+                if let Some(step) = step {
+                    walk_reassigned_in_expr(step, out);
+                }
+            }
+            Stmt::Continue => {}
             Stmt::Block(ss) => walk_reassigned_stmts(ss, out),
             Stmt::FuncDecl(_) => {} // nested literal: own scope
         }
+    }
+}
+
+/// Identify identifier targets reassigned by an expression's
+/// `Expr::Update`. We only track ident updates here (matching the
+/// `Stmt::Assign` rule in `walk_reassigned_stmts`); update on
+/// `Expr::Member` / `Expr::Index` mutates a property, not a binding.
+fn walk_reassigned_in_expr(e: &Expr, out: &mut HashSet<String>) {
+    match e {
+        Expr::Update {
+            target, ..
+        } => {
+            if let Expr::Ident(n) = target.as_ref() {
+                out.insert(n.clone());
+            }
+            walk_reassigned_in_expr(target, out);
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            walk_reassigned_in_expr(lhs, out);
+            walk_reassigned_in_expr(rhs, out);
+        }
+        Expr::Unary { operand, .. } => walk_reassigned_in_expr(operand, out),
+        Expr::Call { callee, args } => {
+            walk_reassigned_in_expr(callee, out);
+            for a in args {
+                walk_reassigned_in_expr(a, out);
+            }
+        }
+        Expr::Member { obj, .. } => walk_reassigned_in_expr(obj, out),
+        Expr::Index { obj, index } => {
+            walk_reassigned_in_expr(obj, out);
+            walk_reassigned_in_expr(index, out);
+        }
+        Expr::Ternary {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            walk_reassigned_in_expr(cond, out);
+            walk_reassigned_in_expr(then_branch, out);
+            walk_reassigned_in_expr(else_branch, out);
+        }
+        Expr::Array { elements } => {
+            for el in elements {
+                walk_reassigned_in_expr(el, out);
+            }
+        }
+        Expr::Object { props } => {
+            for p in props {
+                if let crate::ir::tree::ObjectKey::Computed(e) = &p.key {
+                    walk_reassigned_in_expr(e, out);
+                }
+                walk_reassigned_in_expr(&p.value, out);
+            }
+        }
+        Expr::New { callee, args } => {
+            walk_reassigned_in_expr(callee, out);
+            for a in args {
+                walk_reassigned_in_expr(a, out);
+            }
+        }
+        // Stop at function literals — nested scope.
+        Expr::Func(_) => {}
+        Expr::Number(_)
+        | Expr::String(_)
+        | Expr::Bool(_)
+        | Expr::Null
+        | Expr::Undefined
+        | Expr::Ident(_) => {}
     }
 }
 
@@ -521,6 +602,55 @@ fn discover_stmt<'a>(
                 parent_fid,
             );
         }
+        Stmt::For {
+            init,
+            cond,
+            step,
+            body,
+        } => {
+            // Init lives in a fresh inner scope; bindings introduced by
+            // it (e.g. `let i = 0`) don't escape past the loop.
+            let mut inner_seen = seen.clone();
+            if let Some(init) = init {
+                discover_stmt(
+                    init,
+                    pending,
+                    captures_by_fid,
+                    &mut inner_seen,
+                    reassigned,
+                    parent_fid,
+                );
+            }
+            if let Some(cond) = cond {
+                discover_expr(
+                    cond,
+                    pending,
+                    captures_by_fid,
+                    &mut inner_seen,
+                    reassigned,
+                    parent_fid,
+                );
+            }
+            discover_stmts(
+                body,
+                pending,
+                captures_by_fid,
+                &mut inner_seen,
+                reassigned,
+                parent_fid,
+            );
+            if let Some(step) = step {
+                discover_expr(
+                    step,
+                    pending,
+                    captures_by_fid,
+                    &mut inner_seen,
+                    reassigned,
+                    parent_fid,
+                );
+            }
+        }
+        Stmt::Continue => {}
         Stmt::Block(ss) => {
             let mut inner_seen = seen.clone();
             discover_stmts(
@@ -592,6 +722,18 @@ fn discover_expr<'a>(
             for a in args {
                 discover_expr(a, pending, captures_by_fid, seen, reassigned, parent_fid);
             }
+        }
+        Expr::Ternary {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            discover_expr(cond, pending, captures_by_fid, seen, reassigned, parent_fid);
+            discover_expr(then_branch, pending, captures_by_fid, seen, reassigned, parent_fid);
+            discover_expr(else_branch, pending, captures_by_fid, seen, reassigned, parent_fid);
+        }
+        Expr::Update { target, .. } => {
+            discover_expr(target, pending, captures_by_fid, seen, reassigned, parent_fid);
         }
     }
 }
@@ -932,6 +1074,14 @@ struct Converter<'b, 'm> {
     // Braun for that SymbolId so the out-of-SSA renamer can recover the
     // original name across loop carriers.
     symbol_names: HashMap<SymbolId, StrId>,
+
+    /// Stack of (continue_target, break_target) for the active enclosing
+    /// loops. `Stmt::Continue` reads the top of stack and emits a Branch
+    /// to the continue target — for `Stmt::While` this is the header,
+    /// for `Stmt::For` this is a separate step block that runs the
+    /// update expression before re-checking the condition. `break` is
+    /// not yet supported in the IR; the second slot is reserved.
+    loop_targets: Vec<(BlockId, BlockId)>,
 }
 
 impl<'b, 'm> Converter<'b, 'm> {
@@ -956,6 +1106,7 @@ impl<'b, 'm> Converter<'b, 'm> {
             incomplete_params: HashMap::new(),
             sealed: HashSet::new(),
             symbol_names: HashMap::new(),
+            loop_targets: Vec::new(),
         }
     }
 
@@ -1437,6 +1588,25 @@ impl<'b, 'm> Converter<'b, 'm> {
                 else_body,
             } => self.lower_if(cond, then_body, else_body.as_deref()),
             Stmt::While { cond, body } => self.lower_while(cond, body),
+            Stmt::For {
+                init,
+                cond,
+                step,
+                body,
+            } => self.lower_for(init.as_deref(), cond.as_ref(), step.as_ref(), body),
+            Stmt::Continue => {
+                let (cont, _brk) = *self
+                    .loop_targets
+                    .last()
+                    .expect("Stmt::Continue outside any loop — walker should have rejected");
+                self.builder.set_terminator(Terminator::Branch {
+                    target: cont,
+                    args: vec![],
+                });
+                // Leave the current block terminated; the lower_stmt prologue
+                // creates a fresh dead block on demand for any following
+                // (dead) code.
+            }
             Stmt::Block(stmts) => {
                 self.push_scope();
                 for s in stmts {
@@ -1545,13 +1715,15 @@ impl<'b, 'm> Converter<'b, 'm> {
             else_args: vec![],
         });
 
-        // Body.
+        // Body. `continue` inside the body jumps to the header.
         self.builder.switch_to_block(body_b);
+        self.loop_targets.push((header_b, exit_b));
         self.push_scope();
         for s in body {
             self.lower_stmt(s);
         }
         self.pop_scope();
+        self.loop_targets.pop();
         let body_end = self.current_block();
         if !self.is_terminated(body_end) {
             self.builder.set_terminator(Terminator::Branch {
@@ -1567,6 +1739,111 @@ impl<'b, 'm> Converter<'b, 'm> {
         self.seal_block(header_b);
 
         self.builder.switch_to_block(exit_b);
+    }
+
+    /// Lower `for (init; cond; step) body`. Distinct from while only in
+    /// that `continue` targets a step block (not the header), and the
+    /// step expression evaluates after every iteration, including
+    /// continued ones. The CFG shape:
+    ///
+    /// ```text
+    ///     pre  ──init──▶ header
+    ///                       │ (cond)
+    ///                  ┌────┴────┐
+    ///                  ▼         ▼
+    ///                body       exit
+    ///                  │
+    ///                  ▼ (fallthrough or `continue`)
+    ///                step
+    ///                  │
+    ///                  ▼ (back-edge)
+    ///                header
+    /// ```
+    ///
+    /// SSA→tree's loop-shape recognizer treats this as a single loop
+    /// whose body contains the original body's instructions followed
+    /// by the step's instructions; the `continue` jumps cause empty
+    /// then-branches in the if/else recovery, which is correct.
+    fn lower_for(
+        &mut self,
+        init: Option<&Stmt>,
+        cond: Option<&Expr>,
+        step: Option<&Expr>,
+        body: &[Stmt],
+    ) {
+        // Init lives in a fresh block scope so its bindings (`let i = 0`
+        // etc.) don't leak past the loop.
+        self.push_scope();
+        if let Some(init) = init {
+            self.lower_stmt(init);
+        }
+
+        let header_b = self.builder.new_block();
+        let body_b = self.builder.new_block();
+        let step_b = self.builder.new_block();
+        let exit_b = self.builder.new_block();
+
+        self.builder.set_terminator(Terminator::Branch {
+            target: header_b,
+            args: vec![],
+        });
+        self.sealed.insert(body_b);
+        self.sealed.insert(exit_b);
+        // step_b is reachable from the body's fallthrough AND every
+        // `continue` inside the body — the predecessor count isn't
+        // known until the body finishes. Defer its sealing.
+
+        // Header.
+        self.builder.switch_to_block(header_b);
+        let cond_op = match cond {
+            Some(c) => self.convert_expr(c),
+            None => Operand::Const(Constant::Bool(true)),
+        };
+        self.builder.set_terminator(Terminator::CondBranch {
+            cond: cond_op,
+            then_b: body_b,
+            then_args: vec![],
+            else_b: exit_b,
+            else_args: vec![],
+        });
+
+        // Body. `continue` inside jumps to step_b.
+        self.builder.switch_to_block(body_b);
+        self.loop_targets.push((step_b, exit_b));
+        self.push_scope();
+        for s in body {
+            self.lower_stmt(s);
+        }
+        self.pop_scope();
+        self.loop_targets.pop();
+        let body_end = self.current_block();
+        if !self.is_terminated(body_end) {
+            self.builder.set_terminator(Terminator::Branch {
+                target: step_b,
+                args: vec![],
+            });
+        }
+
+        // Step block: every continue and the body's fallthrough have
+        // arrived; safe to seal.
+        self.seal_block(step_b);
+        self.builder.switch_to_block(step_b);
+        if let Some(step) = step {
+            let _ = self.convert_expr(step);
+        }
+        let step_end = self.current_block();
+        if !self.is_terminated(step_end) {
+            self.builder.set_terminator(Terminator::Branch {
+                target: header_b,
+                args: vec![],
+            });
+        }
+
+        // Back-edge predecessor exists; seal header.
+        self.seal_block(header_b);
+
+        self.builder.switch_to_block(exit_b);
+        self.pop_scope();
     }
 
     // ------------------------------------------------------------------
@@ -1731,6 +2008,147 @@ impl<'b, 'm> Converter<'b, 'm> {
                 }
                 obj
             }
+            Expr::Ternary {
+                cond,
+                then_branch,
+                else_branch,
+            } => self.convert_ternary(cond, then_branch, else_branch),
+            Expr::Update { op, target, prefix } => self.convert_update(*op, target, *prefix),
+        }
+    }
+
+    /// Lower `cond ? a : b`. Same control-flow shape as `if (cond) { t
+    /// = a } else { t = b }; t`: write the value into a fresh symbol
+    /// in each branch, then read it after the join — Braun inserts
+    /// the phi automatically.
+    fn convert_ternary(&mut self, cond: &Expr, then_e: &Expr, else_e: &Expr) -> Operand {
+        let cond_op = self.convert_expr(cond);
+        let then_b = self.builder.new_block();
+        let else_b = self.builder.new_block();
+        let join_b = self.builder.new_block();
+
+        self.builder.set_terminator(Terminator::CondBranch {
+            cond: cond_op,
+            then_b,
+            then_args: vec![],
+            else_b,
+            else_args: vec![],
+        });
+        self.sealed.insert(then_b);
+        self.sealed.insert(else_b);
+
+        // Synthesized symbol for the ternary's value. No source name —
+        // the renamer will give it a `_tN`-style hoisted-temporary name.
+        let sym = self.fresh_symbol();
+
+        self.builder.switch_to_block(then_b);
+        let v_then = self.convert_expr(then_e);
+        let then_end = self.current_block();
+        self.write_variable(sym, then_end, v_then);
+        if !self.is_terminated(then_end) {
+            self.builder.set_terminator(Terminator::Branch {
+                target: join_b,
+                args: vec![],
+            });
+        }
+
+        self.builder.switch_to_block(else_b);
+        let v_else = self.convert_expr(else_e);
+        let else_end = self.current_block();
+        self.write_variable(sym, else_end, v_else);
+        if !self.is_terminated(else_end) {
+            self.builder.set_terminator(Terminator::Branch {
+                target: join_b,
+                args: vec![],
+            });
+        }
+
+        self.seal_block(join_b);
+        self.builder.switch_to_block(join_b);
+        self.read_variable(sym, join_b)
+    }
+
+    /// Lower `++x`, `x++`, `--x`, `x--`. The receiver and key (if any)
+    /// of the target are evaluated exactly once before the read+write,
+    /// then the operator emits a binary `+ 1` / `- 1` and writes back.
+    /// Returns the old value for postfix, the new value for prefix —
+    /// matching JS semantics for numeric inputs (non-numeric inputs
+    /// diverge on `ToNumber` coercion; see docs/DECISIONS.md).
+    fn convert_update(&mut self, op: UpdateOp, target: &Expr, prefix: bool) -> Operand {
+        match target {
+            Expr::Ident(name) => {
+                if let Some(sym) = self.lookup(name) {
+                    let cb = self.current_block();
+                    let old = self.read_variable(sym, cb);
+                    let new = self.emit(make_inc_dec(op, old.clone()));
+                    self.tag_binding_source_name(new.clone(), name);
+                    let cb2 = self.current_block();
+                    self.write_variable(sym, cb2, new.clone());
+                    if self.pt_referenced_names.contains(name) {
+                        let key = self.builder.intern(name);
+                        self.builder.add_inst(InstKind::StoreProp {
+                            obj: Operand::Const(Constant::GlobalThis),
+                            key,
+                            val: new.clone(),
+                            purity: Purity::Throws,
+                        });
+                    }
+                    if prefix { new } else { old }
+                } else {
+                    // Unbound update: lower as global property load + store.
+                    let key = self.builder.intern(name);
+                    let old = self.emit(InstKind::LoadProp {
+                        obj: Operand::Const(Constant::GlobalThis),
+                        key,
+                        purity: Purity::Throws,
+                    });
+                    let new = self.emit(make_inc_dec(op, old.clone()));
+                    self.builder.add_inst(InstKind::StoreProp {
+                        obj: Operand::Const(Constant::GlobalThis),
+                        key,
+                        val: new.clone(),
+                        purity: Purity::Throws,
+                    });
+                    if prefix { new } else { old }
+                }
+            }
+            Expr::Member { obj, prop } => {
+                let obj_op = self.convert_expr(obj);
+                let key = self.builder.intern(prop);
+                let purity = property_access_purity(&obj_op);
+                let old = self.emit(InstKind::LoadProp {
+                    obj: obj_op.clone(),
+                    key,
+                    purity,
+                });
+                let new = self.emit(make_inc_dec(op, old.clone()));
+                self.builder.add_inst(InstKind::StoreProp {
+                    obj: obj_op,
+                    key,
+                    val: new.clone(),
+                    purity,
+                });
+                if prefix { new } else { old }
+            }
+            Expr::Index { obj, index } => {
+                let obj_op = self.convert_expr(obj);
+                let idx_op = self.convert_expr(index);
+                let purity = property_access_purity(&obj_op);
+                let old = self.emit(InstKind::LoadIndex {
+                    obj: obj_op.clone(),
+                    index: idx_op.clone(),
+                    purity,
+                });
+                let new = self.emit(make_inc_dec(op, old.clone()));
+                self.builder.add_inst(InstKind::StoreIndex {
+                    obj: obj_op,
+                    index: idx_op,
+                    val: new.clone(),
+                    purity,
+                });
+                if prefix { new } else { old }
+            }
+            other => panic!("invalid update target: {other:?}"),
         }
     }
 
@@ -2129,6 +2547,18 @@ fn special_global_constant(name: &str) -> Option<Constant> {
 /// the bare unbound read of `foo` would lower to `Throws` — the same
 /// observable JS denoted by two different SSA shapes, defeating CSE on
 /// equivalent rewrites.
+/// Build the increment/decrement instruction for an `Expr::Update`'s
+/// read-modify-write step. Always uses the generic numeric-with-coercion
+/// variant — the IR has no dedicated "always-number" variant and adding
+/// one for `++`/`--` would be premature.
+fn make_inc_dec(op: UpdateOp, old: Operand) -> InstKind {
+    let one = Operand::Const(Constant::Number(1.0));
+    match op {
+        UpdateOp::Inc => InstKind::AddGeneric { lhs: old, rhs: one },
+        UpdateOp::Dec => InstKind::SubGeneric { lhs: old, rhs: one },
+    }
+}
+
 fn property_access_purity(obj: &Operand) -> Purity {
     match obj {
         Operand::Const(Constant::GlobalThis) => Purity::Throws,
