@@ -547,10 +547,6 @@ impl LowerCtx<'_> {
                 op: UnOp::Not,
                 operand: Box::new(self.operand_to_expr(operand)),
             },
-            Neg { operand } => Expr::Unary {
-                op: UnOp::Neg,
-                operand: Box::new(self.operand_to_expr(operand)),
-            },
             BitNot { operand } => Expr::Unary {
                 op: UnOp::BitNot,
                 operand: Box::new(self.operand_to_expr(operand)),
@@ -1998,5 +1994,25 @@ mod tests {
         cfg.immovable_names.insert(v_a.0, "y".to_string());
         cfg.immovable_names.insert(v_b.0, "y".to_string());
         let _ = lower_module_with_config(&module, &cfg);
+    }
+
+    /// `-0` must survive the roundtrip as negative zero, not be silently
+    /// flipped to `+0`.  The decomposition `(-0.0) - x` only preserves the
+    /// sign if the lhs constant is -0.0 (IEEE 754: -0.0 - 0.0 == -0.0, but
+    /// 0.0 - 0.0 == +0.0).
+    #[test]
+    fn neg_zero_roundtrip() {
+        let src = r#"function f() { return -0; }"#;
+        let out = full_roundtrip(src);
+        // The emitted JS must contain the -0 sentinel so that it evaluates to
+        // negative zero (Object.is(-0, result) would hold at runtime).
+        assert!(
+            out.contains("(-0)"),
+            "negative zero must survive roundtrip as (-0), got:\n{out}"
+        );
+        assert!(
+            !out.contains("return 0"),
+            "plain `return 0` would silently produce +0:\n{out}"
+        );
     }
 }

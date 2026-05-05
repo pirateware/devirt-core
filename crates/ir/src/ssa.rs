@@ -215,9 +215,6 @@ pub enum InstKind {
     },
 
     // Unary arithmetic
-    Neg {
-        operand: Operand,
-    },
     BitNot {
         operand: Operand,
     },
@@ -365,7 +362,6 @@ impl InstKind {
             | Eq { .. }
             | Lt { .. }
             | Le { .. }
-            | Neg { .. }
             | BitNot { .. }
             | ToNumber { .. }
             | ToString { .. }
@@ -1205,7 +1201,7 @@ fn walk_inst_operands(kind: &InstKind, mut f: impl FnMut(&Operand)) {
             f(lhs);
             f(rhs);
         }
-        Not { operand } | Neg { operand } | BitNot { operand } => f(operand),
+        Not { operand } | BitNot { operand } => f(operand),
         LoadProp { obj, .. } => f(obj),
         StoreProp { obj, val, .. } => {
             f(obj);
@@ -1458,7 +1454,6 @@ fn write_inst_kind(out: &mut String, kind: &InstKind, m: &Module) {
             out.push_str("not ");
             write_operand(out, operand, m);
         }
-        Neg { operand } => unop(out, "neg", operand, m),
         BitNot { operand } => unop(out, "bit_not", operand, m),
         LogAnd { lhs, rhs } => write_binop(out, "log_and", lhs, rhs, m),
         LogOr { lhs, rhs } => write_binop(out, "log_or", lhs, rhs, m),

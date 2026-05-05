@@ -394,7 +394,12 @@ impl Printer<'_> {
         match e {
             Expr::Number(n) => {
                 if n.is_finite() && n.fract() == 0.0 && n.abs() < 1e15 {
-                    write!(self.buf, "{}", *n as i64).unwrap();
+                    // -0.0 as i64 is 0, so check sign before casting.
+                    if *n == 0.0 && n.is_sign_negative() {
+                        self.buf.push_str("(-0)");
+                    } else {
+                        write!(self.buf, "{}", *n as i64).unwrap();
+                    }
                 } else {
                     write!(self.buf, "{n}").unwrap();
                 }

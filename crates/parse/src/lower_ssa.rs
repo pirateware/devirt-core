@@ -2385,7 +2385,16 @@ impl<'b, 'm> Converter<'b, 'm> {
                 // The convert_expr above already evaluated e.
                 return Operand::Const(Constant::Undefined);
             }
-            UnOp::Neg => InstKind::Neg { operand: v },
+            UnOp::Neg => {
+                // Decompose `-x` as `(-0.0) - x`.  The lhs MUST be -0.0, not
+                // 0.0: IEEE 754 says -(0.0) == -0.0, but 0.0 - 0.0 == +0.0.
+                // JS follows IEEE 754, so a roundtrip through 0.0 - x silently
+                // flips the sign of zero.  See also: LLVM's fneg history.
+                return self.emit(InstKind::SubGeneric {
+                    lhs: Operand::Const(Constant::Number(-0.0_f64)),
+                    rhs: v,
+                });
+            }
             UnOp::BitNot => InstKind::BitNot { operand: v },
         };
         self.emit(kind)
@@ -2726,7 +2735,7 @@ fn walk_inst_operands_mut(kind: &mut InstKind, f: &mut impl FnMut(&mut Operand))
             f(lhs);
             f(rhs);
         }
-        Not { operand } | Neg { operand } | BitNot { operand } => f(operand),
+        Not { operand } | BitNot { operand } => f(operand),
         LoadProp { obj, .. } => f(obj),
         StoreProp { obj, val, .. } => {
             f(obj);
