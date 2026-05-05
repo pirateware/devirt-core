@@ -1,4 +1,0 @@
-Source: https://unpkg.com/lodash.debounce@4.0.8/index.js
-License: MIT
-Fetched: 2025-01-05
-Description: Lodash debounce module - delays invoking function until after wait milliseconds
