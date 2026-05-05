@@ -167,8 +167,26 @@ fn passthrough_to_literal(
     func: &Function,
     pt: &ssa::PassThroughBody,
 ) -> tree::FuncLiteral {
+    // Top-level functions always have a name (SSA `Function.name` is
+    // populated for every top-level item). The SSA-side
+    // `PassThroughBody.function_name` is `Option` because it's also
+    // used for inner anonymous function expressions; for the top-level
+    // mapping use `func.name` so the emit `Item::PassThroughFunction`
+    // arm always finds a name. Empty string sentinel (unnamed inner
+    // arrow that ended up as a top-level item via fallback) maps to
+    // None to preserve the existing emit invariant.
+    let name = pt
+        .function_name
+        .map(|n| sm.strings.resolve(&n).to_string())
+        .or_else(|| {
+            if func.name.is_empty() {
+                None
+            } else {
+                Some(func.name.clone())
+            }
+        });
     tree::FuncLiteral {
-        name: pt.function_name.map(|n| sm.strings.resolve(&n).to_string()),
+        name,
         params: pt
             .param_names
             .iter()
@@ -183,8 +201,6 @@ fn passthrough_to_literal(
         force_passthrough: std::cell::Cell::new(false),
         blockers: std::collections::BTreeSet::new(),
     }
-    // `func.name` and `pt.function_name` agree by construction (the OXC
-    // lowerer populates both); we trust pt.function_name here.
     .into_with_func_name_check(&func.name)
 }
 
@@ -526,6 +542,7 @@ impl<'a> LowerCtx<'a> {
             // `global` collapse to the same Const(GlobalThis) and therefore
             // all re-emit as `globalThis`.
             Constant::GlobalThis => Expr::Ident("globalThis".to_string()),
+            Constant::This => Expr::This,
         }
     }
 }
@@ -1596,6 +1613,7 @@ fn render_expr_to_string(e: &Expr) -> String {
         Expr::Null => "null".to_string(),
         Expr::Undefined => "undefined".to_string(),
         Expr::Ident(n) => n.clone(),
+        Expr::This => "this".to_string(),
         Expr::Binary { op, lhs, rhs } => format!(
             "({}{}{})",
             render_expr_to_string(lhs),

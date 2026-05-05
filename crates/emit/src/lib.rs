@@ -330,6 +330,11 @@ impl Printer<'_> {
             Stmt::Continue => {
                 self.buf.push_str("continue;");
             }
+            Stmt::Throw(e) => {
+                self.buf.push_str("throw ");
+                self.expr(e);
+                self.buf.push(';');
+            }
             Stmt::Block(stmts) => {
                 self.buf.push_str("{\n");
                 self.indent += 1;
@@ -504,6 +509,7 @@ impl Printer<'_> {
             Expr::Null => self.buf.push_str("null"),
             Expr::Undefined => self.buf.push_str("undefined"),
             Expr::Ident(name) => self.buf.push_str(name),
+            Expr::This => self.buf.push_str("this"),
             Expr::Binary { op, lhs, rhs } => {
                 // Always parenthesize. Not pretty, but trivially correct.
                 self.buf.push('(');

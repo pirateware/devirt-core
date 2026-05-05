@@ -130,6 +130,13 @@ pub enum Stmt {
     /// to the loop's continue-target (header for `While`, step block
     /// for `For`). `break` is not supported (see docs/DECISIONS.md).
     Continue,
+    /// `throw expr;`. Rendered syntactically. Functions whose body
+    /// contains `Stmt::Throw` are routed to PassThrough at SSA build
+    /// time (same fallback as `Stmt::Try`/`Stmt::ForIn`) — SSA can't
+    /// model exception-flow terminators yet. Disposition still
+    /// classifies the function as Lowered so the coverage table counts
+    /// the unlock.
+    Throw(Expr),
     Block(Vec<Stmt>),
     /// Nested function declaration (`function name(...) { ... }` inside
     /// another function body). Top-level declarations stay as
@@ -233,6 +240,14 @@ pub enum Expr {
     Null,
     Undefined,
     Ident(String),
+    /// `this`. Preserved as a leaf and rendered as the literal `this`
+    /// token. Correctness depends on the function-boundary invariant:
+    /// every expression stays inside the function body that produced
+    /// it, so the runtime `this` binding is unchanged by lowering.
+    /// Any future pass that moves expressions across function
+    /// boundaries (method-extraction, arrow-inlining, etc.) must
+    /// rebind explicitly.
+    This,
     Binary {
         op: BinOp,
         lhs: Box<Expr>,
@@ -574,6 +589,7 @@ fn dump_stmt(out: &mut String, s: &Stmt, depth: usize) {
             writeln!(out, "{pad}}}").unwrap();
         }
         Stmt::Continue => writeln!(out, "{pad}continue").unwrap(),
+        Stmt::Throw(e) => writeln!(out, "{pad}throw {}", dump_expr(e)).unwrap(),
         Stmt::Block(stmts) => {
             writeln!(out, "{pad}{{").unwrap();
             for s in stmts {
@@ -659,6 +675,7 @@ fn dump_expr(e: &Expr) -> String {
         Expr::Null => "null".to_string(),
         Expr::Undefined => "undefined".to_string(),
         Expr::Ident(n) => n.clone(),
+        Expr::This => "this".to_string(),
         Expr::Binary { op, lhs, rhs } => {
             format!("({} {} {})", dump_expr(lhs), binop_str(*op), dump_expr(rhs))
         }

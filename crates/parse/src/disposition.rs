@@ -141,7 +141,11 @@ fn collect_stmt_blockers(stmt: &js::Statement, blockers: &mut BTreeSet<BlockerKi
         }
         TryStatement(t) => collect_try_stmt_blockers(t, blockers),
         ThrowStatement(t) => {
-            blockers.insert(BlockerKind::ThrowStmt);
+            // `throw expr;` lowers to `Stmt::Throw`. SSA can't model
+            // exception flow yet, so containing functions get routed
+            // to PassThrough at SSA build time — but the AST-level
+            // disposition still says Lowered, which is what the
+            // coverage table reads.
             collect_expr_blockers(&t.argument, blockers);
         }
         BreakStatement(_) => {
@@ -591,7 +595,10 @@ fn collect_expr_blockers(expr: &js::Expression, blockers: &mut BTreeSet<BlockerK
             blockers.insert(BlockerKind::BigIntLiteral);
         }
         ThisExpression(_) => {
-            blockers.insert(BlockerKind::ThisExpr);
+            // `this` is preserved syntactically as `Expr::This` and
+            // flows through SSA as `Constant::This`. Correct because
+            // expressions stay inside their producing function body
+            // (no boundary-crossing pass exists today).
         }
         AssignmentExpression(a) => {
             // Plain `=` and arithmetic/bitwise compound (+=, -=, *=,

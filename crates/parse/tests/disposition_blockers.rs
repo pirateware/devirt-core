@@ -49,28 +49,28 @@ fn arithmetic_and_return_is_lowered() {
 // --- Three distinct blockers all reported ---
 
 #[test]
-fn three_distinct_blockers_all_reported() {
-    // ThrowStmt + BreakStmt + NullishCoalescing — three constructs that
-    // remain blocked after the SequenceExpr / AssignmentExpr / ForInStmt
-    // ticket (those are no longer blockers in their simple forms).
-    let src = "function f(a) { throw new Error(); while (a) { break; } let x = a ?? 1; }";
+fn two_distinct_blockers_all_reported() {
+    // BreakStmt + NullishCoalescing — two constructs still blocked
+    // after the throw/this lowering ticket. (ThrowStmt is no longer
+    // a blocker; it lowers to `Stmt::Throw` and routes through the
+    // SSA-fallback path.)
+    let src = "function f(a) { while (a) { break; } let x = a ?? 1; }";
     let b = blockers_of(src);
-    assert!(b.contains(&BlockerKind::ThrowStmt), "missing ThrowStmt in {b:?}");
     assert!(b.contains(&BlockerKind::BreakStmt), "missing BreakStmt in {b:?}");
     assert!(b.contains(&BlockerKind::NullishCoalescing), "missing NullishCoalescing in {b:?}");
-    assert_eq!(b.len(), 3, "expected exactly 3 blockers, got {b:?}");
+    assert_eq!(b.len(), 2, "expected exactly 2 blockers, got {b:?}");
 }
 
 // --- Set semantics: same kind 5 times = 1 entry ---
 
 #[test]
 fn repeated_blocker_kind_reported_once() {
-    // Five throw statements — all ThrowStmt, only one entry in the set.
+    // Five break statements — all BreakStmt, only one entry in the set.
     let src = "function f() {
-        throw 1; throw 2; throw 3; throw 4; throw 5;
+        while (true) { break; break; break; break; break; }
     }";
     let b = blockers_of(src);
-    assert!(b.contains(&BlockerKind::ThrowStmt), "{b:?}");
+    assert!(b.contains(&BlockerKind::BreakStmt), "{b:?}");
     assert_eq!(b.len(), 1, "expected exactly 1 unique blocker, got {b:?}");
 }
 
@@ -95,9 +95,13 @@ fn default_param_blocked() {
 }
 
 #[test]
-fn throw_stmt_blocked() {
-    let b = blockers_of("function f() { throw new Error('x'); }");
-    assert!(b.contains(&BlockerKind::ThrowStmt), "{b:?}");
+fn throw_stmt_is_lowered() {
+    // `throw expr;` lowers to `Stmt::Throw`; functions containing it
+    // route through SSA-fallback but the AST disposition is Lowered.
+    assert_eq!(
+        decide_first_fn("function f() { throw new Error('x'); }"),
+        Disposition::Lowered
+    );
 }
 
 #[test]
@@ -139,9 +143,13 @@ fn nullish_coalescing_blocked() {
 }
 
 #[test]
-fn this_expr_blocked() {
-    let b = blockers_of("function f() { return this.x; }");
-    assert!(b.contains(&BlockerKind::ThisExpr), "{b:?}");
+fn this_expr_is_lowered() {
+    // `this` lowers to `Expr::This`; functions referencing it route
+    // through SSA-fallback but the AST disposition is Lowered.
+    assert_eq!(
+        decide_first_fn("function f() { return this.x; }"),
+        Disposition::Lowered
+    );
 }
 
 #[test]
