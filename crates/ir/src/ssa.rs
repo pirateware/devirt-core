@@ -427,6 +427,14 @@ pub enum InstKind {
         obj: Operand,
         ctor: Operand,
     },
+    /// `key in obj` — runtime property-existence check. Equivalent
+    /// to `HasProperty(obj, ToPropertyKey(key))` per ECMA-262.
+    /// `obj` must be an object (TypeError otherwise); `key` may
+    /// throw on Symbol/object coercion.
+    In {
+        key: Operand,
+        obj: Operand,
+    },
 
     // Escape hatch — opaque, blocks all reordering and analysis.
     OpaqueEval {
@@ -476,7 +484,8 @@ impl InstKind {
             | ToNumber { .. }
             | ToString { .. }
             | ToInt32 { .. }
-            | Instanceof { .. } => Effect::MAY_THROW,
+            | Instanceof { .. }
+            | In { .. } => Effect::MAY_THROW,
 
             // Heap reads: dispatched by the per-site Purity tier.
             LoadProp { purity, .. } | LoadIndex { purity, .. } => purity.load_effect(),
@@ -1403,6 +1412,10 @@ fn walk_inst_operands(kind: &InstKind, mut f: impl FnMut(&Operand)) {
             f(obj);
             f(ctor);
         }
+        In { key, obj } => {
+            f(key);
+            f(obj);
+        }
     }
 }
 
@@ -1750,6 +1763,7 @@ fn write_inst_kind(out: &mut String, kind: &InstKind, m: &Module) {
         ToInt32 { val } => unop(out, "to_int32", val, m),
         Typeof { val } => unop(out, "typeof", val, m),
         Instanceof { obj, ctor } => write_binop(out, "instanceof", obj, ctor, m),
+        In { key, obj } => write_binop(out, "in", key, obj, m),
         OpaqueEval { source } => unop(out, "opaque_eval", source, m),
     }
 }

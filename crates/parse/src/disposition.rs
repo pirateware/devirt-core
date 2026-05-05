@@ -662,6 +662,8 @@ fn binop_lowerable(op: js::BinaryOperator) -> bool {
             | ShiftRight
             | ShiftRightZeroFill
             | Exponential
+            | In
+            | Instanceof
     )
 }
 

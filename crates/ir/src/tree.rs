@@ -406,6 +406,12 @@ pub enum BinOp {
     Shl,
     Shr,
     UShr,
+    /// `key in obj`. RHS must be an object (TypeError if not); LHS
+    /// is coerced via ToPropertyKey, which can throw on Symbol mixing.
+    In,
+    /// `obj instanceof Ctor`. Looks up `Ctor[Symbol.hasInstance]` if
+    /// defined, else walks the prototype chain. Both arms can throw.
+    Instanceof,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -442,6 +448,8 @@ pub fn binop_str(op: BinOp) -> &'static str {
         BinOp::Shl => "<<",
         BinOp::Shr => ">>",
         BinOp::UShr => ">>>",
+        BinOp::In => "in",
+        BinOp::Instanceof => "instanceof",
     }
 }
 

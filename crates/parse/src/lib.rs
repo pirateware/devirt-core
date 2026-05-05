@@ -1246,6 +1246,8 @@ fn lower_binop(op: js::BinaryOperator) -> Result<BinOp, Error> {
         B::ShiftRight => BinOp::Shr,
         B::ShiftRightZeroFill => BinOp::UShr,
         B::Exponential => BinOp::Pow,
+        B::In => BinOp::In,
+        B::Instanceof => BinOp::Instanceof,
         _ => return Err(Error::Unsupported("binary operator")),
     })
 }
