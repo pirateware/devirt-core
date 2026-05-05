@@ -1,4 +1,0 @@
-Source: Synthetic minified bundle (webpack-style)
-License: Public domain (synthetic)
-Created: 2025-01-05
-Description: Representative webpack-style minified bundle with IIFE wrapper

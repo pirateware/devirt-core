@@ -1,5 +1,0 @@
-Source: Synthetic obfuscated code (javascript-obfuscator style)
-License: Public domain (synthetic)
-Created: 2025-01-05
-Description: String array obfuscation with hexadecimal identifiers
-WARNING: DO NOT EXECUTE - For analysis only
