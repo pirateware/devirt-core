@@ -5,9 +5,9 @@ This report tests the parse → IR → emit pipeline against real-world JavaScri
 ## Summary
 
 - Total files tested: 308
-- Parse success: 301/308 (97.7%)
-- Roundtrip success: 301/308 (97.7%)
-- Panics/crashes: 7
+- Parse success: 308/308 (100.0%)
+- Roundtrip success: 308/308 (100.0%)
+- Panics/crashes: 0
 
 ## Tier 1
 
@@ -20,7 +20,7 @@ This report tests the parse → IR → emit pipeline against real-world JavaScri
 | lodash_snakeCase.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 100.0% |  |
 | lodash_identity.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 46.4% |  |
 | lodash_sortBy.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 100.0% |  |
-| lodash_cloneDeep.js | ✗ | ✗ | ✗ | ✗ | ✗ | 0% | 0% | PANIC: Panic during test (likely unimplemented feature) |
+| lodash_cloneDeep.js | ✓ | ✓ | ✓ | ✓ | ✓ | 74.7% | 29.9% | High PT% |
 | datefns_isBefore.js | ✓ | ✓ | ✓ | ✓ | ✓ | 100.0% | 64.7% | High PT% |
 | datefns_format.js | ✓ | ✓ | ✓ | ✓ | ✓ | 97.8% | 19.2% | High PT% |
 | lodash_without.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 100.0% |  |
@@ -36,7 +36,7 @@ This report tests the parse → IR → emit pipeline against real-world JavaScri
 | lodash_debounce.js | ✓ | ✓ | ✓ | ✓ | ✓ | 87.0% | 15.7% | High PT% |
 | lodash_camelCase.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 100.0% |  |
 | lodash_compact.js | ✓ | ✓ | ✓ | ✓ | ✓ | 100.0% | 9.3% | High PT% |
-| datefns_parseISO.js | ✗ | ✗ | ✗ | ✗ | ✗ | 0% | 0% | PANIC: Panic during test (likely unimplemented feature) |
+| datefns_parseISO.js | ✓ | ✓ | ✓ | ✓ | ✓ | 59.5% | 14.9% | High PT% |
 | lodash_flow.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 100.0% |  |
 | datefns_isAfter.js | ✓ | ✓ | ✓ | ✓ | ✓ | 100.0% | 64.6% | High PT% |
 | lodash_startCase.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 100.0% |  |
@@ -66,7 +66,7 @@ This report tests the parse → IR → emit pipeline against real-world JavaScri
 | lodash_memoize.js | ✓ | ✓ | ✓ | ✓ | ✓ | 100.0% | 19.6% | High PT% |
 | lodash_mapKeys.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 52.7% |  |
 | lodash_constant.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 30.2% |  |
-| datefns_differenceInDays.js | ✗ | ✗ | ✗ | ✗ | ✗ | 0% | 0% | PANIC: Panic during test (likely unimplemented feature) |
+| datefns_differenceInDays.js | ✓ | ✓ | ✓ | ✓ | ✓ | 79.2% | 34.5% | High PT% |
 | lodash_pick.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 100.0% |  |
 | lodash_isPlainObject.js | ✓ | ✓ | ✓ | ✓ | ✓ | 100.0% | 53.4% | High PT% |
 
@@ -93,7 +93,7 @@ This report tests the parse → IR → emit pipeline against real-world JavaScri
 | moment.min.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 100.0% |  |
 | lodash_get.terser.min.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 46.9% |  |
 | lodash_camelCase.terser.min.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 100.0% |  |
-| datefns_differenceInDays.terser.min.js | ✗ | ✗ | ✗ | ✗ | ✗ | 0% | 0% | PANIC: Panic during test (likely unimplemented feature) |
+| datefns_differenceInDays.terser.min.js | ✓ | ✓ | ✓ | ✓ | ✓ | 79.6% | 59.3% | High PT% |
 | core_js_bundle.min.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 100.0% |  |
 | lodash_groupBy.terser.min.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 100.0% |  |
 | redux.min.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 100.0% |  |
@@ -155,7 +155,7 @@ This report tests the parse → IR → emit pipeline against real-world JavaScri
 | immer.min.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 100.0% |  |
 | datefns_subDays.terser.min.js | ✓ | ✓ | ✓ | ✓ | ✓ | 100.0% | 81.7% | High PT% |
 | lodash_startCase.terser.min.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 100.0% |  |
-| lodash_cloneDeep.terser.min.js | ✗ | ✗ | ✗ | ✗ | ✗ | 0% | 0% | PANIC: Panic during test (likely unimplemented feature) |
+| lodash_cloneDeep.terser.min.js | ✓ | ✓ | ✓ | ✓ | ✓ | 62.5% | 37.3% | High PT% |
 
 ## Tier 3
 
@@ -174,7 +174,7 @@ This report tests the parse → IR → emit pipeline against real-world JavaScri
 | datefns_addMonths.low.js | ✓ | ✓ | ✓ | ✓ | ✓ | 70.3% | 56.4% | High PT% |
 | datefns_isBefore.low.js | ✓ | ✓ | ✓ | ✓ | ✓ | 47.7% | 67.7% | High PT% |
 | lodash_range.medium.js | ✓ | ✓ | ✓ | ✓ | ✓ | 90.2% | 36.7% | High PT% |
-| lodash_cloneDeep.low.js | ✗ | ✗ | ✗ | ✗ | ✗ | 0% | 0% | PANIC: Panic during test (likely unimplemented feature) |
+| lodash_cloneDeep.low.js | ✓ | ✓ | ✓ | ✓ | ✓ | 78.7% | 30.8% | High PT% |
 | datefns_addMonths.medium.js | ✓ | ✓ | ✓ | ✓ | ✓ | 93.4% | 37.0% | High PT% |
 | lodash_isEqual.medium.js | ✓ | ✓ | ✓ | ✓ | ✓ | 88.0% | 36.0% | High PT% |
 | lodash_partition.high.js | ✓ | ✓ | ✓ | ✓ | ✓ | 95.8% | 28.2% | High PT% |
@@ -311,7 +311,7 @@ This report tests the parse → IR → emit pipeline against real-world JavaScri
 | lodash_compact.low.js | ✓ | ✓ | ✓ | ✓ | ✓ | 51.2% | 57.9% | High PT% |
 | lodash_chunk.low.js | ✓ | ✓ | ✓ | ✓ | ✓ | 66.0% | 52.8% | High PT% |
 | datefns_formatDistance.low.js | ✓ | ✓ | ✓ | ✓ | ✓ | 93.1% | 32.6% | High PT% |
-| lodash_cloneDeep.medium.js | ✗ | ✗ | ✗ | ✗ | ✗ | 0% | 0% | PANIC: Panic during test (likely unimplemented feature) |
+| lodash_cloneDeep.medium.js | ✓ | ✓ | ✓ | ✓ | ✓ | 84.1% | 27.2% | High PT% |
 | lodash_snakeCase.medium.js | ✓ | ✓ | ✓ | ✓ | ✓ | 90.2% | 39.3% | High PT% |
 | lodash_uniqBy.high.js | ✓ | ✓ | ✓ | ✓ | ✓ | 96.3% | 22.1% | High PT% |
 | lodash_partial.high.js | ✓ | ✓ | ✓ | ✓ | ✓ | 95.8% | 40.8% | High PT% |
@@ -332,40 +332,9 @@ This report tests the parse → IR → emit pipeline against real-world JavaScri
 | lodash_snakeCase.low.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 76.6% |  |
 | lodash_union.high.js | ✓ | ✓ | ✓ | ✓ | ✓ | 95.8% | 35.3% | High PT% |
 
-## Issues Found
-
-### Tier 1 - lodash_cloneDeep.js
-
-Panic: `Panic during test (likely unimplemented feature)`
-
-### Tier 1 - datefns_parseISO.js
-
-Panic: `Panic during test (likely unimplemented feature)`
-
-### Tier 1 - datefns_differenceInDays.js
-
-Panic: `Panic during test (likely unimplemented feature)`
-
-### Tier 2 - datefns_differenceInDays.terser.min.js
-
-Panic: `Panic during test (likely unimplemented feature)`
-
-### Tier 2 - lodash_cloneDeep.terser.min.js
-
-Panic: `Panic during test (likely unimplemented feature)`
-
-### Tier 3 - lodash_cloneDeep.low.js
-
-Panic: `Panic during test (likely unimplemented feature)`
-
-### Tier 3 - lodash_cloneDeep.medium.js
-
-Panic: `Panic during test (likely unimplemented feature)`
-
 ## Decision Rules Summary
 
 Based on the test results:
 
-- ⚠️ **PANICS DETECTED**: 7 file(s) caused panics. These are bugs that need to be fixed immediately.
-- ⚠️ **Tier 1 parse failures**: 3 file(s) failed to parse. These are likely real bugs in the parser.
-- ℹ️ **High passthrough**: 175 file(s) have >20% function-body passthrough. These should be investigated to identify dominant unlowered constructs.
+- ℹ️ **High passthrough**: 182 file(s) have >20% function-body passthrough. These should be investigated to identify dominant unlowered constructs.
+

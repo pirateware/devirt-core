@@ -547,6 +547,14 @@ impl LowerCtx<'_> {
                 op: UnOp::Not,
                 operand: Box::new(self.operand_to_expr(operand)),
             },
+            Neg { operand } => Expr::Unary {
+                op: UnOp::Neg,
+                operand: Box::new(self.operand_to_expr(operand)),
+            },
+            BitNot { operand } => Expr::Unary {
+                op: UnOp::BitNot,
+                operand: Box::new(self.operand_to_expr(operand)),
+            },
             // Value-producing logical ops shouldn't normally appear (the
             // converter routes && / || through a CFG diamond). If one does
             // sneak in, the both-sides-eval semantics differ slightly from

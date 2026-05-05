@@ -2385,8 +2385,8 @@ impl<'b, 'm> Converter<'b, 'm> {
                 // The convert_expr above already evaluated e.
                 return Operand::Const(Constant::Undefined);
             }
-            UnOp::Neg => unimplemented!("unary neg not yet lowered"),
-            UnOp::BitNot => unimplemented!("bitwise not not yet lowered"),
+            UnOp::Neg => InstKind::Neg { operand: v },
+            UnOp::BitNot => InstKind::BitNot { operand: v },
         };
         self.emit(kind)
     }
@@ -2726,7 +2726,7 @@ fn walk_inst_operands_mut(kind: &mut InstKind, f: &mut impl FnMut(&mut Operand))
             f(lhs);
             f(rhs);
         }
-        Not { operand } => f(operand),
+        Not { operand } | Neg { operand } | BitNot { operand } => f(operand),
         LoadProp { obj, .. } => f(obj),
         StoreProp { obj, val, .. } => {
             f(obj);
