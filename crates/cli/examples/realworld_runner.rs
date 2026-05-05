@@ -2,8 +2,11 @@
 //!
 //! Run with: cargo run --example realworld_runner -- ./corpus/realworld
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use ir::blocker::BlockerKind;
 
 fn main() {
     let corpus_dir = std::env::args()
@@ -65,6 +68,8 @@ struct TestStats {
     fb_pt_pct: f64,
     tl_pt_pct: f64,
     error: Option<String>,
+    /// Blocker sets for each PassThrough function in this file.
+    pt_blocker_sets: Vec<BTreeSet<BlockerKind>>,
 }
 
 fn test_file_safely(path: &Path) -> Result<TestStats, String> {
@@ -94,6 +99,7 @@ fn test_file_inner(source: &str) -> Result<TestStats, String> {
         fb_pt_pct: 0.0,
         tl_pt_pct: 0.0,
         error: None,
+        pt_blocker_sets: Vec::new(),
     };
 
     // Step 1: Parse
@@ -112,6 +118,12 @@ fn test_file_inner(source: &str) -> Result<TestStats, String> {
     let cov = coverage::analyze(&tree_module);
     stats.fb_pt_pct = calculate_fb_pt_pct(&cov);
     stats.tl_pt_pct = calculate_tl_pt_pct(&cov);
+    stats.pt_blocker_sets = cov
+        .functions
+        .iter()
+        .filter(|f| f.disposition == coverage::Disposition::PassThrough)
+        .map(|f| f.blockers.clone())
+        .collect();
 
     // Step 2: Lower to SSA and validate
     let ssa_module = cli::ir::lower_ssa::lower_module(&tree_module);
@@ -324,6 +336,27 @@ fn generate_and_write_report(
     }
 
     report.push_str("\n");
+
+    // Corpus-wide blocker analysis: aggregate all PT function blocker sets.
+    let corpus_pt_functions: Vec<cli::coverage::FunctionCoverage> = results
+        .iter()
+        .filter_map(|(_, _, r)| r.as_ref().ok())
+        .flat_map(|s| {
+            s.pt_blocker_sets.iter().map(|bs| cli::coverage::FunctionCoverage {
+                name: String::new(),
+                disposition: cli::coverage::Disposition::PassThrough,
+                lowered_stmts: 0,
+                passthrough_bytes: 0,
+                blockers: bs.clone(),
+            })
+        })
+        .collect();
+    let corpus_cov = cli::coverage::ModuleCoverage {
+        functions: corpus_pt_functions,
+        top_level_passthrough_stmts: 0,
+        top_level_passthrough_bytes: 0,
+    };
+    report.push_str(&cli::coverage::format_blocker_table(&corpus_cov));
 
     let report_path = corpus_dir.join("STABILITY_REPORT.md");
     if let Some(parent) = report_path.parent() {

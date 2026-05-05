@@ -10,7 +10,10 @@
 //! see?" Used by `cargo run -- --coverage-stats <file.js>` from
 //! `main.rs`.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+
+use ::ir::blocker::BlockerKind;
 
 use crate::ir::tree::{self, Expr, FuncBody, FuncLiteral, Item, Stmt};
 
@@ -33,6 +36,8 @@ pub struct FunctionCoverage {
     pub lowered_stmts: usize,
     /// PassThrough: byte count of the source slice. Lowered: 0.
     pub passthrough_bytes: usize,
+    /// PassThrough: set of all constructs that blocked lowering. Lowered: empty.
+    pub blockers: BTreeSet<BlockerKind>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +65,7 @@ pub fn analyze(tm: &tree::Module) -> ModuleCoverage {
                     disposition: Disposition::Lowered,
                     lowered_stmts: count_stmts(&f.body),
                     passthrough_bytes: 0,
+                    blockers: BTreeSet::new(),
                 });
                 walk_stmts(&f.body, &f.name, &mut out.functions);
             }
@@ -74,6 +80,7 @@ pub fn analyze(tm: &tree::Module) -> ModuleCoverage {
                     disposition: Disposition::PassThrough,
                     lowered_stmts: 0,
                     passthrough_bytes: bytes,
+                    blockers: lit.blockers.clone(),
                 });
             }
             Item::Stmt(_) => {
@@ -257,6 +264,7 @@ fn emit_lit_row(lit: &FuncLiteral, parent: &str, rows: &mut Vec<FunctionCoverage
                 disposition: Disposition::Lowered,
                 lowered_stmts: count_stmts(b),
                 passthrough_bytes: 0,
+                blockers: BTreeSet::new(),
             });
             walk_stmts(b, &qname, rows);
         }
@@ -269,6 +277,7 @@ fn emit_lit_row(lit: &FuncLiteral, parent: &str, rows: &mut Vec<FunctionCoverage
                 disposition: Disposition::Lowered,
                 lowered_stmts: 1,
                 passthrough_bytes: 0,
+                blockers: BTreeSet::new(),
             });
             walk_expr(e, &qname, rows);
         }
@@ -278,6 +287,7 @@ fn emit_lit_row(lit: &FuncLiteral, parent: &str, rows: &mut Vec<FunctionCoverage
                 disposition: Disposition::PassThrough,
                 lowered_stmts: 0,
                 passthrough_bytes: s.len(),
+                blockers: lit.blockers.clone(),
             });
         }
     }
@@ -379,6 +389,106 @@ pub fn format_table(cov: &ModuleCoverage) -> String {
         )
         .unwrap();
     }
+    out
+}
+
+/// Format three blocker-analysis views for PassThrough functions:
+///
+/// 1. **Occurrence count** — how many PT functions contain each `BlockerKind`
+/// 2. **Counterfactual unlock** — how many PT functions have this as their *sole* blocker
+/// 3. **Cumulative unlock projection** — running total if we fix kinds greedily
+///    (ordered by counterfactual count descending)
+pub fn format_blocker_table(cov: &ModuleCoverage) -> String {
+    let pt_fns: Vec<&FunctionCoverage> = cov
+        .functions
+        .iter()
+        .filter(|f| f.disposition == Disposition::PassThrough)
+        .collect();
+
+    if pt_fns.is_empty() {
+        return String::from("(no passthrough functions — blocker table empty)\n");
+    }
+
+    // Collect every BlockerKind seen across all PT functions.
+    let all_kinds: BTreeSet<BlockerKind> = pt_fns
+        .iter()
+        .flat_map(|f| f.blockers.iter().cloned())
+        .collect();
+
+    // Per-kind occurrence and counterfactual counts.
+    let occurrences: BTreeMap<BlockerKind, usize> = all_kinds
+        .iter()
+        .map(|k| (k.clone(), pt_fns.iter().filter(|f| f.blockers.contains(k)).count()))
+        .collect();
+    let counterfactuals: BTreeMap<BlockerKind, usize> = all_kinds
+        .iter()
+        .map(|k| {
+            (
+                k.clone(),
+                pt_fns
+                    .iter()
+                    .filter(|f| f.blockers.len() == 1 && f.blockers.contains(k))
+                    .count(),
+            )
+        })
+        .collect();
+
+    // Sort by counterfactual count descending, break ties by kind name.
+    let mut ranked: Vec<BlockerKind> = all_kinds.into_iter().collect();
+    ranked.sort_by(|a, b| {
+        counterfactuals[b]
+            .cmp(&counterfactuals[a])
+            .then_with(|| a.to_string().cmp(&b.to_string()))
+    });
+
+    // Greedy cumulative simulation: fix kinds in `ranked` order and track
+    // how many additional PT functions become fully unlocked at each step.
+    let mut fixed: BTreeSet<BlockerKind> = BTreeSet::new();
+    let mut prev_unlocked = 0usize;
+    let total_pt = pt_fns.len();
+
+    // Collect rows for the table.
+    let rows: Vec<(String, usize, usize, usize, usize)> = ranked
+        .iter()
+        .map(|k| {
+            fixed.insert(k.clone());
+            let cumulative = pt_fns
+                .iter()
+                .filter(|f| f.blockers.iter().all(|b| fixed.contains(b)))
+                .count();
+            let additional = cumulative - prev_unlocked;
+            prev_unlocked = cumulative;
+            (k.to_string(), occurrences[k], counterfactuals[k], additional, cumulative)
+        })
+        .collect();
+
+    let mut out = String::new();
+    writeln!(
+        &mut out,
+        "\n## Blocker Analysis ({total_pt} passthrough function(s))\n"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "{:<34} {:>10} {:>14} {:>9} {:>11}",
+        "blocker_kind", "occurrences", "counterfactual", "+unlocked", "cumulative"
+    )
+    .unwrap();
+    writeln!(&mut out, "{}", "-".repeat(82)).unwrap();
+    for (name, occ, cf, additional, cumulative) in &rows {
+        writeln!(
+            &mut out,
+            "{:<34} {:>10} {:>14} {:>9} {:>11}",
+            name, occ, cf, additional, cumulative
+        )
+        .unwrap();
+    }
+    writeln!(&mut out, "{}", "-".repeat(82)).unwrap();
+    writeln!(
+        &mut out,
+        "Fixing all listed blockers would unlock {prev_unlocked}/{total_pt} passthrough function(s)."
+    )
+    .unwrap();
     out
 }
 
