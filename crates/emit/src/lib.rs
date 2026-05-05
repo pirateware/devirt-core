@@ -663,6 +663,13 @@ impl Printer<'_> {
                 self.expr(value);
                 self.buf.push(')');
             }
+            Expr::CompoundAssign { op, target, value } => {
+                self.buf.push('(');
+                self.expr(target);
+                write!(self.buf, " {}= ", binop_str(*op)).unwrap();
+                self.expr(value);
+                self.buf.push(')');
+            }
             Expr::Template { quasis, exprs } => {
                 self.buf.push('`');
                 let mut quasis_iter = quasis.iter();

@@ -761,6 +761,13 @@ impl LowerCtx<'_> {
             }
             DivGeneric { lhs, rhs } => self.binop(BinOp::Div, lhs, rhs),
             ModGeneric { lhs, rhs } => self.binop(BinOp::Mod, lhs, rhs),
+            PowGeneric { lhs, rhs } => self.binop(BinOp::Pow, lhs, rhs),
+            BitAnd { lhs, rhs } => self.binop(BinOp::BitAnd, lhs, rhs),
+            BitOr { lhs, rhs } => self.binop(BinOp::BitOr, lhs, rhs),
+            BitXor { lhs, rhs } => self.binop(BinOp::BitXor, lhs, rhs),
+            Shl { lhs, rhs } => self.binop(BinOp::Shl, lhs, rhs),
+            Shr { lhs, rhs } => self.binop(BinOp::Shr, lhs, rhs),
+            UShr { lhs, rhs } => self.binop(BinOp::UShr, lhs, rhs),
             ConcatStr { lhs, rhs } => self.binop(BinOp::Add, lhs, rhs),
             Not { operand } => Expr::Unary {
                 op: UnOp::Not,
@@ -1683,6 +1690,12 @@ fn render_expr_to_string(e: &Expr) -> String {
         Expr::Assign { target, value } => format!(
             "({}={})",
             render_expr_to_string(target),
+            render_expr_to_string(value)
+        ),
+        Expr::CompoundAssign { op, target, value } => format!(
+            "({}{}={})",
+            render_expr_to_string(target),
+            binop_str(*op),
             render_expr_to_string(value)
         ),
         Expr::Template { quasis, exprs } => {

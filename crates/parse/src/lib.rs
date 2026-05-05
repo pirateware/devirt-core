@@ -47,8 +47,9 @@ fn compound_to_binop(op: js::AssignmentOperator) -> Result<BinOp, Error> {
         A::BitwiseAnd => BinOp::BitAnd,
         A::BitwiseOR => BinOp::BitOr,
         A::BitwiseXOR => BinOp::BitXor,
-        // Exponential and logical/nullish-assign are rejected at the
-        // walker; reaching here is a walker bug.
+        A::Exponential => BinOp::Pow,
+        // Logical/nullish-assign (`||=`, `&&=`, `??=`) are rejected at
+        // the walker; reaching here is a walker bug.
         _ => return Err(Error::Unsupported("compound assignment operator")),
     })
 }
@@ -1144,18 +1145,21 @@ impl Lowerer<'_> {
             }
 
             js::Expression::AssignmentExpression(a) => {
-                // Only plain `=` is lowerable in expression position.
-                // Compound (+= etc.) and logical (||= etc.) remain
-                // blocked; reaching here with a non-Assign operator
-                // means the disposition walker is too permissive.
-                if !matches!(a.operator, js::AssignmentOperator::Assign) {
-                    return Err(Error::Unsupported(
-                        "compound/logical assignment in expression position",
-                    ));
-                }
                 let target = self.lower_assign_target(&a.left)?;
                 let value = self.lower_expr(&a.right)?;
-                Ok(Expr::Assign {
+                if matches!(a.operator, js::AssignmentOperator::Assign) {
+                    return Ok(Expr::Assign {
+                        target: Box::new(target),
+                        value: Box::new(value),
+                    });
+                }
+                // Compound (`+=`, `-=`, ...). Logical-assign (`||=`,
+                // `&&=`, `??=`) is still blocked at the walker; if
+                // `compound_to_binop` rejects, the walker is too
+                // permissive — surface as Unsupported.
+                let op = compound_to_binop(a.operator)?;
+                Ok(Expr::CompoundAssign {
+                    op,
                     target: Box::new(target),
                     value: Box::new(value),
                 })
@@ -1188,6 +1192,7 @@ fn lower_binop(op: js::BinaryOperator) -> Result<BinOp, Error> {
         B::ShiftLeft => BinOp::Shl,
         B::ShiftRight => BinOp::Shr,
         B::ShiftRightZeroFill => BinOp::UShr,
+        B::Exponential => BinOp::Pow,
         _ => return Err(Error::Unsupported("binary operator")),
     })
 }

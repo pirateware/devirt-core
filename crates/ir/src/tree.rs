@@ -325,6 +325,22 @@ pub enum Expr {
         target: Box<Expr>,
         value: Box<Expr>,
     },
+    /// Compound assignment in expression position: `x op= rhs`,
+    /// `obj.x op= rhs`, `obj[k] op= rhs`. Like `Expr::Assign`, this
+    /// preserves spec semantics (single LHS evaluation, getter/setter
+    /// asymmetry, exception ordering) by rendering syntactically rather
+    /// than statically reasoning about the target. Statement-position
+    /// compound assignment is decomposed at lower-time into temps +
+    /// `Stmt::Assign`; this variant is for cases where the assignment's
+    /// value flows into a surrounding expression. `op` is the binary
+    /// operator that combines with `=`: e.g. `BinOp::Add` for `+=`.
+    /// Logical-assign (`||=`, `&&=`, `??=`) is NOT represented here —
+    /// short-circuit semantics need a different lowering shape.
+    CompoundAssign {
+        op: BinOp,
+        target: Box<Expr>,
+        value: Box<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -358,6 +374,7 @@ pub enum BinOp {
     Mul,
     Div,
     Mod,
+    Pow,
     Eq,
     StrictEq,
     Ne,
@@ -393,6 +410,7 @@ pub fn binop_str(op: BinOp) -> &'static str {
         BinOp::Mul => "*",
         BinOp::Div => "/",
         BinOp::Mod => "%",
+        BinOp::Pow => "**",
         BinOp::Eq => "==",
         BinOp::StrictEq => "===",
         BinOp::Ne => "!=",
@@ -735,6 +753,14 @@ fn dump_expr(e: &Expr) -> String {
         ),
         Expr::Assign { target, value } => {
             format!("({} = {})", dump_expr(target), dump_expr(value))
+        }
+        Expr::CompoundAssign { op, target, value } => {
+            format!(
+                "({} {}= {})",
+                dump_expr(target),
+                binop_str(*op),
+                dump_expr(value)
+            )
         }
     }
 }
