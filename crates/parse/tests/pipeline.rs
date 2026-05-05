@@ -1179,3 +1179,75 @@ fn compound_assign_ident_statement_position_still_lowers() {
         assert_ssa_roundtrip(&src);
     }
 }
+
+// ---------------------------------------------------------------------------
+// For-init multi-declarator (var only). Keep first declarator in the for-init
+// slot, hoist the rest as preceding `var` statements wrapped in a Block.
+// `var` is function-scoped so the hoist preserves observable behavior.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn for_init_two_declarators_var_lowers() {
+    let src = "function f(arr) {
+        var s = 0;
+        for (var i = 0, n = arr.length; i < n; i++) { s = s + arr[i]; }
+        return s;
+    }";
+    let m = parse_and_lower(src).expect("must lower");
+    use ir::tree::Item;
+    assert!(
+        matches!(m.items[0], Item::Function(_)),
+        "for-init multi-declarator (var) must lower, got {:?}",
+        m.items[0]
+    );
+    assert_ssa_roundtrip(src);
+}
+
+#[test]
+fn for_init_three_declarators_var_lowers() {
+    let src = "function f(arr) {
+        var s = 0;
+        for (var i = 0, n = arr.length, step = 1; i < n; i += step) {
+            s = s + arr[i];
+        }
+        return s;
+    }";
+    let m = parse_and_lower(src).expect("must lower");
+    use ir::tree::Item;
+    assert!(matches!(m.items[0], Item::Function(_)));
+    assert_ssa_roundtrip(src);
+}
+
+#[test]
+fn for_init_four_declarators_uninitialized_mix_lowers() {
+    // Obfuscated base64 decode loop shape: some declarators have
+    // initializers, some don't.
+    let src = "function f(s, table) {
+        var out = '';
+        for (var i = 0, acc, ch, j = 0; (ch = s.charAt(j++)); i++) {
+            acc = table[ch];
+            out = out + String.fromCharCode(acc);
+        }
+        return out;
+    }";
+    let m = parse_and_lower(src).expect("must lower");
+    use ir::tree::Item;
+    assert!(matches!(m.items[0], Item::Function(_)));
+    assert_ssa_roundtrip(src);
+}
+
+#[test]
+fn for_init_let_multi_declarator_stays_blocked() {
+    // `let`/`const` in for-init multi-declarator must stay PassThrough.
+    // Hoisting them would change per-iteration scope semantics.
+    let src = "function f(arr) {
+        for (let i = 0, n = arr.length; i < n; i++) {}
+    }";
+    let m = parse_and_lower(src).expect("must parse");
+    use ir::tree::Item;
+    assert!(
+        matches!(m.items[0], Item::PassThroughFunction(_)),
+        "let multi-declarator for-init must stay PassThrough, got {:?}",
+        m.items[0]
+    );
+}

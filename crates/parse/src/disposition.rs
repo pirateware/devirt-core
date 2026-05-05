@@ -277,9 +277,15 @@ fn collect_for_of_stmt_blockers(f: &js::ForOfStatement, blockers: &mut BTreeSet<
 fn collect_for_init_blockers(init: &js::ForStatementInit, blockers: &mut BTreeSet<BlockerKind>) {
     match init {
         js::ForStatementInit::VariableDeclaration(decl) => {
-            // For-init multi-declarator can't be split into separate statements
-            // (for-init expects a single declaration node), so it stays blocked.
-            if decl.declarations.len() != 1 {
+            // For-init multi-declarator: lowerable for `var` (function-
+            // scoped, so hoisting all-but-the-first declarator out of
+            // the for-init is semantics-preserving). For `let`/`const`,
+            // the per-iteration scoping changes if we hoist out, so
+            // we keep them blocked. (Zero corpus occurrences as of
+            // this writing.)
+            if decl.declarations.len() != 1
+                && !matches!(decl.kind, js::VariableDeclarationKind::Var)
+            {
                 blockers.insert(BlockerKind::MultipleDeclarators);
                 for d in &decl.declarations {
                     if let Some(e) = &d.init {
