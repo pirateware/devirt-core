@@ -179,7 +179,7 @@ This report tests the parse → IR → emit pipeline against real-world JavaScri
 | lodash_isEqual.medium.js | ✓ | ✓ | ✓ | ✓ | ✓ | 58.4% | 39.4% | High PT% |
 | lodash_partition.high.js | ✓ | ✓ | ✓ | ✓ | ✓ | 81.6% | 31.5% | High PT% |
 | lodash_invert.medium.js | ✓ | ✓ | ✓ | ✓ | ✓ | 60.1% | 51.6% | High PT% |
-| datefns_addDays.high.js | ✓ | ✓ | ✓ | ✓ | ✓ | 87.2% | 29.7% | High PT% |
+| datefns_addDays.high.js | ✓ | ✓ | ✓ | ✓ | ✓ | 92.7% | 24.3% | High PT% |
 | lodash_flow.high.js | ✓ | ✓ | ✓ | ✓ | ✓ | 81.6% | 27.4% | High PT% |
 | lodash_debounce.low.js | ✓ | ✓ | ✓ | ✓ | ✓ | 74.3% | 29.3% | High PT% |
 | lodash_without.medium.js | ✓ | ✓ | ✓ | ✓ | ✓ | 60.1% | 45.7% | High PT% |

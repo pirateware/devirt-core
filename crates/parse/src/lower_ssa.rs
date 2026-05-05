@@ -124,10 +124,15 @@ pub fn lower_module(tm: &tree::Module) -> ssa::Module {
     for p in &pending {
         match &p.kind {
             PendingKind::TopLevel(f) => {
-                let pt_refs = pt_referenced_for_fid
+                let mut pt_refs = pt_referenced_for_fid
                     .get(&p.fid)
                     .cloned()
                     .unwrap_or_default();
+                // Names targeted by an `Expr::Assign` in expression
+                // position must materialize as textual stores, not
+                // dissolve into Braun bookkeeping — see
+                // `collect_assign_expr_target_names` doc.
+                pt_refs.extend(collect_assign_expr_target_names(&f.body));
                 lower_top_level_function(
                     &mut sm,
                     f,
@@ -141,10 +146,13 @@ pub fn lower_module(tm: &tree::Module) -> ssa::Module {
                 push_passthrough_function(&mut sm, lit);
             }
             PendingKind::InnerLiteral(lit) => {
-                let pt_refs = pt_referenced_for_fid
+                let mut pt_refs = pt_referenced_for_fid
                     .get(&p.fid)
                     .cloned()
                     .unwrap_or_default();
+                if let FuncBody::Stmts(ss) = &lit.body {
+                    pt_refs.extend(collect_assign_expr_target_names(ss));
+                }
                 lower_inner_literal(
                     &mut sm,
                     lit,
@@ -1002,6 +1010,110 @@ fn body_needs_ssa_fallback(stmts: &[Stmt]) -> bool {
         }
     }
     stmts.iter().any(visit)
+}
+
+/// Collect every identifier name that appears as the target of an
+/// `Expr::Assign` anywhere in `stmts`, NOT descending into nested
+/// function literals. These names need a textual reassignment in the
+/// emitted output even when the value would otherwise be inlined as
+/// a control-flow condition by the tree reconstruction — same
+/// mechanism `pt_referenced_names` uses. Without it, code like
+/// `while ((x = foo())) { use(x); }` reconstructs as `while (foo())
+/// { use(x); }` with `x` reading an unbound declaration, silently
+/// breaking semantics.
+fn collect_assign_expr_target_names(stmts: &[Stmt]) -> std::collections::HashSet<String> {
+    fn visit_stmt(s: &Stmt, out: &mut std::collections::HashSet<String>) {
+        match s {
+            Stmt::Let { init: Some(e), .. } | Stmt::Const { init: e, .. }
+            | Stmt::ExprStmt(e) | Stmt::Return(Some(e)) => visit_expr(e, out),
+            Stmt::Assign { value, target } => {
+                // The assignment itself is fine (it produces a real
+                // Stmt::Assign in tree-IR). Recurse only into the RHS
+                // and into the target's sub-expressions for nested
+                // Expr::Assigns.
+                visit_expr(target, out);
+                visit_expr(value, out);
+            }
+            Stmt::If { cond, then_body, else_body } => {
+                visit_expr(cond, out);
+                for s in then_body { visit_stmt(s, out); }
+                if let Some(eb) = else_body { for s in eb { visit_stmt(s, out); } }
+            }
+            Stmt::While { cond, body } => {
+                visit_expr(cond, out);
+                for s in body { visit_stmt(s, out); }
+            }
+            Stmt::For { init, cond, step, body } => {
+                if let Some(init) = init { visit_stmt(init, out); }
+                if let Some(cond) = cond { visit_expr(cond, out); }
+                if let Some(step) = step { visit_expr(step, out); }
+                for s in body { visit_stmt(s, out); }
+            }
+            Stmt::ForOf { iterable, body, .. } => {
+                visit_expr(iterable, out);
+                for s in body { visit_stmt(s, out); }
+            }
+            Stmt::ForIn { obj, body, .. } => {
+                visit_expr(obj, out);
+                for s in body { visit_stmt(s, out); }
+            }
+            Stmt::Block(b) => for s in b { visit_stmt(s, out); },
+            // Stop at nested function literals.
+            Stmt::FuncDecl(_) => {}
+            Stmt::Try { body, catch, finally } => {
+                for s in body { visit_stmt(s, out); }
+                if let Some((_, cb)) = catch { for s in cb { visit_stmt(s, out); } }
+                if let Some(fb) = finally { for s in fb { visit_stmt(s, out); } }
+            }
+            Stmt::Let { init: None, .. } | Stmt::Return(None) | Stmt::Continue => {}
+        }
+    }
+    fn visit_expr(e: &Expr, out: &mut std::collections::HashSet<String>) {
+        match e {
+            Expr::Assign { target, value } => {
+                if let Expr::Ident(n) = target.as_ref() {
+                    out.insert(n.clone());
+                }
+                visit_expr(target, out);
+                visit_expr(value, out);
+            }
+            Expr::Sequence { exprs } => for e in exprs { visit_expr(e, out); },
+            Expr::Binary { lhs, rhs, .. } => { visit_expr(lhs, out); visit_expr(rhs, out); }
+            Expr::Unary { operand, .. } => visit_expr(operand, out),
+            Expr::Call { callee, args } => {
+                visit_expr(callee, out);
+                for a in args { visit_expr(a, out); }
+            }
+            Expr::Member { obj, .. } => visit_expr(obj, out),
+            Expr::Index { obj, index } => { visit_expr(obj, out); visit_expr(index, out); }
+            Expr::New { callee, args } => {
+                visit_expr(callee, out);
+                for a in args { visit_expr(a, out); }
+            }
+            Expr::Array { elements } => for el in elements { visit_expr(el, out); },
+            Expr::Object { props } => {
+                for p in props {
+                    if let ir::tree::ObjectKey::Computed(k) = &p.key { visit_expr(k, out); }
+                    visit_expr(&p.value, out);
+                }
+            }
+            Expr::Ternary { cond, then_branch, else_branch } => {
+                visit_expr(cond, out);
+                visit_expr(then_branch, out);
+                visit_expr(else_branch, out);
+            }
+            Expr::Update { target, .. } => visit_expr(target, out),
+            Expr::Spread(inner) => visit_expr(inner, out),
+            Expr::Template { exprs, .. } => for e in exprs { visit_expr(e, out); },
+            // Stop at function literals — nested scope.
+            Expr::Func(_) => {}
+            Expr::Number(_) | Expr::String(_) | Expr::Bool(_) | Expr::Null
+            | Expr::Undefined | Expr::Ident(_) => {}
+        }
+    }
+    let mut out = std::collections::HashSet::new();
+    for s in stmts { visit_stmt(s, &mut out); }
+    out
 }
 
 /// Push a PassThrough SSA function synthesized from an `IrFunction`
@@ -2487,10 +2599,20 @@ impl<'b, 'm> Converter<'b, 'm> {
                 // Plain `=` in expression position: emit the same
                 // side-effecting store as `Stmt::Assign` and yield the
                 // RHS as the expression's value (per ECMA-262 13.15
-                // for plain bindings and properties without setters;
-                // the setter case differs slightly but only an actual
-                // setter would observe the divergence — for syntactic
-                // round-trip fidelity see `Expr::Assign`'s emit arm).
+                // for plain bindings and properties without setters).
+                //
+                // Ident targets here always synthesize a
+                // `StoreProp(GlobalThis, name, val)` regardless of
+                // whether `name` is in `pt_referenced_names`. The
+                // tree reconstruction inlines branch-condition values,
+                // which would otherwise drop the binding's write
+                // (silently producing a body that reads an unbound
+                // `name`). The synthesized store resugars textually to
+                // `name = val` and resolves lexically to the local
+                // let-binding at runtime — equivalent to writing the
+                // tagged-name through a forced let-decl. See
+                // `collect_assign_expr_target_names` for the related
+                // `pt_referenced_names` extension.
                 let val_op = self.convert_expr(value);
                 match target.as_ref() {
                     Expr::Ident(name) => {
@@ -2498,15 +2620,14 @@ impl<'b, 'm> Converter<'b, 'm> {
                             self.tag_binding_source_name(val_op.clone(), name);
                             let cb = self.current_block();
                             self.write_variable(sym, cb, val_op.clone());
-                            if self.pt_referenced_names.contains(name) {
-                                let key = self.builder.intern(name);
-                                self.builder.add_inst(InstKind::StoreProp {
-                                    obj: Operand::Const(Constant::GlobalThis),
-                                    key,
-                                    val: val_op.clone(),
-                                    purity: Purity::Throws,
-                                });
-                            }
+                            self.builder.mark_forced_let_decl(name);
+                            let key = self.builder.intern(name);
+                            self.builder.add_inst(InstKind::StoreProp {
+                                obj: Operand::Const(Constant::GlobalThis),
+                                key,
+                                val: val_op.clone(),
+                                purity: Purity::Throws,
+                            });
                         } else {
                             // Unbound assignment-as-expression: store on globalThis.
                             let key = self.builder.intern(name);
