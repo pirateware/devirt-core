@@ -141,15 +141,27 @@ fn test_file_inner(source: &str) -> Result<TestStats, String> {
     stats.emit_ok = true;
 
     // Step 4: Re-parse
-    match lower::parse_and_lower(&emitted) {
-        Ok(_) => {
+    let tree2 = match lower::parse_and_lower(&emitted) {
+        Ok(m) => {
             stats.reparse_ok = true;
-            stats.roundtrip_ok = true;
+            m
         }
         Err(e) => {
             stats.error = Some(format!("Re-parse: {:?}", e));
             return Ok(stats);
         }
+    };
+
+    // Step 5: Structural roundtrip check.
+    // Compare the post-SSA tree-IR (the form emit actually consumed)
+    // against the re-parsed emit, NOT the original `tree_module`.
+    // SSA decomposition is intentionally lossy in shape; the gate we
+    // care about is "emit re-parses to the same shape it was emitted
+    // from."
+    if let Some(reason) = cli::roundtrip_check::structural_diff(&tree_back, &tree2) {
+        stats.error = Some(format!("Roundtrip mismatch: {reason}"));
+    } else {
+        stats.roundtrip_ok = true;
     }
 
     Ok(stats)

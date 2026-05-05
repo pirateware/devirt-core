@@ -18,6 +18,7 @@ pub mod ir {
 
 pub use ::parse as lower;
 pub mod coverage;
+pub mod roundtrip_check;
 
 pub const DEMO: &str = r#"
 function asd() {

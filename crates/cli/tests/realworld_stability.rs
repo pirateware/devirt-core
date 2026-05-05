@@ -155,10 +155,22 @@ fn test_file(path: &Path, tier: Tier) -> TestResult {
         }
     };
 
-    // Step 5: Compare IR1 and IR2 structurally
-    result.roundtrip_ok = compare_modules(&tree_module, &tree_module2);
-    if !result.roundtrip_ok {
-        result.error = Some("Roundtrip mismatch: IR1 != IR2".to_string());
+    // Step 5: Structural roundtrip check.
+    //
+    // The right comparison is `tree_back` (the post-SSA tree-IR that
+    // emit consumes) against `tree_module2` (the re-parsed emit). This
+    // measures emit↔parse symmetry on the SSA-decomposed form.
+    //
+    // Comparing the *original* `tree_module` against `tree_module2`
+    // would conflate decomposition (intentional, lossy) with corruption
+    // (unintentional, the thing we actually want to catch).
+    if let Some(reason) =
+        cli::roundtrip_check::structural_diff(&tree_back, &tree_module2)
+    {
+        result.roundtrip_ok = false;
+        result.error = Some(format!("Roundtrip mismatch: {reason}"));
+    } else {
+        result.roundtrip_ok = true;
     }
 
     // Step 6: Behavioral equivalence check (Tier 1 only)
@@ -191,18 +203,6 @@ fn calculate_tl_pt_pct(cov: &ModuleCoverage) -> f64 {
     cov.top_level_passthrough_bytes as f64
 }
 
-fn compare_modules(m1: &TreeModule, m2: &TreeModule) -> bool {
-    // Structural comparison ignoring block ID renumbering
-    // For now, we compare the item count as a basic check
-    // A full implementation would walk the IR and compare structure
-    if m1.items.len() != m2.items.len() {
-        return false;
-    }
-
-    // TODO: Implement deeper structural comparison
-    // For MVP, we just check that both parsed successfully
-    true
-}
 
 fn check_behavioral_equivalence(original_path: &Path, emitted: &str) -> bool {
     // Write emitted code to temp file
@@ -355,17 +355,37 @@ mod tests {
             .iter()
             .filter(|r| matches!(r.tier, Tier::Tier1))
             .collect();
-        if !tier1_results.is_empty() {
-            // Report results but don't fail - this is for information gathering
-            for r in &tier1_results {
-                println!(
-                    "{}: parse={}, roundtrip={}",
-                    r.file_name, r.parse_ok, r.roundtrip_ok
-                );
-                if let Some(ref err) = r.error {
-                    println!("  Error: {}", err);
-                }
+        // Hard CI gate: every file in every tier must parse and
+        // structurally round-trip. The gate previously only printed
+        // and returned; now it asserts so regressions surface as
+        // test failures instead of console noise.
+        let mut failures: Vec<String> = Vec::new();
+        for r in &results {
+            if !r.parse_ok {
+                failures.push(format!(
+                    "{} ({}): parse failed: {}",
+                    r.file_name,
+                    r.tier.as_str(),
+                    r.error.as_deref().unwrap_or("?")
+                ));
+            } else if !r.roundtrip_ok {
+                failures.push(format!(
+                    "{} ({}): roundtrip failed: {}",
+                    r.file_name,
+                    r.tier.as_str(),
+                    r.error.as_deref().unwrap_or("?")
+                ));
             }
+        }
+        if !failures.is_empty() {
+            for f in &failures {
+                eprintln!("{f}");
+            }
+            panic!(
+                "{}/{} files failed parse-or-roundtrip — see lines above",
+                failures.len(),
+                results.len()
+            );
         }
     }
 }
