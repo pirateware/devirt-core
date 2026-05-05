@@ -1,0 +1,4 @@
+Source: https://unpkg.com/lodash.clonedeep@4.5.0/index.js (simplified)
+License: MIT
+Fetched: 2025-01-05
+Description: Lodash cloneDeep module - creates a deep clone of value
