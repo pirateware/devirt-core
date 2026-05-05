@@ -263,6 +263,10 @@ fn lower_function(sm: &ssa::Module, _id: FuncId, func: &Function, cfg: &EmitConf
         name: func.name.clone(),
         params: param_names,
         body,
+        // Source slice is meaningless for tree-IR reconstructed from
+        // SSA — the SSA round-trip is lossy and the original slice no
+        // longer corresponds to `body`.
+        source: None,
     }
 }
 
@@ -1657,6 +1661,19 @@ fn render_expr_to_string(e: &Expr) -> String {
             }
         }
         Expr::Spread(inner) => format!("...{}", render_expr_to_string(inner)),
+        Expr::Sequence { exprs } => format!(
+            "({})",
+            exprs
+                .iter()
+                .map(render_expr_to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Expr::Assign { target, value } => format!(
+            "({}={})",
+            render_expr_to_string(target),
+            render_expr_to_string(value)
+        ),
         Expr::Template { quasis, exprs } => {
             let mut out = String::from("`");
             let mut q_iter = quasis.iter();

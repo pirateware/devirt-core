@@ -50,11 +50,13 @@ fn arithmetic_and_return_is_lowered() {
 
 #[test]
 fn three_distinct_blockers_all_reported() {
-    // ThrowStmt + SequenceExpr (comma in parens) + NullishCoalescing
-    let src = "function f(a) { throw new Error(); (a, a); let x = a ?? 1; }";
+    // ThrowStmt + BreakStmt + NullishCoalescing — three constructs that
+    // remain blocked after the SequenceExpr / AssignmentExpr / ForInStmt
+    // ticket (those are no longer blockers in their simple forms).
+    let src = "function f(a) { throw new Error(); while (a) { break; } let x = a ?? 1; }";
     let b = blockers_of(src);
     assert!(b.contains(&BlockerKind::ThrowStmt), "missing ThrowStmt in {b:?}");
-    assert!(b.contains(&BlockerKind::SequenceExpr), "missing SequenceExpr in {b:?}");
+    assert!(b.contains(&BlockerKind::BreakStmt), "missing BreakStmt in {b:?}");
     assert!(b.contains(&BlockerKind::NullishCoalescing), "missing NullishCoalescing in {b:?}");
     assert_eq!(b.len(), 3, "expected exactly 3 blockers, got {b:?}");
 }
@@ -111,9 +113,23 @@ fn switch_stmt_blocked() {
 }
 
 #[test]
-fn sequence_expr_blocked() {
-    let b = blockers_of("function f(a, b) { (a, b); }");
-    assert!(b.contains(&BlockerKind::SequenceExpr), "{b:?}");
+fn sequence_expr_is_lowered() {
+    // Sequence expressions are now lowered as `Expr::Sequence`; no blocker.
+    assert_eq!(
+        decide_first_fn("function f(a, b) { (a, b); }"),
+        Disposition::Lowered
+    );
+}
+
+#[test]
+fn sequence_expr_in_call_callee_is_lowered() {
+    // The bundler-interop `(0, foo.bar)(args)` pattern must lower
+    // (the `this`-binding correctness is verified by a behavioral test
+    // in the corpus, not here).
+    assert_eq!(
+        decide_first_fn("function f(o) { return (0, o.m)(); }"),
+        Disposition::Lowered
+    );
 }
 
 #[test]
@@ -188,22 +204,20 @@ fn multi_declarator_destructuring_reports_destructuring_not_multiple() {
 }
 
 #[test]
-fn nested_assignment_expr_blocked() {
-    // Assignment in expression position (call argument) → AssignmentExpr.
-    // Statement-level assignments are still lowered, so this should NOT
-    // appear when the assignment is the whole statement.
-    let b = blockers_of("function f(x) { g(x = 1); }");
-    assert!(b.contains(&BlockerKind::AssignmentExpr), "{b:?}");
-    assert!(
-        !b.contains(&BlockerKind::UnsupportedExpr),
-        "AssignmentExpr should replace UnsupportedExpr fallback: {b:?}"
+fn nested_assignment_expr_is_lowered() {
+    // Plain `=` in expression position is now lowered as `Expr::Assign`.
+    assert_eq!(
+        decide_first_fn("function f(x) { g(x = 1); }"),
+        Disposition::Lowered
     );
 }
 
 #[test]
-fn nested_assignment_expr_in_if_test_blocked() {
-    let b = blockers_of("function f(a, b) { if (a = b) { return a; } }");
-    assert!(b.contains(&BlockerKind::AssignmentExpr), "{b:?}");
+fn nested_assignment_expr_in_if_test_is_lowered() {
+    assert_eq!(
+        decide_first_fn("function f(a, b) { if (a = b) { return a; } }"),
+        Disposition::Lowered
+    );
 }
 
 #[test]
@@ -241,6 +255,29 @@ fn nested_logical_assignment_reports_logical_op_only() {
         !b.contains(&BlockerKind::CompoundAssignmentExpr),
         "should not double-count: {b:?}"
     );
+}
+
+#[test]
+fn for_in_simple_is_lowered() {
+    assert_eq!(
+        decide_first_fn("function f(o) { for (let k in o) { g(k); } }"),
+        Disposition::Lowered
+    );
+}
+
+#[test]
+fn for_in_var_kind_is_lowered() {
+    assert_eq!(
+        decide_first_fn("function f(o) { for (var k in o) { g(k); } }"),
+        Disposition::Lowered
+    );
+}
+
+#[test]
+fn for_in_destructuring_binding_still_blocked() {
+    // Disposition still rejects exotic for-in left sides.
+    let b = blockers_of("function f(o) { for (let { a } in o) { g(a); } }");
+    assert!(b.contains(&BlockerKind::ForInStmt), "{b:?}");
 }
 
 #[test]

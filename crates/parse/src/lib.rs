@@ -247,10 +247,21 @@ impl Lowerer<'_> {
 
         let stmts = self.lower_stmts_list(&body.statements)?;
 
+        // Stash the body source slice so `lower_ssa` can fall back to
+        // a PassThrough function if the body contains a construct that
+        // cannot be expressed in SSA (currently `Stmt::ForIn` and
+        // `Stmt::Try`). `slice_body_inner` may return None for synthetic
+        // spans; in that case the SSA fallback is unavailable for this
+        // function.
+        let source = self
+            .slice_body_inner(body.span())
+            .map(|s| s.to_string());
+
         Ok(Item::Function(IrFunction {
             name: name.to_string(),
             params,
             body: stmts,
+            source,
         }))
     }
 
@@ -584,6 +595,7 @@ impl Lowerer<'_> {
             }
             js::Statement::ForStatement(f) => self.lower_for_stmt(f),
             js::Statement::ForOfStatement(f) => self.lower_for_of_stmt(f),
+            js::Statement::ForInStatement(f) => self.lower_for_in_stmt(f),
             js::Statement::ContinueStatement(c) => {
                 if c.label.is_some() {
                     return Err(Error::Unsupported("labeled continue"));
@@ -624,6 +636,37 @@ impl Lowerer<'_> {
             init,
             cond,
             step,
+            body,
+        })
+    }
+
+    fn lower_for_in_stmt(&self, f: &js::ForInStatement) -> Result<Stmt, Error> {
+        let (kind, binding) = match &f.left {
+            js::ForStatementLeft::VariableDeclaration(decl) => {
+                if decl.declarations.len() != 1 {
+                    return Err(Error::Unsupported("for-in with multiple declarators"));
+                }
+                let d = &decl.declarations[0];
+                let name = match &d.id.kind {
+                    js::BindingPatternKind::BindingIdentifier(id) => id.name.to_string(),
+                    _ => return Err(Error::Unsupported("for-in with destructuring binding")),
+                };
+                let kind = match decl.kind {
+                    js::VariableDeclarationKind::Const => "const".to_string(),
+                    js::VariableDeclarationKind::Let => "let".to_string(),
+                    js::VariableDeclarationKind::Var => "var".to_string(),
+                    _ => return Err(Error::Unsupported("for-in with exotic binding kind")),
+                };
+                (kind, name)
+            }
+            _ => return Err(Error::Unsupported("for-in with non-declaration left side")),
+        };
+        let obj = self.lower_expr(&f.right)?;
+        let body = self.stmts_from(&f.body)?;
+        Ok(Stmt::ForIn {
+            kind,
+            binding,
+            obj: Box::new(obj),
             body,
         })
     }
@@ -1092,6 +1135,32 @@ impl Lowerer<'_> {
                 Ok(Expr::Template { quasis, exprs })
             }
 
+            js::Expression::SequenceExpression(s) => {
+                let mut exprs = Vec::with_capacity(s.expressions.len());
+                for e in &s.expressions {
+                    exprs.push(self.lower_expr(e)?);
+                }
+                Ok(Expr::Sequence { exprs })
+            }
+
+            js::Expression::AssignmentExpression(a) => {
+                // Only plain `=` is lowerable in expression position.
+                // Compound (+= etc.) and logical (||= etc.) remain
+                // blocked; reaching here with a non-Assign operator
+                // means the disposition walker is too permissive.
+                if !matches!(a.operator, js::AssignmentOperator::Assign) {
+                    return Err(Error::Unsupported(
+                        "compound/logical assignment in expression position",
+                    ));
+                }
+                let target = self.lower_assign_target(&a.left)?;
+                let value = self.lower_expr(&a.right)?;
+                Ok(Expr::Assign {
+                    target: Box::new(target),
+                    value: Box::new(value),
+                })
+            }
+
             _ => Err(Error::Unsupported("expression kind")),
         }
     }
@@ -1125,7 +1194,6 @@ fn lower_binop(op: js::BinaryOperator) -> Result<BinOp, Error> {
 
 fn stmt_kind(s: &js::Statement) -> &'static str {
     match s {
-        js::Statement::ForInStatement(_) => "for-in statement",
         js::Statement::ForOfStatement(_) => "for-of statement",
         js::Statement::DoWhileStatement(_) => "do-while statement",
         js::Statement::SwitchStatement(_) => "switch statement",

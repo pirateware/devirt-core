@@ -174,6 +174,10 @@ fn walk_stmts(stmts: &[Stmt], parent: &str, rows: &mut Vec<FunctionCoverage>) {
                 walk_expr(iterable, parent, rows);
                 walk_stmts(body, parent, rows);
             }
+            Stmt::ForIn { obj, body, .. } => {
+                walk_expr(obj, parent, rows);
+                walk_stmts(body, parent, rows);
+            }
             Stmt::Continue => {}
             Stmt::Block(b) => walk_stmts(b, parent, rows),
             Stmt::Let { init: Some(e), .. } | Stmt::ExprStmt(e) | Stmt::Return(Some(e)) => {

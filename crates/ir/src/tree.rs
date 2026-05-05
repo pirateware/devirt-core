@@ -45,6 +45,13 @@ pub struct IrFunction {
     pub name: String,
     pub params: Vec<String>,
     pub body: Vec<Stmt>,
+    /// Verbatim body source slice (between `{` and `}`, exclusive).
+    /// Populated at AST→tree-IR time. Used by the SSA layer to fall
+    /// back to a PassThrough function when the body contains a
+    /// construct that cannot be expressed in SSA form (currently
+    /// `Stmt::ForIn` and `Stmt::Try`). `None` for hand-built tree-IR
+    /// in tests; the SSA fallback path is then unavailable.
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +104,26 @@ pub enum Stmt {
         /// The iterable expression.
         iterable: Box<Expr>,
         /// The loop body.
+        body: Vec<Stmt>,
+    },
+    /// `for (kind binding in obj) body`. Iterates string-named
+    /// enumerable properties of `obj`, walking the prototype chain.
+    /// Preserved syntactically rather than desugared: the spec
+    /// iteration semantics are too gnarly to reimplement faithfully
+    /// (prototype walk + shadowed-by-non-enumerable + numeric-index
+    /// ordering). Functions containing this statement do not enter
+    /// SSA optimization — `lower_ssa::lower_module` detects ForIn in
+    /// the body and routes the function to PassThrough using
+    /// `IrFunction.source`, mirroring the precedent for `Stmt::Try`.
+    ForIn {
+        /// `const`, `let`, or `var` — stored as a string for parity
+        /// with `ForOf`.
+        kind: String,
+        /// Plain identifier binding.
+        binding: String,
+        /// The object being enumerated.
+        obj: Box<Expr>,
+        /// Loop body.
         body: Vec<Stmt>,
     },
     /// `continue` inside the nearest enclosing loop. Lowered as a jump
@@ -272,6 +299,31 @@ pub enum Expr {
     Template {
         quasis: Vec<String>,
         exprs: Vec<Expr>,
+    },
+    /// Comma operator: `(a, b, c)`. Evaluates each operand left-to-right
+    /// for side effects; the value of the expression is the last
+    /// operand. Preserved as syntax through the IR rather than
+    /// decomposed into separate statements, because doing so collapses
+    /// the bundler-interop pattern `(0, obj.method)(args)` (which
+    /// strips the receiver and binds `this` to undefined) into a plain
+    /// method call. The SSA `Expr::Call` arm only specializes
+    /// `Expr::Member` callees into `CallMethod`; a `Sequence` callee
+    /// falls through to the plain `Call` path, preserving
+    /// `this === undefined`.
+    Sequence {
+        exprs: Vec<Expr>,
+    },
+    /// Plain `=` assignment used as an expression (`if (x = foo())`,
+    /// `a = b = c`, `arr[i++] = expr`). Statement-level `=` continues
+    /// to lower to `Stmt::Assign`; this variant is reserved for
+    /// assignments in expression position. Compound (`+=` etc.) and
+    /// logical (`||=` etc.) operators are NOT represented here and
+    /// remain blocked. Rendering syntactically as `target = value`
+    /// preserves ECMA-262 13.15 spec semantics — e.g. setter-LHS
+    /// behavior — without statically reasoning about the target.
+    Assign {
+        target: Box<Expr>,
+        value: Box<Expr>,
     },
 }
 
@@ -486,6 +538,23 @@ fn dump_stmt(out: &mut String, s: &Stmt, depth: usize) {
             }
             writeln!(out, "{pad}}}").unwrap();
         }
+        Stmt::ForIn {
+            kind,
+            binding,
+            obj,
+            body,
+        } => {
+            writeln!(
+                out,
+                "{pad}for ({kind} {binding} in {}) {{",
+                dump_expr(obj)
+            )
+            .unwrap();
+            for s in body {
+                dump_stmt(out, s, depth + 1);
+            }
+            writeln!(out, "{pad}}}").unwrap();
+        }
         Stmt::Continue => writeln!(out, "{pad}continue").unwrap(),
         Stmt::Block(stmts) => {
             writeln!(out, "{pad}{{").unwrap();
@@ -659,6 +728,13 @@ fn dump_expr(e: &Expr) -> String {
             }
             s.push('`');
             s
+        }
+        Expr::Sequence { exprs } => format!(
+            "({})",
+            exprs.iter().map(dump_expr).collect::<Vec<_>>().join(", ")
+        ),
+        Expr::Assign { target, value } => {
+            format!("({} = {})", dump_expr(target), dump_expr(value))
         }
     }
 }

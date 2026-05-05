@@ -308,6 +308,25 @@ impl Printer<'_> {
                 self.pad();
                 self.buf.push('}');
             }
+            Stmt::ForIn {
+                kind,
+                binding,
+                obj,
+                body,
+            } => {
+                write!(self.buf, "for ({kind} {binding} in ").unwrap();
+                self.expr(obj);
+                self.buf.push_str(") {\n");
+                self.indent += 1;
+                for s in body {
+                    self.pad();
+                    self.stmt(s);
+                    self.buf.push('\n');
+                }
+                self.indent -= 1;
+                self.pad();
+                self.buf.push('}');
+            }
             Stmt::Continue => {
                 self.buf.push_str("continue;");
             }
@@ -626,6 +645,23 @@ impl Printer<'_> {
             Expr::Spread(inner) => {
                 self.buf.push_str("...");
                 self.expr(inner);
+            }
+            Expr::Sequence { exprs } => {
+                self.buf.push('(');
+                for (i, e) in exprs.iter().enumerate() {
+                    if i > 0 {
+                        self.buf.push_str(", ");
+                    }
+                    self.expr(e);
+                }
+                self.buf.push(')');
+            }
+            Expr::Assign { target, value } => {
+                self.buf.push('(');
+                self.expr(target);
+                self.buf.push_str(" = ");
+                self.expr(value);
+                self.buf.push(')');
             }
             Expr::Template { quasis, exprs } => {
                 self.buf.push('`');

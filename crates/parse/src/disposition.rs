@@ -165,7 +165,30 @@ fn collect_stmt_blockers(stmt: &js::Statement, blockers: &mut BTreeSet<BlockerKi
             collect_stmt_blockers(&s.body, blockers);
         }
         ForInStatement(f) => {
-            blockers.insert(BlockerKind::ForInStmt);
+            // The for-in loop is preserved as `Stmt::ForIn`. The IR
+            // only represents the simple form: single-declarator
+            // var/let/const with a plain-identifier binding. Fall back
+            // to the blocker for exotic shapes (multiple declarators,
+            // destructuring, no declaration on the left, etc.).
+            let binding_ok = match &f.left {
+                js::ForStatementLeft::VariableDeclaration(decl) => {
+                    decl.declarations.len() == 1
+                        && matches!(
+                            decl.declarations[0].id.kind,
+                            js::BindingPatternKind::BindingIdentifier(_)
+                        )
+                        && matches!(
+                            decl.kind,
+                            js::VariableDeclarationKind::Const
+                                | js::VariableDeclarationKind::Let
+                                | js::VariableDeclarationKind::Var
+                        )
+                }
+                _ => false,
+            };
+            if !binding_ok {
+                blockers.insert(BlockerKind::ForInStmt);
+            }
             collect_expr_blockers(&f.right, blockers);
             collect_stmt_blockers(&f.body, blockers);
         }
@@ -526,7 +549,9 @@ fn collect_expr_blockers(expr: &js::Expression, blockers: &mut BTreeSet<BlockerK
         // Named unsupported kinds — each gets its own variant so the
         // frequency table is actionable.
         SequenceExpression(s) => {
-            blockers.insert(BlockerKind::SequenceExpr);
+            // Sequence is now lowered to `Expr::Sequence`. Walk
+            // children so other blockers in the operands are still
+            // surfaced.
             for e in &s.expressions {
                 collect_expr_blockers(e, blockers);
             }
@@ -563,16 +588,15 @@ fn collect_expr_blockers(expr: &js::Expression, blockers: &mut BTreeSet<BlockerK
             blockers.insert(BlockerKind::ThisExpr);
         }
         AssignmentExpression(a) => {
-            // Split by operator class — plain `=`, compound (+=, -=, ...),
-            // and logical-assign (||=, ??=, &&=) lower differently. Logical-assign
-            // already has its own variant; emit only that one for those operators.
+            // Plain `=` in expression position is now lowered to
+            // `Expr::Assign`. Compound (+=, -=, ...) and logical-assign
+            // (||=, ??=, &&=) remain blocked by their own variants.
             if !assignment_op_lowerable(a.operator) {
                 blockers.insert(BlockerKind::LogicalAssignOp);
-            } else if matches!(a.operator, js::AssignmentOperator::Assign) {
-                blockers.insert(BlockerKind::AssignmentExpr);
-            } else {
+            } else if !matches!(a.operator, js::AssignmentOperator::Assign) {
                 blockers.insert(BlockerKind::CompoundAssignmentExpr);
             }
+            // Walk children so blockers inside target/value are surfaced.
             collect_assignment_target_blockers(&a.left, blockers);
             collect_expr_blockers(&a.right, blockers);
         }
