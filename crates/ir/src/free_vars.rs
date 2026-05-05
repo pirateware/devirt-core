@@ -142,6 +142,7 @@ impl Ctx<'_> {
                 self.walk_expr(value);
             }
             Stmt::ExprStmt(e) => self.walk_expr(e),
+            Stmt::Throw(e) => self.walk_expr(e),
             Stmt::Return(e) => {
                 if let Some(e) = e {
                     self.walk_expr(e);
@@ -258,6 +259,7 @@ impl Ctx<'_> {
     fn walk_expr(&mut self, e: &Expr) {
         match e {
             Expr::Number(_) | Expr::String(_) | Expr::Bool(_) | Expr::Null | Expr::Undefined => {}
+            Expr::This => {}
             Expr::Ident(name) => self.use_name(name),
             Expr::Binary { lhs, rhs, .. } => {
                 self.walk_expr(lhs);

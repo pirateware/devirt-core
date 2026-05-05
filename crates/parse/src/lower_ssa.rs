@@ -340,6 +340,18 @@ fn discover_module<'a>(tm: &'a tree::Module) -> Vec<PendingFunction<'a>> {
                     captures: Vec::new(),
                     parent: None,
                 });
+                // If this function is going to take the SSA-fallback
+                // path (body contains Try/ForIn/Throw/This), its body
+                // is preserved as a verbatim source slice and inner
+                // literals inside it stay opaque — just like the
+                // already-PassThrough case below. Skip body recursion
+                // so we don't allocate FuncIds for inner literals
+                // we'll never emit, which would also misalign
+                // top-level FuncIds.
+                if body_needs_ssa_fallback(&f.body) {
+                    captures_by_fid.insert(fid, Vec::new());
+                    continue;
+                }
                 // Build outer-body context: reassigned-name set + an
                 // empty bindings-seen-so-far set (params and the
                 // function's own name are bound at body entry).
@@ -414,6 +426,7 @@ fn walk_reassigned_stmts(stmts: &[Stmt], out: &mut HashSet<String>) {
             }
             Stmt::Assign { .. } => {}
             Stmt::Let { .. } | Stmt::Const { .. } | Stmt::ExprStmt(_) | Stmt::Return(_) => {}
+            Stmt::Throw(_) => {}
             Stmt::If {
                 then_body,
                 else_body,
@@ -528,7 +541,8 @@ fn walk_reassigned_in_expr(e: &Expr, out: &mut HashSet<String>) {
         | Expr::Bool(_)
         | Expr::Null
         | Expr::Undefined
-        | Expr::Ident(_) => {}
+        | Expr::Ident(_)
+        | Expr::This => {}
         Expr::Sequence { exprs } => {
             for e in exprs {
                 walk_reassigned_in_expr(e, out);
@@ -767,6 +781,9 @@ fn discover_stmt<'a>(
                 discover_stmts(finally_body, pending, captures_by_fid, &mut finally_seen, reassigned, parent_fid);
             }
         }
+        Stmt::Throw(e) => {
+            discover_expr(e, pending, captures_by_fid, seen, reassigned, parent_fid);
+        }
     }
 }
 
@@ -784,7 +801,8 @@ fn discover_expr<'a>(
         | Expr::Bool(_)
         | Expr::Null
         | Expr::Undefined
-        | Expr::Ident(_) => {}
+        | Expr::Ident(_)
+        | Expr::This => {}
         Expr::Binary { lhs, rhs, .. } => {
             discover_expr(lhs, pending, captures_by_fid, seen, reassigned, parent_fid);
             discover_expr(rhs, pending, captures_by_fid, seen, reassigned, parent_fid);
@@ -1002,26 +1020,73 @@ fn push_passthrough_function(sm: &mut ssa::Module, lit: &tree::FuncLiteral) {
 /// already classified the function as `Lowered` (no blocker), so the
 /// coverage metric still counts the unlock.
 fn body_needs_ssa_fallback(stmts: &[Stmt]) -> bool {
-    fn visit(s: &Stmt) -> bool {
+    fn visit_stmt(s: &Stmt) -> bool {
         match s {
-            Stmt::ForIn { .. } | Stmt::Try { .. } => true,
-            Stmt::If { then_body, else_body, .. } => {
-                then_body.iter().any(visit)
-                    || else_body.as_ref().is_some_and(|b| b.iter().any(visit))
+            Stmt::ForIn { .. } | Stmt::Try { .. } | Stmt::Throw(_) => true,
+            Stmt::If { cond, then_body, else_body, .. } => {
+                visit_expr(cond)
+                    || then_body.iter().any(visit_stmt)
+                    || else_body.as_ref().is_some_and(|b| b.iter().any(visit_stmt))
             }
-            Stmt::While { body, .. } => body.iter().any(visit),
-            Stmt::For { body, init, .. } => {
-                body.iter().any(visit)
-                    || init.as_deref().is_some_and(visit)
+            Stmt::While { cond, body } => {
+                visit_expr(cond) || body.iter().any(visit_stmt)
             }
-            Stmt::ForOf { body, .. } => body.iter().any(visit),
-            Stmt::Block(body) => body.iter().any(visit),
+            Stmt::For { body, init, cond, step } => {
+                init.as_deref().is_some_and(visit_stmt)
+                    || cond.as_ref().is_some_and(visit_expr)
+                    || step.as_ref().is_some_and(visit_expr)
+                    || body.iter().any(visit_stmt)
+            }
+            Stmt::ForOf { iterable, body, .. } => {
+                visit_expr(iterable) || body.iter().any(visit_stmt)
+            }
+            Stmt::Block(body) => body.iter().any(visit_stmt),
             // Nested function literals have their own disposition.
             Stmt::FuncDecl(_) => false,
+            Stmt::Let { init: Some(e), .. } | Stmt::Const { init: e, .. }
+            | Stmt::ExprStmt(e) | Stmt::Return(Some(e)) => visit_expr(e),
+            Stmt::Assign { target, value } => visit_expr(target) || visit_expr(value),
             _ => false,
         }
     }
-    stmts.iter().any(visit)
+    // `Expr::This` flows through SSA as `Constant::This`, which works
+    // for simple uses but exposes a latent CFG-reconstruction bug in
+    // `lower_tree::loop_info` on certain back-edge shapes (visible on
+    // `lodash_cloneDeep.high.js`). Until that's fixed, route any
+    // function whose body references `this` to the same SSA-fallback
+    // path used by Try/ForIn/Throw — disposition still classifies the
+    // function as Lowered, so coverage counts the unlock.
+    fn visit_expr(e: &Expr) -> bool {
+        match e {
+            Expr::This => true,
+            Expr::Binary { lhs, rhs, .. } => visit_expr(lhs) || visit_expr(rhs),
+            Expr::Unary { operand, .. } => visit_expr(operand),
+            Expr::Call { callee, args } | Expr::New { callee, args } => {
+                visit_expr(callee) || args.iter().any(visit_expr)
+            }
+            Expr::Member { obj, .. } => visit_expr(obj),
+            Expr::Index { obj, index } => visit_expr(obj) || visit_expr(index),
+            Expr::Ternary { cond, then_branch, else_branch } => {
+                visit_expr(cond) || visit_expr(then_branch) || visit_expr(else_branch)
+            }
+            Expr::Array { elements } => elements.iter().any(visit_expr),
+            Expr::Object { props } => props.iter().any(|p| visit_expr(&p.value)),
+            Expr::Sequence { exprs } | Expr::Template { exprs, .. } => {
+                exprs.iter().any(visit_expr)
+            }
+            Expr::Assign { target, value } => visit_expr(target) || visit_expr(value),
+            Expr::CompoundAssign { target, value, .. } => {
+                visit_expr(target) || visit_expr(value)
+            }
+            Expr::Update { target, .. } => visit_expr(target),
+            Expr::Spread(inner) => visit_expr(inner),
+            // Nested function literals have their own disposition; their
+            // body's `this` is independent of the enclosing function.
+            Expr::Func(_) => false,
+            _ => false,
+        }
+    }
+    stmts.iter().any(visit_stmt)
 }
 
 /// Collect every identifier name that appears as the target of an
@@ -1078,6 +1143,7 @@ fn collect_assign_expr_target_names(stmts: &[Stmt]) -> std::collections::HashSet
                 if let Some(fb) = finally { for s in fb { visit_stmt(s, out); } }
             }
             Stmt::Let { init: None, .. } | Stmt::Return(None) | Stmt::Continue => {}
+            Stmt::Throw(e) => visit_expr(e, out),
         }
     }
     fn visit_expr(e: &Expr, out: &mut std::collections::HashSet<String>) {
@@ -1127,7 +1193,7 @@ fn collect_assign_expr_target_names(stmts: &[Stmt]) -> std::collections::HashSet
             // Stop at function literals — nested scope.
             Expr::Func(_) => {}
             Expr::Number(_) | Expr::String(_) | Expr::Bool(_) | Expr::Null
-            | Expr::Undefined | Expr::Ident(_) => {}
+            | Expr::Undefined | Expr::Ident(_) | Expr::This => {}
         }
     }
     let mut out = std::collections::HashSet::new();
@@ -1951,17 +2017,17 @@ impl<'b, 'm> Converter<'b, 'm> {
                 let cb = self.current_block();
                 self.write_variable(sym, cb, alloc);
             }
-            Stmt::Try { .. } | Stmt::ForIn { .. } => {
-                // Neither construct is expressible in SSA. The
+            Stmt::Try { .. } | Stmt::ForIn { .. } | Stmt::Throw(_) => {
+                // None of these are expressible in SSA. The
                 // `body_needs_ssa_fallback` check at function entry
                 // (in `lower_top_level_function` / `lower_inner_literal`)
-                // routes any function containing these to PassThrough
+                // routes any function containing them to PassThrough
                 // using the stashed source slice. Reaching this arm
                 // means that check missed a textual position (or a
                 // hand-built tree-IR test fixture lacks the source
                 // slice required to fall back).
                 unreachable!(
-                    "Stmt::{{Try,ForIn}} reached SSA conversion — \
+                    "Stmt::{{Try,ForIn,Throw}} reached SSA conversion — \
                      body_needs_ssa_fallback should have routed this function \
                      to PassThrough"
                 );
@@ -2352,6 +2418,7 @@ impl<'b, 'm> Converter<'b, 'm> {
             Expr::Bool(b) => Operand::Const(Constant::Bool(*b)),
             Expr::Null => Operand::Const(Constant::Null),
             Expr::Undefined => Operand::Const(Constant::Undefined),
+            Expr::This => Operand::Const(Constant::This),
             Expr::Ident(name) => {
                 if let Some(sym) = self.lookup(name) {
                     let cb = self.current_block();

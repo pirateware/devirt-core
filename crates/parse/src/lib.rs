@@ -604,6 +604,7 @@ impl Lowerer<'_> {
                 Ok(Stmt::Continue)
             }
             js::Statement::TryStatement(t) => self.lower_try_stmt(t),
+            js::Statement::ThrowStatement(t) => Ok(Stmt::Throw(self.lower_expr(&t.argument)?)),
             _ => Err(Error::Unsupported(stmt_kind(stmt))),
         }
     }
@@ -957,6 +958,7 @@ impl Lowerer<'_> {
                     Ok(Expr::Ident(id.name.to_string()))
                 }
             }
+            js::Expression::ThisExpression(_) => Ok(Expr::This),
             js::Expression::ParenthesizedExpression(p) => self.lower_expr(&p.expression),
 
             js::Expression::BinaryExpression(b) => Ok(Expr::Binary {

@@ -1236,6 +1236,68 @@ fn for_init_four_declarators_uninitialized_mix_lowers() {
     assert_ssa_roundtrip(src);
 }
 
+// ---------------------------------------------------------------------------
+// ThrowStmt and ThisExpr. Both lower at the disposition level (functions
+// containing them count as Lowered for coverage), and route through the
+// SSA-fallback path (preserve as text). The roundtrip survives, the emit
+// re-parses, and the syntactic forms come back through.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn throw_stmt_lowers_and_roundtrips() {
+    let src = "function f() { throw new Error('x'); }";
+    let m = parse_and_lower(src).expect("must lower");
+    use ir::tree::Item;
+    assert!(
+        matches!(m.items[0], Item::Function(_)),
+        "throw must lower to Item::Function, got {:?}",
+        m.items[0]
+    );
+    let out = ssa_roundtrip(src);
+    assert!(out.contains("throw"), "throw must survive: {out}");
+}
+
+#[test]
+fn throw_with_object_argument_roundtrips() {
+    let src = "function f(msg) { throw { code: 500, message: msg }; }";
+    let _ = ssa_roundtrip(src);
+}
+
+#[test]
+fn throw_in_branch_roundtrips() {
+    let src = "function f(x) { if (x < 0) { throw new RangeError('neg'); } return x; }";
+    let _ = ssa_roundtrip(src);
+}
+
+#[test]
+fn this_expr_lowers_and_roundtrips() {
+    let src = "function f() { return this.x; }";
+    let m = parse_and_lower(src).expect("must lower");
+    use ir::tree::Item;
+    assert!(
+        matches!(m.items[0], Item::Function(_)),
+        "this must lower to Item::Function, got {:?}",
+        m.items[0]
+    );
+    let out = ssa_roundtrip(src);
+    assert!(out.contains("this"), "this must survive: {out}");
+}
+
+#[test]
+fn this_method_call_roundtrips() {
+    let src = "function f(arg) { return this.fn(arg); }";
+    let _ = ssa_roundtrip(src);
+}
+
+#[test]
+fn this_in_nested_arrow_roundtrips() {
+    // Arrow captures `this` lexically. Outer body has no direct `this`
+    // (so no SSA fallback for outer); inner arrow has `this` and gets
+    // routed through fallback. Both halves emit correctly.
+    let src = "function f() { return [1, 2, 3].map(x => this.scale * x); }";
+    let _ = ssa_roundtrip(src);
+}
+
 #[test]
 fn for_init_let_multi_declarator_stays_blocked() {
     // `let`/`const` in for-init multi-declarator must stay PassThrough.

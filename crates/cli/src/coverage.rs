@@ -189,6 +189,7 @@ fn walk_stmts(stmts: &[Stmt], parent: &str, rows: &mut Vec<FunctionCoverage>) {
                 walk_expr(value, parent, rows);
             }
             Stmt::Let { init: None, .. } | Stmt::Return(None) => {}
+            Stmt::Throw(e) => walk_expr(e, parent, rows),
             Stmt::Try { body, catch, finally } => {
                 walk_stmts(body, parent, rows);
                 if let Some((_, catch_body)) = catch {

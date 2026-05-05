@@ -54,6 +54,13 @@ pub enum Constant {
     /// opaque: no folding against other constants. The out-of-SSA pass
     /// recognizes it as a load-root and emits the bare property name.
     GlobalThis,
+    /// Sentinel for the function's `this` binding. Each function has
+    /// its own `this` established by the call site (method receiver,
+    /// `new` target, lexical capture for arrows). Treated as opaque:
+    /// equivalent only to itself, no folding. The out-of-SSA pass
+    /// renders it as the literal `this` token. Correctness depends
+    /// on the function-boundary invariant (see `tree::Expr::This`).
+    This,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1282,6 +1289,7 @@ fn const_eq(a: &Constant, b: &Constant) -> bool {
         (Undefined, Undefined) => true,
         (Func(x), Func(y)) => x.0 == y.0,
         (GlobalThis, GlobalThis) => true,
+        (This, This) => true,
         _ => false,
     }
 }
@@ -1820,6 +1828,7 @@ fn write_constant(out: &mut String, c: &Constant, m: &Module) {
         Constant::Undefined => out.push_str("undefined"),
         Constant::Func(id) => write!(out, "@{}", func_label(m, *id)).unwrap(),
         Constant::GlobalThis => out.push_str("globalThis"),
+        Constant::This => out.push_str("this"),
     }
 }
 
