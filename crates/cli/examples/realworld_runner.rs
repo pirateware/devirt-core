@@ -185,7 +185,7 @@ fn generate_and_write_report(
     let mut report = String::new();
     report.push_str("# Real-World Stability Test Report\n\n");
     report.push_str(
-        "This report tests the Reify parse → IR → emit pipeline against real-world JavaScript.\n\n",
+        "This report tests the parse → IR → emit pipeline against real-world JavaScript.\n\n",
     );
 
     // Summary

@@ -206,7 +206,7 @@ fn compare_modules(m1: &TreeModule, m2: &TreeModule) -> bool {
 
 fn check_behavioral_equivalence(original_path: &Path, emitted: &str) -> bool {
     // Write emitted code to temp file
-    let temp_path = std::env::temp_dir().join("reify_emitted.js");
+    let temp_path = std::env::temp_dir().join("emitted.js");
     fs::write(&temp_path, emitted).unwrap();
 
     // Try to run both files with node and compare outputs
