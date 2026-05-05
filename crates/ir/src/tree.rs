@@ -11,7 +11,7 @@
 use std::cell::Cell;
 use std::fmt::Write as _;
 
-use crate::ir::ssa::FuncId;
+use crate::ssa::FuncId;
 
 #[derive(Debug, Clone)]
 pub struct Module {

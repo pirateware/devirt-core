@@ -1,11 +1,11 @@
-//! IR module. The tree-IR is the frontend's output shape; the SSA-IR is the
-//! analysis-friendly form. Conversion between them comes in a later milestone.
+//! IR module. Tree-IR and SSA-IR types now live in the `ir` crate; this
+//! module re-exports them so existing `crate::ir::tree::…` paths inside
+//! mvp keep resolving while remaining mvp-local IR-adjacent code (the
+//! lowering passes, disposition, pass manager) is migrated out.
+
+pub use ::ir::{free_vars, pt_free_vars, ssa, tree};
 
 pub mod disposition;
-pub mod free_vars;
 pub mod lower_ssa;
-pub mod pt_free_vars;
 pub mod lower_tree;
 pub mod pass;
-pub mod ssa;
-pub mod tree;

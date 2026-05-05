@@ -2,3 +2,14 @@
 name = "ir"
 version = "0.1.0"
 edition = "2024"
+
+[dependencies]
+oxc_allocator = "0.40"
+oxc_ast       = "0.40"
+oxc_parser    = "0.40"
+oxc_span      = "0.40"
+bitflags      = "2"
+lasso         = "0.7"
+
+[dev-dependencies]
+insta         = "1"

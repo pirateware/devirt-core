@@ -29,9 +29,9 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use crate::ir::pt_free_vars;
-use crate::ir::ssa::FuncId;
-use crate::ir::tree::{Expr, FuncBody, FuncLiteral, Stmt};
+use crate::pt_free_vars;
+use crate::ssa::FuncId;
+use crate::tree::{Expr, FuncBody, FuncLiteral, Stmt};
 
 /// Free names of `lit`, sorted alphabetically. The list is empty for a
 /// function whose body references nothing from outside its own
@@ -234,7 +234,7 @@ impl Ctx<'_> {
             }
             Expr::Object { props } => {
                 for p in props {
-                    if let crate::ir::tree::ObjectKey::Computed(e) = &p.key {
+                    if let crate::tree::ObjectKey::Computed(e) = &p.key {
                         self.walk_expr(e);
                     }
                     self.walk_expr(&p.value);

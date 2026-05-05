@@ -11,6 +11,7 @@ oxc_parser    = "0.40"
 oxc_span      = "0.40"
 bitflags      = "2"
 lasso         = "0.7"
+ir            = { path = "../ir" }
 
 [dev-dependencies]
 insta         = "1"

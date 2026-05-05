@@ -240,6 +240,15 @@ dependencies = [
 [[package]]
 name = "ir"
 version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "insta",
+ "lasso",
+ "oxc_allocator",
+ "oxc_ast",
+ "oxc_parser",
+ "oxc_span",
+]
 
 [[package]]
 name = "itertools"
@@ -301,6 +310,7 @@ version = "0.1.0"
 dependencies = [
  "bitflags",
  "insta",
+ "ir",
  "lasso",
  "oxc_allocator",
  "oxc_ast",
