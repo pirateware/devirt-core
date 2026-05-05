@@ -338,3 +338,20 @@ Based on the test results:
 
 - ℹ️ **High passthrough**: 182 file(s) have >20% function-body passthrough. These should be investigated to identify dominant unlowered constructs.
 
+
+## Blocker Analysis (363 passthrough function(s))
+
+blocker_kind                       occurrences counterfactual +unlocked  cumulative
+----------------------------------------------------------------------------------
+MultipleDeclarators                       304             60        60          60
+SequenceExpr                              247             22        52         112
+ThisExpr                                   11              5        10         122
+ForInStmt                                  10              4        10         132
+UnsupportedBinOp                            6              4         4         136
+UnsupportedExpr                           214              2       176         312
+RegExpLiteral                               5              1         4         316
+ThrowStmt                                  31              1        29         345
+BreakStmt                                  18              0         0         345
+SwitchStmt                                 18              0        18         363
+----------------------------------------------------------------------------------
+Fixing all listed blockers would unlock 363/363 passthrough function(s).
