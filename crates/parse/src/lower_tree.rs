@@ -930,9 +930,15 @@ impl LowerCtx<'_> {
                 lhs: Box::new(self.operand_to_expr(val)),
                 rhs: Box::new(Expr::Number(0.0)),
             },
-            Instanceof { obj, ctor } => Expr::Call {
-                callee: Box::new(Expr::Ident("__instanceof__".to_string())),
-                args: vec![self.operand_to_expr(obj), self.operand_to_expr(ctor)],
+            Instanceof { obj, ctor } => Expr::Binary {
+                op: BinOp::Instanceof,
+                lhs: Box::new(self.operand_to_expr(obj)),
+                rhs: Box::new(self.operand_to_expr(ctor)),
+            },
+            In { key, obj } => Expr::Binary {
+                op: BinOp::In,
+                lhs: Box::new(self.operand_to_expr(key)),
+                rhs: Box::new(self.operand_to_expr(obj)),
             },
             OpaqueEval { source } => Expr::Call {
                 callee: Box::new(Expr::Ident("eval".to_string())),

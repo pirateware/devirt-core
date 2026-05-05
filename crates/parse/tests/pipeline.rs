@@ -1424,3 +1424,69 @@ fn negative_zero_roundtrip_preserves_sign() {
         (a, b) => panic!("expected matching Number(-0), got {a:?} vs {b:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// `in` and `instanceof`. The dump on UnsupportedBinOp showed these as the
+// only two operators rejected by the disposition walker; both lower as
+// preserve-as-syntactic `Expr::Binary` with their respective `BinOp` variant
+// and emit through the existing `(lhs op rhs)` formatter (the leading/trailing
+// space around the keyword is supplied by `binop_str`'s wrapping).
+// Tests are intentionally separate so a regression in one doesn't mask the
+// other (the `Instanceof` SSA InstKind is older and was never exercised
+// end-to-end before this ticket).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn in_operator_in_expression_lowers() {
+    let src = "function f(k, o) { return k in o; }";
+    let m = parse_and_lower(src).expect("must lower");
+    use ir::tree::Item;
+    assert!(
+        matches!(m.items[0], Item::Function(_)),
+        "`in` must lower, got {:?}",
+        m.items[0]
+    );
+    let out = ssa_roundtrip(src);
+    assert!(out.contains(" in "), "`in` keyword must survive: {out}");
+}
+
+#[test]
+fn in_operator_in_branch_condition_lowers() {
+    let src = "function f(k, o) { if (k in o) { return 1; } return 0; }";
+    let _ = ssa_roundtrip(src);
+}
+
+#[test]
+fn instanceof_operator_in_expression_lowers() {
+    let src = "function f(o, C) { return o instanceof C; }";
+    let m = parse_and_lower(src).expect("must lower");
+    use ir::tree::Item;
+    assert!(
+        matches!(m.items[0], Item::Function(_)),
+        "`instanceof` must lower, got {:?}",
+        m.items[0]
+    );
+    let out = ssa_roundtrip(src);
+    assert!(
+        out.contains(" instanceof "),
+        "`instanceof` keyword must survive: {out}"
+    );
+}
+
+#[test]
+fn instanceof_operator_in_branch_condition_lowers() {
+    let src = "function f(o, C) { if (o instanceof C) { return 1; } return 0; }";
+    let _ = ssa_roundtrip(src);
+}
+
+#[test]
+fn in_and_instanceof_combined_lower() {
+    // The lodash_isPlainObject shape: nested instanceof inside a
+    // larger expression. Confirms both operators co-exist cleanly.
+    let src = r#"
+        function f(o, C) {
+            return ('key' in o) && (o instanceof C);
+        }
+    "#;
+    let _ = ssa_roundtrip(src);
+}

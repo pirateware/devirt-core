@@ -3235,6 +3235,14 @@ impl<'b, 'm> Converter<'b, 'm> {
                 lhs: lhs_op,
                 rhs: rhs_op,
             },
+            BinOp::In => InstKind::In {
+                key: lhs_op,
+                obj: rhs_op,
+            },
+            BinOp::Instanceof => InstKind::Instanceof {
+                obj: lhs_op,
+                ctor: rhs_op,
+            },
         };
         self.emit(kind)
     }
@@ -3736,6 +3744,10 @@ fn walk_inst_operands_mut(kind: &mut InstKind, f: &mut impl FnMut(&mut Operand))
         Instanceof { obj, ctor } => {
             f(obj);
             f(ctor);
+        }
+        In { key, obj } => {
+            f(key);
+            f(obj);
         }
     }
 }
