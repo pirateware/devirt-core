@@ -14,6 +14,7 @@ lasso         = "0.7"
 ir            = { path = "../ir" }
 emit          = { path = "../emit" }
 parse         = { path = "../parse" }
+pass          = { path = "../pass" }
 
 [dev-dependencies]
 insta         = "1"

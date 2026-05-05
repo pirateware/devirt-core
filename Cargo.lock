@@ -327,6 +327,7 @@ dependencies = [
  "oxc_parser",
  "oxc_span",
  "parse",
+ "pass",
 ]
 
 [[package]]
@@ -651,6 +652,9 @@ dependencies = [
 [[package]]
 name = "pass"
 version = "0.1.0"
+dependencies = [
+ "ir",
+]
 
 [[package]]
 name = "petgraph"
