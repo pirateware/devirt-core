@@ -5,6 +5,7 @@
 //! - `free_vars`: free-variable analysis over both forms.
 //! - `pt_free_vars`: free-variable analysis over PassThrough source slices.
 
+pub mod blocker;
 pub mod error;
 pub mod free_vars;
 pub mod pt_free_vars;
