@@ -114,7 +114,7 @@ fn test_file_inner(source: &str) -> Result<TestStats, String> {
     stats.tl_pt_pct = calculate_tl_pt_pct(&cov);
 
     // Step 2: Lower to SSA and validate
-    let mut ssa_module = cli::ir::lower_ssa::lower_module(&tree_module);
+    let ssa_module = cli::ir::lower_ssa::lower_module(&tree_module);
     match ssa_module.validate() {
         Ok(()) => stats.validate_ok = true,
         Err(e) => {
@@ -161,7 +161,21 @@ fn calculate_fb_pt_pct(cov: &cli::coverage::ModuleCoverage) -> f64 {
 }
 
 fn calculate_tl_pt_pct(cov: &cli::coverage::ModuleCoverage) -> f64 {
-    cov.top_level_passthrough_bytes as f64
+    let mut total_lowered_stmts = 0usize;
+    let mut total_pt_bytes = 0usize;
+
+    for row in &cov.functions {
+        total_lowered_stmts += row.lowered_stmts;
+        total_pt_bytes += row.passthrough_bytes;
+    }
+
+    let tl_bytes = cov.top_level_passthrough_bytes as f64;
+    let tl_denom = tl_bytes + total_lowered_stmts as f64 * 30.0 + total_pt_bytes as f64;
+    if tl_denom > 0.0 {
+        (tl_bytes / tl_denom) * 100.0
+    } else {
+        0.0
+    }
 }
 
 fn generate_and_write_report(
@@ -170,7 +184,6 @@ fn generate_and_write_report(
 ) {
     let mut report = String::new();
     report.push_str("# Real-World Stability Test Report\n\n");
-    report.push_str("Generated: 2025-01-05\n\n");
     report.push_str(
         "This report tests the Reify parse → IR → emit pipeline against real-world JavaScript.\n\n",
     );
@@ -289,7 +302,7 @@ fn generate_and_write_report(
     report.push_str("Based on the test results:\n\n");
 
     if panics > 0 {
-        report.push_str("- ⚠️ **PANICS DETECTED**: {} file(s) caused panics. These are bugs that need to be fixed immediately.\n");
+        report.push_str(&format!("- ⚠️ **PANICS DETECTED**: {} file(s) caused panics. These are bugs that need to be fixed immediately.\n", panics));
     }
 
     let tier1_parse_failures = results
@@ -307,13 +320,15 @@ fn generate_and_write_report(
         .count();
 
     if high_pt > 0 {
-        report.push_str(&format!("- ℹ️ **High passthrough**: {} file(s) have >20%% function-body passthrough. These should be investigated to identify dominant unlowered constructs.\n", high_pt));
+        report.push_str(&format!("- ℹ️ **High passthrough**: {} file(s) have >20% function-body passthrough. These should be investigated to identify dominant unlowered constructs.\n", high_pt));
     }
 
     report.push_str("\n");
 
-    // Write report
-    let report_path = PathBuf::from("../../docs/REALWORLD_STABILITY.md");
+    let report_path = corpus_dir.join("STABILITY_REPORT.md");
+    if let Some(parent) = report_path.parent() {
+        fs::create_dir_all(parent).expect("Failed to create report directory");
+    }
     fs::write(&report_path, report).expect("Failed to write report");
     println!("Report written to: {}", report_path.display());
 }
