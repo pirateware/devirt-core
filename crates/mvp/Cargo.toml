@@ -12,6 +12,7 @@ oxc_span      = "0.40"
 bitflags      = "2"
 lasso         = "0.7"
 ir            = { path = "../ir" }
+emit          = { path = "../emit" }
 
 [dev-dependencies]
 insta         = "1"

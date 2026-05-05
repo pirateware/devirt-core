@@ -6,7 +6,7 @@
 //! shelling out to the binary.
 
 pub mod coverage;
-pub mod emit;
+pub use ::emit;
 pub mod error;
 pub mod ir;
 pub mod lower;
