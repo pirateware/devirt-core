@@ -48,9 +48,20 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# Tier 1 — unminified library modules.
-# Strategy: pull individual lodash modules + a handful of date-fns modules
-# straight off unpkg. Each file is small and self-contained.
+# Tier 1 — unminified library modules + full unminified bundles.
+#
+# Two sub-strategies:
+#   (a) Per-module: pull individual lodash modules + a handful of date-fns
+#       modules straight off unpkg. Each file is small and self-contained.
+#   (b) Full bundle: pull the un-minified full distribution for a few
+#       libraries. These are large single files (lodash.js is ~17K LOC) and
+#       exercise the construct mix we *don't* see in the per-module split:
+#       prototype chains, fall-through control flow, real-world var-scoping
+#       quirks, and (for axios/zod) ES2015+ shapes (classes, async,
+#       destructuring) the per-module corpus avoids. They are the FB-PT% /
+#       TL-PT% reality check — if a library's full source PassThroughs
+#       heavily, that's a coverage gap regardless of what the per-module
+#       view says.
 # ---------------------------------------------------------------------------
 
 LODASH_VERSION="4.17.21"
@@ -71,6 +82,35 @@ DATEFNS_MODULES=(
   format/index.js parseISO/index.js addDays/index.js differenceInDays/index.js
   isAfter/index.js isBefore/index.js startOfDay/index.js endOfMonth/index.js
   subDays/index.js addMonths/index.js getDay/index.js formatDistance/index.js
+)
+
+# Full un-minified bundles. Format: pkg@version:dist-path:license:description
+# Pinned versions (mirrors TIER2_VENDOR's pinning rationale: identical input
+# across runs makes the stability report comparable across commits).
+#
+# **What "un-minified" means in practice:** these are dist bundles, which
+# means Babel / esbuild / Rollup typically compiled the source down to ES5
+# before publishing. So even packages whose source uses classes / async /
+# optional chaining ship a UMD with prototype-based pseudo-classes,
+# regenerator-runtime state machines, and explicit ternaries instead.
+# Useful for "do we handle real-world ES5-shaped code at scale", NOT for
+# "do we handle modern syntax". For modern-syntax coverage, point at the
+# package's `src/` or its ESM-only entrypoint (`module` field in
+# package.json) — that's an open corpus gap to ticket if/when it matters.
+#
+# - lodash full: ~17K LOC, hand-written ES5, prototype chains, no
+#   async/await/classes. Pairs with tier2/lodash.min.js for
+#   matched-pair (un-min ↔ min) analysis.
+# - axios un-min: transpiled UMD — classes-as-prototypes, async-as-
+#   regenerator. Pairs with tier2/axios.min.js. Stresses the pipeline
+#   on the de-sugared shape obfuscators / minifiers actually see.
+#
+# Each entry must point at a path that is *not* already covered by
+# TIER2_VENDOR — duplicate URLs waste corpus space and conflate the
+# minified-vs-unminified signal.
+TIER1_UNMIN_BUNDLES=(
+  "lodash@4.17.21:lodash.js:MIT:Lodash full unminified bundle"
+  "axios@1.7.2:dist/axios.js:MIT:Axios full unminified UMD bundle"
 )
 
 fetch_tier1() {
@@ -107,6 +147,23 @@ fetch_tier1() {
     else
       rm -f "$out"
       echo "  miss datefns.$name"
+    fi
+  done
+
+  echo "== Tier 1: full un-minified bundles =="
+  for spec in "${TIER1_UNMIN_BUNDLES[@]}"; do
+    IFS=':' read -r pkgver dist license desc <<<"$spec"
+    local pkg="${pkgver%@*}"
+    local safe="${pkg//[^a-zA-Z0-9]/_}"
+    local out="$CORPUS/tier1/${safe}.full.js"
+    skip_if_exists "$out" && { echo "  skip $pkg.full"; continue; }
+    local url="https://unpkg.com/${pkgver}/${dist}"
+    if curl -fsSL "$url" -o "$out" 2>/dev/null; then
+      write_sidecar "$out" "$url" "$license" "$desc"
+      echo "  ok   $pkg.full"
+    else
+      rm -f "$out"
+      echo "  miss $pkg.full ($url)"
     fi
   done
 }
