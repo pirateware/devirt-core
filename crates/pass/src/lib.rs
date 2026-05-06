@@ -11,15 +11,16 @@
 //! is one pass exposing opportunities for an earlier pass; per-pass
 //! convergence would miss those.
 
-// The production pipeline today wires an empty PassManager only: builders
-// (`add_pass`, `with_max_iterations`, the dump-sink hook) and the
-// `StderrDumpSink` go unused until the first real pass lands. Tests
-// exercise the full surface; mirror the `ssa.rs` precedent and silence
-// dead-code noise here instead of fabricating shadow uses.
+// `StderrDumpSink` and the optional builders (`with_validate_between`,
+// `with_dump_sink`) are exposed to consumers but the production
+// pipeline doesn't wire them yet. Tests exercise the full surface;
+// silence dead-code lint here rather than fabricating shadow uses.
 #![allow(dead_code)]
 
 use ir::error::Error;
 use ir::ssa::{FuncId, Function, Module, pretty_function};
+
+pub mod const_fold;
 
 /// A single function-local pass. Returns `true` iff `func` was mutated.
 ///
