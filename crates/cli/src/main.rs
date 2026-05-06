@@ -100,10 +100,13 @@ fn main() -> ExitCode {
             eprintln!("\ninternal error: SSA module failed validation: {errs:#?}");
             return ExitCode::FAILURE;
         }
-        // Pass pipeline runs between SSA build and out-of-SSA. Empty for
-        // now — real passes (constant folding, DCE) land in follow-up
-        // tickets. The empty pipeline must short-circuit cleanly.
+        // Pass pipeline runs between SSA build and out-of-SSA. RefineArith
+        // first (specialises *Generic into typed variants), then ConstFold
+        // (which only folds typed arithmetic). The manager's fixed-point
+        // loop handles the refine→fold→refine cascade.
         let mut pm = PassManager::new();
+        pm.add_pass(Box::new(::pass::refine_arith::RefineArithPass));
+        pm.add_pass(Box::new(::pass::const_fold::ConstFoldPass));
         if let Err(e) = pm.run_module(&mut ssa_module) {
             eprintln!("\ninternal error: pass pipeline failed: {e}");
             return ExitCode::FAILURE;

@@ -22,7 +22,8 @@
 
 use ir::error::Error;
 use ir::ssa::{
-    Constant, Function, InstId, Operand, ValueDef, find_value_for_inst, try_const_fold,
+    Constant, FuncId, InstId, Module, Operand, ValueDef, find_value_for_inst,
+    try_const_fold_in_module,
 };
 
 use crate::FunctionPass;
@@ -34,21 +35,32 @@ impl FunctionPass for ConstFoldPass {
         "const_fold"
     }
 
-    fn run(&mut self, func: &mut Function) -> Result<bool, Error> {
-        if func.is_pass_through() {
+    fn run(&mut self, module: &mut Module, fid: FuncId) -> Result<bool, Error> {
+        if module.functions[fid.0 as usize].is_pass_through() {
             return Ok(false);
         }
-        let body = func.lowered_mut();
 
-        // Snapshot foldable (block_index, inst_id, folded_constant) tuples
-        // from the read-only walk, then apply mutations after.
-        let mut to_fold: Vec<(usize, InstId, Constant)> = Vec::new();
-        for (bi, blk) in body.blocks.iter().enumerate() {
-            for &iid in &blk.instructions {
-                let kind = &body.instructions[iid.0 as usize].kind;
-                if let Some(c) = try_const_fold(kind) {
-                    to_fold.push((bi, iid, c));
+        // Two phases: read-only walk produces (block_index, inst_id, kind)
+        // candidates, then we hand each kind to the module-aware folder
+        // (which may need to intern strings for ConcatStr) and apply the
+        // resulting Constants. Cloning the InstKind is cheap — operands
+        // are 16-byte enums and the candidate set is the foldable subset
+        // only.
+        let mut candidates: Vec<(usize, InstId, ir::ssa::InstKind)> = Vec::new();
+        {
+            let body = module.functions[fid.0 as usize].lowered();
+            for (bi, blk) in body.blocks.iter().enumerate() {
+                for &iid in &blk.instructions {
+                    let kind = &body.instructions[iid.0 as usize].kind;
+                    candidates.push((bi, iid, kind.clone()));
                 }
+            }
+        }
+
+        let mut to_fold: Vec<(usize, InstId, Constant)> = Vec::new();
+        for (bi, iid, kind) in candidates {
+            if let Some(c) = try_const_fold_in_module(module, &kind) {
+                to_fold.push((bi, iid, c));
             }
         }
 
@@ -56,8 +68,7 @@ impl FunctionPass for ConstFoldPass {
             return Ok(false);
         }
 
-        // Apply each fold. Folds are independent (different InstIds /
-        // Values); processing in source order keeps behavior predictable.
+        let body = module.functions[fid.0 as usize].lowered_mut();
         for (bi, iid, c) in &to_fold {
             let v = find_value_for_inst(body, *iid);
             body.replace_value_uses(v, Operand::Const(*c));
@@ -200,7 +211,7 @@ mod tests {
         // Replace with PassThrough body — exercises the
         // is_pass_through() short-circuit.
         module.functions[0].body = FunctionBody::PassThrough(PassThroughBody {
-            source: String::new(),
+            source: "function f(){}".to_string(),
             param_names: vec![],
             function_name: None,
             is_async: false,
@@ -213,5 +224,67 @@ mod tests {
         pm.add_pass(Box::new(ConstFoldPass));
         let iters = pm.run(&mut module, FuncId(0)).expect("pass succeeds");
         assert_eq!(iters, 1, "PassThrough function should not iterate");
+    }
+
+    #[test]
+    fn folds_concat_str_constants() {
+        let mut module = Module::new();
+        let mut b = FunctionBuilder::new(&mut module, "f", 0);
+        let a = b.intern("hello ");
+        let b_id = b.intern("world");
+        let bb0 = b.new_block();
+        b.switch_to_block(bb0);
+        let v = b
+            .add_inst(InstKind::ConcatStr {
+                lhs: Operand::Const(Constant::String(a)),
+                rhs: Operand::Const(Constant::String(b_id)),
+            })
+            .unwrap();
+        b.set_terminator(Terminator::Return { val: Some(Operand::Value(v)) });
+        b.finish();
+
+        let mut pm = PassManager::new();
+        pm.add_pass(Box::new(ConstFoldPass));
+        pm.run(&mut module, FuncId(0)).expect("pass succeeds");
+
+        let body = module.functions[0].lowered();
+        let entry = body.entry;
+        match &body.blocks[entry.0 as usize].terminator {
+            Terminator::Return {
+                val: Some(Operand::Const(Constant::String(id))),
+            } => {
+                assert_eq!(module.strings.resolve(id), "hello world");
+            }
+            other => panic!("expected ret Const(String('hello world')), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn folds_bitwise_int32_constants() {
+        let mut module = Module::new();
+        let mut b = FunctionBuilder::new(&mut module, "f", 0);
+        let bb0 = b.new_block();
+        b.switch_to_block(bb0);
+        let v = b
+            .add_inst(InstKind::BitAnd {
+                lhs: Operand::Const(Constant::Int32(0xff)),
+                rhs: Operand::Const(Constant::Int32(0x0f)),
+            })
+            .unwrap();
+        b.set_terminator(Terminator::Return { val: Some(Operand::Value(v)) });
+        b.finish();
+
+        let mut pm = PassManager::new();
+        pm.add_pass(Box::new(ConstFoldPass));
+        pm.run(&mut module, FuncId(0)).expect("pass succeeds");
+
+        let body = module.functions[0].lowered();
+        let entry = body.entry;
+        assert!(matches!(
+            body.blocks[entry.0 as usize].terminator,
+            Terminator::Return {
+                val: Some(Operand::Const(Constant::Int32(0x0f))),
+            }
+        ));
     }
 }

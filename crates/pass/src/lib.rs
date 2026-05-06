@@ -17,9 +17,10 @@
 // silence dead-code lint here rather than fabricating shadow uses.
 
 use ir::error::Error;
-use ir::ssa::{FuncId, Function, Module, pretty_function};
+use ir::ssa::{FuncId, Module, pretty_function};
 
 pub mod const_fold;
+pub mod refine_arith;
 
 /// A single function-local pass. Returns `true` iff `func` was mutated.
 ///
@@ -28,7 +29,7 @@ pub mod const_fold;
 /// that actually needs it.
 pub trait FunctionPass {
     fn name(&self) -> &'static str;
-    fn run(&mut self, func: &mut Function) -> Result<bool, Error>;
+    fn run(&mut self, module: &mut Module, fid: FuncId) -> Result<bool, Error>;
 }
 
 /// Hook for emitting per-pass IR snapshots. The manager invokes this after
@@ -110,10 +111,7 @@ impl PassManager {
         for iter in 0..max_iterations {
             let mut changed_this_round = false;
             for pass in passes.iter_mut() {
-                let changed = {
-                    let func = &mut module.functions[fid.0 as usize];
-                    pass.run(func)?
-                };
+                let changed = pass.run(module, fid)?;
                 if validate_between && let Err(errs) = module.validate() {
                     return Err(Error::PassValidationFailed {
                         pass: pass.name(),
@@ -171,7 +169,7 @@ pub mod identity {
             "identity"
         }
 
-        fn run(&mut self, _func: &mut Function) -> Result<bool, Error> {
+        fn run(&mut self, _module: &mut Module, _fid: FuncId) -> Result<bool, Error> {
             Ok(false)
         }
     }
@@ -231,7 +229,7 @@ mod tests {
         fn name(&self) -> &'static str {
             "always_changes"
         }
-        fn run(&mut self, _func: &mut Function) -> Result<bool, Error> {
+        fn run(&mut self, _module: &mut Module, _fid: FuncId) -> Result<bool, Error> {
             Ok(true)
         }
     }
@@ -255,7 +253,8 @@ mod tests {
         fn name(&self) -> &'static str {
             "breaking"
         }
-        fn run(&mut self, func: &mut Function) -> Result<bool, Error> {
+        fn run(&mut self, module: &mut Module, fid: FuncId) -> Result<bool, Error> {
+            let func = &mut module.functions[fid.0 as usize];
             let entry = func.lowered_mut().entry;
             func.lowered_mut().blocks[entry.0 as usize].terminator = Terminator::Branch {
                 target: BlockId(9999),
@@ -301,7 +300,8 @@ mod tests {
         fn name(&self) -> &'static str {
             self.name
         }
-        fn run(&mut self, func: &mut Function) -> Result<bool, Error> {
+        fn run(&mut self, module: &mut Module, fid: FuncId) -> Result<bool, Error> {
+            let func = &mut module.functions[fid.0 as usize];
             // Same breakage as BreakingPass, but with a configurable name.
             let entry = func.lowered_mut().entry;
             func.lowered_mut().blocks[entry.0 as usize].terminator = Terminator::Branch {

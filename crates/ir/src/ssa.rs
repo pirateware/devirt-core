@@ -1935,6 +1935,196 @@ impl LoweredBody {
     }
 }
 
+// ============================================================================
+// Type lattice — used by RefineArithPass to specialise *Generic arithmetic
+// ============================================================================
+
+/// Coarse static type for an SSA `Value`. The lattice is flat over the JS
+/// primitive types; `Top` means "could be anything" and `Bottom` means
+/// "no information" (used as the join identity).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ValueType {
+    Bottom,
+    Int32,
+    Number,
+    String,
+    Bool,
+    Null,
+    Undefined,
+    Top,
+}
+
+impl ValueType {
+    /// Lattice join: `Bottom ⊔ x = x`, `Top ⊔ x = Top`, equal types stay,
+    /// any disagreement collapses to `Top`. Note Int32 and Number are
+    /// kept distinct — refinement uses the finer distinction (Int32
+    /// operands enable AddInt32, mixed Int32/Number does not).
+    pub fn join(self, other: ValueType) -> ValueType {
+        match (self, other) {
+            (ValueType::Bottom, x) | (x, ValueType::Bottom) => x,
+            (a, b) if a == b => a,
+            _ => ValueType::Top,
+        }
+    }
+}
+
+fn const_type(c: &Constant) -> ValueType {
+    match c {
+        Constant::Number(_) => ValueType::Number,
+        Constant::Int32(_) => ValueType::Int32,
+        Constant::Bool(_) => ValueType::Bool,
+        Constant::String(_) => ValueType::String,
+        Constant::Null => ValueType::Null,
+        Constant::Undefined => ValueType::Undefined,
+        // GlobalThis/This/Func: opaque, no useful type.
+        Constant::GlobalThis | Constant::This | Constant::Func(_) => ValueType::Top,
+    }
+}
+
+/// Static type of an instruction's result, given a way to ask for the
+/// type of any operand. Returns `Top` for instructions whose result
+/// type we don't track (allocations, calls, loads, etc.).
+fn inst_result_type(
+    kind: &InstKind,
+    mut op_type: impl FnMut(&Operand) -> ValueType,
+) -> ValueType {
+    use InstKind::*;
+    match kind {
+        // Always-Number arithmetic.
+        AddNumber { .. }
+        | SubNumber { .. }
+        | MulNumber { .. }
+        | DivGeneric { .. }
+        | ModGeneric { .. }
+        | PowGeneric { .. }
+        | SubGeneric { .. }
+        | MulGeneric { .. }
+        | ToNumber { .. } => ValueType::Number,
+
+        // Always-Int32: typed int arithmetic + bitwise (post-ToInt32).
+        AddInt32 { .. }
+        | SubInt32 { .. }
+        | MulInt32 { .. }
+        | BitAnd { .. }
+        | BitOr { .. }
+        | BitXor { .. }
+        | Shl { .. }
+        | Shr { .. }
+        | BitNot { .. }
+        | ToInt32 { .. } => ValueType::Int32,
+
+        // UShr produces a Uint32 — out of i32 range when high bit set;
+        // claiming Int32 would be unsound. Conservative Top.
+        UShr { .. } => ValueType::Top,
+
+        // String-producing.
+        ConcatStr { .. } | ToString { .. } | Typeof { .. } | ForInNext { .. } => {
+            ValueType::String
+        }
+
+        // Bool-producing.
+        Not { .. }
+        | Eq { .. }
+        | StrictEq { .. }
+        | Lt { .. }
+        | Le { .. }
+        | Instanceof { .. }
+        | In { .. }
+        | ToBool { .. }
+        | ForInDone { .. } => ValueType::Bool,
+
+        // AddGeneric: Number unless either side could be String, in which
+        // case the result could be String. Be conservative — Top.
+        AddGeneric { lhs, rhs } => {
+            let lt = op_type(lhs);
+            let rt = op_type(rhs);
+            match (lt, rt) {
+                (ValueType::Number, ValueType::Number)
+                | (ValueType::Int32, ValueType::Int32)
+                | (ValueType::Number, ValueType::Int32)
+                | (ValueType::Int32, ValueType::Number) => ValueType::Number,
+                (ValueType::String, ValueType::String) => ValueType::String,
+                _ => ValueType::Top,
+            }
+        }
+
+        // Logical short-circuit returns one of its operands; could be
+        // either side's type. Take the join.
+        LogAnd { lhs, rhs } | LogOr { lhs, rhs } => op_type(lhs).join(op_type(rhs)),
+
+        // Everything else: opaque to this analysis.
+        _ => ValueType::Top,
+    }
+}
+
+/// Type of an SSA `Value` in the given body. Walks `ValueDef` once and
+/// recurses through block-param edges and instruction operands. Cycles
+/// (phi-of-phi loops) bail to `Top`.
+pub fn value_type(body: &LoweredBody, v: Value) -> ValueType {
+    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    value_type_rec(body, v, &mut seen)
+}
+
+/// Type of an `Operand` — `Const` reads off the constant, `Value`
+/// defers to `value_type`, and the opaque variants (Capture / Global /
+/// This-binding) return `Top`.
+pub fn operand_type(body: &LoweredBody, op: &Operand) -> ValueType {
+    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    operand_type_rec(body, op, &mut seen)
+}
+
+fn value_type_rec(
+    body: &LoweredBody,
+    v: Value,
+    seen: &mut std::collections::HashSet<u32>,
+) -> ValueType {
+    if !seen.insert(v.0) {
+        return ValueType::Top;
+    }
+    let def = &body.values[v.0 as usize];
+    let result = match &def.kind {
+        ValueDefKind::Removed | ValueDefKind::Arg(_) => ValueType::Top,
+        ValueDefKind::Inst(iid) => {
+            let kind = &body.instructions[iid.0 as usize].kind;
+            inst_result_type(kind, |op| operand_type_rec(body, op, seen))
+        }
+        ValueDefKind::BlockParam { block, index } => {
+            let blk = &body.blocks[block.0 as usize];
+            let mut t = ValueType::Bottom;
+            for &pred_id in &blk.predecessors {
+                let pred = &body.blocks[pred_id.0 as usize];
+                for (succ_block, args) in pred.terminator.successors() {
+                    if succ_block == *block && (*index as usize) < args.len() {
+                        t = t.join(operand_type_rec(body, &args[*index as usize], seen));
+                    }
+                }
+            }
+            // No predecessors contributed (entry block params, or the
+            // catch-value edge): treat as opaque.
+            if matches!(t, ValueType::Bottom) {
+                ValueType::Top
+            } else {
+                t
+            }
+        }
+    };
+    seen.remove(&v.0);
+    result
+}
+
+fn operand_type_rec(
+    body: &LoweredBody,
+    op: &Operand,
+    seen: &mut std::collections::HashSet<u32>,
+) -> ValueType {
+    match op {
+        Operand::Const(c) => const_type(c),
+        Operand::Value(v) => value_type_rec(body, *v, seen),
+        // Capture / non-Const opaque operands: unknown.
+        _ => ValueType::Top,
+    }
+}
+
 /// Try to constant-fold a typed-arithmetic / pure-comparison `InstKind`.
 /// Returns `Some(c)` iff the instruction's result is determined by its
 /// constant operands AND the fold is sound under JS semantics
@@ -1970,12 +2160,34 @@ pub fn try_const_fold(kind: &InstKind) -> Option<Constant> {
     fn n(op: &Operand) -> Option<f64> {
         match op {
             Operand::Const(Constant::Number(x)) => Some(*x),
+            // Int32 ⊆ Number — accept either, since AddNumber et al.
+            // operate on Number-typed values (Int32 is a subset).
+            Operand::Const(Constant::Int32(x)) => Some(*x as f64),
             _ => None,
         }
     }
     fn i(op: &Operand) -> Option<i32> {
         match op {
             Operand::Const(Constant::Int32(x)) => Some(*x),
+            _ => None,
+        }
+    }
+    /// ECMA-262 §7.1.6 ToInt32 over a pure numeric constant. Bitwise
+    /// ops apply ToInt32 to their operands implicitly, so accepting
+    /// Number here matches their semantics. NaN/±Infinity → 0; finite
+    /// values truncate then mod-2^32 then map to signed.
+    fn to_i32(op: &Operand) -> Option<i32> {
+        match op {
+            Operand::Const(Constant::Int32(x)) => Some(*x),
+            Operand::Const(Constant::Number(n)) => {
+                if !n.is_finite() {
+                    return Some(0);
+                }
+                let trunc = n.trunc();
+                let modulo = trunc.rem_euclid(4_294_967_296.0);
+                let u = modulo as u32;
+                Some(u as i32)
+            }
             _ => None,
         }
     }
@@ -1992,6 +2204,19 @@ pub fn try_const_fold(kind: &InstKind) -> Option<Constant> {
         AddInt32 { lhs, rhs } => Some(Constant::Int32(i(lhs)?.wrapping_add(i(rhs)?))),
         SubInt32 { lhs, rhs } => Some(Constant::Int32(i(lhs)?.wrapping_sub(i(rhs)?))),
         MulInt32 { lhs, rhs } => Some(Constant::Int32(i(lhs)?.wrapping_mul(i(rhs)?))),
+        // Bitwise on Int32 constants — operands' ToInt32 already happened
+        // (they're Constant::Int32), so these cannot throw. Shift counts
+        // are masked by 31 per ECMA-262.
+        BitAnd { lhs, rhs } => Some(Constant::Int32(to_i32(lhs)? & to_i32(rhs)?)),
+        BitOr { lhs, rhs } => Some(Constant::Int32(to_i32(lhs)? | to_i32(rhs)?)),
+        BitXor { lhs, rhs } => Some(Constant::Int32(to_i32(lhs)? ^ to_i32(rhs)?)),
+        Shl { lhs, rhs } => {
+            Some(Constant::Int32(to_i32(lhs)?.wrapping_shl((to_i32(rhs)? as u32) & 31)))
+        }
+        Shr { lhs, rhs } => {
+            Some(Constant::Int32(to_i32(lhs)? >> ((to_i32(rhs)? as u32) & 31)))
+        }
+        BitNot { operand } => Some(Constant::Int32(!to_i32(operand)?)),
         Not { operand } => Some(Constant::Bool(!b(operand)?)),
         Lt { lhs, rhs } => {
             // Try Number-Number first, fall back to Int32-Int32. NaN
@@ -2063,6 +2288,27 @@ pub fn try_const_fold(kind: &InstKind) -> Option<Constant> {
         }
         _ => None,
     }
+}
+
+/// Module-aware constant folding. Falls through to `try_const_fold` for
+/// everything that doesn't need string-interner access; the only extra
+/// case it handles is `ConcatStr(Const::String, Const::String)`, which
+/// needs `&mut Module` to intern the joined result.
+pub fn try_const_fold_in_module(module: &mut Module, kind: &InstKind) -> Option<Constant> {
+    if let InstKind::ConcatStr {
+        lhs: Operand::Const(Constant::String(a)),
+        rhs: Operand::Const(Constant::String(b)),
+    } = kind
+    {
+        let la = module.strings.resolve(a).to_string();
+        let lb = module.strings.resolve(b).to_string();
+        let mut joined = String::with_capacity(la.len() + lb.len());
+        joined.push_str(&la);
+        joined.push_str(&lb);
+        let id = module.strings.get_or_intern(&joined);
+        return Some(Constant::String(id));
+    }
+    try_const_fold(kind)
 }
 
 /// Returns the `Value` that names the result of instruction `iid` in
