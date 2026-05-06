@@ -89,14 +89,17 @@ DATEFNS_MODULES=(
 # across runs makes the stability report comparable across commits).
 #
 # **What "un-minified" means in practice:** these are dist bundles, which
-# means Babel / esbuild / Rollup typically compiled the source down to ES5
-# before publishing. So even packages whose source uses classes / async /
-# optional chaining ship a UMD with prototype-based pseudo-classes,
+# means Babel / esbuild / Rollup compiled the source down to ES5 before
+# publishing. Even packages whose source uses classes / async / optional
+# chaining ship a UMD with prototype-based pseudo-classes,
 # regenerator-runtime state machines, and explicit ternaries instead.
-# Useful for "do we handle real-world ES5-shaped code at scale", NOT for
-# "do we handle modern syntax". For modern-syntax coverage, point at the
-# package's `src/` or its ESM-only entrypoint (`module` field in
-# package.json) — that's an open corpus gap to ticket if/when it matters.
+#
+# This matches the project's actual input distribution. Malware in the
+# wild ships as compiled / minified / obfuscated dist bundles, not as
+# source. The de-sugared shape Babel emits IS the shape obfuscators
+# consume IS the shape we're built to handle. We deliberately do NOT
+# corpus-test against `src/` or ESM-only `module` entrypoints — those
+# represent an input class we never see.
 #
 # - lodash full: ~17K LOC, hand-written ES5, prototype chains, no
 #   async/await/classes. Pairs with tier2/lodash.min.js for
