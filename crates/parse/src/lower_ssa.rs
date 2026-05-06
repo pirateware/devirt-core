@@ -171,7 +171,7 @@ pub fn lower_module(tm: &tree::Module) -> ssa::Module {
     // `discover_module` did, and copying PassThrough source slices for
     // non-function statements. Mirrors source order so emit reproduces
     // the original interleaving.
-    sm.top_level_layout = build_top_level_layout(tm);
+    sm.top_level_layout = build_top_level_layout(tm, &pending);
 
     // Fixed-point propagation: for every Lowered function whose
     // `captures_pass_through_onward` set is non-empty, walk every
@@ -299,17 +299,37 @@ enum PendingKind<'a> {
 
 /// Walk `tm.items` in source order and produce the layout that the
 /// out-of-SSA emitter will use to interleave functions with passthrough
-/// statements. FuncId assignment must match `discover_module`: top-level
-/// functions get FuncId(0), FuncId(1), ... in source order — the same
-/// order they were pushed onto `pending`.
-fn build_top_level_layout(tm: &tree::Module) -> Vec<TopLevelEntry> {
+/// statements.
+///
+/// Reads top-level FuncIds out of `pending` rather than reconstructing
+/// them with a sequential counter. `discover_module` assigns FuncIds
+/// via `pending.len()` at push time, so a top-level function's FuncId
+/// is _not_ its source-order index when prior top-level functions
+/// contained inner literals (those literals get pushed between
+/// top-level entries). Sequential numbering produced
+/// `TopLevelEntry::Function(FuncId(N))` references that pointed at
+/// inner literals, which `lower_module_inner` then dropped via the
+/// `inner_targets` filter — silently losing top-level functions from
+/// emission. Reading FuncIds straight from `pending` (filtered for
+/// `parent.is_none()`) closes that hole; both walks are in source
+/// order so a single advancing index over each suffices.
+fn build_top_level_layout(tm: &tree::Module, pending: &[PendingFunction]) -> Vec<TopLevelEntry> {
+    let top_level_fids: Vec<FuncId> = pending
+        .iter()
+        .filter(|p| p.parent.is_none())
+        .map(|p| p.fid)
+        .collect();
+    let mut top_iter = top_level_fids.into_iter();
     let mut out = Vec::with_capacity(tm.items.len());
-    let mut next_top_fid: u32 = 0;
     for it in &tm.items {
         match it {
             tree::Item::Function(_) | tree::Item::PassThroughFunction(_) => {
-                out.push(TopLevelEntry::Function(FuncId(next_top_fid)));
-                next_top_fid += 1;
+                let fid = top_iter.next().expect(
+                    "tree::Module has more top-level Function/PassThroughFunction \
+                     items than `pending` has parent-less entries — discover_module \
+                     and build_top_level_layout disagree about what is top-level",
+                );
+                out.push(TopLevelEntry::Function(fid));
             }
             tree::Item::PassThroughStmt(src) => {
                 out.push(TopLevelEntry::PassThroughStmt(src.clone()));
@@ -324,6 +344,11 @@ fn build_top_level_layout(tm: &tree::Module) -> Vec<TopLevelEntry> {
             }
         }
     }
+    debug_assert!(
+        top_iter.next().is_none(),
+        "build_top_level_layout: pending has parent-less entries with no matching \
+         tree::Item::Function/PassThroughFunction"
+    );
     out
 }
 

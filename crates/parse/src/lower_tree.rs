@@ -2412,6 +2412,49 @@ mod tests {
         assert!(out.contains("this"), "this must survive: {out}");
     }
 
+    /// Regression for `build_top_level_layout`: when a top-level
+    /// function contains an inner function literal, the second
+    /// top-level function gets dropped from the output.
+    ///
+    /// Root cause: `discover_module` assigns FuncIds via
+    /// `pending.len()`, which counts top-level + inner literals
+    /// interleaved (top-level first, then inner literals discovered
+    /// inside its body, then the next top-level). So the second
+    /// top-level function's FuncId is `1 + (count of inner literals in
+    /// the first)`, not `1`. But `build_top_level_layout` uses a
+    /// sequential counter `0, 1, 2, ...` that only counts top-level
+    /// items. The `TopLevelEntry::Function(FuncId(1))` it records for
+    /// the second top-level function actually points at an inner
+    /// literal — which `lower_module_inner` recognizes via
+    /// `inner_targets` and silently skips, dropping the top-level
+    /// item entirely.
+    ///
+    /// This bug doesn't bite the corpus because most corpus files
+    /// have a single top-level function (the IIFE wrapper). Surfaces
+    /// only with 2+ top-level functions where the first has nested
+    /// literals.
+    #[test]
+    fn second_top_level_function_after_inner_literal_is_not_dropped() {
+        let src = r#"
+            function first(x) {
+                let inner = function (y) { return y + 1; };
+                return inner(x);
+            }
+            function second(z) {
+                return z * 2;
+            }
+        "#;
+        let out = full_roundtrip(src);
+        assert!(
+            out.contains("function first"),
+            "first must emit:\n{out}"
+        );
+        assert!(
+            out.contains("function second"),
+            "second was silently dropped (build_top_level_layout bug):\n{out}"
+        );
+    }
+
     /// `-0` must survive the roundtrip as negative zero, not be silently
     /// flipped to `+0`.  The decomposition `(-0.0) - x` only preserves the
     /// sign if the lhs constant is -0.0 (IEEE 754: -0.0 - 0.0 == -0.0, but
