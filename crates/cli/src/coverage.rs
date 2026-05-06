@@ -190,6 +190,19 @@ fn walk_stmts(stmts: &[Stmt], parent: &str, rows: &mut Vec<FunctionCoverage>) {
             }
             Stmt::Let { init: None, .. } | Stmt::Return(None) => {}
             Stmt::Throw(e) => walk_expr(e, parent, rows),
+            Stmt::Break { .. } => {}
+            Stmt::Switch {
+                discriminant,
+                cases,
+            } => {
+                walk_expr(discriminant, parent, rows);
+                for case in cases {
+                    if let Some(t) = &case.test {
+                        walk_expr(t, parent, rows);
+                    }
+                    walk_stmts(&case.body, parent, rows);
+                }
+            }
             Stmt::Try { body, catch, finally } => {
                 walk_stmts(body, parent, rows);
                 if let Some((_, catch_body)) = catch {

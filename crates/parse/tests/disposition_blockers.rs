@@ -50,27 +50,27 @@ fn arithmetic_and_return_is_lowered() {
 
 #[test]
 fn two_distinct_blockers_all_reported() {
-    // BreakStmt + NullishCoalescing — two constructs still blocked
-    // after the throw/this lowering ticket. (ThrowStmt is no longer
-    // a blocker; it lowers to `Stmt::Throw` and routes through the
-    // SSA-fallback path.)
-    let src = "function f(a) { while (a) { break; } let x = a ?? 1; }";
+    // NullishCoalescing + DefaultParam — two constructs still blocked
+    // after the switch/break lowering ticket. (BreakStmt and SwitchStmt
+    // are no longer blockers; they lower syntactically and route
+    // through the SSA-fallback path, same as Throw/Try/ForIn.)
+    let src = "function f(a = 1) { let x = a ?? 1; return x; }";
     let b = blockers_of(src);
-    assert!(b.contains(&BlockerKind::BreakStmt), "missing BreakStmt in {b:?}");
+    assert!(b.contains(&BlockerKind::DefaultParam), "missing DefaultParam in {b:?}");
     assert!(b.contains(&BlockerKind::NullishCoalescing), "missing NullishCoalescing in {b:?}");
     assert_eq!(b.len(), 2, "expected exactly 2 blockers, got {b:?}");
 }
 
-// --- Set semantics: same kind 5 times = 1 entry ---
+// --- Set semantics: same kind repeated = 1 entry ---
 
 #[test]
 fn repeated_blocker_kind_reported_once() {
-    // Five break statements — all BreakStmt, only one entry in the set.
-    let src = "function f() {
-        while (true) { break; break; break; break; break; }
+    // Multiple `??` operands — all NullishCoalescing, only one entry in the set.
+    let src = "function f(a, b, c) {
+        return (a ?? b) ?? c;
     }";
     let b = blockers_of(src);
-    assert!(b.contains(&BlockerKind::BreakStmt), "{b:?}");
+    assert!(b.contains(&BlockerKind::NullishCoalescing), "{b:?}");
     assert_eq!(b.len(), 1, "expected exactly 1 unique blocker, got {b:?}");
 }
 
@@ -105,15 +105,23 @@ fn throw_stmt_is_lowered() {
 }
 
 #[test]
-fn break_in_while_blocked() {
-    let b = blockers_of("function f() { while (true) { break; } }");
-    assert!(b.contains(&BlockerKind::BreakStmt), "{b:?}");
+fn break_in_while_is_lowered() {
+    // `break` lowers to `Stmt::Break`; functions containing it route
+    // through SSA-fallback but the AST disposition is Lowered.
+    assert_eq!(
+        decide_first_fn("function f() { while (true) { break; } }"),
+        Disposition::Lowered
+    );
 }
 
 #[test]
-fn switch_stmt_blocked() {
-    let b = blockers_of("function f(x) { switch (x) { case 1: return 1; } }");
-    assert!(b.contains(&BlockerKind::SwitchStmt), "{b:?}");
+fn switch_stmt_is_lowered() {
+    // `switch` lowers to `Stmt::Switch`; same SSA-fallback pattern as
+    // throw/try/for-in. Disposition is Lowered.
+    assert_eq!(
+        decide_first_fn("function f(x) { switch (x) { case 1: return 1; } }"),
+        Disposition::Lowered
+    );
 }
 
 #[test]

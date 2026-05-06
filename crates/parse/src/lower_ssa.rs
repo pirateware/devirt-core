@@ -455,6 +455,12 @@ fn walk_reassigned_stmts(stmts: &[Stmt], out: &mut HashSet<String>) {
                 walk_reassigned_stmts(body, out);
             }
             Stmt::Continue => {}
+            Stmt::Break { .. } => {}
+            Stmt::Switch { cases, .. } => {
+                for case in cases {
+                    walk_reassigned_stmts(&case.body, out);
+                }
+            }
             Stmt::Block(ss) => walk_reassigned_stmts(ss, out),
             Stmt::FuncDecl(_) => {} // nested literal: own scope
             Stmt::Try { body, catch, finally } => {
@@ -751,6 +757,27 @@ fn discover_stmt<'a>(
             );
         }
         Stmt::Continue => {}
+        Stmt::Break { .. } => {}
+        Stmt::Switch {
+            discriminant,
+            cases,
+        } => {
+            discover_expr(discriminant, pending, captures_by_fid, seen, reassigned, parent_fid);
+            for case in cases {
+                if let Some(test) = &case.test {
+                    discover_expr(test, pending, captures_by_fid, seen, reassigned, parent_fid);
+                }
+                let mut inner_seen = seen.clone();
+                discover_stmts(
+                    &case.body,
+                    pending,
+                    captures_by_fid,
+                    &mut inner_seen,
+                    reassigned,
+                    parent_fid,
+                );
+            }
+        }
         Stmt::Block(ss) => {
             let mut inner_seen = seen.clone();
             discover_stmts(
@@ -1024,7 +1051,11 @@ fn push_passthrough_function(sm: &mut ssa::Module, lit: &tree::FuncLiteral) {
 fn body_needs_ssa_fallback(stmts: &[Stmt]) -> bool {
     fn visit_stmt(s: &Stmt) -> bool {
         match s {
-            Stmt::ForIn { .. } | Stmt::Try { .. } | Stmt::Throw(_) => true,
+            Stmt::ForIn { .. }
+            | Stmt::Try { .. }
+            | Stmt::Throw(_)
+            | Stmt::Switch { .. }
+            | Stmt::Break { .. } => true,
             Stmt::If { cond, then_body, else_body, .. } => {
                 visit_expr(cond)
                     || then_body.iter().any(visit_stmt)
@@ -1145,6 +1176,16 @@ fn collect_assign_expr_target_names(stmts: &[Stmt]) -> std::collections::HashSet
                 if let Some(fb) = finally { for s in fb { visit_stmt(s, out); } }
             }
             Stmt::Let { init: None, .. } | Stmt::Return(None) | Stmt::Continue => {}
+            Stmt::Break { .. } => {}
+            Stmt::Switch { discriminant, cases } => {
+                visit_expr(discriminant, out);
+                for case in cases {
+                    if let Some(t) = &case.test {
+                        visit_expr(t, out);
+                    }
+                    for s in &case.body { visit_stmt(s, out); }
+                }
+            }
             Stmt::Throw(e) => visit_expr(e, out),
         }
     }
@@ -2019,7 +2060,11 @@ impl<'b, 'm> Converter<'b, 'm> {
                 let cb = self.current_block();
                 self.write_variable(sym, cb, alloc);
             }
-            Stmt::Try { .. } | Stmt::ForIn { .. } | Stmt::Throw(_) => {
+            Stmt::Try { .. }
+            | Stmt::ForIn { .. }
+            | Stmt::Throw(_)
+            | Stmt::Switch { .. }
+            | Stmt::Break { .. } => {
                 // None of these are expressible in SSA. The
                 // `body_needs_ssa_fallback` check at function entry
                 // (in `lower_top_level_function` / `lower_inner_literal`)
@@ -2029,7 +2074,7 @@ impl<'b, 'm> Converter<'b, 'm> {
                 // hand-built tree-IR test fixture lacks the source
                 // slice required to fall back).
                 unreachable!(
-                    "Stmt::{{Try,ForIn,Throw}} reached SSA conversion — \
+                    "Stmt::{{Try,ForIn,Throw,Switch,Break}} reached SSA conversion — \
                      body_needs_ssa_fallback should have routed this function \
                      to PassThrough"
                 );

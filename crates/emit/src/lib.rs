@@ -330,6 +330,42 @@ impl Printer<'_> {
             Stmt::Continue => {
                 self.buf.push_str("continue;");
             }
+            Stmt::Break { label } => match label {
+                Some(l) => {
+                    write!(self.buf, "break {l};").unwrap();
+                }
+                None => {
+                    self.buf.push_str("break;");
+                }
+            },
+            Stmt::Switch { discriminant, cases } => {
+                self.buf.push_str("switch (");
+                self.expr(discriminant);
+                self.buf.push_str(") {\n");
+                self.indent += 1;
+                for case in cases {
+                    self.pad();
+                    match &case.test {
+                        Some(t) => {
+                            self.buf.push_str("case ");
+                            self.expr(t);
+                            self.buf.push(':');
+                        }
+                        None => self.buf.push_str("default:"),
+                    }
+                    self.buf.push('\n');
+                    self.indent += 1;
+                    for s in &case.body {
+                        self.pad();
+                        self.stmt(s);
+                        self.buf.push('\n');
+                    }
+                    self.indent -= 1;
+                }
+                self.indent -= 1;
+                self.pad();
+                self.buf.push('}');
+            }
             Stmt::Throw(e) => {
                 self.buf.push_str("throw ");
                 self.expr(e);

@@ -30,7 +30,7 @@
 //! regression of either fold will surface as a structural diff
 //! (the desired loud-failure mode).
 
-use ir::tree::{Expr, Item, Module, Stmt};
+use ir::tree::{Expr, Item, Module, Stmt, SwitchCase};
 
 /// Returns `None` when `m1` and `m2` are structurally equivalent,
 /// `Some(reason)` describing the first mismatch otherwise.
@@ -178,6 +178,18 @@ fn stmt_diff(a: &Stmt, b: &Stmt, path: &str) -> Option<String> {
             stmts_diff(ba, bb, &format!("{path}.body"))
         }
         (Stmt::Continue, Stmt::Continue) => None,
+        (Stmt::Break { label: la }, Stmt::Break { label: lb }) => {
+            if la == lb {
+                None
+            } else {
+                Some(format!("{path}: break label {la:?} vs {lb:?}"))
+            }
+        }
+        (
+            Stmt::Switch { discriminant: da, cases: ca },
+            Stmt::Switch { discriminant: db, cases: cb },
+        ) => expr_diff(da, db, &format!("{path}.discriminant"))
+            .or_else(|| switch_cases_diff(ca, cb, path)),
         (Stmt::Throw(ea), Stmt::Throw(eb)) => expr_diff(ea, eb, &format!("{path}.throw")),
         (Stmt::Block(a), Stmt::Block(b)) => stmts_diff(a, b, path),
         (Stmt::FuncDecl(la), Stmt::FuncDecl(lb)) => {
@@ -203,6 +215,32 @@ fn stmt_diff(a: &Stmt, b: &Stmt, path: &str) -> Option<String> {
     }
 }
 
+fn switch_cases_diff(a: &[SwitchCase], b: &[SwitchCase], path: &str) -> Option<String> {
+    if a.len() != b.len() {
+        return Some(format!(
+            "{path}: switch case-count mismatch {} vs {}",
+            a.len(),
+            b.len()
+        ));
+    }
+    for (i, (ca, cb)) in a.iter().zip(b.iter()).enumerate() {
+        let cpath = format!("{path}.case[{i}]");
+        match (&ca.test, &cb.test) {
+            (None, None) => {}
+            (Some(ea), Some(eb)) => {
+                if let Some(d) = expr_diff(ea, eb, &format!("{cpath}.test")) {
+                    return Some(d);
+                }
+            }
+            _ => return Some(format!("{cpath}: default-vs-cased mismatch")),
+        }
+        if let Some(d) = stmts_diff(&ca.body, &cb.body, &format!("{cpath}.body")) {
+            return Some(d);
+        }
+    }
+    None
+}
+
 fn stmt_kind(s: &Stmt) -> &'static str {
     match s {
         Stmt::Let { .. } => "Let",
@@ -216,6 +254,8 @@ fn stmt_kind(s: &Stmt) -> &'static str {
         Stmt::ForOf { .. } => "ForOf",
         Stmt::ForIn { .. } => "ForIn",
         Stmt::Continue => "Continue",
+        Stmt::Break { .. } => "Break",
+        Stmt::Switch { .. } => "Switch",
         Stmt::Throw(_) => "Throw",
         Stmt::Block(_) => "Block",
         Stmt::FuncDecl(_) => "FuncDecl",
