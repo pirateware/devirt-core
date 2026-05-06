@@ -440,6 +440,130 @@ fn collect_reassigned_names(stmts: &[Stmt]) -> HashSet<String> {
     out
 }
 
+/// Collect identifier names that appear as the LHS of an assignment /
+/// compound-assignment / update inside any try-body whose catch is in
+/// the same function. Reads of these symbols inside the corresponding
+/// catch body MUST go through memory (rather than reading a renamed
+/// SSA value) so the catch sees the live value at throw time. Same
+/// shape as `collect_reassigned_names` but scoped only to try-bodies
+/// of (catch-bearing, no-finally) tries — Phase A handles those only.
+///
+/// Phase B (finally) will need to extend this walker; the API is
+/// stable.
+pub fn collect_try_address_taken_names(stmts: &[Stmt]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    fn walk(stmts: &[Stmt], inside_try_body: bool, out: &mut HashSet<String>) {
+        for s in stmts {
+            match s {
+                Stmt::Try { body, catch: Some(_), finally: None } => {
+                    // Phase A target shape: any ident write in `body`
+                    // counts. Walk `body` with the flag set; walk catch
+                    // bodies *without* the flag set (writes inside catch
+                    // don't need address-taken treatment for THIS try
+                    // — they're already in the catch's own scope).
+                    walk(body, true, out);
+                    if let Some((_, catch_body)) = catch_body_of(s) {
+                        walk(catch_body, false, out);
+                    }
+                }
+                Stmt::Try { body, catch, finally } => {
+                    // Phase B shape (catch=None or finally=Some) — leave
+                    // the function in fallback; nothing to register.
+                    let _ = (body, catch, finally);
+                }
+                Stmt::Assign { target: Expr::Ident(n), .. } if inside_try_body => {
+                    out.insert(n.clone());
+                }
+                Stmt::Assign { .. } => {}
+                Stmt::Let { .. } | Stmt::Const { .. } => {}
+                Stmt::ExprStmt(e) | Stmt::Return(Some(e)) | Stmt::Throw(e) => {
+                    if inside_try_body {
+                        walk_expr(e, out);
+                    }
+                }
+                Stmt::Return(None) => {}
+                Stmt::If { then_body, else_body, .. } => {
+                    walk(then_body, inside_try_body, out);
+                    if let Some(eb) = else_body { walk(eb, inside_try_body, out); }
+                }
+                Stmt::While { body, .. }
+                | Stmt::For { body, .. }
+                | Stmt::ForOf { body, .. }
+                | Stmt::ForIn { body, .. } => walk(body, inside_try_body, out),
+                Stmt::Switch { cases, .. } => {
+                    for c in cases { walk(&c.body, inside_try_body, out); }
+                }
+                Stmt::Block(b) => walk(b, inside_try_body, out),
+                Stmt::FuncDecl(_) => {} // nested literal: own scope
+                Stmt::Continue | Stmt::Break { .. } => {}
+            }
+        }
+    }
+    fn catch_body_of(s: &Stmt) -> Option<(Option<&str>, &[Stmt])> {
+        if let Stmt::Try { catch: Some((name, body)), .. } = s {
+            Some((name.as_deref(), body))
+        } else {
+            None
+        }
+    }
+    fn walk_expr(e: &Expr, out: &mut HashSet<String>) {
+        match e {
+            Expr::Assign { target, value } => {
+                if let Expr::Ident(n) = target.as_ref() {
+                    out.insert(n.clone());
+                }
+                walk_expr(value, out);
+            }
+            Expr::CompoundAssign { target, value, .. } => {
+                if let Expr::Ident(n) = target.as_ref() {
+                    out.insert(n.clone());
+                }
+                walk_expr(value, out);
+            }
+            Expr::Update { target, .. } => {
+                if let Expr::Ident(n) = target.as_ref() {
+                    out.insert(n.clone());
+                }
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                walk_expr(lhs, out);
+                walk_expr(rhs, out);
+            }
+            Expr::Unary { operand, .. } => walk_expr(operand, out),
+            Expr::Call { callee, args } | Expr::New { callee, args } => {
+                walk_expr(callee, out);
+                for a in args { walk_expr(a, out); }
+            }
+            Expr::Member { obj, .. } => walk_expr(obj, out),
+            Expr::Index { obj, index } => {
+                walk_expr(obj, out);
+                walk_expr(index, out);
+            }
+            Expr::Ternary { cond, then_branch, else_branch } => {
+                walk_expr(cond, out);
+                walk_expr(then_branch, out);
+                walk_expr(else_branch, out);
+            }
+            Expr::Sequence { exprs } | Expr::Template { exprs, .. } => {
+                for e in exprs { walk_expr(e, out); }
+            }
+            Expr::Array { elements } => {
+                for e in elements { walk_expr(e, out); }
+            }
+            Expr::Object { props } => {
+                for p in props { walk_expr(&p.value, out); }
+            }
+            Expr::Spread(inner) => walk_expr(inner, out),
+            // Nested function literals have their own scope; their writes
+            // don't affect the enclosing try.
+            Expr::Func(_) => {}
+            _ => {}
+        }
+    }
+    walk(stmts, false, &mut out);
+    out
+}
+
 fn walk_reassigned_stmts(stmts: &[Stmt], out: &mut HashSet<String>) {
     for s in stmts {
         match s {
@@ -1076,7 +1200,18 @@ fn push_passthrough_function(sm: &mut ssa::Module, lit: &tree::FuncLiteral) {
 fn body_needs_ssa_fallback(stmts: &[Stmt]) -> bool {
     fn visit_stmt(s: &Stmt) -> bool {
         match s {
-            Stmt::ForIn { .. } | Stmt::Try { .. } => true,
+            Stmt::ForIn { .. } => true,
+            // Phase A: try+catch (no finally) lowers through real SSA
+            // (Terminator::Try framing block + catch-handler stack).
+            // Try with finally OR try with no catch stays in fallback —
+            // Phase B will lift them.
+            Stmt::Try { finally: Some(_), .. } => true,
+            Stmt::Try { catch: None, .. } => true,
+            Stmt::Try {
+                body,
+                catch: Some((_, cb)),
+                finally: None,
+            } => body.iter().any(visit_stmt) || cb.iter().any(visit_stmt),
             // Throw is now lowered through Terminator::Throw and no
             // longer triggers fallback. Walk its expression so any
             // fallback-trigger nested inside the thrown value still
@@ -1329,6 +1464,16 @@ fn lower_top_level_function(
         push_top_level_passthrough_from_lowered(sm, f);
         return;
     }
+    // Merge try-address-taken names into pt_referenced_names. The two
+    // sets share an identical "force memory residence" effect on the
+    // lowering — a write that needs to be visible across either an
+    // opaque PassThrough boundary OR an opaque try→catch boundary
+    // emits the same StoreProp(GlobalThis, ...) shape and forces the
+    // same `let name;` declaration. Phase A merges them because the
+    // behaviors are identical; Phase B may revisit if finally adds
+    // distinct invariants. See docs/design-try-phase-a.md §4.
+    let mut pt_referenced_names = pt_referenced_names;
+    pt_referenced_names.extend(collect_try_address_taken_names(&f.body));
     let mut builder = FunctionBuilder::new(sm, f.name.clone(), f.params.len() as u32);
     {
         let mut conv = Converter::new(
@@ -1401,6 +1546,12 @@ fn lower_inner_literal(
         }
     }
 
+    let mut pt_referenced_names = pt_referenced_names;
+    if let FuncBody::Stmts(stmts) = &lit.body {
+        // Merge try-address-taken names — see lower_top_level_function
+        // for the rationale.
+        pt_referenced_names.extend(collect_try_address_taken_names(stmts));
+    }
     let mut builder =
         FunctionBuilder::new_with_captures(sm, name, lit.params.len() as u32, captures.len());
     {
@@ -1552,6 +1703,21 @@ struct Converter<'b, 'm> {
     /// expression runs before re-checking the condition); `Stmt::ForOf`
     /// uses the desugared iterator-protocol header.
     break_stack: Vec<BreakFrame>,
+
+    /// Active enclosing try/catch frames, innermost on top.
+    ///
+    /// Phase A wires this stack but doesn't consult it from `Stmt::Throw`
+    /// lowering — under structural framing (Option 3), Throw still emits
+    /// `Terminator::Throw { val }` inside an active try; the framing
+    /// block declares the catch relationship structurally. The stack
+    /// exists for the AST→SSA construction site (commit 4) to build the
+    /// framing terminator with the right `catch_entry` and `join`, and
+    /// for the address-taken bookkeeping (next field).
+    ///
+    /// Empty in functions with no surrounding try; top of stack at the
+    /// AST→SSA construction site for `Stmt::Try`.
+    catch_stack: Vec<CatchFrame>,
+
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1571,6 +1737,21 @@ impl BreakFrame {
             BreakFrame::Loop { break_to, .. } | BreakFrame::Switch { break_to } => *break_to,
         }
     }
+}
+
+/// One frame of the catch-handler stack maintained by `Converter` during
+/// AST→SSA lowering. Pushed at the start of `Stmt::Try`'s body, popped
+/// after the catch body has been lowered.
+#[derive(Debug, Clone, Copy)]
+struct CatchFrame {
+    /// First block of the catch body. The framing block's
+    /// `Terminator::Try` directs control here on (implicit) throw from
+    /// inside try-body.
+    catch_entry: BlockId,
+    /// Post-try landing block. Both try-body's tail and catch-body's
+    /// tail terminate in `Branch { target: join }` (modulo abrupt
+    /// completion via Return / Throw / Break).
+    join: BlockId,
 }
 
 impl<'b, 'm> Converter<'b, 'm> {
@@ -1596,6 +1777,7 @@ impl<'b, 'm> Converter<'b, 'm> {
             sealed: HashSet::new(),
             symbol_names: HashMap::new(),
             break_stack: Vec::new(),
+            catch_stack: Vec::new(),
         }
     }
 
@@ -2161,19 +2343,25 @@ impl<'b, 'm> Converter<'b, 'm> {
                 let val = self.convert_expr(e);
                 self.builder.set_terminator(Terminator::Throw { val });
             }
+            Stmt::Try {
+                body,
+                catch: Some((catch_param, catch_body)),
+                finally: None,
+            } => {
+                self.lower_try(body, catch_param.as_deref(), catch_body);
+            }
             Stmt::Try { .. } | Stmt::ForIn { .. } => {
-                // Neither is expressible in SSA yet. The
-                // `body_needs_ssa_fallback` check at function entry
-                // (in `lower_top_level_function` / `lower_inner_literal`)
-                // routes any function containing them to PassThrough
-                // using the stashed source slice. Reaching this arm
-                // means that check missed a textual position (or a
-                // hand-built tree-IR test fixture lacks the source
-                // slice required to fall back).
+                // try with finally OR try with no catch is Phase B —
+                // body_needs_ssa_fallback routes such functions to
+                // PassThrough. ForIn likewise stays in fallback (own
+                // ticket). Reaching this arm means the predicate
+                // missed a textual position (or a hand-built tree-IR
+                // fixture lacks the source slice required to fall
+                // back).
                 unreachable!(
-                    "Stmt::{{Try,ForIn}} reached SSA conversion — \
-                     body_needs_ssa_fallback should have routed this function \
-                     to PassThrough"
+                    "Stmt::{{Try-with-finally, Try-no-catch, ForIn}} reached SSA \
+                     conversion — body_needs_ssa_fallback should have routed \
+                     this function to PassThrough"
                 );
             }
         }
@@ -2701,6 +2889,98 @@ impl<'b, 'm> Converter<'b, 'm> {
 
         // Join is reachable from however many cases broke into it
         // (possibly zero). Seal now — all predecessors known.
+        self.seal_block(join_b);
+        self.builder.switch_to_block(join_b);
+    }
+
+    /// Lower `try { body } catch (catch_param) { catch_body }` (no
+    /// finally). Phase A. See docs/design-try-phase-a.md §1 for the
+    /// structural framing.
+    fn lower_try(
+        &mut self,
+        body: &[Stmt],
+        catch_param: Option<&str>,
+        catch_body: &[Stmt],
+    ) {
+        let try_entry_b = self.builder.new_block();
+        let catch_entry_b = self.builder.new_block();
+        let join_b = self.builder.new_block();
+
+        // try_entry's only direct CFG predecessor is the framing block;
+        // seal upfront. Same for catch_entry.
+        self.sealed.insert(try_entry_b);
+        self.sealed.insert(catch_entry_b);
+
+        // Framing terminator on the current (framing) block.
+        self.builder.set_terminator(Terminator::Try {
+            try_entry: try_entry_b,
+            try_args: vec![],
+            catch_entry: catch_entry_b,
+            join: join_b,
+        });
+
+        // Push catch frame so future Stmt::Throw inside body could
+        // route to this handler if a future implementation wants to
+        // (Phase A doesn't consult this from Throw lowering — the
+        // framing block declares the catch relationship structurally).
+        self.catch_stack.push(CatchFrame {
+            catch_entry: catch_entry_b,
+            join: join_b,
+        });
+
+        // Lower try-body.
+        self.builder.switch_to_block(try_entry_b);
+        for s in body {
+            self.lower_stmt(s);
+        }
+        let body_end = self.current_block();
+        if !self.is_terminated(body_end) {
+            self.builder.set_terminator(Terminator::Branch {
+                target: join_b,
+                args: vec![],
+            });
+        }
+
+        self.catch_stack.pop();
+
+        // Lower catch-body in a fresh lexical scope so the catch param
+        // is bound only inside the catch (matches JS semantics).
+        self.builder.switch_to_block(catch_entry_b);
+        self.push_scope();
+
+        // Emit CatchValue at the start of catch_entry. Bind it to the
+        // catch-param symbol if the source has a binding.
+        let catch_value_op = self.emit(InstKind::CatchValue);
+        if let Some(name) = catch_param {
+            // Tag the result Value with the source name so the renamer
+            // recovers `catch (name)` rather than the synthesized
+            // hoisted name.
+            if let Operand::Value(v) = catch_value_op {
+                let strid = self.builder.intern(name);
+                self.builder.set_source_name(v, strid);
+            }
+            let sym = self.fresh_symbol();
+            self.bind_in_top_scope(name.to_string(), sym);
+            let cb = self.current_block();
+            self.write_variable(sym, cb, catch_value_op);
+        }
+
+        for s in catch_body {
+            self.lower_stmt(s);
+        }
+        let catch_end = self.current_block();
+        if !self.is_terminated(catch_end) {
+            self.builder.set_terminator(Terminator::Branch {
+                target: join_b,
+                args: vec![],
+            });
+        }
+
+        self.pop_scope();
+
+        // Seal join (all predecessors known: zero, one, or two of
+        // {try-body tail, catch-body tail}, depending on abrupt
+        // completion in either branch).
         self.seal_block(join_b);
         self.builder.switch_to_block(join_b);
     }
@@ -3915,6 +4195,22 @@ fn edge_args(t: &Terminator, dst: BlockId) -> Option<&[Operand]> {
                 None
             }
         }
+        Terminator::Try {
+            try_entry,
+            try_args,
+            catch_entry,
+            ..
+        } => {
+            if *try_entry == dst {
+                Some(try_args.as_slice())
+            } else if *catch_entry == dst {
+                // Catch entry takes no edge args (CatchValue inst supplies
+                // the exception value).
+                Some([].as_slice())
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -3950,6 +4246,19 @@ fn push_edge_arg(t: &mut Terminator, dst: BlockId, op: Operand) {
             if *default == dst {
                 default_args.push(op);
             }
+        }
+        Terminator::Try {
+            try_entry,
+            try_args,
+            ..
+        } if *try_entry == dst => {
+            try_args.push(op);
+        }
+        Terminator::Try { catch_entry, .. } if *catch_entry == dst => {
+            panic!(
+                "push_edge_arg: catch_entry takes no edge args; use CatchValue \
+                 instruction at the catch entry instead"
+            );
         }
         _ => panic!("push_edge_arg: terminator does not target bb{}", dst.0),
     }
@@ -3988,6 +4297,13 @@ fn remove_edge_arg(t: &mut Terminator, dst: BlockId, index: usize) {
             if *default == dst {
                 default_args.remove(index);
             }
+        }
+        Terminator::Try {
+            try_entry,
+            try_args,
+            ..
+        } if *try_entry == dst => {
+            try_args.remove(index);
         }
         _ => panic!("remove_edge_arg: terminator does not target bb{}", dst.0),
     }
@@ -4111,6 +4427,7 @@ fn walk_inst_operands_mut(kind: &mut InstKind, f: &mut impl FnMut(&mut Operand))
             f(key);
             f(obj);
         }
+        CatchValue => {} // no operands
     }
 }
 
@@ -4154,6 +4471,11 @@ fn walk_term_operands_mut(t: &mut Terminator, f: &mut impl FnMut(&mut Operand)) 
         Terminator::Return { val: Some(v) } => f(v),
         Terminator::Return { val: None } => {}
         Terminator::Throw { val } => f(val),
+        Terminator::Try { try_args, .. } => {
+            for a in try_args {
+                f(a);
+            }
+        }
         Terminator::Unreachable => {}
     }
 }

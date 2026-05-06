@@ -433,6 +433,7 @@ impl<'a> LowerCtx<'a> {
                 Terminator::Switch { .. } => "Switch",
                 Terminator::Return { .. } => "Return",
                 Terminator::Throw { .. } => "Throw",
+                Terminator::Try { .. } => "Try",
                 Terminator::Unreachable => "Unreachable",
             };
             let preds: Vec<String> = self.func.lowered().blocks[b.0 as usize]
@@ -506,6 +507,30 @@ impl<'a> LowerCtx<'a> {
         self.value_names
             .get(&v.0)
             .unwrap_or_else(|| panic!("no name allocated for value %{}", v.0))
+    }
+
+    /// If `bb`'s first instruction is `InstKind::CatchValue`, return
+    /// the catch-param's source name (resolved through the result
+    /// Value's hoisted name). Returns `None` if the catch has no
+    /// binding (ES2019 `} catch { … }`) — represented by a CatchValue
+    /// whose result is unused, or no leading CatchValue at all.
+    fn first_inst_catch_param_name(&self, bb: BlockId) -> Option<String> {
+        let blk = &self.func.lowered().blocks[bb.0 as usize];
+        let first_iid = *blk.instructions.first()?;
+        let kind = &self.func.lowered().instructions[first_iid.0 as usize].kind;
+        if !matches!(kind, InstKind::CatchValue) {
+            return None;
+        }
+        let v = find_value_for_inst(self.func, first_iid);
+        // A `name_for` lookup panics if the name isn't allocated. For
+        // ES2019 binding-less catch (where the construction site emits
+        // CatchValue but the result is never bound to a source name),
+        // the name will still be a synthesized hoisted name like
+        // `__v3` — which is fine: that's the catch-param name we
+        // emit. The renamer downstream can recover the source name
+        // when the source had one (set via `set_source_name` at
+        // construction time).
+        Some(self.name_for(v).to_string())
     }
 
     fn operand_to_expr(&self, op: &Operand) -> Expr {
@@ -642,6 +667,53 @@ impl LowerCtx<'_> {
                     }));
                     return;
                 }
+                Terminator::Try {
+                    try_entry,
+                    try_args,
+                    catch_entry,
+                    join,
+                } => {
+                    // Reconstruct `try { … } catch (param) { … }` from
+                    // the structural framing. Body and catch each walk
+                    // up to `join` (the post-try landing block); both
+                    // bodies' tails terminate in `Branch { target: join }`
+                    // (modulo abrupt completion). See
+                    // docs/design-try-phase-a.md §1.
+                    //
+                    // Phase A does not produce `finally` blocks — the
+                    // construction site (lower_ssa) routes
+                    // try-with-finally through fallback. Reconstruction
+                    // therefore always emits `Stmt::Try { finally: None }`.
+
+                    // Walk try-body.
+                    let mut try_body_stmts = Vec::new();
+                    self.emit_edge_copies(try_entry, &try_args, &mut try_body_stmts);
+                    self.walk(try_entry, Some(join), &mut try_body_stmts);
+
+                    // Walk catch-body. Inspect catch_entry's first
+                    // instruction: if it's `CatchValue`, extract the
+                    // catch-param name from its result Value's
+                    // source name. The CatchValue inst itself is
+                    // suppressed in emit_inst (the JS `catch (param)`
+                    // syntax binds the param implicitly), but its
+                    // hoisted-name lookup still works for references
+                    // inside the catch body.
+                    let catch_param_name = self
+                        .first_inst_catch_param_name(catch_entry);
+                    let mut catch_body_stmts = Vec::new();
+                    self.walk(catch_entry, Some(join), &mut catch_body_stmts);
+
+                    out.push(Stmt::Try {
+                        body: try_body_stmts,
+                        catch: Some((catch_param_name, catch_body_stmts)),
+                        finally: None,
+                    });
+
+                    if Some(join) == stop {
+                        return;
+                    }
+                    cur = join;
+                }
                 Terminator::Branch { target, args } => {
                     self.emit_edge_copies(target, &args, out);
                     // Branch into the innermost open switch's join is
@@ -762,6 +834,17 @@ impl LowerCtx<'_> {
 
     fn emit_inst(&self, iid: InstId, out: &mut Vec<Stmt>) {
         let kind = &self.func.lowered().instructions[iid.0 as usize].kind;
+        // CatchValue is the implicit "read the active exception" at a
+        // catch entry. Its result Value carries the catch-param's
+        // source name; references to it inside the catch body resolve
+        // through `name_for` automatically. The binding itself is
+        // implicit in the JS `catch (param)` syntax — do NOT emit a
+        // synthetic `let __vN = catch_value();` statement here, since
+        // there's no such function and the param is already bound by
+        // the surrounding `Stmt::Try`'s catch clause.
+        if matches!(kind, InstKind::CatchValue) {
+            return;
+        }
         if kind.is_void() {
             // Stores produce no value. Emit as a side-effecting statement.
             match kind {
@@ -1011,6 +1094,15 @@ impl LowerCtx<'_> {
                 callee: Box::new(Expr::Ident("eval".to_string())),
                 args: vec![self.operand_to_expr(source)],
             },
+            // CatchValue is reconstructed in commit 3 by binding the
+            // catch-param name at catch_entry and resugaring the
+            // CatchValue inst's result-name use as the bare param. At
+            // commit 1 the inst is never emitted because no construction
+            // site exists; surface a clear panic if it leaks through.
+            CatchValue => unimplemented!(
+                "lower_tree: CatchValue reconstruction lands in \
+                 Try-Phase-A commit 3"
+            ),
         }
     }
 

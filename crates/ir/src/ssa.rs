@@ -448,6 +448,17 @@ pub enum InstKind {
     OpaqueEval {
         source: Operand,
     },
+
+    /// Reads the active exception value at the start of a catch entry
+    /// block. MUST be the first instruction of a block reached as
+    /// `catch_entry` from a `Terminator::Try`.
+    ///
+    /// Modeled as Opaque (depends on the implicit exception register;
+    /// frontend lacks evidence of narrower behavior). A future
+    /// `READS_EXCEPTION_STATE` lattice flag is the right precision tier
+    /// when an optimization pass demands it; until then, Opaque is
+    /// honest. See docs/design-try-phase-a.md §3.
+    CatchValue,
 }
 
 impl InstKind {
@@ -512,6 +523,10 @@ impl InstKind {
             | Construct { .. }
             | OpaqueEval { .. } => Effect::OPAQUE,
 
+            // CatchValue: reads the implicit exception register.
+            // Opaque per design — see docs/design-try-phase-a.md §3.
+            CatchValue => Effect::OPAQUE,
+
             // Spread collections: opaque (iterator protocol can throw and mutate heap).
             ArrayWithSpread { .. } | ObjectWithSpread { .. } => Effect::OPAQUE,
         }
@@ -570,6 +585,34 @@ pub enum Terminator {
     Throw {
         val: Operand,
     },
+    /// `try { try_body } catch (catch_param) { catch_body }` framing.
+    /// Phase A — try+catch only, no finally. Same structural-landmark
+    /// shape as Switch's `default` / `join`.
+    ///
+    /// Implicit-throw approximation: throws from inside the try-body to
+    /// the catch handler are NOT modeled as per-block CFG edges.
+    /// Instead this terminator declares the relationship structurally:
+    /// "any throw between `try_entry` and `join` is caught at
+    /// `catch_entry`." The CFG successor relation reports both
+    /// `try_entry` and `catch_entry` as direct successors of the block
+    /// terminating in `Terminator::Try`. See `docs/design-try-phase-a.md`
+    /// for the implicit-throw approximation's correctness implications
+    /// (catch cannot see SSA values defined inside try-body; catch
+    /// reads of try-body-mutated symbols go through the
+    /// try-address-taken set).
+    Try {
+        try_entry: BlockId,
+        try_args: Vec<Operand>,
+        catch_entry: BlockId,
+        /// Post-try landing block — where execution lands after try-body
+        /// completes normally OR after catch handler completes. Both
+        /// `try_entry`'s tail and `catch_entry`'s tail terminate in
+        /// `Branch { target: join }` (modulo abrupt completion via
+        /// Return/Throw, same rules as elsewhere). Tracked as a
+        /// landmark, like Switch's `join`. Not a successor edge — the
+        /// walker / successors() helpers don't traverse it.
+        join: BlockId,
+    },
     Unreachable,
 }
 
@@ -608,6 +651,19 @@ impl Terminator {
                 s.push((*default, default_args.as_slice()));
                 s
             }
+            Terminator::Try {
+                try_entry,
+                try_args,
+                catch_entry,
+                ..
+            } => vec![
+                (*try_entry, try_args.as_slice()),
+                // catch_entry takes no edge args — its first instruction
+                // is `InstKind::CatchValue`, which reads the implicit
+                // exception value as an instruction result (not a
+                // block-arg / phi). See docs/design-try-phase-a.md §1.
+                (*catch_entry, [].as_slice()),
+            ],
             Terminator::Return { .. } | Terminator::Throw { .. } | Terminator::Unreachable => {
                 vec![]
             }
@@ -1441,6 +1497,7 @@ fn walk_inst_operands(kind: &InstKind, mut f: impl FnMut(&Operand)) {
             f(key);
             f(obj);
         }
+        CatchValue => {} // no operands
     }
 }
 
@@ -1484,6 +1541,11 @@ fn walk_term_operands(t: &Terminator, mut f: impl FnMut(&Operand)) {
         Terminator::Return { val: Some(v) } => f(v),
         Terminator::Return { val: None } => {}
         Terminator::Throw { val } => f(val),
+        Terminator::Try { try_args, .. } => {
+            for a in try_args {
+                f(a);
+            }
+        }
         Terminator::Unreachable => {}
     }
 }
@@ -1794,6 +1856,7 @@ fn write_inst_kind(out: &mut String, kind: &InstKind, m: &Module) {
         Instanceof { obj, ctor } => write_binop(out, "instanceof", obj, ctor, m),
         In { key, obj } => write_binop(out, "in", key, obj, m),
         OpaqueEval { source } => unop(out, "opaque_eval", source, m),
+        CatchValue => out.push_str("catch_value"),
     }
 }
 
@@ -1944,6 +2007,16 @@ fn write_terminator(out: &mut String, t: &Terminator, _func: &LoweredBody, m: &M
         Terminator::Throw { val } => {
             line.push_str("throw ");
             write_operand(&mut line, val, m);
+        }
+        Terminator::Try {
+            try_entry,
+            try_args,
+            catch_entry,
+            join,
+        } => {
+            line.push_str("try ");
+            write_block_target(&mut line, *try_entry, try_args, m);
+            write!(&mut line, " catch bb{} join bb{}", catch_entry.0, join.0).unwrap();
         }
         Terminator::Unreachable => line.push_str("unreachable"),
     }
