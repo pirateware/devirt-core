@@ -106,6 +106,7 @@ fn main() -> ExitCode {
         // loop handles the refine→fold→refine cascade.
         let mut pm = PassManager::new();
         pm.add_module_pass(Box::new(::pass::identity_fn_inline::IdentityFnInlinePass));
+        pm.add_module_pass(Box::new(::pass::dead_fn_elim::DeadFnElimPass));
         pm.add_pass(Box::new(::pass::refine_purity::RefinePurityPass));
         pm.add_pass(Box::new(::pass::refine_arith::RefineArithPass));
         pm.add_pass(Box::new(::pass::const_fold::ConstFoldPass));
