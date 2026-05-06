@@ -723,6 +723,142 @@ impl Terminator {
             }
         }
     }
+
+    /// Edge args for the (first) edge targeting `dst`. Returns `None` if
+    /// no edge from this terminator reaches `dst`.
+    pub fn edge_args_to(&self, dst: BlockId) -> Option<&[Operand]> {
+        match self {
+            Terminator::Branch { target, args } if *target == dst => Some(args.as_slice()),
+            Terminator::CondBranch {
+                then_b, then_args, ..
+            } if *then_b == dst => Some(then_args.as_slice()),
+            Terminator::CondBranch {
+                else_b, else_args, ..
+            } if *else_b == dst => Some(else_args.as_slice()),
+            Terminator::Switch {
+                cases,
+                default,
+                default_args,
+                ..
+            } => {
+                for c in cases {
+                    if c.target == dst {
+                        return Some(c.args.as_slice());
+                    }
+                }
+                if *default == dst {
+                    Some(default_args.as_slice())
+                } else {
+                    None
+                }
+            }
+            Terminator::Try {
+                try_entry,
+                try_args,
+                catch_entry,
+                finally_entry,
+                ..
+            } => {
+                if *try_entry == dst {
+                    Some(try_args.as_slice())
+                } else if catch_entry == &Some(dst) || finally_entry == &Some(dst) {
+                    Some([].as_slice())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Drop `args[index]` from every edge of this terminator that targets
+    /// `dst`. Catch/finally edges of `Terminator::Try` carry no args and
+    /// are skipped. Panics if no edge to `dst` exists.
+    pub fn remove_edge_arg_to(&mut self, dst: BlockId, index: usize) {
+        let mut hit = false;
+        match self {
+            Terminator::Branch { target, args } if *target == dst => {
+                args.remove(index);
+                hit = true;
+            }
+            Terminator::CondBranch {
+                then_b,
+                then_args,
+                else_b,
+                else_args,
+                ..
+            } => {
+                if *then_b == dst {
+                    then_args.remove(index);
+                    hit = true;
+                }
+                if *else_b == dst {
+                    else_args.remove(index);
+                    hit = true;
+                }
+            }
+            Terminator::Switch {
+                cases,
+                default,
+                default_args,
+                ..
+            } => {
+                for c in cases.iter_mut() {
+                    if c.target == dst {
+                        c.args.remove(index);
+                        hit = true;
+                    }
+                }
+                if *default == dst {
+                    default_args.remove(index);
+                    hit = true;
+                }
+            }
+            Terminator::Try {
+                try_entry,
+                try_args,
+                ..
+            } if *try_entry == dst => {
+                try_args.remove(index);
+                hit = true;
+            }
+            _ => {}
+        }
+        if !hit {
+            panic!("remove_edge_arg_to: terminator does not target bb{}", dst.0);
+        }
+    }
+}
+
+/// Bit-equal comparison on `Constant`. Two `Constant::Number(NaN)` are
+/// considered equal here (bit-equal NaNs); that mirrors what the SSA
+/// converter's trivial-param dedup needs ("did this exact bit pattern
+/// arrive on both edges?") and is intentionally distinct from JS `===`.
+pub fn const_bit_eq(a: &Constant, b: &Constant) -> bool {
+    use Constant::*;
+    match (a, b) {
+        (Number(x), Number(y)) => x.to_bits() == y.to_bits(),
+        (Int32(x), Int32(y)) => x == y,
+        (Bool(x), Bool(y)) => x == y,
+        (String(x), String(y)) => x == y,
+        (Null, Null) => true,
+        (Undefined, Undefined) => true,
+        (Func(x), Func(y)) => x.0 == y.0,
+        (GlobalThis, GlobalThis) => true,
+        (This, This) => true,
+        _ => false,
+    }
+}
+
+/// Bit-equal comparison on `Operand`. `Value(x) == Value(y)` iff same id;
+/// `Const(a) == Const(b)` iff `const_bit_eq`; other variants are unequal.
+pub fn operand_bit_eq(a: &Operand, b: &Operand) -> bool {
+    match (a, b) {
+        (Operand::Value(x), Operand::Value(y)) => x == y,
+        (Operand::Const(x), Operand::Const(y)) => const_bit_eq(x, y),
+        (Operand::Capture(x), Operand::Capture(y)) => x == y,
+        _ => false,
+    }
 }
 
 // ============================================================================
@@ -1919,6 +2055,83 @@ impl LoweredBody {
                 }
             }
         }
+    }
+
+    /// Drop `block.params[idx]`, then shift the trailing params'
+    /// `BlockParam.index` records down by one so block-param value
+    /// lookups stay consistent. Caller is responsible for retiring
+    /// the dropped Value's slot (`ValueDef::removed()`) and stripping
+    /// the corresponding edge arg from each predecessor's terminator.
+    pub fn remove_block_param(&mut self, block: BlockId, idx: usize) {
+        let blk = &mut self.blocks[block.0 as usize];
+        blk.params.remove(idx);
+        let trailing: Vec<Value> = blk.params[idx..].to_vec();
+        for (offset, v) in trailing.iter().enumerate() {
+            if let ValueDefKind::BlockParam { index, .. } =
+                &mut self.values[v.0 as usize].kind
+            {
+                *index = (idx + offset) as u32;
+            }
+        }
+    }
+
+    /// Try to retire `param` if it has only one distinct non-self
+    /// incoming value. Returns `Some(replacement)` when the param was
+    /// trivial and has been replaced; `None` otherwise.
+    ///
+    /// Trivial-phi elimination in classic SSA. When all predecessors
+    /// arrive at this block with the same `Operand` (modulo
+    /// self-references — `Operand::Value(param)` from a back-edge
+    /// counts as harmless), the param adds no information: every use
+    /// can be substituted with that single Operand. We then strip the
+    /// param and the corresponding arg from every predecessor's edge.
+    ///
+    /// Does NOT cascade. Callers (passes, the converter) iterate until
+    /// fixed point.
+    pub fn try_remove_trivial_block_param(&mut self, param: Value) -> Option<Operand> {
+        let (block, idx) = match self.values[param.0 as usize].kind {
+            ValueDefKind::BlockParam { block, index } => (block, index as usize),
+            _ => return None,
+        };
+
+        // Snapshot incoming Operands at edges from each predecessor of
+        // `block` at position `idx`. Multiple edges from one predecessor
+        // (e.g., a degenerate `cbr cond, L, L`) contribute each.
+        let preds: Vec<BlockId> = self.blocks[block.0 as usize].predecessors.clone();
+        let mut incomings: Vec<Operand> = Vec::with_capacity(preds.len());
+        for &p in &preds {
+            let term = &self.blocks[p.0 as usize].terminator;
+            let args = term.edge_args_to(block)?;
+            if idx >= args.len() {
+                return None;
+            }
+            incomings.push(args[idx]);
+        }
+
+        let mut same: Option<Operand> = None;
+        for op in &incomings {
+            if let Operand::Value(v) = op
+                && *v == param
+            {
+                continue;
+            }
+            match same {
+                None => same = Some(*op),
+                Some(s) if operand_bit_eq(&s, op) => continue,
+                Some(_) => return None,
+            }
+        }
+        let same = same.unwrap_or(Operand::Const(Constant::Undefined));
+
+        self.replace_value_uses(param, same);
+        self.remove_block_param(block, idx);
+        for &p in &preds {
+            self.blocks[p.0 as usize]
+                .terminator
+                .remove_edge_arg_to(block, idx);
+        }
+        self.values[param.0 as usize] = ValueDef::removed();
+        Some(same)
     }
 
     pub fn replace_value_uses(&mut self, old: Value, new: Operand) {

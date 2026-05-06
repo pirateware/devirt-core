@@ -21,6 +21,7 @@ use ir::ssa::{FuncId, Module, pretty_function};
 
 pub mod branch_fold;
 pub mod const_fold;
+pub mod copy_prop;
 pub mod dce;
 pub mod refine_arith;
 
