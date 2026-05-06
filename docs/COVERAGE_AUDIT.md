@@ -23,8 +23,18 @@ analysis, etc.):
 - `Stmt::Throw` (round 10)
 - `Stmt::Try` (since project start)
 - `Stmt::ForIn` (round 9)
-- `Expr::This` (round 10, until the cloneDeep CFG-back-edge bug is fixed)
-- `Stmt::Switch` and `Stmt::Break` (round 11 — SwitchStmt/BreakStmt cluster)
+
+Constructs that previously fell back but now lower through real SSA:
+
+- `Expr::This` — un-fell-back in round 11 (PR #11; the cloneDeep
+  CFG-back-edge bug got fixed by adding a reachability precondition
+  to `dominates`).
+- `Stmt::Switch` and `Stmt::Break` — un-fell-back in the
+  Real-SSA-Switch ticket (Issue #11). Real `Terminator::Switch` with
+  break-target stack lives in `lower_ssa::lower_switch`; SSA →
+  tree-IR reconstruction lives in `lower_tree::walk_inner`'s Switch
+  arm. See "Deferred SSA Switch shapes" below for what the
+  implementation does NOT yet handle.
 
 A function using any of these reads as Lowered in the AST disposition
 column and counts as 0 toward FB-PT%, but is functionally identical to
@@ -148,3 +158,56 @@ Or, less rigorously, use the per-function blocker sets (available via
 blockers. That set is the upper bound on what your bundle can unlock —
 which is closer to the truth than the greedy cumulative was, but still
 optimistic for the same walker-recursion reason.
+
+## Deferred SSA Switch shapes
+
+The Real-SSA-Switch ticket landed a `Terminator::Switch` that handles
+the corpus shape — every observed switch in `corpus/realworld` lowers
+fully through SSA without fallback. The following shapes are
+*deliberately* not implemented; each will be ticketed if the corpus
+grows the relevant pattern. Re-run `dump_switch_fallthrough.rs` to
+verify zero before assuming they're still safe to defer.
+
+- **Fallthrough.** Source: a case body without `break`/`return`/
+  `throw`/`continue` falls through to the next case. Currently 0
+  in corpus. Today, `lower_switch` panics if it sees a non-terminating
+  case body (loud failure). Adding fallthrough means a
+  `fallthrough_edges: Vec<(BlockId, BlockId)>` field on
+  `Terminator::Switch`, an explicit `Branch{next_case_body}` from
+  the end of each non-terminating case, and matching reconstruction
+  in `lower_tree`.
+
+- **`default:` not at the end.** Source: `case 1: ...; default: ...;
+  case 2: ...`. Currently 0 in corpus (no defaults at all in
+  obfuscated dispatch). Today's reconstruction emits the default
+  case last in the round-tripped output regardless of source
+  position. To preserve position, the SSA terminator would need to
+  remember the source-order index of the default case alongside the
+  `default: BlockId` field.
+
+- **Labeled break/continue out of switch.** Source: `outer: for (...) {
+  switch (x) { case 1: break outer; } }`. Currently 0 in corpus
+  *and* still blocked at AST disposition by `LabeledStmt`. The
+  break-target stack in `lower_ssa::Converter` doesn't yet walk for
+  matching labels — when LabeledStmt is removed from the blocker
+  set, the stack walk needs to be added.
+
+- **Side-effecting / non-constant case keys.** Source: `case foo():
+  ...`. Currently 0 in corpus — every observed case key is a number
+  or string literal. Today, `lower_switch` panics if
+  `case_key_constant` returns None. Supporting non-constant keys
+  needs a different lowering shape (chain of `cbr eq` instead of a
+  single Switch terminator) plus a fallback for keys that mix
+  constant and computed.
+
+- **String case keys via the free helper.** Today the free function
+  `expr_to_constant` declines string literals because
+  `Constant::String` requires `StrId` interning. The Converter
+  method `case_key_constant` handles strings by interning at the
+  call site. If a future caller wants to convert constants outside
+  the Converter, it must either intern up-front or accept the
+  string-key limitation.
+
+If any of these go from "0 in corpus" to non-zero, that's the trigger
+to ticket the shape — with the relevant section above as the starting
+point.
