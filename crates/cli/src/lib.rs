@@ -49,6 +49,9 @@ pub fn process(source: &str) -> Result<String, error::Error> {
         .map_err(|errs| error::Error::Malformed(format!("SSA validation: {errs:#?}")))?;
     let mut pm = ::pass::PassManager::new();
     pm.add_module_pass(Box::new(::pass::identity_fn_inline::IdentityFnInlinePass));
+    pm.add_module_pass(Box::new(
+        ::pass::constructor_fn_inline::ConstructorFnInlinePass,
+    ));
     pm.add_module_pass(Box::new(::pass::dead_fn_elim::DeadFnElimPass));
     pm.add_pass(Box::new(::pass::refine_purity::RefinePurityPass));
     pm.add_pass(Box::new(::pass::refine_arith::RefineArithPass));

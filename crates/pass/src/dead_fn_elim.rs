@@ -197,7 +197,9 @@ impl ModulePass for DeadFnElimPass {
             if real_uses.get(&g).copied().unwrap_or(0) > 0 {
                 continue;
             }
-            if !is_trivial_return_shape(func) {
+            if !is_trivial_return_shape(func)
+                && !crate::constructor_fn_inline::is_constructor_shape(func)
+            {
                 continue;
             }
             // Decl-stores: every name must NOT be in global_name_loads.

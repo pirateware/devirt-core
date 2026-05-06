@@ -20,8 +20,8 @@ use std::collections::{HashMap, HashSet};
 
 use ir::error::Error;
 use ir::ssa::{
-    Constant, FuncId, Module, Operand, Value, ValueDef, ValueDefKind, walk_inst_operands,
-    walk_inst_operands_mut, walk_term_operands,
+    Constant, FuncId, InstKind, Module, Operand, Value, ValueDef, ValueDefKind,
+    walk_inst_operands, walk_inst_operands_mut, walk_term_operands,
 };
 
 use crate::FunctionPass;
@@ -83,10 +83,6 @@ impl FunctionPass for DcePass {
             }
         }
 
-        if worklist.is_empty() {
-            return Ok(false);
-        }
-
         let mut removed_any = false;
         while let Some(v) = worklist.pop() {
             // Re-check guards — earlier removal may have already retired
@@ -141,6 +137,111 @@ impl FunctionPass for DcePass {
             walk_inst_operands_mut(&mut body.instructions[iid.0 as usize].kind, &mut |op| {
                 *op = Operand::Const(Constant::Undefined);
             });
+            removed_any = true;
+        }
+
+        // Dead-store elimination on store-only allocations.
+        //
+        // A live AllocObject/AllocArray Value whose ONLY uses are as
+        // the `obj` operand of StoreProp/StoreIndex (no loads, no
+        // escapes) is observably dead — every write goes to an object
+        // nothing reads. Safe to delete the alloc AND all dependent
+        // stores. This handles the common post-forwarding shape:
+        // ForwardLoadsPass eats the loads, leaving alloc + write-only
+        // stores; basic DCE can't remove the alloc (its uses are the
+        // store objs) or the stores (they're void / WRITES_HEAP).
+        //
+        // Skip pinned (captured-by-passthrough) and source-named —
+        // those are visible to outer scope or PassThrough bodies.
+        let mut alloc_candidates: Vec<u32> = Vec::new();
+        for (vi, def) in body.values.iter().enumerate() {
+            if def.is_removed() || def.source_name.is_some() {
+                continue;
+            }
+            if pinned.contains(&(vi as u32)) {
+                continue;
+            }
+            if let ValueDefKind::Inst(iid) = def.kind
+                && matches!(
+                    body.instructions[iid.0 as usize].kind,
+                    InstKind::AllocObject | InstKind::AllocArray { .. }
+                )
+            {
+                alloc_candidates.push(vi as u32);
+            }
+        }
+        for av in alloc_candidates {
+            let alloc_val = Value(av);
+            // Find every inst that uses this Value. Classify: store-obj
+            // use vs anything else. If anything else, skip.
+            let mut store_iids: Vec<u32> = Vec::new();
+            let mut escapes = false;
+            for (idx, inst) in body.instructions.iter().enumerate() {
+                let mut is_store_obj = false;
+                let mut other_use = false;
+                match &inst.kind {
+                    InstKind::StoreProp { obj, val, .. }
+                    | InstKind::StoreIndex { obj, val, .. } => {
+                        if matches!(obj, Operand::Value(v) if *v == alloc_val) {
+                            is_store_obj = true;
+                        }
+                        if matches!(val, Operand::Value(v) if *v == alloc_val) {
+                            other_use = true;
+                        }
+                        if let InstKind::StoreIndex { index, .. } = &inst.kind
+                            && matches!(index, Operand::Value(v) if *v == alloc_val)
+                        {
+                            other_use = true;
+                        }
+                    }
+                    _ => {
+                        walk_inst_operands(&inst.kind, |op| {
+                            if matches!(op, Operand::Value(v) if *v == alloc_val) {
+                                other_use = true;
+                            }
+                        });
+                    }
+                }
+                if other_use {
+                    escapes = true;
+                    break;
+                }
+                if is_store_obj {
+                    store_iids.push(idx as u32);
+                }
+            }
+            if escapes {
+                continue;
+            }
+            // Terminator operands: any reference also escapes.
+            let mut term_use = false;
+            for blk in &body.blocks {
+                ir::ssa::walk_term_operands(&blk.terminator, |op| {
+                    if matches!(op, Operand::Value(v) if *v == alloc_val) {
+                        term_use = true;
+                    }
+                });
+            }
+            if term_use {
+                continue;
+            }
+            // Retire alloc + all dependent stores.
+            let alloc_iid = match body.values[av as usize].kind {
+                ValueDefKind::Inst(iid) => iid.0,
+                _ => continue,
+            };
+            body.values[av as usize] = ValueDef::removed();
+            for iid in std::iter::once(alloc_iid).chain(store_iids.iter().copied()) {
+                if let Some(&bi) = inst_block.get(&iid) {
+                    body.blocks[bi].instructions.retain(|i| i.0 != iid);
+                }
+                walk_inst_operands_mut(
+                    &mut body.instructions[iid as usize].kind,
+                    &mut |op| {
+                        *op = Operand::Const(Constant::Undefined);
+                    },
+                );
+            }
             removed_any = true;
         }
 
