@@ -25,7 +25,6 @@
 //! source slice with OXC and walks the AST scope-aware. See that
 //! module's header for the rationale.
 
-#![allow(dead_code)]
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 

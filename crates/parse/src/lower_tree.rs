@@ -34,7 +34,6 @@
 //!     heuristics; small differences (extra temporaries, redundant blocks)
 //!     are fine.
 
-#![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
 
@@ -360,14 +359,13 @@ struct LoopInfo {
 
 /// Operands captured during `detect_forin_loop` and used by
 /// `emit_for_in` to reconstruct `Stmt::ForIn { binding, obj, body }`.
-#[derive(Clone, Debug)]
+/// Only the two fields the emitter actually consumes are kept; the
+/// detector verifies the rest of the four-block shape but doesn't
+/// need to thread the matched InstIds / pre-header BlockId forward.
+#[derive(Clone, Copy, Debug)]
 struct ForInPattern {
     obj: Operand,
-    iter_op: Operand,
-    init_iid: InstId,
-    done_iid: InstId,
     next_iid: InstId,
-    pre_header_b: BlockId,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -1521,14 +1519,7 @@ impl LowerCtx<'_> {
         if init_result_inst != init_iid {
             return None;
         }
-        Some(ForInPattern {
-            obj: obj_op,
-            iter_op,
-            init_iid,
-            done_iid: cv_inst,
-            next_iid,
-            pre_header_b,
-        })
+        Some(ForInPattern { obj: obj_op, next_iid })
     }
 
     /// Cheap "is `pred` reached only via a back-edge from `header`'s
@@ -1736,12 +1727,6 @@ impl LowerCtx<'_> {
         let dominates = !reaches_target;
         self.dom_cache.insert(key, dominates);
         dominates
-    }
-
-    fn reaches(&mut self, start: BlockId, target: BlockId) -> bool {
-        // Convenience: reachability through forward edges.
-        let r = self.forward_reachable(start);
-        r.contains(&target)
     }
 
     /// Reachability bounded to the dominated subgraph of `dominator`.

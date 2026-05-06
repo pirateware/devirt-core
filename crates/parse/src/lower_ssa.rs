@@ -11,7 +11,6 @@
 //! join block accumulates redundant parameters that downstream passes have
 //! to see through.
 
-#![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
 
@@ -1535,20 +1534,6 @@ struct Converter<'b, 'm> {
     /// uses the desugared iterator-protocol header.
     break_stack: Vec<BreakFrame>,
 
-    /// Active enclosing try/catch frames, innermost on top.
-    ///
-    /// Phase A wires this stack but doesn't consult it from `Stmt::Throw`
-    /// lowering — under structural framing (Option 3), Throw still emits
-    /// `Terminator::Throw { val }` inside an active try; the framing
-    /// block declares the catch relationship structurally. The stack
-    /// exists for the AST→SSA construction site (commit 4) to build the
-    /// framing terminator with the right `catch_entry` and `join`, and
-    /// for the address-taken bookkeeping (next field).
-    ///
-    /// Empty in functions with no surrounding try; top of stack at the
-    /// AST→SSA construction site for `Stmt::Try`.
-    catch_stack: Vec<CatchFrame>,
-
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1568,21 +1553,6 @@ impl BreakFrame {
             BreakFrame::Loop { break_to, .. } | BreakFrame::Switch { break_to } => *break_to,
         }
     }
-}
-
-/// One frame of the catch-handler stack maintained by `Converter` during
-/// AST→SSA lowering. Pushed at the start of `Stmt::Try`'s body, popped
-/// after the catch body has been lowered.
-#[derive(Debug, Clone, Copy)]
-struct CatchFrame {
-    /// First block of the catch body. The framing block's
-    /// `Terminator::Try` directs control here on (implicit) throw from
-    /// inside try-body.
-    catch_entry: BlockId,
-    /// Post-try landing block. Both try-body's tail and catch-body's
-    /// tail terminate in `Branch { target: join }` (modulo abrupt
-    /// completion via Return / Throw / Break).
-    join: BlockId,
 }
 
 impl<'b, 'm> Converter<'b, 'm> {
@@ -1608,7 +1578,6 @@ impl<'b, 'm> Converter<'b, 'm> {
             sealed: HashSet::new(),
             symbol_names: HashMap::new(),
             break_stack: Vec::new(),
-            catch_stack: Vec::new(),
         }
     }
 
@@ -2840,12 +2809,13 @@ impl<'b, 'm> Converter<'b, 'm> {
             join: join_b,
         });
 
-        if let Some(c) = catch_entry_b {
-            self.catch_stack.push(CatchFrame {
-                catch_entry: c,
-                join: join_b,
-            });
-        }
+        // Note: an earlier design maintained a Converter-level
+        // catch-handler stack so `Stmt::Throw` lowering could
+        // consult it and route throws explicitly to catch_entry.
+        // The structural-framing approach (Terminator::Try declares
+        // the relationship) made that stack write-only state — every
+        // attempt to read it died at code-review time. Removed.
+        // See `docs/design-try-phase-a.md` §2 for context.
 
         // Branch target for normal completion of try-body and catch-body:
         // finally_entry if present, else join.
@@ -2862,10 +2832,6 @@ impl<'b, 'm> Converter<'b, 'm> {
                 target: normal_completion_target,
                 args: vec![],
             });
-        }
-
-        if catch.is_some() {
-            self.catch_stack.pop();
         }
 
         // Lower catch-body in a fresh lexical scope so the catch param

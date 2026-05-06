@@ -24,7 +24,6 @@
 
 // Wired into the lowering by stage 4; suppress unused-symbol warnings
 // until then.
-#![allow(dead_code)]
 
 use std::collections::BTreeSet;
 
