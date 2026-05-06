@@ -133,3 +133,37 @@ means:
 The `try_entry` / `catch_entry` / `join` landmarks stay; finally is
 inserted as additional structure between `try`/`catch` tails and
 `join`, without altering existing fields.
+
+---
+
+# Phase B addendum (PR #22, post-merge)
+
+Phase B extends `Terminator::Try` with `finally_entry: Option<BlockId>` and migrates `catch_entry: BlockId` to `Option<BlockId>`. The framing now covers all three shapes:
+- try+catch (Phase A)
+- try+catch+finally (Phase B)
+- try+finally (no catch — Phase B)
+
+## Abrupt-completion approximation
+
+JS runs `finally` before any abrupt completion: `return`, `throw` (when uncaught or rethrown from catch), `break`/`continue` through try. Phase B does **not** model this with block duplication or a dispatch variable. Instead:
+
+- The IR has a finally region. Lowered SSA. Walked, validated.
+- Reconstruction emits `try { } catch (e) { } finally { }` JS source. The JS runtime handles abrupt-completion semantics exactly per ECMA-262.
+- Same trade-off as Phase A's implicit-throw approximation: SSA optimization passes that move instructions across try boundaries (none exist) would be unsound; for round-trip correctness, JS runtime semantics carry us.
+
+This means: a `Stmt::Return` inside try-body emits `Terminator::Return` directly (no edge to finally in the CFG). The reconstruction emits `return …;` inside `try { }` and the JS runtime runs finally. **The IR lies about control flow but the emitted JS is correct.** Future passes that need accurate control flow must consult `Terminator::Try`'s finally_entry as a sentinel.
+
+## Address-taken extension
+
+Phase A's collector registered "names assigned in try-body" because catch reads them. Phase B extends to handle finally:
+- Symbols assigned in try-body remain address-taken (catch and/or finally may read them).
+- Symbols assigned in catch-body are address-taken **only when finally is present** (finally can read catch's mutations). Without finally (Phase A shape), catch-body writes don't register — they're in catch's own scope.
+- Symbols assigned in finally-body don't register — no consumer reads finally's mutations from outside.
+
+Implementation: same merge into `pt_referenced_names` at construction time. Existing pt_referenced_names machinery handles the StoreProp(GlobalThis, ...)/LoadProp pattern.
+
+## Out of scope (future work)
+
+- **Block duplication or dispatch-variable encoding** for faithful abrupt-completion modeling. Would matter for an optimization pass that wants to reason about which finally-paths a return takes. No pass exists.
+- **`READS_EXCEPTION_STATE` lattice flag** — same as Phase A, deferred until a pass needs the precision.
+- **finally that itself contains complex control flow** (try/throw/return inside finally) — works structurally because all sub-bodies recurse through `body_needs_ssa_fallback`, but the SSA shape gets tangled enough that future maintenance may want a re-think. The corpus has no such cases.

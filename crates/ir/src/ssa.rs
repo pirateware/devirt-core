@@ -603,14 +603,19 @@ pub enum Terminator {
     Try {
         try_entry: BlockId,
         try_args: Vec<Operand>,
-        catch_entry: BlockId,
-        /// Post-try landing block — where execution lands after try-body
-        /// completes normally OR after catch handler completes. Both
-        /// `try_entry`'s tail and `catch_entry`'s tail terminate in
-        /// `Branch { target: join }` (modulo abrupt completion via
-        /// Return/Throw, same rules as elsewhere). Tracked as a
-        /// landmark, like Switch's `join`. Not a successor edge — the
-        /// walker / successors() helpers don't traverse it.
+        /// `Some(_)` for try+catch (with or without finally); `None`
+        /// for try+finally with no catch (Phase B).
+        catch_entry: Option<BlockId>,
+        /// `Some(_)` for try+finally (with or without catch — Phase B);
+        /// `None` for Phase A's try+catch without finally.
+        finally_entry: Option<BlockId>,
+        /// Post-try landing block. With finally: try-body's tail and
+        /// catch-body's tail (when present) branch to `finally_entry`;
+        /// finally-body's tail branches to `join`. Without finally
+        /// (Phase A shape): try-body's tail and catch-body's tail
+        /// branch to `join` directly. Tracked as a landmark, like
+        /// Switch's `join`. Not a successor edge — the walker /
+        /// successors() helpers don't traverse it.
         join: BlockId,
     },
     Unreachable,
@@ -655,15 +660,27 @@ impl Terminator {
                 try_entry,
                 try_args,
                 catch_entry,
+                finally_entry,
                 ..
-            } => vec![
-                (*try_entry, try_args.as_slice()),
+            } => {
+                let mut s: Vec<(BlockId, &[Operand])> =
+                    vec![(*try_entry, try_args.as_slice())];
                 // catch_entry takes no edge args — its first instruction
                 // is `InstKind::CatchValue`, which reads the implicit
                 // exception value as an instruction result (not a
                 // block-arg / phi). See docs/design-try-phase-a.md §1.
-                (*catch_entry, [].as_slice()),
-            ],
+                if let Some(c) = catch_entry {
+                    s.push((*c, [].as_slice()));
+                }
+                // finally_entry similarly takes no edge args — control
+                // arrives via Branch from try-body's tail and (when
+                // catch is present) catch-body's tail; both Branches
+                // carry empty args.
+                if let Some(f) = finally_entry {
+                    s.push((*f, [].as_slice()));
+                }
+                s
+            }
             Terminator::Return { .. } | Terminator::Throw { .. } | Terminator::Unreachable => {
                 vec![]
             }
@@ -2012,11 +2029,18 @@ fn write_terminator(out: &mut String, t: &Terminator, _func: &LoweredBody, m: &M
             try_entry,
             try_args,
             catch_entry,
+            finally_entry,
             join,
         } => {
             line.push_str("try ");
             write_block_target(&mut line, *try_entry, try_args, m);
-            write!(&mut line, " catch bb{} join bb{}", catch_entry.0, join.0).unwrap();
+            if let Some(c) = catch_entry {
+                write!(&mut line, " catch bb{}", c.0).unwrap();
+            }
+            if let Some(f) = finally_entry {
+                write!(&mut line, " finally bb{}", f.0).unwrap();
+            }
+            write!(&mut line, " join bb{}", join.0).unwrap();
         }
         Terminator::Unreachable => line.push_str("unreachable"),
     }

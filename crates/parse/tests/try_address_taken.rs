@@ -58,11 +58,42 @@ fn assign_in_catch_body_is_not_address_taken() {
 }
 
 #[test]
-fn try_with_finally_does_not_register() {
-    // Phase A: try-with-finally stays in fallback; we don't register
-    // address-taken names for it. Phase B will revisit.
+fn try_catch_finally_registers_try_body_writes() {
+    // Phase B: try+catch+finally lowers through real SSA. Try-body
+    // writes are address-taken (catch and finally can read them).
     let names = collect("var x = 0; try { x = 1; } catch (e) { } finally { }");
-    assert!(names.is_empty(), "got {names:?}");
+    assert!(names.contains("x"), "got {names:?}");
+}
+
+#[test]
+fn try_catch_finally_registers_catch_body_writes() {
+    // Phase B: with finally present, catch-body writes are
+    // address-taken too (finally can read them).
+    let names = collect("var x = 0; try { } catch (e) { x = 1; } finally { }");
+    assert!(names.contains("x"), "got {names:?}");
+}
+
+#[test]
+fn try_finally_no_catch_registers_try_body_writes() {
+    // Phase B: try+finally without catch is now valid.
+    let names = collect("var x = 0; try { x = 1; } finally { }");
+    assert!(names.contains("x"), "got {names:?}");
+}
+
+#[test]
+fn try_catch_no_finally_does_not_register_catch_writes() {
+    // Phase A invariant preserved: without finally, catch-body writes
+    // don't register (they're in catch's own scope, no consumer).
+    let names = collect("var x = 0; try { } catch (e) { x = 1; }");
+    assert!(!names.contains("x"), "got {names:?}");
+}
+
+#[test]
+fn try_finally_does_not_register_finally_body_writes() {
+    // Finally-body's own writes don't register — no consumer reads
+    // finally's mutations from outside.
+    let names = collect("var x = 0; try { } catch (e) { } finally { x = 1; }");
+    assert!(!names.contains("x"), "got {names:?}");
 }
 
 #[test]
