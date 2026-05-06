@@ -1936,6 +1936,136 @@ impl LoweredBody {
     }
 }
 
+/// Try to constant-fold a typed-arithmetic / pure-comparison `InstKind`.
+/// Returns `Some(c)` iff the instruction's result is determined by its
+/// constant operands AND the fold is sound under JS semantics
+/// (no coercion-throw risk, no Module-state required).
+///
+/// Handled InstKinds:
+/// - `AddNumber` / `SubNumber` / `MulNumber` — IEEE-754 arithmetic on
+///   Constant::Number operands. NaN / -0 / Infinity propagate per
+///   IEEE-754; consumer is responsible for re-interpreting the result
+///   under JS-equality semantics if relevant.
+/// - `AddInt32` / `SubInt32` / `MulInt32` — i32 *wrapping* arithmetic
+///   on Constant::Int32 operands. Matches the lowering's invariant
+///   that AddInt32/SubInt32/MulInt32 are emitted only when both
+///   operands fit i32; the result may wrap (matches `|0` semantics
+///   in JS).
+/// - `StrictEq` — between any pair of Const operands of the same
+///   primitive type (Number/Int32/Bool/String/Null/Undefined).
+///   Returns `Constant::Bool`. Number comparisons honor NaN ≠ NaN
+///   and +0 === -0. Mixed-type comparisons are always `false`.
+/// - `Lt` / `Le` — between Number or Int32 operands. Returns
+///   Constant::Bool. NaN comparisons are always `false` per IEEE-754.
+/// - `Not` — on Constant::Bool. Returns Constant::Bool.
+///
+/// Deliberately NOT handled (would require Module access or have
+/// coercion-throw risk):
+/// - `ConcatStr` (needs Module to intern result; future helper with
+///   `try_const_fold_with_module(&Module, &InstKind)` signature).
+/// - `Eq` (loose equality has coercion that may throw via valueOf).
+/// - `AddGeneric` / `SubGeneric` / etc. (coercion may throw).
+/// - Heap reads, calls, allocations.
+pub fn try_const_fold(kind: &InstKind) -> Option<Constant> {
+    use InstKind::*;
+    fn n(op: &Operand) -> Option<f64> {
+        match op {
+            Operand::Const(Constant::Number(x)) => Some(*x),
+            _ => None,
+        }
+    }
+    fn i(op: &Operand) -> Option<i32> {
+        match op {
+            Operand::Const(Constant::Int32(x)) => Some(*x),
+            _ => None,
+        }
+    }
+    fn b(op: &Operand) -> Option<bool> {
+        match op {
+            Operand::Const(Constant::Bool(x)) => Some(*x),
+            _ => None,
+        }
+    }
+    match kind {
+        AddNumber { lhs, rhs } => Some(Constant::Number(n(lhs)? + n(rhs)?)),
+        SubNumber { lhs, rhs } => Some(Constant::Number(n(lhs)? - n(rhs)?)),
+        MulNumber { lhs, rhs } => Some(Constant::Number(n(lhs)? * n(rhs)?)),
+        AddInt32 { lhs, rhs } => Some(Constant::Int32(i(lhs)?.wrapping_add(i(rhs)?))),
+        SubInt32 { lhs, rhs } => Some(Constant::Int32(i(lhs)?.wrapping_sub(i(rhs)?))),
+        MulInt32 { lhs, rhs } => Some(Constant::Int32(i(lhs)?.wrapping_mul(i(rhs)?))),
+        Not { operand } => Some(Constant::Bool(!b(operand)?)),
+        Lt { lhs, rhs } => {
+            // Try Number-Number first, fall back to Int32-Int32. NaN
+            // comparisons return false per IEEE-754 (which `<` already
+            // does in Rust).
+            if let (Some(l), Some(r)) = (n(lhs), n(rhs)) {
+                return Some(Constant::Bool(l < r));
+            }
+            if let (Some(l), Some(r)) = (i(lhs), i(rhs)) {
+                return Some(Constant::Bool(l < r));
+            }
+            None
+        }
+        Le { lhs, rhs } => {
+            if let (Some(l), Some(r)) = (n(lhs), n(rhs)) {
+                return Some(Constant::Bool(l <= r));
+            }
+            if let (Some(l), Some(r)) = (i(lhs), i(rhs)) {
+                return Some(Constant::Bool(l <= r));
+            }
+            None
+        }
+        StrictEq { lhs, rhs } => {
+            // Same-type comparison only. Mixed types are `false` per
+            // ECMA-262 §7.2.16. NaN !== NaN; +0 === -0.
+            match (lhs, rhs) {
+                (Operand::Const(Constant::Number(a)), Operand::Const(Constant::Number(b))) => {
+                    Some(Constant::Bool(a == b))
+                }
+                (Operand::Const(Constant::Int32(a)), Operand::Const(Constant::Int32(b))) => {
+                    Some(Constant::Bool(a == b))
+                }
+                (Operand::Const(Constant::Bool(a)), Operand::Const(Constant::Bool(b))) => {
+                    Some(Constant::Bool(a == b))
+                }
+                (Operand::Const(Constant::String(a)), Operand::Const(Constant::String(b))) => {
+                    Some(Constant::Bool(a == b))
+                }
+                (Operand::Const(Constant::Null), Operand::Const(Constant::Null)) => {
+                    Some(Constant::Bool(true))
+                }
+                (
+                    Operand::Const(Constant::Undefined),
+                    Operand::Const(Constant::Undefined),
+                ) => Some(Constant::Bool(true)),
+                // Cross-type comparisons of distinct primitive types: false.
+                // We only return Some when BOTH operands are Const, otherwise
+                // we don't know.
+                (Operand::Const(a), Operand::Const(b)) => {
+                    // Same-primitive-type cases handled above; reaching
+                    // here means different primitive types (or one of the
+                    // opaque sentinels — GlobalThis/This/Func — where we
+                    // can't fold safely).
+                    if matches!(
+                        (a, b),
+                        (Constant::GlobalThis, _)
+                            | (_, Constant::GlobalThis)
+                            | (Constant::This, _)
+                            | (_, Constant::This)
+                            | (Constant::Func(_), _)
+                            | (_, Constant::Func(_))
+                    ) {
+                        return None;
+                    }
+                    Some(Constant::Bool(false))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Returns the `Value` that names the result of instruction `iid` in
 /// the given lowered body. Panics if the instruction has no value-def
 /// (i.e., a void instruction like `StoreProp`); callers must check
