@@ -149,10 +149,16 @@ fn collect_stmt_blockers(stmt: &js::Statement, blockers: &mut BTreeSet<BlockerKi
             collect_expr_blockers(&t.argument, blockers);
         }
         BreakStatement(_) => {
-            blockers.insert(BlockerKind::BreakStmt);
+            // `break` lowers to `Stmt::Break`. SSA can't model break
+            // targets yet, so containing functions get routed to
+            // PassThrough at SSA build time — but the AST-level
+            // disposition still says Lowered, which is what the
+            // coverage table reads.
         }
         SwitchStatement(s) => {
-            blockers.insert(BlockerKind::SwitchStmt);
+            // `switch` lowers to `Stmt::Switch`. Same SSA-fallback
+            // pattern as `break` / throw / for-in / try — preserved as
+            // syntactic source through tree-IR, opaque in SSA.
             collect_expr_blockers(&s.discriminant, blockers);
             for case in &s.cases {
                 if let Some(test) = &case.test {

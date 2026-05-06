@@ -4,6 +4,46 @@ The blocker-analysis table emitted at the bottom of
 `corpus/realworld/STABILITY_REPORT.md` (and any per-file
 `--coverage-stats` output) is a planning aid, not a forecast.
 
+## What FB-PT% measures (and what it doesn't)
+
+`FB-PT%` (function-body passthrough percent) and the `PT functions`
+count are computed on the **initial tree-IR** produced by
+`parse_and_lower`, before any SSA lowering happens (see
+`crates/cli/src/coverage.rs::analyze`). The metric reports AST-level
+disposition: a function is "Lowered" if its construct set is in the
+supported subset and "PassThrough" otherwise.
+
+**It is not a measure of SSA optimization coverage.** Several
+constructs lower into tree-IR cleanly but route through SSA-fallback
+(`body_needs_ssa_fallback` in `lower_ssa.rs`) at SSA-build time,
+producing a `FunctionBody::PassThrough(source_slice)` that is invisible
+to every SSA-level pass (constant prop, DCE, escape analysis, free-var
+analysis, etc.):
+
+- `Stmt::Throw` (round 10)
+- `Stmt::Try` (since project start)
+- `Stmt::ForIn` (round 9)
+- `Expr::This` (round 10, until the cloneDeep CFG-back-edge bug is fixed)
+- `Stmt::Switch` and `Stmt::Break` (round 11 — SwitchStmt/BreakStmt cluster)
+
+A function using any of these reads as Lowered in the AST disposition
+column and counts as 0 toward FB-PT%, but is functionally identical to
+the old `Item::PassThroughFunction` shape from the optimizer's point of
+view: the body is a verbatim source slice that re-parses at emit time
+via `oxc_codegen`. The metric improvement is real — emit handles it,
+the rename pipeline sees a single named entity rather than an opaque
+top-level item, the function participates in the source-order layout —
+but it does not mean the body went through SSA.
+
+If FB-PT% is the input to a planning decision about *optimization*
+coverage, subtract the SSA-fallback set first. If it's the input to a
+decision about *emit / round-trip* coverage, take it at face value.
+
+When a future ticket promotes one of these constructs from SSA-fallback
+to a real SSA representation (e.g., the follow-up `Terminator::Switch`
+ticket), this list shrinks and the FB-PT% metric stops over-counting.
+Until then: caveat lector.
+
 ## Two columns, both bounded in scope
 
 The table reports per `BlockerKind`:

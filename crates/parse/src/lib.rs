@@ -605,6 +605,22 @@ impl Lowerer<'_> {
             }
             js::Statement::TryStatement(t) => self.lower_try_stmt(t),
             js::Statement::ThrowStatement(t) => Ok(Stmt::Throw(self.lower_expr(&t.argument)?)),
+            js::Statement::BreakStatement(b) => Ok(Stmt::Break {
+                label: b.label.as_ref().map(|l| l.name.to_string()),
+            }),
+            js::Statement::SwitchStatement(s) => {
+                let discriminant = self.lower_expr(&s.discriminant)?;
+                let mut cases = Vec::with_capacity(s.cases.len());
+                for c in &s.cases {
+                    let test = match &c.test {
+                        Some(e) => Some(self.lower_expr(e)?),
+                        None => None,
+                    };
+                    let body = self.lower_stmts_list(&c.consequent)?;
+                    cases.push(SwitchCase { test, body });
+                }
+                Ok(Stmt::Switch { discriminant, cases })
+            }
             _ => Err(Error::Unsupported(stmt_kind(stmt))),
         }
     }

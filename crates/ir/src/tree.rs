@@ -128,8 +128,41 @@ pub enum Stmt {
     },
     /// `continue` inside the nearest enclosing loop. Lowered as a jump
     /// to the loop's continue-target (header for `While`, step block
-    /// for `For`). `break` is not supported (see docs/DECISIONS.md).
+    /// for `For`). `continue` inside a `switch` inside a loop targets
+    /// the enclosing loop, not the switch (`continue` only ever targets
+    /// loops).
     Continue,
+    /// `break;` or `break label;`. Targets either the nearest enclosing
+    /// `switch` or loop (unlabeled), or the labeled construct (labeled).
+    /// Stored without a resolved target — the meaning is determined by
+    /// surrounding statement context at re-emit time, so no information
+    /// is lost. Functions whose body contains `Stmt::Break` route to
+    /// SSA-fallback (PassThrough body) at lower_ssa time, mirroring the
+    /// `Stmt::Throw` / `Stmt::ForIn` / `Stmt::Try` precedent — the SSA
+    /// layer doesn't model break targets, but the syntactic shape is
+    /// preserved through tree-IR for emit and round-trip. AST-level
+    /// disposition treats `break` as Lowered so coverage counts the
+    /// unlock.
+    Break {
+        label: Option<String>,
+    },
+    /// `switch (discriminant) { case <expr>: ... default: ... }`.
+    /// Preserved syntactically — the SSA layer does not model switch
+    /// dispatch (no Terminator::Switch). Functions containing
+    /// `Stmt::Switch` route to PassThrough at SSA build time
+    /// (`body_needs_ssa_fallback`), so the original source slice is
+    /// re-emitted verbatim. Same pattern as Throw/ForIn/Try. AST-level
+    /// disposition classifies the function as Lowered so the coverage
+    /// table counts the unlock.
+    ///
+    /// `cases` preserves source order; the `default` case is identified
+    /// by `SwitchCase.test == None` and lives at its source-order
+    /// position (no separate `default_index` field — keeps round-trip
+    /// mechanical).
+    Switch {
+        discriminant: Expr,
+        cases: Vec<SwitchCase>,
+    },
     /// `throw expr;`. Rendered syntactically. Functions whose body
     /// contains `Stmt::Throw` are routed to PassThrough at SSA build
     /// time (same fallback as `Stmt::Try`/`Stmt::ForIn`) — SSA can't
@@ -217,6 +250,15 @@ pub struct FuncLiteral {
     /// initial-lowering time; SSA and tree-reconstruction layers leave
     /// this empty.
     pub blockers: std::collections::BTreeSet<crate::blocker::BlockerKind>,
+}
+
+/// One case in a `Stmt::Switch`. `test == None` denotes the `default:`
+/// clause; otherwise the case matches when the discriminant is
+/// strict-equal to `test`.
+#[derive(Debug, Clone)]
+pub struct SwitchCase {
+    pub test: Option<Expr>,
+    pub body: Vec<Stmt>,
 }
 
 #[derive(Debug, Clone)]
@@ -603,6 +645,23 @@ fn dump_stmt(out: &mut String, s: &Stmt, depth: usize) {
             writeln!(out, "{pad}}}").unwrap();
         }
         Stmt::Continue => writeln!(out, "{pad}continue").unwrap(),
+        Stmt::Break { label } => match label {
+            Some(l) => writeln!(out, "{pad}break {l}").unwrap(),
+            None => writeln!(out, "{pad}break").unwrap(),
+        },
+        Stmt::Switch { discriminant, cases } => {
+            writeln!(out, "{pad}switch {} {{", dump_expr(discriminant)).unwrap();
+            for case in cases {
+                match &case.test {
+                    Some(t) => writeln!(out, "{pad}  case {}:", dump_expr(t)).unwrap(),
+                    None => writeln!(out, "{pad}  default:").unwrap(),
+                }
+                for s in &case.body {
+                    dump_stmt(out, s, depth + 2);
+                }
+            }
+            writeln!(out, "{pad}}}").unwrap();
+        }
         Stmt::Throw(e) => writeln!(out, "{pad}throw {}", dump_expr(e)).unwrap(),
         Stmt::Block(stmts) => {
             writeln!(out, "{pad}{{").unwrap();

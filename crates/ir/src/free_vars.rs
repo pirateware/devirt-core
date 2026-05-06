@@ -218,6 +218,21 @@ impl Ctx<'_> {
                 self.leave_scope();
             }
             Stmt::Continue => {}
+            Stmt::Break { .. } => {}
+            Stmt::Switch {
+                discriminant,
+                cases,
+            } => {
+                self.walk_expr(discriminant);
+                for case in cases {
+                    if let Some(test) = &case.test {
+                        self.walk_expr(test);
+                    }
+                    self.enter_block_scope();
+                    self.walk_stmts(&case.body);
+                    self.leave_scope();
+                }
+            }
             Stmt::Block(stmts) => {
                 self.enter_block_scope();
                 self.walk_stmts(stmts);
