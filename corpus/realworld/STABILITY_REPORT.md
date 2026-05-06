@@ -4,9 +4,9 @@ This report tests the parse → IR → emit pipeline against real-world JavaScri
 
 ## Summary
 
-- Total files tested: 310
-- Parse success: 310/310 (100.0%)
-- Roundtrip success: 310/310 (100.0%)
+- Total files tested: 313
+- Parse success: 313/313 (100.0%)
+- Roundtrip success: 313/313 (100.0%)
 - Panics/crashes: 0
 
 ## Tier 1
@@ -333,6 +333,14 @@ This report tests the parse → IR → emit pipeline against real-world JavaScri
 | lodash_partial.medium.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 52.5% |  |
 | lodash_snakeCase.low.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 76.6% |  |
 | lodash_union.high.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 52.0% |  |
+
+## Tier 4
+
+| File | Parse | Validate | Emit | Re-parse | Roundtrip | FB-PT% | TL-PT% | Notes |
+|------|-------|----------|------|----------|-----------|--------|--------|-------|
+| baseline.jsconfuser_high.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 100.0% |  |
+| baseline.obfuscatorio_high.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 15.4% |  |
+| baseline.jsconfuser_vm.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 100.0% |  |
 
 ## Decision Rules Summary
 

@@ -34,7 +34,8 @@ pub struct TestResult {
 pub enum Tier {
     Tier1, // Small libraries (unminified)
     Tier2, // Minified production bundles
-    Tier3, // Obfuscated samples
+    Tier3, // Obfuscated samples (per-construct, obfuscator.io)
+    Tier4, // Whole-program obfuscated samples (multiple obfuscators)
 }
 
 impl Tier {
@@ -43,6 +44,7 @@ impl Tier {
             Tier::Tier1 => "Tier 1",
             Tier::Tier2 => "Tier 2",
             Tier::Tier3 => "Tier 3",
+            Tier::Tier4 => "Tier 4",
         }
     }
 }
@@ -85,6 +87,19 @@ pub fn run_realworld_tests(corpus_dir: &Path) -> Vec<TestResult> {
             let path = entry.path();
             if path.extension().map(|e| e == "js").unwrap_or(false) {
                 let result = test_file(&path, Tier::Tier3);
+                results.push(result);
+            }
+        }
+    }
+
+    // Test Tier 4
+    let tier4_dir = corpus_dir.join("tier4");
+    if tier4_dir.exists() {
+        for entry in fs::read_dir(&tier4_dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.extension().map(|e| e == "js").unwrap_or(false) {
+                let result = test_file(&path, Tier::Tier4);
                 results.push(result);
             }
         }
@@ -243,7 +258,7 @@ pub fn generate_report(results: &[TestResult]) -> String {
 
     // Summary by tier
     report.push_str("## Summary\n\n");
-    for tier in [Tier::Tier1, Tier::Tier2, Tier::Tier3] {
+    for tier in [Tier::Tier1, Tier::Tier2, Tier::Tier3, Tier::Tier4] {
         let tier_results: Vec<_> = results.iter().filter(|r| matches!(r.tier, t if std::mem::discriminant(&t) == std::mem::discriminant(&tier))).collect();
         if !tier_results.is_empty() {
             report.push_str(&format!("### {}\n\n", tier.as_str()));
@@ -279,7 +294,7 @@ pub fn generate_report(results: &[TestResult]) -> String {
     }
 
     // Detailed tables
-    for tier in [Tier::Tier1, Tier::Tier2, Tier::Tier3] {
+    for tier in [Tier::Tier1, Tier::Tier2, Tier::Tier3, Tier::Tier4] {
         let tier_results: Vec<_> = results.iter().filter(|r| matches!(r.tier, t if std::mem::discriminant(&t) == std::mem::discriminant(&tier))).collect();
         if !tier_results.is_empty() {
             report.push_str(&format!("## {} Details\n\n", tier.as_str()));
