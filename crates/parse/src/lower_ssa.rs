@@ -4464,6 +4464,8 @@ fn walk_inst_operands_mut(kind: &mut InstKind, f: &mut impl FnMut(&mut Operand))
             f(obj);
         }
         CatchValue => {} // no operands
+        ForInInit { obj } => f(obj),
+        ForInDone { iter } | ForInNext { iter } => f(iter),
     }
 }
 

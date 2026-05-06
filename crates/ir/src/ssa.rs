@@ -459,6 +459,40 @@ pub enum InstKind {
     /// when an optimization pass demands it; until then, Opaque is
     /// honest. See docs/design-try-phase-a.md §3.
     CatchValue,
+
+    // -- For-in iteration protocol -----------------------------------------
+    //
+    // Three opaque iteration instructions implementing JS for-in
+    // semantics: walk obj's enumerable string-keyed properties along
+    // the prototype chain, lazily, in implementation-defined-but-
+    // deterministic order. Reconstruction pattern-matches the standard
+    // four-block loop (pre-header / header / body / exit) and re-emits
+    // `for (k in obj) body`. See docs/design-forin.md.
+    //
+    // All three are Opaque purity (iteration touches getters / Proxy
+    // traps / can throw / observes mutations during iteration). A
+    // future `MAY_OBSERVE_GETTERS` lattice flag is the right precision
+    // tier when an optimization pass demands it; until then, Opaque is
+    // honest.
+
+    /// Initialize a for-in iterator over `obj`. Returns an opaque
+    /// iterator handle threaded through `ForInDone` / `ForInNext`.
+    /// The handle's representation is not exposed; passes treat it
+    /// as opaque.
+    ForInInit { obj: Operand },
+
+    /// Test whether the iterator has produced all keys. Returns Bool
+    /// (`true` when iteration is exhausted). Idiomatically used as the
+    /// loop's exit condition: `CondBranch !done, body, exit`.
+    ForInDone { iter: Operand },
+
+    /// Advance the iterator and return the next key as a string Value.
+    /// MUST be called only when the matching `ForInDone` has returned
+    /// `false` for the same iterator; calling on an exhausted iterator
+    /// is undefined (in practice the JS engine panics at re-emit time).
+    /// Reconstruction enforces this by pattern-matching the four-block
+    /// shape — out-of-pattern construction would fail to round-trip.
+    ForInNext { iter: Operand },
 }
 
 impl InstKind {
@@ -526,6 +560,10 @@ impl InstKind {
             // CatchValue: reads the implicit exception register.
             // Opaque per design — see docs/design-try-phase-a.md §3.
             CatchValue => Effect::OPAQUE,
+
+            // For-in iteration: opaque per design — getters / Proxy
+            // traps / can throw / observe mutations. See docs/design-forin.md.
+            ForInInit { .. } | ForInDone { .. } | ForInNext { .. } => Effect::OPAQUE,
 
             // Spread collections: opaque (iterator protocol can throw and mutate heap).
             ArrayWithSpread { .. } | ObjectWithSpread { .. } => Effect::OPAQUE,
@@ -1515,6 +1553,8 @@ fn walk_inst_operands(kind: &InstKind, mut f: impl FnMut(&Operand)) {
             f(obj);
         }
         CatchValue => {} // no operands
+        ForInInit { obj } => f(obj),
+        ForInDone { iter } | ForInNext { iter } => f(iter),
     }
 }
 
@@ -1874,6 +1914,9 @@ fn write_inst_kind(out: &mut String, kind: &InstKind, m: &Module) {
         In { key, obj } => write_binop(out, "in", key, obj, m),
         OpaqueEval { source } => unop(out, "opaque_eval", source, m),
         CatchValue => out.push_str("catch_value"),
+        ForInInit { obj } => unop(out, "for_in_init", obj, m),
+        ForInDone { iter } => unop(out, "for_in_done", iter, m),
+        ForInNext { iter } => unop(out, "for_in_next", iter, m),
     }
 }
 
