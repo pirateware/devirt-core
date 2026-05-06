@@ -41,29 +41,43 @@
 //!     need cloning the upstream sub-DAG; deferred).
 //!   - Construct (`new`) — different semantics; skip.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ir::error::Error;
 use ir::ssa::{
-    Constant, FunctionBody, InstId, InstKind, Module, Operand, Value, ValueDef, ValueDefKind,
-    find_value_for_inst, walk_inst_operands_mut,
+    Constant, Effect, FunctionBody, InstId, InstKind, Module, Operand, Value, ValueDef,
+    ValueDefKind, find_value_for_inst, walk_inst_operands_mut,
 };
-// `walk_inst_operands_mut` is used by the Call-retire blanking; the
-// targeted store rewrites in `rewrite_operands` use direct field access.
 
 use crate::ModulePass;
 
 pub struct ConstructorFnInlinePass;
 
-/// Function summary for a constructor candidate. Stores the cloned
-/// instruction kinds that form the construction sequence (alloc
-/// first, stores after) along with the alloc's Value and the result
-/// Value (for the return).
+/// One construction step, in body order. Either an expression
+/// instruction (produces a Value) or a store on the alloc (void).
+#[derive(Clone, Debug)]
+struct Step {
+    kind: InstKind,
+    /// `Some(body_value_idx)` if this step produces a Value (i.e., is
+    /// an expression instruction). `None` for stores.
+    produced: Option<u32>,
+}
+
+/// Function summary for a constructor candidate. Steps are stored in
+/// body order; the alloc step is one of them (identified by
+/// `alloc_body_value` matching its `produced`), not pulled out
+/// separately. AST-level "evaluate expressions, then construct
+/// object literal" leaves expressions in body order BEFORE the alloc
+/// — handled naturally by walking steps in order.
 #[derive(Clone, Debug)]
 struct ConstructorSummary {
-    alloc_kind: InstKind,
-    /// Each store's `kind` — must be StoreProp or StoreIndex.
-    store_kinds: Vec<InstKind>,
+    /// Body's Value index for the alloc result.
+    alloc_body_value: u32,
+    /// Function arity — bounds the call_args lookup at cloning time.
+    arity: usize,
+    /// All non-terminator instructions in body order: alloc,
+    /// expressions, and stores interleaved.
+    steps: Vec<Step>,
 }
 
 impl ModulePass for ConstructorFnInlinePass {
@@ -141,6 +155,25 @@ pub fn is_constructor_shape(func: &ir::ssa::Function) -> bool {
 
 /// Match the constructor shape on `func`. Returns the summary if it
 /// matches, `None` otherwise.
+///
+/// Accepted body shape (single block, no block params):
+///   - Instruction 0: `AllocObject` or `AllocArray`.
+///   - Instructions 1..N: each is either
+///       a. A **store** (`StoreProp` / `StoreIndex`) whose `obj` is
+///          the alloc Value, key is `Const(_)`, val is an "allowed
+///          operand" (see below). StoreIndex's `index` must also be
+///          `Const(_)` so the post-clone shape is trackable by
+///          ForwardLoadsPass.
+///       b. An **expression** instruction whose effect is a subset
+///          of `PURE | MAY_THROW` (no heap reads/writes, no diverge,
+///          not opaque) and whose every operand is "allowed."
+///   - Terminator: `Return(Some(Value(alloc)))`.
+///
+/// "Allowed operand" = `Const(_)`, `Arg(i)` Value, or a Value
+/// produced by an earlier expression step in this same body. That
+/// last case is what makes the matcher accept patterns like
+/// `function mk(x) { return { val: x + 1 }; }`: the `AddGeneric`
+/// step produces a Value referenced by the subsequent StoreProp.
 fn match_constructor(func: &ir::ssa::Function) -> Option<ConstructorSummary> {
     let body = match &func.body {
         FunctionBody::Lowered(b) => b,
@@ -157,52 +190,109 @@ fn match_constructor(func: &ir::ssa::Function) -> Option<ConstructorSummary> {
         return None;
     }
 
-    // First inst must be AllocObject or AllocArray, producing the
-    // alloc Value.
-    let first_iid = entry.instructions[0];
-    let alloc_kind = body.instructions[first_iid.0 as usize].kind.clone();
-    if !matches!(
-        alloc_kind,
-        InstKind::AllocObject | InstKind::AllocArray { .. }
-    ) {
-        return None;
-    }
-    let alloc_value = find_value_for_inst(body, first_iid);
+    let arity = body.params.len();
 
-    // Subsequent insts must be StoreProp/StoreIndex on the alloc, with
-    // const keys and const-or-arg val operands.
-    let mut store_kinds: Vec<InstKind> = Vec::new();
-    for &iid in &entry.instructions[1..] {
+    // Allowed-operand set grows as we walk: seeded with all Args, gains
+    // each expression's produced Value (and the alloc when we see it).
+    let mut allowed_values: HashSet<u32> = HashSet::new();
+    for v_idx in 0..body.values.len() {
+        if let ValueDefKind::Arg(_) = body.values[v_idx].kind {
+            allowed_values.insert(v_idx as u32);
+        }
+    }
+
+    let mut steps: Vec<Step> = Vec::new();
+    let allowed_effect = Effect::PURE | Effect::MAY_THROW;
+    let mut alloc_value: Option<Value> = None;
+
+    for &iid in &entry.instructions {
         let kind = &body.instructions[iid.0 as usize].kind;
         match kind {
+            InstKind::AllocObject | InstKind::AllocArray { .. } => {
+                if alloc_value.is_some() {
+                    // Multiple allocs in one body — not modeled.
+                    return None;
+                }
+                let v = find_value_for_inst(body, iid);
+                allowed_values.insert(v.0);
+                alloc_value = Some(v);
+                steps.push(Step {
+                    kind: kind.clone(),
+                    produced: Some(v.0),
+                });
+            }
             InstKind::StoreProp { obj, val, .. } => {
-                if !operand_is(obj, alloc_value) {
+                let av = match alloc_value {
+                    Some(v) => v,
+                    None => return None, // store before alloc
+                };
+                if !operand_is(obj, av) {
                     return None;
                 }
-                if !val_is_const_or_arg(val, body) {
+                if !operand_allowed(val, &allowed_values) {
                     return None;
                 }
-                store_kinds.push(kind.clone());
+                steps.push(Step {
+                    kind: kind.clone(),
+                    produced: None,
+                });
             }
             InstKind::StoreIndex {
                 obj, index, val, ..
             } => {
-                if !operand_is(obj, alloc_value) {
+                let av = match alloc_value {
+                    Some(v) => v,
+                    None => return None,
+                };
+                if !operand_is(obj, av) {
                     return None;
                 }
                 if !matches!(index, Operand::Const(_)) {
                     return None;
                 }
-                if !val_is_const_or_arg(val, body) {
+                if !operand_allowed(val, &allowed_values) {
                     return None;
                 }
-                store_kinds.push(kind.clone());
+                steps.push(Step {
+                    kind: kind.clone(),
+                    produced: None,
+                });
             }
-            _ => return None,
+            // Expression: pure or may-throw only (no heap, no diverge,
+            // not opaque). Stores/loads are excluded because they'd
+            // need their own purity reasoning. Calls excluded (OPAQUE).
+            other => {
+                let eff = other.effect();
+                if eff.intersects(!allowed_effect) {
+                    return None;
+                }
+                if other.is_void() {
+                    return None;
+                }
+                let mut ok = true;
+                ir::ssa::walk_inst_operands(other, |op| {
+                    if let Operand::Value(v) = op
+                        && !allowed_values.contains(&v.0)
+                    {
+                        ok = false;
+                    }
+                });
+                if !ok {
+                    return None;
+                }
+                let produced_v = find_value_for_inst(body, iid);
+                allowed_values.insert(produced_v.0);
+                steps.push(Step {
+                    kind: kind.clone(),
+                    produced: Some(produced_v.0),
+                });
+            }
         }
     }
 
-    // Terminator must Return Some(Value(alloc)).
+    let alloc_value = alloc_value?;
+
+    // Terminator: Return Some(Value(alloc)).
     match &entry.terminator {
         ir::ssa::Terminator::Return {
             val: Some(Operand::Value(v)),
@@ -211,8 +301,9 @@ fn match_constructor(func: &ir::ssa::Function) -> Option<ConstructorSummary> {
     }
 
     Some(ConstructorSummary {
-        alloc_kind,
-        store_kinds,
+        alloc_body_value: alloc_value.0,
+        arity,
+        steps,
     })
 }
 
@@ -220,25 +311,27 @@ fn operand_is(op: &Operand, target: Value) -> bool {
     matches!(op, Operand::Value(v) if *v == target)
 }
 
-fn val_is_const_or_arg(val: &Operand, body: &ir::ssa::LoweredBody) -> bool {
-    match val {
+fn operand_allowed(op: &Operand, allowed_values: &HashSet<u32>) -> bool {
+    match op {
         Operand::Const(_) => true,
-        Operand::Value(v) => matches!(
-            body.values[v.0 as usize].kind,
-            ValueDefKind::Arg(_)
-        ),
-        _ => false,
+        Operand::Value(v) => allowed_values.contains(&v.0),
+        _ => false, // Capture etc.: not supported by this matcher.
     }
 }
 
 /// Splice the constructor's construction sequence into the caller's
-/// block at `pos`, with operands rewritten so:
-///   - Stores' `obj` reference the freshly-cloned alloc Value (not
-///     the original constructor's alloc Value).
-///   - `Operand::Value(arg_i)` operands become the call's args[i] (or
-///     Const::Undefined if out of range).
+/// block at `pos`, with operands rewritten via a body-Value →
+/// caller-Operand remap that handles all four substitution kinds
+/// uniformly:
+///   - The constructor's alloc Value → the freshly-cloned alloc Value.
+///   - Each `Arg(i)` Value → `call_args[i]` (or `Const::Undefined` for
+///     missing args).
+///   - Each previously-cloned expression Value → its fresh caller-side
+///     Value.
+///   - Const operands pass through unchanged.
 ///
-/// Then retire the Call inst.
+/// Steps are cloned in body order; expression steps push fresh
+/// `ValueDef::inst` entries before subsequent steps reference them.
 fn inline_constructor_at(
     body: &mut ir::ssa::LoweredBody,
     bi: usize,
@@ -246,45 +339,59 @@ fn inline_constructor_at(
     call_iid: InstId,
     summary: &ConstructorSummary,
 ) {
-    // Extract Call's args (clone — we'll mutate body.instructions).
     let call_args: Vec<Operand> = match &body.instructions[call_iid.0 as usize].kind {
         InstKind::Call { args, .. } => args.clone(),
         _ => unreachable!("inline_constructor_at called on non-Call inst"),
     };
 
-    // 1. Allocate a fresh Value for the cloned alloc.
-    let new_alloc_iid = InstId(body.instructions.len() as u32);
-    body.instructions.push(ir::ssa::Instruction {
-        kind: rewrite_operands(&summary.alloc_kind, None, &call_args),
-    });
-    body.values.push(ValueDef::inst(new_alloc_iid));
-    let new_alloc_value = Value(body.values.len() as u32 - 1);
-
-    // 2. Allocate fresh InstIds for each cloned store. Stores are void
-    // (no Value), so we don't push to body.values for them.
-    let mut new_inst_ids: Vec<InstId> = Vec::with_capacity(1 + summary.store_kinds.len());
-    new_inst_ids.push(new_alloc_iid);
-    for store_kind in &summary.store_kinds {
-        let new_store_iid = InstId(body.instructions.len() as u32);
-        body.instructions.push(ir::ssa::Instruction {
-            kind: rewrite_operands(store_kind, Some(new_alloc_value), &call_args),
-        });
-        new_inst_ids.push(new_store_iid);
+    // Build the body-Value → caller-Operand remap. Args map to
+    // call_args[i]; expression and alloc Values get added as we walk
+    // steps. The alloc step's new Value is what the Call's result
+    // gets retargeted to (after step cloning).
+    let mut remap: HashMap<u32, Operand> = HashMap::new();
+    for i in 0..summary.arity {
+        let substitute = call_args
+            .get(i)
+            .copied()
+            .unwrap_or(Operand::Const(Constant::Undefined));
+        remap.insert(i as u32, substitute);
     }
 
+    let mut new_inst_ids: Vec<InstId> = Vec::with_capacity(summary.steps.len());
+
+    // Walk steps in body order; alloc, expressions, and stores all go
+    // through the same uniform clone path. Expression-shaped steps
+    // (including the alloc) push fresh ValueDefs and feed the remap;
+    // stores are void.
+    for step in &summary.steps {
+        let new_iid = InstId(body.instructions.len() as u32);
+        let new_kind = clone_with_remap(&step.kind, &remap);
+        body.instructions.push(ir::ssa::Instruction { kind: new_kind });
+        if let Some(orig_body_val) = step.produced {
+            body.values.push(ValueDef::inst(new_iid));
+            let new_v = Value(body.values.len() as u32 - 1);
+            remap.insert(orig_body_val, Operand::Value(new_v));
+        }
+        new_inst_ids.push(new_iid);
+    }
+
+    // Look up the cloned alloc's Value via the remap we just built.
+    let new_alloc_value = match remap.get(&summary.alloc_body_value) {
+        Some(Operand::Value(v)) => *v,
+        _ => unreachable!(
+            "matcher invariant: alloc step must have populated remap with a Value"
+        ),
+    };
+
     // 3. Splice cloned InstIds into the block immediately before the
-    // Call. Preserve insertion order. (Stores into a Vec at index N
-    // shift everything from N onwards down by len(new_inst_ids).)
+    // Call. The Call's position shifts by len(new_inst_ids).
     let blk = &mut body.blocks[bi];
     blk.instructions.splice(pos..pos, new_inst_ids.iter().copied());
-
-    // After the splice, the Call's position has shifted by
-    // `new_inst_ids.len()`. Recompute and retire it.
     let call_pos = pos + new_inst_ids.len();
     debug_assert_eq!(blk.instructions[call_pos].0, call_iid.0);
 
-    // Retire the Call: replace its result Value uses with the cloned
-    // alloc's Value, mark Removed, unhook, blank operands.
+    // 4. Retire the Call: replace its result Value uses with the
+    // cloned alloc Value, mark Removed, unhook, blank operands.
     let call_result_v = find_value_for_inst(body, call_iid);
     body.replace_value_uses(call_result_v, Operand::Value(new_alloc_value));
     body.values[call_result_v.0 as usize] = ValueDef::removed();
@@ -298,50 +405,27 @@ fn inline_constructor_at(
     );
 }
 
-/// Rewrite a constructor-body instruction kind for splicing into the
-/// caller. Two targeted edits driven by the matcher's invariants:
-///
-///   1. `new_alloc` (Some only when rewriting a Store): retarget
-///      the store's `obj` to the freshly-cloned alloc Value. The
-///      matcher guaranteed the original `obj` equals the constructor's
-///      alloc, so this is a direct overwrite.
-///   2. Store `val` operand: if it's `Operand::Value(v)`, then per the
-///      matcher's invariant `v` must be an `Arg(i)` — substitute with
-///      `call_args[i]` (or `Const::Undefined` for out-of-range, which
-///      mirrors JS missing-arg semantics). The constructor's args
-///      occupy Value indices 0..arity-1 (FunctionBuilder pushes Arg
-///      ValueDefs before any Inst ValueDefs), so `v.0` is the arg
-///      index.
-///
-/// AllocObject / AllocArray have no operands needing rewriting.
-/// StoreIndex's `index` is always `Const` per the matcher (rejected
-/// otherwise) — no rewrite needed.
-fn rewrite_operands(
-    src: &InstKind,
-    new_alloc: Option<Value>,
-    call_args: &[Operand],
-) -> InstKind {
+/// Clone an InstKind, walking every operand and substituting
+/// `Operand::Value(v)` per the body→caller remap. Unmapped Values
+/// would mean the matcher missed a case — debug-assert. Const and
+/// Capture operands pass through unchanged.
+fn clone_with_remap(src: &InstKind, remap: &HashMap<u32, Operand>) -> InstKind {
     let mut out = src.clone();
-    if let Some(a) = new_alloc {
-        match &mut out {
-            InstKind::StoreProp { obj, .. } | InstKind::StoreIndex { obj, .. } => {
-                *obj = Operand::Value(a);
-            }
-            _ => {}
-        }
-    }
-    match &mut out {
-        InstKind::StoreProp { val, .. } | InstKind::StoreIndex { val, .. } => {
-            if let Operand::Value(v) = val {
-                let idx = v.0 as usize;
-                *val = call_args
-                    .get(idx)
-                    .copied()
-                    .unwrap_or(Operand::Const(Constant::Undefined));
+    walk_inst_operands_mut(&mut out, &mut |op| {
+        if let Operand::Value(v) = op {
+            match remap.get(&v.0) {
+                Some(replacement) => *op = *replacement,
+                None => {
+                    debug_assert!(
+                        false,
+                        "constructor body referenced unmapped Value %{}; \
+                         matcher invariant broken",
+                        v.0
+                    );
+                }
             }
         }
-        _ => {}
-    }
+    });
     out
 }
 
@@ -561,22 +645,37 @@ mod tests {
         }
     }
 
-    /// Body has a non-store instruction → not a constructor.
+    /// Body has an opaque-effect instruction (a Call) → matcher rejects.
+    /// The relaxed matcher accepts pure / may-throw expressions, but
+    /// OPAQUE-effect insts (Calls, OpaqueEval, heap loads/stores not on
+    /// the alloc) still disqualify because faithfully cloning them
+    /// would change observable side effects relative to the wrapping
+    /// Call.
     #[test]
     fn does_not_match_when_body_has_extra_instruction() {
         let mut module = Module::new();
         let key_foo;
+        // Helper fn — needs to exist so we can take a Func reference
+        // to it as a Call callee.
+        {
+            let mut b = FunctionBuilder::new(&mut module, "helper", 0);
+            let bb0 = b.new_block();
+            b.switch_to_block(bb0);
+            b.set_terminator(Terminator::Return { val: None });
+            b.finish();
+        }
+        // mk fn — body has alloc + Call(helper) + store + ret. The
+        // Call should disqualify it.
         {
             let mut b = FunctionBuilder::new(&mut module, "mk", 0);
             key_foo = b.intern("foo");
             let bb0 = b.new_block();
             b.switch_to_block(bb0);
             let alloc = b.add_inst(InstKind::AllocObject).unwrap();
-            // Extra side-effecty inst — disqualifies.
             let _ = b
-                .add_inst(InstKind::AddGeneric {
-                    lhs: Operand::Const(Constant::Number(1.0)),
-                    rhs: Operand::Const(Constant::Number(2.0)),
+                .add_inst(InstKind::Call {
+                    callee: Operand::Const(Constant::Func(FuncId(0))),
+                    args: vec![],
                 })
                 .unwrap();
             b.add_inst(InstKind::StoreProp {
@@ -590,13 +689,14 @@ mod tests {
             });
             b.finish();
         }
+        // Caller invokes the (non-matching) mk.
         {
             let mut b = FunctionBuilder::new(&mut module, "f", 0);
             let bb0 = b.new_block();
             b.switch_to_block(bb0);
             let _ = b
                 .add_inst(InstKind::Call {
-                    callee: Operand::Const(Constant::Func(FuncId(0))),
+                    callee: Operand::Const(Constant::Func(FuncId(1))),
                     args: vec![],
                 })
                 .unwrap();
@@ -608,7 +708,7 @@ mod tests {
         pm.add_module_pass(Box::new(ConstructorFnInlinePass));
         pm.run_module(&mut module).unwrap();
 
-        let f_body = module.functions[1].lowered();
+        let f_body = module.functions[2].lowered();
         let entry = f_body.entry;
         assert!(
             f_body.blocks[entry.0 as usize]
@@ -616,9 +716,158 @@ mod tests {
                 .iter()
                 .any(|iid| matches!(
                     f_body.instructions[iid.0 as usize].kind,
-                    InstKind::Call { .. }
+                    InstKind::Call { callee: Operand::Const(Constant::Func(FuncId(1))), .. }
                 )),
-            "non-matching constructor → Call must remain"
+            "non-matching constructor → Call to mk must remain"
         );
+    }
+
+    /// `function mk(x) { return { val: x + 1 }; }` — body has an
+    /// AddGeneric whose result feeds the StoreProp. The relaxed
+    /// matcher should accept this, the cloning should propagate the
+    /// arithmetic into the caller, and (after the full pipeline) the
+    /// load resolves to the call-arg + 1.
+    #[test]
+    fn inlines_constructor_with_arithmetic_step() {
+        let mut module = Module::new();
+        let key_val;
+        {
+            let mut b = FunctionBuilder::new(&mut module, "mk", 1);
+            key_val = b.intern("val");
+            let arg0 = b.body().params[0];
+            let bb0 = b.new_block();
+            b.switch_to_block(bb0);
+            let alloc = b.add_inst(InstKind::AllocObject).unwrap();
+            let plus = b
+                .add_inst(InstKind::AddGeneric {
+                    lhs: Operand::Value(arg0),
+                    rhs: Operand::Const(Constant::Number(1.0)),
+                })
+                .unwrap();
+            b.add_inst(InstKind::StoreProp {
+                obj: Operand::Value(alloc),
+                key: key_val,
+                val: Operand::Value(plus),
+                purity: Purity::Pure,
+            });
+            b.set_terminator(Terminator::Return {
+                val: Some(Operand::Value(alloc)),
+            });
+            b.finish();
+        }
+        // f() — calls mk(41); pulls .val.
+        {
+            let mut b = FunctionBuilder::new(&mut module, "f", 0);
+            let bb0 = b.new_block();
+            b.switch_to_block(bb0);
+            let call_v = b
+                .add_inst(InstKind::Call {
+                    callee: Operand::Const(Constant::Func(FuncId(0))),
+                    args: vec![Operand::Const(Constant::Number(41.0))],
+                })
+                .unwrap();
+            let load_v = b
+                .add_inst(InstKind::LoadProp {
+                    obj: Operand::Value(call_v),
+                    key: key_val,
+                    purity: Purity::Pure,
+                })
+                .unwrap();
+            b.set_terminator(Terminator::Return {
+                val: Some(Operand::Value(load_v)),
+            });
+            b.finish();
+        }
+
+        let mut pm = PassManager::new();
+        pm.add_module_pass(Box::new(ConstructorFnInlinePass));
+        pm.add_pass(Box::new(crate::forward_loads::ForwardLoadsPass));
+        pm.add_pass(Box::new(crate::refine_arith::RefineArithPass));
+        pm.add_pass(Box::new(crate::const_fold::ConstFoldPass));
+        pm.run_module(&mut module).unwrap();
+
+        let f_body = module.functions[1].lowered();
+        let entry = f_body.entry;
+        match &f_body.blocks[entry.0 as usize].terminator {
+            Terminator::Return {
+                val: Some(Operand::Const(Constant::Number(n))),
+            } => assert_eq!(*n, 42.0, "should fold (41 + 1) → 42"),
+            other => panic!("expected ret 42, got {other:?}"),
+        }
+    }
+
+    /// Chained expressions: a.x = (a + 1) * 2.
+    #[test]
+    fn inlines_constructor_with_chained_expression_steps() {
+        let mut module = Module::new();
+        let key_v;
+        {
+            let mut b = FunctionBuilder::new(&mut module, "mk", 1);
+            key_v = b.intern("v");
+            let arg0 = b.body().params[0];
+            let bb0 = b.new_block();
+            b.switch_to_block(bb0);
+            let alloc = b.add_inst(InstKind::AllocObject).unwrap();
+            let plus = b
+                .add_inst(InstKind::AddGeneric {
+                    lhs: Operand::Value(arg0),
+                    rhs: Operand::Const(Constant::Number(1.0)),
+                })
+                .unwrap();
+            let times = b
+                .add_inst(InstKind::MulGeneric {
+                    lhs: Operand::Value(plus),
+                    rhs: Operand::Const(Constant::Number(2.0)),
+                })
+                .unwrap();
+            b.add_inst(InstKind::StoreProp {
+                obj: Operand::Value(alloc),
+                key: key_v,
+                val: Operand::Value(times),
+                purity: Purity::Pure,
+            });
+            b.set_terminator(Terminator::Return {
+                val: Some(Operand::Value(alloc)),
+            });
+            b.finish();
+        }
+        {
+            let mut b = FunctionBuilder::new(&mut module, "f", 0);
+            let bb0 = b.new_block();
+            b.switch_to_block(bb0);
+            let call_v = b
+                .add_inst(InstKind::Call {
+                    callee: Operand::Const(Constant::Func(FuncId(0))),
+                    args: vec![Operand::Const(Constant::Number(10.0))],
+                })
+                .unwrap();
+            let load_v = b
+                .add_inst(InstKind::LoadProp {
+                    obj: Operand::Value(call_v),
+                    key: key_v,
+                    purity: Purity::Pure,
+                })
+                .unwrap();
+            b.set_terminator(Terminator::Return {
+                val: Some(Operand::Value(load_v)),
+            });
+            b.finish();
+        }
+
+        let mut pm = PassManager::new();
+        pm.add_module_pass(Box::new(ConstructorFnInlinePass));
+        pm.add_pass(Box::new(crate::forward_loads::ForwardLoadsPass));
+        pm.add_pass(Box::new(crate::refine_arith::RefineArithPass));
+        pm.add_pass(Box::new(crate::const_fold::ConstFoldPass));
+        pm.run_module(&mut module).unwrap();
+
+        let f_body = module.functions[1].lowered();
+        let entry = f_body.entry;
+        match &f_body.blocks[entry.0 as usize].terminator {
+            Terminator::Return {
+                val: Some(Operand::Const(Constant::Number(n))),
+            } => assert_eq!(*n, 22.0, "should fold (10 + 1) * 2 → 22"),
+            other => panic!("expected ret 22, got {other:?}"),
+        }
     }
 }
