@@ -2911,11 +2911,14 @@ impl<'b, 'm> Converter<'b, 'm> {
         self.sealed.insert(try_entry_b);
         self.sealed.insert(catch_entry_b);
 
-        // Framing terminator on the current (framing) block.
+        // Framing terminator on the current (framing) block. Phase A
+        // shape: catch present, no finally. Phase B's lower_try
+        // (commit 2) handles all three shapes.
         self.builder.set_terminator(Terminator::Try {
             try_entry: try_entry_b,
             try_args: vec![],
-            catch_entry: catch_entry_b,
+            catch_entry: Some(catch_entry_b),
+            finally_entry: None,
             join: join_b,
         });
 
@@ -4199,13 +4202,17 @@ fn edge_args(t: &Terminator, dst: BlockId) -> Option<&[Operand]> {
             try_entry,
             try_args,
             catch_entry,
+            finally_entry,
             ..
         } => {
             if *try_entry == dst {
                 Some(try_args.as_slice())
-            } else if *catch_entry == dst {
+            } else if catch_entry.map_or(false, |c| c == dst) {
                 // Catch entry takes no edge args (CatchValue inst supplies
                 // the exception value).
+                Some([].as_slice())
+            } else if finally_entry.map_or(false, |f| f == dst) {
+                // Finally entry takes no edge args (Phase B).
                 Some([].as_slice())
             } else {
                 None
@@ -4254,10 +4261,15 @@ fn push_edge_arg(t: &mut Terminator, dst: BlockId, op: Operand) {
         } if *try_entry == dst => {
             try_args.push(op);
         }
-        Terminator::Try { catch_entry, .. } if *catch_entry == dst => {
+        Terminator::Try { catch_entry, .. } if catch_entry.map_or(false, |c| c == dst) => {
             panic!(
                 "push_edge_arg: catch_entry takes no edge args; use CatchValue \
                  instruction at the catch entry instead"
+            );
+        }
+        Terminator::Try { finally_entry, .. } if finally_entry.map_or(false, |f| f == dst) => {
+            panic!(
+                "push_edge_arg: finally_entry takes no edge args under Phase B"
             );
         }
         _ => panic!("push_edge_arg: terminator does not target bb{}", dst.0),

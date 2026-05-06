@@ -671,42 +671,50 @@ impl LowerCtx<'_> {
                     try_entry,
                     try_args,
                     catch_entry,
+                    finally_entry,
                     join,
                 } => {
-                    // Reconstruct `try { … } catch (param) { … }` from
-                    // the structural framing. Body and catch each walk
-                    // up to `join` (the post-try landing block); both
-                    // bodies' tails terminate in `Branch { target: join }`
-                    // (modulo abrupt completion). See
-                    // docs/design-try-phase-a.md §1.
-                    //
-                    // Phase A does not produce `finally` blocks — the
-                    // construction site (lower_ssa) routes
-                    // try-with-finally through fallback. Reconstruction
-                    // therefore always emits `Stmt::Try { finally: None }`.
+                    // Reconstruct `try { … } catch (param) { … } finally { … }`
+                    // from the structural framing. Each body walks up
+                    // to its successor landmark:
+                    //   - try-body stops at finally_entry (if present)
+                    //     or join.
+                    //   - catch-body stops at finally_entry (if present)
+                    //     or join.
+                    //   - finally-body stops at join.
+                    // See docs/design-try-phase-a.md §1 (Phase A) and
+                    // docs/design-try-phase-b.md §1 (Phase B).
+
+                    let body_stop = finally_entry.unwrap_or(join);
 
                     // Walk try-body.
                     let mut try_body_stmts = Vec::new();
                     self.emit_edge_copies(try_entry, &try_args, &mut try_body_stmts);
-                    self.walk(try_entry, Some(join), &mut try_body_stmts);
+                    self.walk(try_entry, Some(body_stop), &mut try_body_stmts);
 
-                    // Walk catch-body. Inspect catch_entry's first
-                    // instruction: if it's `CatchValue`, extract the
-                    // catch-param name from its result Value's
-                    // source name. The CatchValue inst itself is
-                    // suppressed in emit_inst (the JS `catch (param)`
-                    // syntax binds the param implicitly), but its
-                    // hoisted-name lookup still works for references
-                    // inside the catch body.
-                    let catch_param_name = self
-                        .first_inst_catch_param_name(catch_entry);
-                    let mut catch_body_stmts = Vec::new();
-                    self.walk(catch_entry, Some(join), &mut catch_body_stmts);
+                    // Walk catch-body if present. CatchValue's
+                    // hoisted-name lookup yields the catch-param name;
+                    // emit_inst suppresses the CatchValue binding
+                    // itself (the JS `catch (param)` syntax binds it
+                    // implicitly).
+                    let catch_clause = catch_entry.map(|ce| {
+                        let param_name = self.first_inst_catch_param_name(ce);
+                        let mut stmts = Vec::new();
+                        self.walk(ce, Some(body_stop), &mut stmts);
+                        (param_name, stmts)
+                    });
+
+                    // Walk finally-body if present.
+                    let finally_clause = finally_entry.map(|fe| {
+                        let mut stmts = Vec::new();
+                        self.walk(fe, Some(join), &mut stmts);
+                        stmts
+                    });
 
                     out.push(Stmt::Try {
                         body: try_body_stmts,
-                        catch: Some((catch_param_name, catch_body_stmts)),
-                        finally: None,
+                        catch: catch_clause,
+                        finally: finally_clause,
                     });
 
                     if Some(join) == stop {
