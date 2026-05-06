@@ -2215,15 +2215,11 @@ fn is_valid_js_ident(s: &str) -> bool {
     )
 }
 
+/// Local adapter over `ir::ssa::find_value_for_inst` so call sites can
+/// pass `&Function` directly (rather than threading through `lowered()`
+/// at every call). Pure thin wrapper.
 fn find_value_for_inst(func: &Function, iid: InstId) -> Value {
-    for (i, def) in func.lowered().values.iter().enumerate() {
-        if let ValueDefKind::Inst(j) = &def.kind
-            && *j == iid
-        {
-            return Value(i as u32);
-        }
-    }
-    panic!("instruction {iid:?} has no value-def");
+    ir::ssa::find_value_for_inst(func.lowered(), iid)
 }
 
 // ============================================================================
