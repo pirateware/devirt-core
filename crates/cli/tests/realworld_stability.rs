@@ -3,15 +3,12 @@
 //! Tests the parse → IR → emit pipeline against real-world JS files.
 //! Records success/failure for each phase and generates a report.
 
-use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use cli::coverage::{self, ModuleCoverage};
 use cli::emit;
-use cli::error::Error;
-use cli::ir::tree::Module as TreeModule;
 use cli::lower;
 
 /// Test result for a single file
@@ -144,7 +141,7 @@ fn test_file(path: &Path, tier: Tier) -> TestResult {
     result.tl_pt_pct = calculate_tl_pt_pct(&cov);
 
     // Step 2: Lower to SSA and validate
-    let mut ssa_module = cli::ir::lower_ssa::lower_module(&tree_module);
+    let ssa_module = cli::ir::lower_ssa::lower_module(&tree_module);
     result.validate_ok = match ssa_module.validate() {
         Ok(()) => true,
         Err(e) => {
@@ -365,11 +362,6 @@ mod tests {
 
         let results = run_realworld_tests(&corpus);
 
-        // Check that we found some files
-        let tier1_results: Vec<_> = results
-            .iter()
-            .filter(|r| matches!(r.tier, Tier::Tier1))
-            .collect();
         // Hard CI gate: every file in every tier must parse and
         // structurally round-trip. The gate previously only printed
         // and returned; now it asserts so regressions surface as
@@ -460,7 +452,7 @@ mod per_file_tests {
     }
     #[test] fn t1_datefns_format() { test_tier1("datefns_format.js"); }
     #[test] fn t1_lodash_debounce() { test_tier1("lodash_debounce.js"); }
-    #[test] fn t1_lodash_cloneDeep() { test_tier1("lodash_cloneDeep.js"); }
+    #[test] fn t1_lodash_clone_deep() { test_tier1("lodash_cloneDeep.js"); }
 
     #[test]
     fn t_all_tier3() {
@@ -486,7 +478,6 @@ mod per_file_tests {
 
 #[cfg(test)]
 mod overflow_debug {
-    use super::*;
     use std::path::PathBuf;
 
     fn corpus_dir() -> PathBuf {

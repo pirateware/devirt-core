@@ -564,7 +564,7 @@ impl Lowerer<'_> {
                 // Single-declarator path only — multi-declarator is handled by
                 // lower_stmts_list / stmts_from which expand the decl in-place.
                 // Disposition guarantees single-declarator in for-init contexts.
-                let mut stmts = self.lower_var_decl(decl)?;
+                let stmts = self.lower_var_decl(decl)?;
                 debug_assert_eq!(stmts.len(), 1, "lower_stmt called for multi-declarator decl");
                 stmts.into_iter().next().ok_or_else(|| Error::Malformed("empty var decl".into()))
             }
@@ -1278,7 +1278,6 @@ fn lower_binop(op: js::BinaryOperator) -> Result<BinOp, Error> {
         B::Exponential => BinOp::Pow,
         B::In => BinOp::In,
         B::Instanceof => BinOp::Instanceof,
-        _ => return Err(Error::Unsupported("binary operator")),
     })
 }
 

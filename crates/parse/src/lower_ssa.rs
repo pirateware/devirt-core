@@ -17,9 +17,8 @@ use std::collections::{HashMap, HashSet};
 
 use ir::free_vars;
 use ir::ssa::{
-    self, BasicBlock, BlockId, Constant, FuncId, FunctionBuilder, InstKind, Operand, Purity, StrId,
-    Terminator, TopLevelEntry, Value, ValueDef, ValueDefKind, walk_inst_operands_mut,
-    walk_term_operands_mut,
+    self, BlockId, Constant, FuncId, FunctionBuilder, InstKind, Operand, Purity, StrId,
+    Terminator, TopLevelEntry, Value, ValueDef, ValueDefKind,
 };
 use ir::tree::{self, BinOp, Expr, FuncBody, FuncLiteral, Stmt, UnOp, UpdateOp};
 
@@ -4249,12 +4248,6 @@ fn remove_edge_arg(t: &mut Terminator, dst: BlockId, index: usize) {
     }
 }
 
-
-// Silence dead-code lint on `BasicBlock` import — currently re-exported only
-// because `walk_*_mut` and helpers may grow to need direct access in future
-// changes. Kept here so the dependency is explicit.
-#[allow(dead_code)]
-fn _unused_basic_block(_: &BasicBlock) {}
 
 // ============================================================================
 // Tests

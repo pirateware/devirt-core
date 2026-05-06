@@ -528,6 +528,10 @@ fn _silence_unused() {
 /// trip the cross-check: the lowering will return
 /// `Error::Unsupported("class declaration")`, but the walker said
 /// `Lowered`, so the asymmetric debug check panics.
+///
+/// Only consumed by `#[cfg(debug_assertions)]` tests below; gated
+/// the same way to avoid an "unused" warning under `--release`.
+#[cfg(debug_assertions)]
 fn always_lowered(_p: &js::FormalParameters, _b: &js::FunctionBody) -> Disposition {
     Disposition::Lowered
 }
