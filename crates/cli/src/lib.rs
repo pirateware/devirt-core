@@ -48,6 +48,7 @@ pub fn process(source: &str) -> Result<String, error::Error> {
         .validate()
         .map_err(|errs| error::Error::Malformed(format!("SSA validation: {errs:#?}")))?;
     let mut pm = ::pass::PassManager::new();
+    pm.add_pass(Box::new(::pass::refine_purity::RefinePurityPass));
     pm.add_pass(Box::new(::pass::refine_arith::RefineArithPass));
     pm.add_pass(Box::new(::pass::const_fold::ConstFoldPass));
     pm.add_pass(Box::new(::pass::branch_fold::BranchFoldPass));

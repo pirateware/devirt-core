@@ -105,6 +105,7 @@ fn main() -> ExitCode {
         // (which only folds typed arithmetic). The manager's fixed-point
         // loop handles the refine→fold→refine cascade.
         let mut pm = PassManager::new();
+        pm.add_pass(Box::new(::pass::refine_purity::RefinePurityPass));
         pm.add_pass(Box::new(::pass::refine_arith::RefineArithPass));
         pm.add_pass(Box::new(::pass::const_fold::ConstFoldPass));
         pm.add_pass(Box::new(::pass::branch_fold::BranchFoldPass));

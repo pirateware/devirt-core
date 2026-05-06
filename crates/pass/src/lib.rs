@@ -24,6 +24,7 @@ pub mod const_fold;
 pub mod copy_prop;
 pub mod dce;
 pub mod refine_arith;
+pub mod refine_purity;
 
 /// A single function-local pass. Returns `true` iff `func` was mutated.
 ///
