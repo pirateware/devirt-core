@@ -19,7 +19,9 @@
 use ir::error::Error;
 use ir::ssa::{FuncId, Module, pretty_function};
 
+pub mod branch_fold;
 pub mod const_fold;
+pub mod dce;
 pub mod refine_arith;
 
 /// A single function-local pass. Returns `true` iff `func` was mutated.

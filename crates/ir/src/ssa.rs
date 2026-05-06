@@ -1098,27 +1098,7 @@ impl<'m> FunctionBuilder<'m> {
     }
 
     pub fn finish(mut self) -> FuncId {
-        for blk in self.body.blocks.iter_mut() {
-            blk.predecessors.clear();
-        }
-        let n = self.body.blocks.len();
-        for src_idx in 0..n {
-            let src = BlockId(src_idx as u32);
-            let succs: Vec<BlockId> = self.body.blocks[src_idx]
-                .terminator
-                .successors()
-                .iter()
-                .map(|(t, _)| *t)
-                .collect();
-            for t in succs {
-                if (t.0 as usize) < n {
-                    let preds = &mut self.body.blocks[t.0 as usize].predecessors;
-                    if !preds.contains(&src) {
-                        preds.push(src);
-                    }
-                }
-            }
-        }
+        self.body.rebuild_predecessors();
         // Constraint: every captured-by-passthrough Value must carry a
         // source_name. PassThrough bodies refer to their captures by
         // lexical name, so a synthesized intermediate (no name) cannot
@@ -1913,6 +1893,34 @@ impl LoweredBody {
     /// internal state (e.g., `current_def`) and Function-level metadata
     /// (e.g., `captured_by_passthrough`) need separate handling at the
     /// caller.
+    /// Rebuild every block's `predecessors` list from its terminator's
+    /// successors. Passes that mutate terminators (branch folding,
+    /// CFG simplification, etc.) MUST call this before validation runs
+    /// or the predecessor invariant trips. Idempotent.
+    pub fn rebuild_predecessors(&mut self) {
+        let n = self.blocks.len();
+        for blk in self.blocks.iter_mut() {
+            blk.predecessors.clear();
+        }
+        for src_idx in 0..n {
+            let src = BlockId(src_idx as u32);
+            let succs: Vec<BlockId> = self.blocks[src_idx]
+                .terminator
+                .successors()
+                .iter()
+                .map(|(t, _)| *t)
+                .collect();
+            for t in succs {
+                if (t.0 as usize) < n {
+                    let preds = &mut self.blocks[t.0 as usize].predecessors;
+                    if !preds.contains(&src) {
+                        preds.push(src);
+                    }
+                }
+            }
+        }
+    }
+
     pub fn replace_value_uses(&mut self, old: Value, new: Operand) {
         for inst in &mut self.instructions {
             walk_inst_operands_mut(&mut inst.kind, &mut |op| {

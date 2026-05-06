@@ -107,6 +107,8 @@ fn main() -> ExitCode {
         let mut pm = PassManager::new();
         pm.add_pass(Box::new(::pass::refine_arith::RefineArithPass));
         pm.add_pass(Box::new(::pass::const_fold::ConstFoldPass));
+        pm.add_pass(Box::new(::pass::branch_fold::BranchFoldPass));
+        pm.add_pass(Box::new(::pass::dce::DcePass));
         if let Err(e) = pm.run_module(&mut ssa_module) {
             eprintln!("\ninternal error: pass pipeline failed: {e}");
             return ExitCode::FAILURE;

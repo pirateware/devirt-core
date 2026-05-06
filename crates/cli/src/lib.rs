@@ -50,6 +50,8 @@ pub fn process(source: &str) -> Result<String, error::Error> {
     let mut pm = ::pass::PassManager::new();
     pm.add_pass(Box::new(::pass::refine_arith::RefineArithPass));
     pm.add_pass(Box::new(::pass::const_fold::ConstFoldPass));
+    pm.add_pass(Box::new(::pass::branch_fold::BranchFoldPass));
+    pm.add_pass(Box::new(::pass::dce::DcePass));
     pm.run_module(&mut ssa_module)?;
     let back = ::parse::lower_tree::lower_module(&ssa_module);
     Ok(::emit::emit(&back))
