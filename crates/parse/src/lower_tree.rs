@@ -1312,6 +1312,20 @@ impl LowerCtx<'_> {
     /// `dominator` dominates `dominated` iff every path from entry to
     /// `dominated` passes through `dominator`. Equivalent: removing
     /// `dominator` leaves `dominated` unreachable from entry.
+    ///
+    /// Dominance is a reachability-conditional property: if `dominated`
+    /// is unreachable from entry to begin with, dominance is undefined
+    /// and we return `false`. Without that guard, the
+    /// reachability-by-blocking BFS below would conclude
+    /// `reaches_target=false` for any unreachable target — regardless
+    /// of `dominator` — and report `dominates=true`, falsely flagging
+    /// every block as a dominator of every unreachable block. That
+    /// misclassification surfaced on `lodash_cloneDeep.high.js`: a
+    /// stale predecessor entry pointed at an unreachable block, which
+    /// then registered as a phantom back-edge in
+    /// `compute_loop_info` (the dominated-predecessor check), causing
+    /// `loop_info` to attempt loop-shape analysis on a non-loop and
+    /// panic when neither cbr branch reached the alleged header.
     fn dominates(&mut self, dominator: BlockId, dominated: BlockId) -> bool {
         if dominator == dominated {
             return true;
@@ -1322,6 +1336,16 @@ impl LowerCtx<'_> {
         let key = (dominator, dominated);
         if let Some(v) = self.dom_cache.get(&key) {
             return *v;
+        }
+        // Reachability precondition: an unreachable `dominated` is not
+        // dominated by any block (textbook definition). The cache is
+        // shared with the post-block walk below; this short-circuit
+        // does not pollute it because we only insert under `key` after
+        // the full computation.
+        let from_entry = self.forward_reachable(self.func.lowered().entry);
+        if !from_entry.contains(&dominated) {
+            self.dom_cache.insert(key, false);
+            return false;
         }
         let mut visited: HashSet<BlockId> = HashSet::new();
         let mut stack = vec![self.func.lowered().entry];
@@ -2345,6 +2369,90 @@ mod tests {
         cfg.immovable_names.insert(v_a.0, "y".to_string());
         cfg.immovable_names.insert(v_b.0, "y".to_string());
         let _ = lower_module_with_config(&module, &cfg);
+    }
+
+    /// Regression for the `loop_info` / `dominates` phantom back-edge
+    /// bug. Original failure: a function with `this` whose CFG ended up
+    /// with a stale predecessor pointing at an unreachable block.
+    /// `dominates(b, p)` returned `true` for unreachable `p` (the BFS
+    /// from entry never reached `p` regardless of blocking through
+    /// `b`), which then registered as a phantom back-edge in
+    /// `compute_loop_info`, panicking when neither of the alleged
+    /// header's cbr branches reached the header. Fixed by adding a
+    /// reachability precondition to `dominates`.
+    ///
+    /// The exact CFG shape that triggered this lives in
+    /// `corpus/realworld/tier3/lodash_cloneDeep.high.js`; the
+    /// `debug_clonedeep_high` test in `realworld_stability.rs` is the
+    /// integration-level regression. This unit test is a small,
+    /// focused source-level check that `this`-using functions go
+    /// through the full pipeline without panicking — the smallest
+    /// correctness contract the fix establishes.
+    #[test]
+    fn this_in_loop_does_not_panic_loop_info() {
+        // Method-style body: `this` reference, conditional branch,
+        // loop back-edge from an inner `if/continue`. Roughly the
+        // shape that exercises the dominance check in
+        // `compute_loop_info`.
+        let src = r#"
+            function f() {
+                let i = 0;
+                while (i < 10) {
+                    if (this.skip(i)) {
+                        i = i + 1;
+                        continue;
+                    }
+                    this.handle(i);
+                    i = i + 1;
+                }
+                return this.result;
+            }
+        "#;
+        let out = full_roundtrip(src);
+        assert!(out.contains("this"), "this must survive: {out}");
+    }
+
+    /// Regression for `build_top_level_layout`: when a top-level
+    /// function contains an inner function literal, the second
+    /// top-level function gets dropped from the output.
+    ///
+    /// Root cause: `discover_module` assigns FuncIds via
+    /// `pending.len()`, which counts top-level + inner literals
+    /// interleaved (top-level first, then inner literals discovered
+    /// inside its body, then the next top-level). So the second
+    /// top-level function's FuncId is `1 + (count of inner literals in
+    /// the first)`, not `1`. But `build_top_level_layout` uses a
+    /// sequential counter `0, 1, 2, ...` that only counts top-level
+    /// items. The `TopLevelEntry::Function(FuncId(1))` it records for
+    /// the second top-level function actually points at an inner
+    /// literal — which `lower_module_inner` recognizes via
+    /// `inner_targets` and silently skips, dropping the top-level
+    /// item entirely.
+    ///
+    /// This bug doesn't bite the corpus because most corpus files
+    /// have a single top-level function (the IIFE wrapper). Surfaces
+    /// only with 2+ top-level functions where the first has nested
+    /// literals.
+    #[test]
+    fn second_top_level_function_after_inner_literal_is_not_dropped() {
+        let src = r#"
+            function first(x) {
+                let inner = function (y) { return y + 1; };
+                return inner(x);
+            }
+            function second(z) {
+                return z * 2;
+            }
+        "#;
+        let out = full_roundtrip(src);
+        assert!(
+            out.contains("function first"),
+            "first must emit:\n{out}"
+        );
+        assert!(
+            out.contains("function second"),
+            "second was silently dropped (build_top_level_layout bug):\n{out}"
+        );
     }
 
     /// `-0` must survive the roundtrip as negative zero, not be silently
