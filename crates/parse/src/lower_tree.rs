@@ -358,6 +358,18 @@ struct LoopInfo {
     exit_b: BlockId,
 }
 
+/// Operands captured during `detect_forin_loop` and used by
+/// `emit_for_in` to reconstruct `Stmt::ForIn { binding, obj, body }`.
+#[derive(Clone, Debug)]
+struct ForInPattern {
+    obj: Operand,
+    iter_op: Operand,
+    init_iid: InstId,
+    done_iid: InstId,
+    next_iid: InstId,
+    pre_header_b: BlockId,
+}
+
 impl<'a> LowerCtx<'a> {
     fn new(
         sm: &'a ssa::Module,
@@ -634,7 +646,16 @@ impl LowerCtx<'_> {
             // header's instructions are part of the loop's per-iteration
             // condition evaluation, not pre-loop work.
             if let Some(info) = self.loop_info(cur) {
-                self.emit_loop(cur, info, out);
+                // Try the ForIn pattern first — it's a special-case
+                // four-block loop (pre-header / header / body / exit)
+                // distinguished by ForInInit/Done/Next instructions.
+                // Falls through to the generic while-loop emission if
+                // the pattern doesn't match.
+                if let Some(pat) = self.detect_forin_loop(cur, info) {
+                    self.emit_for_in(cur, info, pat, out);
+                } else {
+                    self.emit_loop(cur, info, out);
+                }
                 cur = info.exit_b;
                 continue;
             }
@@ -851,6 +872,24 @@ impl LowerCtx<'_> {
         // there's no such function and the param is already bound by
         // the surrounding `Stmt::Try`'s catch clause.
         if matches!(kind, InstKind::CatchValue) {
+            return;
+        }
+        // For-in iteration InstKinds are consumed by the surrounding
+        // `Stmt::ForIn` reconstruction; their binding-statement
+        // emissions are suppressed here. `ForInInit` is in the
+        // pre-header (would surface as `let __iter = for_in_init(obj);`),
+        // `ForInDone` is the lone header inst (would surface as
+        // `let __done = for_in_done(__iter);`), and `ForInNext` is
+        // the body's first inst (consumed by emit_for_in via
+        // emit_block_insts_skip_first; this branch covers the case
+        // where ForInNext leaks through some other path). All three
+        // are encoded into the surrounding `for (binding in obj)`.
+        if matches!(
+            kind,
+            InstKind::ForInInit { .. }
+                | InstKind::ForInDone { .. }
+                | InstKind::ForInNext { .. }
+        ) {
             return;
         }
         if kind.is_void() {
@@ -1102,14 +1141,26 @@ impl LowerCtx<'_> {
                 callee: Box::new(Expr::Ident("eval".to_string())),
                 args: vec![self.operand_to_expr(source)],
             },
-            // CatchValue is reconstructed in commit 3 by binding the
-            // catch-param name at catch_entry and resugaring the
-            // CatchValue inst's result-name use as the bare param. At
-            // commit 1 the inst is never emitted because no construction
-            // site exists; surface a clear panic if it leaks through.
-            CatchValue => unimplemented!(
-                "lower_tree: CatchValue reconstruction lands in \
-                 Try-Phase-A commit 3"
+            // CatchValue is consumed by the Stmt::Try reconstruction
+            // (see the Terminator::Try arm in `walk`); the inst's
+            // emission is suppressed at the start of catch_entry.
+            // Reaching this fallback means the pattern-match missed
+            // — the JS `catch (param)` syntax binds the value
+            // implicitly, so a free CatchValue is meaningless.
+            CatchValue => unreachable!(
+                "lower_tree: CatchValue reached inst_kind_to_expr — \
+                 Stmt::Try reconstruction should have consumed it"
+            ),
+            // For-in iteration InstKinds are consumed by the
+            // four-block `Stmt::ForIn` reconstruction pattern in
+            // `walk` (loop_info detection). Reaching this fallback
+            // means the pattern-match missed — surface as a clear
+            // panic so the next maintainer knows where to look.
+            ForInInit { .. } | ForInDone { .. } | ForInNext { .. } => unreachable!(
+                "lower_tree: ForIn iteration InstKind reached \
+                 inst_kind_to_expr — the four-block ForIn loop \
+                 pattern in `walk` should have consumed it. See \
+                 docs/design-forin.md."
             ),
         }
     }
@@ -1392,6 +1443,144 @@ impl LowerCtx<'_> {
         // Emit copies for the exit-edge into exit_b. (lower_while produces
         // empty exit_args, so this is a no-op in the typical case.)
         self.emit_edge_copies(info.exit_b, &exit_args, out);
+    }
+
+    /// Pattern detected at a loop header that distinguishes a `for-in`
+    /// loop from a generic while-loop. Carries the operands needed by
+    /// `emit_for_in` to reconstruct `Stmt::ForIn { kind, binding, obj, body }`.
+    fn detect_forin_loop(&mut self, header: BlockId, info: LoopInfo) -> Option<ForInPattern> {
+        let header_blk = &self.func.lowered().blocks[header.0 as usize];
+        // Header must end in `CondBranch cond, exit, body` where cond is
+        // a `ForInDone(iter)` instruction. Construction emits
+        // `ForInDone` then `CondBranch cond=done, then=exit, else=body`.
+        let (cond_op, then_b, else_b) = match &header_blk.terminator {
+            Terminator::CondBranch { cond, then_b, else_b, .. } => (*cond, *then_b, *else_b),
+            _ => return None,
+        };
+        // Construction emits `then_b == exit` (taken when iteration is
+        // exhausted). loop_info classifies the back-edge-reaching branch
+        // as body_b — so for our shape, info.body_b == else_b and
+        // info.exit_b == then_b.
+        if info.body_b != else_b || info.exit_b != then_b {
+            return None;
+        }
+        // Header's cond must be a single inst in the header.
+        let cv = match cond_op {
+            Operand::Value(v) => v,
+            _ => return None,
+        };
+        let cv_inst = match self.func.lowered().values[cv.0 as usize].kind {
+            ValueDefKind::Inst(iid) => iid,
+            _ => return None,
+        };
+        if header_blk.instructions.len() != 1 || header_blk.instructions[0] != cv_inst {
+            return None;
+        }
+        let iter_op = match &self.func.lowered().instructions[cv_inst.0 as usize].kind {
+            InstKind::ForInDone { iter } => *iter,
+            _ => return None,
+        };
+        // Body's first inst must be a matching `ForInNext(iter)`.
+        let body_blk = &self.func.lowered().blocks[info.body_b.0 as usize];
+        let next_iid = *body_blk.instructions.first()?;
+        let next_iter = match &self.func.lowered().instructions[next_iid.0 as usize].kind {
+            InstKind::ForInNext { iter } => *iter,
+            _ => return None,
+        };
+        // Iter operand match: ForInDone and ForInNext must use the
+        // same iter Value (Operand doesn't derive PartialEq;
+        // construction always emits Value-typed iters).
+        match (iter_op, next_iter) {
+            (Operand::Value(a), Operand::Value(b)) if a.0 == b.0 => {}
+            _ => return None,
+        }
+        // Pre-header (header's non-back-edge predecessor) must end with
+        // a `ForInInit(obj)` whose result is `iter`. The pre-header is
+        // the unique predecessor of `header` that is NOT dominated by
+        // `header` (the back-edge predecessor IS).
+        let pre_header_b = header_blk
+            .predecessors
+            .iter()
+            .copied()
+            .find(|p| !self.is_back_edge_pred(*p, header))?;
+        let pre_header_blk = &self.func.lowered().blocks[pre_header_b.0 as usize];
+        let init_iid = *pre_header_blk.instructions.last()?;
+        let obj_op = match &self.func.lowered().instructions[init_iid.0 as usize].kind {
+            InstKind::ForInInit { obj } => *obj,
+            _ => return None,
+        };
+        // Iter operand must match the ForInInit's result.
+        let iter_value = match iter_op {
+            Operand::Value(v) => v,
+            _ => return None,
+        };
+        let init_result_inst = match self.func.lowered().values[iter_value.0 as usize].kind {
+            ValueDefKind::Inst(i) => i,
+            _ => return None,
+        };
+        if init_result_inst != init_iid {
+            return None;
+        }
+        Some(ForInPattern {
+            obj: obj_op,
+            iter_op,
+            init_iid,
+            done_iid: cv_inst,
+            next_iid,
+            pre_header_b,
+        })
+    }
+
+    /// Cheap "is `pred` reached only via a back-edge from `header`'s
+    /// dominated subgraph" check — a back-edge predecessor IS reached
+    /// from header (since header dominates the body), whereas the
+    /// pre-header is not.
+    fn is_back_edge_pred(&mut self, pred: BlockId, header: BlockId) -> bool {
+        self.dominates(header, pred)
+    }
+
+    /// Emit `Stmt::ForIn { kind: "var", binding, obj, body }` for a
+    /// detected ForIn loop. Body is walked from `info.body_b`'s
+    /// instruction-after-ForInNext up to the back-edge.
+    fn emit_for_in(
+        &mut self,
+        header: BlockId,
+        info: LoopInfo,
+        pat: ForInPattern,
+        out: &mut Vec<Stmt>,
+    ) {
+        // The user's binding name is the source-tagged name on the
+        // `ForInNext` result Value. Construction calls `set_source_name`
+        // with the original `binding` string from the tree-IR's
+        // `Stmt::ForIn { binding, .. }`.
+        let next_value = find_value_for_inst(self.func, pat.next_iid);
+        let binding_name = self.name_for(next_value).to_string();
+        let obj_expr = self.operand_to_expr(&pat.obj);
+
+        // Body: walk body_b until reaching `header` (back-edge stop).
+        // The leading `ForInNext` inst is suppressed by emit_inst's
+        // ForInInit/Done/Next match (set in commit 1), so the standard
+        // `walk` machinery handles bodies with internal control flow
+        // (nested if / loop / switch / etc.) naturally.
+        let mut body_stmts = Vec::new();
+        self.loop_headers_open.push(header);
+        self.walk(info.body_b, Some(header), &mut body_stmts);
+        let popped = self.loop_headers_open.pop();
+        debug_assert_eq!(popped, Some(header));
+
+        // The pre-header's `ForInInit` and the header's `ForInDone` are
+        // implicit in the emitted `for (binding in obj)` — emit_block_insts
+        // for those blocks must NOT emit them as bare `let __vN = for_in_init(obj)`
+        // statements. Construction places these instructions at known
+        // positions; reconstruction's emit_inst suppresses them by
+        // checking the InstKind. (See emit_inst's CatchValue precedent.)
+
+        out.push(Stmt::ForIn {
+            kind: "var".to_string(),
+            binding: binding_name,
+            obj: Box::new(obj_expr),
+            body: body_stmts,
+        });
     }
 
     /// If the header's cond is the result of a single instruction in the

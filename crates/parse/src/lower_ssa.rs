@@ -1202,7 +1202,12 @@ fn push_passthrough_function(sm: &mut ssa::Module, lit: &tree::FuncLiteral) {
 fn body_needs_ssa_fallback(stmts: &[Stmt]) -> bool {
     fn visit_stmt(s: &Stmt) -> bool {
         match s {
-            Stmt::ForIn { .. } => true,
+            // ForIn is now lowered through real SSA via the four-block
+            // pattern (ForInInit/Done/Next + standard while-loop CFG).
+            // Walk the body for any nested fallback-trigger.
+            Stmt::ForIn { obj, body, .. } => {
+                visit_expr(obj) || body.iter().any(visit_stmt)
+            }
             // Phase B: all three try shapes (try+catch, try+catch+finally,
             // try+finally) lower through real SSA. The pathological
             // `try { } { }` (no catch, no finally — illegal JS) can't
@@ -2355,13 +2360,9 @@ impl<'b, 'm> Converter<'b, 'm> {
                 let finally_arg = finally.as_ref().map(|fb| fb.as_slice());
                 self.lower_try(body, catch_arg, finally_arg);
             }
-            Stmt::ForIn { .. } => {
-                // ForIn stays in fallback (own ticket).
-                unreachable!(
-                    "Stmt::ForIn reached SSA conversion — \
-                     body_needs_ssa_fallback should have routed this function \
-                     to PassThrough"
-                );
+            Stmt::ForIn { kind, binding, obj, body } => {
+                self.lower_for_in(kind, binding, obj, body);
+                return;
             }
         }
     }
@@ -2724,6 +2725,99 @@ impl<'b, 'm> Converter<'b, 'm> {
         self.bind_in_top_scope(binding.to_string(), binding_sym);
         let cb = self.current_block();
         self.write_variable(binding_sym, cb, binding_val);
+
+        for s in body {
+            self.lower_stmt(s);
+        }
+
+        self.pop_scope();
+        self.break_stack.pop();
+        let body_end = self.current_block();
+        if !self.is_terminated(body_end) {
+            self.builder.set_terminator(Terminator::Branch {
+                target: header_b,
+                args: vec![],
+            });
+        }
+
+        self.seal_block(header_b);
+        self.builder.switch_to_block(exit_b);
+        self.pop_scope();
+    }
+
+    /// Lower `for (binding in obj) body` into the four-block ForIn
+    /// pattern detected by `lower_tree::detect_forin_loop`.
+    /// See docs/design-forin.md.
+    fn lower_for_in(&mut self, _kind: &str, binding: &str, obj: &Expr, body: &[Stmt]) {
+        self.push_scope();
+
+        // Pre-header: emit ForInInit(obj). The current block IS the
+        // pre-header (we don't allocate a new block — `lower_for_in` is
+        // called when the converter is mid-block, like every other
+        // loop lowerer).
+        let obj_op = self.convert_expr(obj);
+        let iter_val = self.emit(InstKind::ForInInit { obj: obj_op });
+
+        // Stash the iterator in a symbol so header / body can read it.
+        let iter_name = format!("__forin_iter_{}__", binding);
+        let iter_sym = self.fresh_symbol();
+        let iter_strid = self.builder.intern(&iter_name);
+        if let Operand::Value(v) = iter_val {
+            self.builder.set_source_name(v, iter_strid);
+        }
+        self.bind_in_top_scope(iter_name, iter_sym);
+        let cb = self.current_block();
+        self.write_variable(iter_sym, cb, iter_val);
+
+        // CFG: pre → header → (body | exit). Same shape as while.
+        let header_b = self.builder.new_block();
+        let body_b = self.builder.new_block();
+        let exit_b = self.builder.new_block();
+
+        self.builder.set_terminator(Terminator::Branch {
+            target: header_b,
+            args: vec![],
+        });
+        self.sealed.insert(body_b);
+        self.sealed.insert(exit_b);
+
+        // Header: `done = ForInDone(iter); CondBranch done, exit, body`.
+        // Note: then = exit (taken when iteration is exhausted),
+        // else = body. This is reversed from lower_while's typical
+        // shape but avoids a `Not` instruction in the header — cleaner
+        // single-inst header, and matches detect_forin_loop's pattern.
+        self.builder.switch_to_block(header_b);
+        let cb = self.current_block();
+        let iter_op = self.read_variable(iter_sym, cb);
+        let done_val = self.emit(InstKind::ForInDone { iter: iter_op });
+        self.builder.set_terminator(Terminator::CondBranch {
+            cond: done_val,
+            then_b: exit_b,
+            then_args: vec![],
+            else_b: body_b,
+            else_args: vec![],
+        });
+
+        // Body: `key = ForInNext(iter)`; bind to user's `binding`
+        // symbol with source-name = binding string.
+        self.builder.switch_to_block(body_b);
+        self.break_stack.push(BreakFrame::Loop {
+            continue_to: header_b,
+            break_to: exit_b,
+        });
+        self.push_scope();
+
+        let cb = self.current_block();
+        let iter_op = self.read_variable(iter_sym, cb);
+        let key_val = self.emit(InstKind::ForInNext { iter: iter_op });
+        let binding_sym = self.fresh_symbol();
+        let binding_strid = self.builder.intern(binding);
+        if let Operand::Value(v) = key_val {
+            self.builder.set_source_name(v, binding_strid);
+        }
+        self.bind_in_top_scope(binding.to_string(), binding_sym);
+        let cb = self.current_block();
+        self.write_variable(binding_sym, cb, key_val);
 
         for s in body {
             self.lower_stmt(s);
@@ -4464,6 +4558,8 @@ fn walk_inst_operands_mut(kind: &mut InstKind, f: &mut impl FnMut(&mut Operand))
             f(obj);
         }
         CatchValue => {} // no operands
+        ForInInit { obj } => f(obj),
+        ForInDone { iter } | ForInNext { iter } => f(iter),
     }
 }
 
