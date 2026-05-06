@@ -25,6 +25,7 @@ fn main() {
         ("Tier 1", corpus_dir.join("tier1")),
         ("Tier 2", corpus_dir.join("tier2")),
         ("Tier 3", corpus_dir.join("tier3")),
+        ("Tier 4", corpus_dir.join("tier4")),
     ] {
         if !tier_dir.exists() {
             continue;
@@ -242,7 +243,7 @@ fn generate_and_write_report(
     report.push_str(&format!("- Panics/crashes: {}\n\n", panics));
 
     // Detailed results by tier
-    for tier in ["Tier 1", "Tier 2", "Tier 3"] {
+    for tier in ["Tier 1", "Tier 2", "Tier 3", "Tier 4"] {
         let tier_results: Vec<_> = results.iter().filter(|(t, _, _)| t == tier).collect();
         if tier_results.is_empty() {
             continue;
