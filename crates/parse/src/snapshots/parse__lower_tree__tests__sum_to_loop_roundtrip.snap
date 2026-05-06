@@ -1,10 +1,10 @@
 ---
-source: src/ir/lower_tree.rs
+source: crates/parse/src/lower_tree.rs
+assertion_line: 2434
 expression: out
 ---
 function sum_to(n) {
   let i;
-  let _t0;
   let s;
   let s_1;
   let i_1;

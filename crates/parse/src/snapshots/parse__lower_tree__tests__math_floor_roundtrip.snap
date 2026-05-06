@@ -1,12 +1,10 @@
 ---
-source: src/ir/lower_tree.rs
-assertion_line: 1603
+source: crates/parse/src/lower_tree.rs
+assertion_line: 2570
 expression: out
 ---
 function f(x) {
-  let _t0;
   let _t1;
-  _t0 = Math;
-  _t1 = _t0.floor(x);
+  _t1 = Math.floor(x);
   return _t1;
 }

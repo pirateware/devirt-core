@@ -35,11 +35,12 @@
 //!     are fine.
 
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use ir::ssa::{
-    self, BlockId, Constant, FuncId, Function, InstId, InstKind, Operand, Terminator, Value,
-    ValueDefKind,
+    self, BlockId, Constant, Effect, FuncId, Function, InstId, InstKind, Operand, Terminator,
+    Value, ValueDefKind, walk_inst_operands, walk_term_operands,
 };
 use ir::tree::{self, BinOp, Expr, IrFunction, Item, Stmt, UnOp};
 
@@ -308,6 +309,17 @@ struct LowerCtx<'a> {
     value_names: HashMap<u32, String>,
     /// Names to hoist at function-body top, in allocation order.
     hoisted: Vec<String>,
+    /// Values whose defining instruction is pure, single-use, same-block,
+    /// and unnamed — eligible for expression inlining at the use site.
+    /// `emit_inst` stashes the instruction's expression in `pending_inlines`
+    /// instead of emitting `_tN = expr;`, and `operand_to_expr` consumes
+    /// the stashed expression at the use site.
+    inlinable: HashSet<u32>,
+    /// Drained map of inlinable Value → its computed Expr. Mutated through
+    /// a RefCell because `emit_inst` and `operand_to_expr` are `&self` to
+    /// LowerCtx. After `walk` finishes the map should be empty; remaining
+    /// entries indicate a missed use site (debug-asserted).
+    pending_inlines: RefCell<HashMap<u32, Expr>>,
     /// Cached forward-reachability per block (for join detection).
     reachable_cache: HashMap<BlockId, HashSet<BlockId>>,
     /// Cached "is loop header" decisions.
@@ -375,12 +387,15 @@ impl<'a> LowerCtx<'a> {
         cfg: &EmitConfig,
         capture_names: Vec<String>,
     ) -> Self {
-        let (value_names, hoisted) = assign_names(sm, func, cfg);
+        let inlinable = compute_inlinable_values(func, cfg);
+        let (value_names, hoisted) = assign_names(sm, func, cfg, &inlinable);
         Self {
             sm,
             func,
             value_names,
             hoisted,
+            inlinable,
+            pending_inlines: RefCell::new(HashMap::new()),
             reachable_cache: HashMap::new(),
             loop_info_cache: HashMap::new(),
             dom_cache: HashMap::new(),
@@ -545,7 +560,12 @@ impl<'a> LowerCtx<'a> {
 
     fn operand_to_expr(&self, op: &Operand) -> Expr {
         match op {
-            Operand::Value(v) => Expr::Ident(self.name_for(*v).to_string()),
+            Operand::Value(v) => {
+                if let Some(expr) = self.pending_inlines.borrow_mut().remove(&v.0) {
+                    return expr;
+                }
+                Expr::Ident(self.name_for(*v).to_string())
+            }
             Operand::Const(c) => self.constant_to_expr(c),
             Operand::Capture(idx) => {
                 // Lowered inner functions reference enclosing-scope values
@@ -933,10 +953,8 @@ impl LowerCtx<'_> {
             return;
         }
 
-        let name = {
-            let v = find_value_for_inst(self.func, iid);
-            self.name_for(v).to_string()
-        };
+        let v = find_value_for_inst(self.func, iid);
+        let name = self.name_for(v).to_string();
         // Inst lowering may need to synthesize predecessor statements
         // (e.g. PassThrough closures capturing const-bound names that
         // never materialize as Inst values; without a synthetic
@@ -944,7 +962,16 @@ impl LowerCtx<'_> {
         // reference to `x` would dangle in the emitted code).
         let mut pre_stmts: Vec<Stmt> = Vec::new();
         let value_expr = self.inst_kind_to_expr(kind, &mut pre_stmts);
-        out.extend(pre_stmts);
+        out.extend(pre_stmts.iter().cloned());
+        // Inlining: if the Value is single-use, pure, same-block, no
+        // source name (vetted in `compute_inlinable_values`), AND no
+        // pre_stmts were synthesized for this lowering (those would
+        // need their own emission point), stash the expression for the
+        // use site instead of emitting `_tN = expr;`.
+        if pre_stmts.is_empty() && self.inlinable.contains(&v.0) {
+            self.pending_inlines.borrow_mut().insert(v.0, value_expr);
+            return;
+        }
         out.push(Stmt::Assign {
             target: Expr::Ident(name),
             value: value_expr,
@@ -1895,6 +1922,127 @@ impl LowerCtx<'_> {
 // Free helpers
 // ============================================================================
 
+/// Compute the set of Value indices eligible for expression inlining
+/// at the use site. An inlinable Value:
+///   - is defined by a non-void instruction (not a block-param, arg,
+///     or `Removed` slot),
+///   - that instruction's effect does NOT include `WRITES_HEAP` or
+///     `MAY_DIVERGE` (READS_HEAP and MAY_THROW are allowed — relocating
+///     them by zero instructions doesn't change observable behavior),
+///   - has exactly one IR-visible use,
+///   - that single use is the IMMEDIATELY-NEXT instruction in the same
+///     block (zero intervening insts), OR the block's terminator with
+///     zero insts after the def. Strict adjacency ensures heap reads
+///     and throw-points don't shift across any other operation.
+///   - has no `source_name` (preserve names the source supplied),
+///   - is not in `Function.captured_by_passthrough` (PassThrough bodies
+///     reference these by lexical name; inlining would lose the binding),
+///   - is not pinned by `EmitConfig.immovable_names`.
+///
+/// `ForInInit/Done/Next` and `CatchValue` are excluded — structural
+/// reconstruction (for-in loops, catch clauses) consumes their operands
+/// directly without going through `operand_to_expr`.
+fn compute_inlinable_values(func: &Function, cfg: &EmitConfig) -> HashSet<u32> {
+    let body = func.lowered();
+
+    // For each Inst, the (block, position-in-block.instructions) it lives at.
+    let mut inst_pos: HashMap<u32, (BlockId, usize)> = HashMap::new();
+    for (bi, blk) in body.blocks.iter().enumerate() {
+        for (ix, &iid) in blk.instructions.iter().enumerate() {
+            inst_pos.insert(iid.0, (BlockId(bi as u32), ix));
+        }
+    }
+
+    // Use counts + single-use locator: where is the unique use? Either
+    // an instruction position, or the terminator of a block.
+    #[derive(Clone, Copy)]
+    enum UseSite {
+        Inst(BlockId, usize),
+        Terminator(BlockId),
+    }
+    let mut use_count: HashMap<u32, u32> = HashMap::new();
+    let mut single_use: HashMap<u32, UseSite> = HashMap::new();
+    for (bi, blk) in body.blocks.iter().enumerate() {
+        let block = BlockId(bi as u32);
+        for (ix, &iid) in blk.instructions.iter().enumerate() {
+            walk_inst_operands(&body.instructions[iid.0 as usize].kind, |op| {
+                if let Operand::Value(v) = op {
+                    let n = use_count.entry(v.0).or_insert(0);
+                    *n += 1;
+                    if *n == 1 {
+                        single_use.insert(v.0, UseSite::Inst(block, ix));
+                    } else {
+                        single_use.remove(&v.0);
+                    }
+                }
+            });
+        }
+        walk_term_operands(&blk.terminator, |op| {
+            if let Operand::Value(v) = op {
+                let n = use_count.entry(v.0).or_insert(0);
+                *n += 1;
+                if *n == 1 {
+                    single_use.insert(v.0, UseSite::Terminator(block));
+                } else {
+                    single_use.remove(&v.0);
+                }
+            }
+        });
+    }
+
+    let captured: HashSet<u32> = func.captured_by_passthrough.iter().copied().collect();
+    let pinned: HashSet<u32> = cfg.immovable_names.keys().copied().collect();
+    let blocked = Effect::WRITES_HEAP | Effect::MAY_DIVERGE;
+
+    let mut inlinable = HashSet::new();
+    for (vi, def) in body.values.iter().enumerate() {
+        let v = vi as u32;
+        if def.is_removed() || def.source_name.is_some() {
+            continue;
+        }
+        if captured.contains(&v) || pinned.contains(&v) {
+            continue;
+        }
+        let iid = match def.kind {
+            ValueDefKind::Inst(iid) => iid,
+            _ => continue,
+        };
+        let kind = &body.instructions[iid.0 as usize].kind;
+        if kind.effect().intersects(blocked) {
+            continue;
+        }
+        if matches!(
+            kind,
+            InstKind::ForInInit { .. }
+                | InstKind::ForInDone { .. }
+                | InstKind::ForInNext { .. }
+                | InstKind::CatchValue
+        ) {
+            continue;
+        }
+        if use_count.get(&v).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+        let (def_block, def_ix) = match inst_pos.get(&iid.0) {
+            Some(p) => *p,
+            None => continue,
+        };
+        let block_len = body.blocks[def_block.0 as usize].instructions.len();
+        let adjacent = match single_use.get(&v) {
+            Some(UseSite::Inst(b, ux)) => *b == def_block && *ux == def_ix + 1,
+            // Terminator is "adjacent" only when the def is the last
+            // instruction in its block (no intervening insts).
+            Some(UseSite::Terminator(b)) => *b == def_block && def_ix + 1 == block_len,
+            None => false,
+        };
+        if !adjacent {
+            continue;
+        }
+        inlinable.insert(v);
+    }
+    inlinable
+}
+
 /// Two-pass renamer. Returns a `(value_index → final_name)` map and the
 /// list of `_tN`-style hoisted-temporary names whose `let` declarations
 /// must be emitted at the function body's top.
@@ -1916,6 +2064,7 @@ fn assign_names(
     sm: &ssa::Module,
     func: &Function,
     cfg: &EmitConfig,
+    inlinable: &HashSet<u32>,
 ) -> (HashMap<u32, String>, Vec<String>) {
     let mut final_names: HashMap<u32, String> = HashMap::new();
     let mut committed: HashMap<String, u32> = HashMap::new();
@@ -1945,11 +2094,15 @@ fn assign_names(
         if final_names.contains_key(&vi) {
             // Already assigned via pinning; if it's an Inst or
             // BlockParam its name still needs to surface in `hoisted`
-            // so the function-top let-block declares it.
+            // so the function-top let-block declares it. Inlinable
+            // Values skip the declaration (compute_inlinable_values
+            // already excludes pinned ones, so this branch should
+            // never see one — defensive check).
             if matches!(
                 def.kind,
                 ValueDefKind::Inst(_) | ValueDefKind::BlockParam { .. }
-            ) {
+            ) && !inlinable.contains(&vi)
+            {
                 hoisted.push(final_names[&vi].clone());
             }
             continue;
@@ -1978,7 +2131,14 @@ fn assign_names(
                     &mut t_counter,
                     true,
                 );
-                hoisted.push(chosen.clone());
+                // Inlinable Values get their expression substituted at
+                // the single use site; no `let _tN;` declaration needed.
+                // The name is still allocated as a fallback in case the
+                // inliner misses (e.g. a structural construct consumes
+                // the operand without going through `operand_to_expr`).
+                if !inlinable.contains(&vi) {
+                    hoisted.push(chosen.clone());
+                }
                 final_names.insert(vi, chosen);
             }
         }

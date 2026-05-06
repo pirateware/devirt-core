@@ -1,23 +1,16 @@
 ---
-source: src/ir/lower_tree.rs
+source: crates/parse/src/lower_tree.rs
+assertion_line: 2415
 expression: out
 ---
 function fibonacci(n) {
-  let _t0;
-  let _t1;
   let _t2;
-  let _t3;
   let _t4;
-  let _t5;
-  _t0 = (n <= 1);
-  if (_t0) {
+  if ((n <= 1)) {
     return n;
   } else {
-    _t1 = (n - 1);
-    _t2 = fibonacci(_t1);
-    _t3 = (n - 2);
-    _t4 = fibonacci(_t3);
-    _t5 = (_t2 + _t4);
-    return _t5;
+    _t2 = fibonacci((n - 1));
+    _t4 = fibonacci((n - 2));
+    return (_t2 + _t4);
   }
 }

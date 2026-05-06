@@ -1,12 +1,10 @@
 ---
-source: src/ir/lower_tree.rs
-assertion_line: 1594
+source: crates/parse/src/lower_tree.rs
+assertion_line: 2561
 expression: out
 ---
 function f() {
-  let _t0;
   let _t1;
-  _t0 = console;
-  _t1 = _t0.log("hi");
+  _t1 = console.log("hi");
   return;
 }

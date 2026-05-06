@@ -1,10 +1,8 @@
 ---
-source: src/ir/lower_tree.rs
-assertion_line: 1055
+source: crates/parse/src/lower_tree.rs
+assertion_line: 2602
 expression: out
 ---
 function f() {
-  let _t0;
-  _t0 = foo;
-  return _t0;
+  return foo;
 }
