@@ -9,7 +9,7 @@
 //!     (continue-in-switch-in-loop, break-out-of-while, labeled break).
 
 use emit::emit;
-use ir::tree::{FuncBody, Item, Stmt, SwitchCase};
+use ir::tree::{Item, Stmt, SwitchCase};
 use parse::lower_ssa;
 use parse::lower_tree;
 use parse::parse_and_lower;
