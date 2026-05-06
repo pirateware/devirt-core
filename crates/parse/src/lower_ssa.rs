@@ -1076,11 +1076,20 @@ fn push_passthrough_function(sm: &mut ssa::Module, lit: &tree::FuncLiteral) {
 fn body_needs_ssa_fallback(stmts: &[Stmt]) -> bool {
     fn visit_stmt(s: &Stmt) -> bool {
         match s {
-            Stmt::ForIn { .. }
-            | Stmt::Try { .. }
-            | Stmt::Throw(_)
-            | Stmt::Switch { .. }
-            | Stmt::Break { .. } => true,
+            Stmt::ForIn { .. } | Stmt::Try { .. } | Stmt::Throw(_) => true,
+            // Switch and Break are now lowered through real SSA
+            // (Terminator::Switch + break-target stack). They no
+            // longer trigger fallback. Recurse into their children
+            // so any remaining fallback-trigger nested inside a
+            // case body still routes the function correctly.
+            Stmt::Switch { discriminant, cases } => {
+                visit_expr(discriminant)
+                    || cases.iter().any(|c| {
+                        c.test.as_ref().is_some_and(visit_expr)
+                            || c.body.iter().any(visit_stmt)
+                    })
+            }
+            Stmt::Break { .. } => false,
             Stmt::If { cond, then_body, else_body, .. } => {
                 visit_expr(cond)
                     || then_body.iter().any(visit_stmt)
@@ -1525,13 +1534,38 @@ struct Converter<'b, 'm> {
     // original name across loop carriers.
     symbol_names: HashMap<SymbolId, StrId>,
 
-    /// Stack of (continue_target, break_target) for the active enclosing
-    /// loops. `Stmt::Continue` reads the top of stack and emits a Branch
-    /// to the continue target — for `Stmt::While` this is the header,
-    /// for `Stmt::For` this is a separate step block that runs the
-    /// update expression before re-checking the condition. `break` is
-    /// not yet supported in the IR; the second slot is reserved.
-    loop_targets: Vec<(BlockId, BlockId)>,
+    /// Active enclosing break/continue targets, innermost on top.
+    ///
+    /// Both loop and switch frames record a `break_to` block that
+    /// `Stmt::Break` resolves against (top of stack). Only loop frames
+    /// record a `continue_to` — `Stmt::Continue` walks the stack past
+    /// switch frames to the nearest loop. ECMAScript spec: continue
+    /// only ever targets loops; switches never claim it.
+    ///
+    /// Loop continue targets vary by loop kind: `Stmt::While` uses the
+    /// header; `Stmt::For` uses the step block (so the update
+    /// expression runs before re-checking the condition); `Stmt::ForOf`
+    /// uses the desugared iterator-protocol header.
+    break_stack: Vec<BreakFrame>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BreakFrame {
+    Loop {
+        continue_to: BlockId,
+        break_to: BlockId,
+    },
+    Switch {
+        break_to: BlockId,
+    },
+}
+
+impl BreakFrame {
+    fn break_to(&self) -> BlockId {
+        match self {
+            BreakFrame::Loop { break_to, .. } | BreakFrame::Switch { break_to } => *break_to,
+        }
+    }
 }
 
 impl<'b, 'm> Converter<'b, 'm> {
@@ -1556,8 +1590,20 @@ impl<'b, 'm> Converter<'b, 'm> {
             incomplete_params: HashMap::new(),
             sealed: HashSet::new(),
             symbol_names: HashMap::new(),
-            loop_targets: Vec::new(),
+            break_stack: Vec::new(),
         }
+    }
+
+    /// Walk the break stack inward → outward to find the nearest
+    /// enclosing loop's `continue_to`. `Stmt::Continue` always targets
+    /// a loop, never a switch (per ES spec); switch frames are skipped.
+    fn enclosing_loop_continue_target(&self) -> Option<BlockId> {
+        for f in self.break_stack.iter().rev() {
+            if let BreakFrame::Loop { continue_to, .. } = f {
+                return Some(*continue_to);
+            }
+        }
+        None
     }
 
     fn lower_top_level(&mut self, f: &tree::IrFunction) {
@@ -2051,10 +2097,9 @@ impl<'b, 'm> Converter<'b, 'm> {
                 body,
             } => self.lower_for_of(kind, binding, iterable, body),
             Stmt::Continue => {
-                let (cont, _brk) = *self
-                    .loop_targets
-                    .last()
-                    .expect("Stmt::Continue outside any loop — walker should have rejected");
+                let cont = self.enclosing_loop_continue_target().expect(
+                    "Stmt::Continue outside any loop — walker should have rejected",
+                );
                 self.builder.set_terminator(Terminator::Branch {
                     target: cont,
                     args: vec![],
@@ -2063,6 +2108,24 @@ impl<'b, 'm> Converter<'b, 'm> {
                 // creates a fresh dead block on demand for any following
                 // (dead) code.
             }
+            Stmt::Break { label } => {
+                debug_assert!(
+                    label.is_none(),
+                    "labeled break reached lower_ssa — LabeledStmt is still a \
+                     disposition blocker; if labels were lowered, this arm \
+                     needs a stack walk for matching label"
+                );
+                let target = self
+                    .break_stack
+                    .last()
+                    .expect("Stmt::Break outside any loop or switch")
+                    .break_to();
+                self.builder.set_terminator(Terminator::Branch {
+                    target,
+                    args: vec![],
+                });
+            }
+            Stmt::Switch { discriminant, cases } => self.lower_switch(discriminant, cases),
             Stmt::Block(stmts) => {
                 self.push_scope();
                 for s in stmts {
@@ -2083,11 +2146,7 @@ impl<'b, 'm> Converter<'b, 'm> {
                 let cb = self.current_block();
                 self.write_variable(sym, cb, alloc);
             }
-            Stmt::Try { .. }
-            | Stmt::ForIn { .. }
-            | Stmt::Throw(_)
-            | Stmt::Switch { .. }
-            | Stmt::Break { .. } => {
+            Stmt::Try { .. } | Stmt::ForIn { .. } | Stmt::Throw(_) => {
                 // None of these are expressible in SSA. The
                 // `body_needs_ssa_fallback` check at function entry
                 // (in `lower_top_level_function` / `lower_inner_literal`)
@@ -2097,7 +2156,7 @@ impl<'b, 'm> Converter<'b, 'm> {
                 // hand-built tree-IR test fixture lacks the source
                 // slice required to fall back).
                 unreachable!(
-                    "Stmt::{{Try,ForIn,Throw,Switch,Break}} reached SSA conversion — \
+                    "Stmt::{{Try,ForIn,Throw}} reached SSA conversion — \
                      body_needs_ssa_fallback should have routed this function \
                      to PassThrough"
                 );
@@ -2192,13 +2251,16 @@ impl<'b, 'm> Converter<'b, 'm> {
 
         // Body. `continue` inside the body jumps to the header.
         self.builder.switch_to_block(body_b);
-        self.loop_targets.push((header_b, exit_b));
+        self.break_stack.push(BreakFrame::Loop {
+            continue_to: header_b,
+            break_to: exit_b,
+        });
         self.push_scope();
         for s in body {
             self.lower_stmt(s);
         }
         self.pop_scope();
-        self.loop_targets.pop();
+        self.break_stack.pop();
         let body_end = self.current_block();
         if !self.is_terminated(body_end) {
             self.builder.set_terminator(Terminator::Branch {
@@ -2284,13 +2346,16 @@ impl<'b, 'm> Converter<'b, 'm> {
 
         // Body. `continue` inside jumps to step_b.
         self.builder.switch_to_block(body_b);
-        self.loop_targets.push((step_b, exit_b));
+        self.break_stack.push(BreakFrame::Loop {
+            continue_to: step_b,
+            break_to: exit_b,
+        });
         self.push_scope();
         for s in body {
             self.lower_stmt(s);
         }
         self.pop_scope();
-        self.loop_targets.pop();
+        self.break_stack.pop();
         let body_end = self.current_block();
         if !self.is_terminated(body_end) {
             self.builder.set_terminator(Terminator::Branch {
@@ -2434,7 +2499,10 @@ impl<'b, 'm> Converter<'b, 'm> {
 
         // Body.
         self.builder.switch_to_block(body_b);
-        self.loop_targets.push((header_b, exit_b));
+        self.break_stack.push(BreakFrame::Loop {
+            continue_to: header_b,
+            break_to: exit_b,
+        });
         self.push_scope();
 
         // `const binding = __step.value`
@@ -2460,7 +2528,7 @@ impl<'b, 'm> Converter<'b, 'm> {
         }
 
         self.pop_scope();
-        self.loop_targets.pop();
+        self.break_stack.pop();
         let body_end = self.current_block();
         if !self.is_terminated(body_end) {
             self.builder.set_terminator(Terminator::Branch {
@@ -2472,6 +2540,154 @@ impl<'b, 'm> Converter<'b, 'm> {
         self.seal_block(header_b);
         self.builder.switch_to_block(exit_b);
         self.pop_scope();
+    }
+
+    /// Convert a tree-IR `Expr` into an SSA `Constant` for use as a
+    /// switch case key. Handles string literals by interning at the
+    /// Converter (which `expr_to_constant` can't do as a free
+    /// function). Returns `None` for non-constant expressions —
+    /// `lower_switch` panics in that case, expecting disposition /
+    /// `body_needs_ssa_fallback` to have routed the function out.
+    fn case_key_constant(&mut self, e: &Expr) -> Option<Constant> {
+        if let Expr::String(s) = e {
+            return Some(Constant::String(self.builder.intern(s)));
+        }
+        expr_to_constant(e)
+    }
+
+    /// Lower `switch (discriminant) { case K: body; ... [default: body] }`
+    /// into a `Terminator::Switch` plus per-case body blocks plus a join
+    /// block.
+    ///
+    /// Constraints we rely on:
+    /// - Every case body must terminate (break/return/throw/continue).
+    ///   Disposition + the corpus's actual shape make this true today
+    ///   (zero fallthrough). If a case body falls off the end, we
+    ///   currently emit no terminator and the SSA validator will flag
+    ///   it; supporting fallthrough means adding a `fallthrough_edges`
+    ///   field to `Terminator::Switch` and emitting an explicit
+    ///   `Branch{next_case_body}` here, deferred per the ticket §6.
+    /// - Case keys must be constants. The corpus has only constant
+    ///   keys; arbitrary expressions would need a different lowering
+    ///   shape (chain of `cbr eq` instead of a single Switch
+    ///   terminator). Deferred per §6.
+    ///
+    /// Layout:
+    ///
+    /// ```text
+    ///     current ──disc eval──▶ Switch terminator
+    ///                              ├──key0──▶ case0_body ──break──▶ join
+    ///                              ├──key1──▶ case1_body ──return / continue / throw
+    ///                              ├──...
+    ///                              └──default──▶ default_body OR join (no source default)
+    ///     join ◀── ... (post-switch code lands here)
+    /// ```
+    fn lower_switch(&mut self, discriminant: &Expr, cases: &[tree::SwitchCase]) {
+        let disc_op = self.convert_expr(discriminant);
+
+        // Allocate per-case body blocks + join. Cases that don't break
+        // never edge to join, but join is always allocated as the
+        // landmark for reconstruction and as the converter's
+        // post-switch current_block.
+        let join_b = self.builder.new_block();
+        let n_cases = cases.len();
+        let mut case_blocks: Vec<BlockId> = Vec::with_capacity(n_cases);
+        for _ in 0..n_cases {
+            case_blocks.push(self.builder.new_block());
+        }
+
+        // Each case body block has a single predecessor (the Switch
+        // terminator). Safe to seal upfront. Join may receive 0..N
+        // predecessors (one per case that breaks); we seal it after
+        // lowering.
+        for &cb in &case_blocks {
+            self.sealed.insert(cb);
+        }
+
+        // Build the Switch terminator. `default` points at the source
+        // default body (if present) or directly at `join` (if not).
+        let mut ssa_cases: Vec<ssa::SwitchCase> = Vec::with_capacity(n_cases);
+        let mut default_target: BlockId = join_b;
+        let mut default_case_body_idx: Option<usize> = None;
+        for (i, c) in cases.iter().enumerate() {
+            match &c.test {
+                Some(test_expr) => {
+                    let key = self.case_key_constant(test_expr).unwrap_or_else(|| {
+                        panic!(
+                            "switch case key is not a constant: {test_expr:?}. Arbitrary \
+                             case expressions are deferred per ticket §6 / \
+                             docs/COVERAGE_AUDIT.md. Disposition / body_needs_ssa_fallback \
+                             should have routed this function to PassThrough."
+                        )
+                    });
+                    ssa_cases.push(ssa::SwitchCase {
+                        key,
+                        target: case_blocks[i],
+                        args: vec![],
+                    });
+                }
+                None => {
+                    // Source `default:` clause. There can be at most
+                    // one — JS spec.
+                    debug_assert!(
+                        default_case_body_idx.is_none(),
+                        "switch with multiple default clauses"
+                    );
+                    default_target = case_blocks[i];
+                    default_case_body_idx = Some(i);
+                }
+            }
+        }
+
+        self.builder.set_terminator(Terminator::Switch {
+            val: disc_op,
+            cases: ssa_cases,
+            default: default_target,
+            default_args: vec![],
+            join: join_b,
+        });
+
+        // Lower each case body. Push a Switch frame so `break;` inside
+        // resolves to `join_b`. Continue still walks past Switch frames
+        // to the enclosing loop (handled by enclosing_loop_continue_target).
+        self.break_stack.push(BreakFrame::Switch { break_to: join_b });
+        for (i, c) in cases.iter().enumerate() {
+            self.builder.switch_to_block(case_blocks[i]);
+            // Deliberately no per-case `push_scope`. JS `var`
+            // declarations are function-scoped, and the obfuscated
+            // dispatch corpus uses `var x = ...; continue;` in one
+            // case and references `x` from another. Case-confined
+            // scopes would lose that cross-case visibility. The
+            // existing tree-IR doesn't distinguish `let` from `var`
+            // (both lower to `Stmt::Let`), so case-internal `let`
+            // bindings get function-scope semantics here too — same
+            // approximation `lower_while` / `lower_for` already make
+            // for their bodies.
+            for s in &c.body {
+                self.lower_stmt(s);
+            }
+            // If the case body didn't terminate (fallthrough shape),
+            // emit Unreachable so the validator surfaces it. This is
+            // the YAGNI escape hatch: corpus has zero fallthrough, so
+            // this branch never fires; if it does, the panic message
+            // tells the next maintainer exactly which deferred shape
+            // surfaced.
+            let body_end = self.current_block();
+            if !self.is_terminated(body_end) {
+                panic!(
+                    "switch case body bb{} did not terminate (fallthrough); \
+                     see docs/COVERAGE_AUDIT.md 'Deferred SSA Switch shapes' \
+                     and ticket §6",
+                    body_end.0
+                );
+            }
+        }
+        self.break_stack.pop();
+
+        // Join is reachable from however many cases broke into it
+        // (possibly zero). Seal now — all predecessors known.
+        self.seal_block(join_b);
+        self.builder.switch_to_block(join_b);
     }
 
     // ------------------------------------------------------------------
@@ -3522,6 +3738,32 @@ impl<'b, 'm> Converter<'b, 'm> {
                 *op = new;
             }
         }
+        // captured_by_passthrough records Value slot indices flowing
+        // into AllocClosure captures whose target is PassThrough.
+        // Trivial-param elimination retires the slot but the stale
+        // index would survive in this list, tripping the no-source-
+        // name constraint at finish() because Removed slots have no
+        // source_name. Mirror the substitution into the metadata:
+        // replace `old.0` with `new`'s slot if new is a Value, drop
+        // the entry entirely if new is a Const (constants don't need
+        // tracking — the per-AllocClosure mark explicitly skips
+        // `Operand::Const`).
+        let cap = &mut self.builder.captured_by_passthrough;
+        match new {
+            Operand::Value(nv) => {
+                for slot in cap.iter_mut() {
+                    if *slot == old.0 {
+                        *slot = nv.0;
+                    }
+                }
+                // Deduplicate in case `nv` was already recorded.
+                cap.sort_unstable();
+                cap.dedup();
+            }
+            Operand::Const(_) | Operand::Capture(_) => {
+                cap.retain(|&s| s != old.0);
+            }
+        }
     }
 }
 
@@ -3537,6 +3779,37 @@ impl<'b, 'm> Converter<'b, 'm> {
 /// than dedicated variants: a future constant-folding pass that produces NaN
 /// from `0/0` (or Infinity from `1/0`) will yield the same canonical form,
 /// avoiding two ways to spell the same value.
+/// Map a tree-IR `Expr` to an SSA `Constant` if and only if the expression
+/// is one of the no-intern-required literal shapes that occur in switch
+/// case keys today: Number / Bool / Null / Undefined / NaN / Infinity, or
+/// a unary `-` on a numeric literal (`case -1:`).
+///
+/// Returns `None` for anything that would need code generation (member
+/// access, calls, etc.) AND for `String` literals — `Constant::String`
+/// holds a `StrId`, which requires the builder's interner to construct;
+/// callers that want string-key support must intern at the call site
+/// rather than going through this free helper. Corpus diagnostic shows
+/// 0 string-keyed cases, so the limitation is moot today; deferred per
+/// ticket §6.
+fn expr_to_constant(e: &Expr) -> Option<Constant> {
+    match e {
+        Expr::Number(n) => Some(Constant::Number(*n)),
+        Expr::Bool(b) => Some(Constant::Bool(*b)),
+        Expr::Null => Some(Constant::Null),
+        Expr::Undefined => Some(Constant::Undefined),
+        // `case -1:` parses as Unary(Neg, Number(1)). The number-fold
+        // in lower_expr already collapses that to Number(-1) for
+        // numeric literals, but stay defensive in case the fold misses
+        // an edge case.
+        Expr::Unary { op: tree::UnOp::Neg, operand } => match operand.as_ref() {
+            Expr::Number(n) => Some(Constant::Number(-n)),
+            _ => None,
+        },
+        Expr::Ident(name) => special_global_constant(name),
+        _ => None,
+    }
+}
+
 fn special_global_constant(name: &str) -> Option<Constant> {
     match name {
         "globalThis" | "window" | "self" | "global" => Some(Constant::GlobalThis),
