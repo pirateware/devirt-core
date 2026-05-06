@@ -1076,7 +1076,12 @@ fn push_passthrough_function(sm: &mut ssa::Module, lit: &tree::FuncLiteral) {
 fn body_needs_ssa_fallback(stmts: &[Stmt]) -> bool {
     fn visit_stmt(s: &Stmt) -> bool {
         match s {
-            Stmt::ForIn { .. } | Stmt::Try { .. } | Stmt::Throw(_) => true,
+            Stmt::ForIn { .. } | Stmt::Try { .. } => true,
+            // Throw is now lowered through Terminator::Throw and no
+            // longer triggers fallback. Walk its expression so any
+            // fallback-trigger nested inside the thrown value still
+            // routes the function correctly.
+            Stmt::Throw(e) => visit_expr(e),
             // Switch and Break are now lowered through real SSA
             // (Terminator::Switch + break-target stack). They no
             // longer trigger fallback. Recurse into their children
@@ -2146,8 +2151,18 @@ impl<'b, 'm> Converter<'b, 'm> {
                 let cb = self.current_block();
                 self.write_variable(sym, cb, alloc);
             }
-            Stmt::Try { .. } | Stmt::ForIn { .. } | Stmt::Throw(_) => {
-                // None of these are expressible in SSA. The
+            Stmt::Throw(e) => {
+                // Throw terminates the current block with no successor
+                // edges (no in-function exception handling — see corpus
+                // diagnostic: zero functions have Throw inside Try in
+                // the same body). Same dead-code rule as Return: any
+                // statement following Throw lands in a dead block that
+                // lower_stmt's prologue creates on demand.
+                let val = self.convert_expr(e);
+                self.builder.set_terminator(Terminator::Throw { val });
+            }
+            Stmt::Try { .. } | Stmt::ForIn { .. } => {
+                // Neither is expressible in SSA yet. The
                 // `body_needs_ssa_fallback` check at function entry
                 // (in `lower_top_level_function` / `lower_inner_literal`)
                 // routes any function containing them to PassThrough
@@ -2156,7 +2171,7 @@ impl<'b, 'm> Converter<'b, 'm> {
                 // hand-built tree-IR test fixture lacks the source
                 // slice required to fall back).
                 unreachable!(
-                    "Stmt::{{Try,ForIn,Throw}} reached SSA conversion — \
+                    "Stmt::{{Try,ForIn}} reached SSA conversion — \
                      body_needs_ssa_fallback should have routed this function \
                      to PassThrough"
                 );

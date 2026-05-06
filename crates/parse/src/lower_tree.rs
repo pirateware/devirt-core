@@ -626,14 +626,13 @@ impl LowerCtx<'_> {
                     return;
                 }
                 Terminator::Throw { val } => {
-                    // Tree-IR has no throw yet. Lower to a placeholder call
-                    // so the IR is well-formed; future tree-IR additions will
-                    // upgrade this to a real Stmt::Throw.
+                    // Stale comment claimed tree-IR had no throw; now it
+                    // does (Stmt::Throw(Expr)). Replace the __throw__
+                    // placeholder call with the real Stmt::Throw — this
+                    // arm becomes hot the moment lower_ssa starts
+                    // constructing Terminator::Throw for Stmt::Throw.
                     let arg = self.operand_to_expr(&val);
-                    out.push(Stmt::ExprStmt(Expr::Call {
-                        callee: Box::new(Expr::Ident("__throw__".to_string())),
-                        args: vec![arg],
-                    }));
+                    out.push(Stmt::Throw(arg));
                     return;
                 }
                 Terminator::Unreachable => {
