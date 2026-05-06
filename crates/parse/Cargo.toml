@@ -13,6 +13,7 @@ oxc_span      = "0.40"
 [dev-dependencies]
 emit          = { path = "../emit" }
 insta         = "1"
+proptest      = "1"
 
 [features]
 # Behavior-preservation tests that shell out to `node`. Enabled by the
