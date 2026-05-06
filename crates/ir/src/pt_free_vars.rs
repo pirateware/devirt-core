@@ -24,7 +24,6 @@
 //! are small and parsing is cheap; caching the AST would reintroduce
 //! the lifetime entanglements the pipeline explicitly avoids.
 
-#![allow(dead_code)]
 
 use std::collections::{BTreeSet, HashSet};
 

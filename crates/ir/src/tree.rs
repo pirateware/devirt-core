@@ -6,7 +6,6 @@
 // Closure variants (`Stmt::FuncDecl`, `Expr::Func`, `FuncLiteral`,
 // `FuncBody`) are wired up by later T2 stages; suppress unused-variant
 // warnings until then.
-#![allow(dead_code)]
 
 use std::cell::Cell;
 use std::fmt::Write as _;

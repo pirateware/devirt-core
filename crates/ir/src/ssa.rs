@@ -8,7 +8,6 @@
 // The binary doesn't yet consume this module; conversion and emit will land
 // in a later milestone. Tests exercise the full surface, so we silence
 // dead-code noise instead of papering over with shadow uses.
-#![allow(dead_code)]
 
 use bitflags::bitflags;
 use lasso::{Rodeo, Spur};

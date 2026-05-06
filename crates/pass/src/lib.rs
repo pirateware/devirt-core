@@ -15,7 +15,6 @@
 // `with_dump_sink`) are exposed to consumers but the production
 // pipeline doesn't wire them yet. Tests exercise the full surface;
 // silence dead-code lint here rather than fabricating shadow uses.
-#![allow(dead_code)]
 
 use ir::error::Error;
 use ir::ssa::{FuncId, Function, Module, pretty_function};
