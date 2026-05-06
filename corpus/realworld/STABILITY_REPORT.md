@@ -4,9 +4,9 @@ This report tests the parse → IR → emit pipeline against real-world JavaScri
 
 ## Summary
 
-- Total files tested: 308
-- Parse success: 308/308 (100.0%)
-- Roundtrip success: 308/308 (100.0%)
+- Total files tested: 310
+- Parse success: 310/310 (100.0%)
+- Roundtrip success: 310/310 (100.0%)
 - Panics/crashes: 0
 
 ## Tier 1
@@ -46,6 +46,7 @@ This report tests the parse → IR → emit pipeline against real-world JavaScri
 | lodash_merge.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 100.0% |  |
 | lodash_partial.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 100.0% |  |
 | datefns_subDays.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 83.0% |  |
+| axios.full.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 100.0% |  |
 | lodash_invert.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 100.0% |  |
 | lodash_isEqual.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 69.7% |  |
 | lodash_capitalize.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 78.1% |  |
@@ -60,6 +61,7 @@ This report tests the parse → IR → emit pipeline against real-world JavaScri
 | lodash_curry.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 48.3% |  |
 | lodash_omit.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 100.0% |  |
 | datefns_getDay.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 75.1% |  |
+| lodash.full.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 100.0% |  |
 | lodash_zip.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 100.0% |  |
 | datefns_addDays.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 61.9% |  |
 | datefns_startOfDay.js | ✓ | ✓ | ✓ | ✓ | ✓ | 0.0% | 75.3% |  |
