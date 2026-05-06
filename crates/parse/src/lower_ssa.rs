@@ -18,7 +18,8 @@ use std::collections::{HashMap, HashSet};
 use ir::free_vars;
 use ir::ssa::{
     self, BasicBlock, BlockId, Constant, FuncId, FunctionBuilder, InstKind, Operand, Purity, StrId,
-    Terminator, TopLevelEntry, Value, ValueDef, ValueDefKind,
+    Terminator, TopLevelEntry, Value, ValueDef, ValueDefKind, walk_inst_operands_mut,
+    walk_term_operands_mut,
 };
 use ir::tree::{self, BinOp, Expr, FuncBody, FuncLiteral, Stmt, UnOp, UpdateOp};
 
@@ -4129,24 +4130,12 @@ impl<'b, 'm> Converter<'b, 'm> {
     /// Substitute every `Operand::Value(old)` with `new` across all
     /// instructions, all terminators, and the converter's own `current_def`.
     fn replace_value_uses(&mut self, old: Value, new: Operand) {
-        for inst in &mut self.builder.body.instructions {
-            walk_inst_operands_mut(&mut inst.kind, &mut |op| {
-                if let Operand::Value(v) = op
-                    && *v == old
-                {
-                    *op = new;
-                }
-            });
-        }
-        for blk in &mut self.builder.body.blocks {
-            walk_term_operands_mut(&mut blk.terminator, &mut |op| {
-                if let Operand::Value(v) = op
-                    && *v == old
-                {
-                    *op = new;
-                }
-            });
-        }
+        // Body-level operand substitution (instructions + terminators)
+        // is now a public IR-crate primitive (LoweredBody::replace_value_uses)
+        // so SSA passes can reuse it. The Converter-only state below
+        // (current_def Braun bookkeeping + captured_by_passthrough
+        // metadata) stays here.
+        self.builder.body_mut().replace_value_uses(old, new);
         for op in self.current_def.values_mut() {
             if let Operand::Value(v) = op
                 && *v == old
@@ -4439,178 +4428,6 @@ fn remove_edge_arg(t: &mut Terminator, dst: BlockId, index: usize) {
     }
 }
 
-// ----------------------------------------------------------------------
-// Mutable operand walks. Mirrors the immutable walks in `ssa.rs` but
-// threads `&mut Operand` so trivial-removal can substitute in place.
-// ----------------------------------------------------------------------
-
-fn walk_inst_operands_mut(kind: &mut InstKind, f: &mut impl FnMut(&mut Operand)) {
-    use InstKind::*;
-    match kind {
-        AddGeneric { lhs, rhs }
-        | SubGeneric { lhs, rhs }
-        | MulGeneric { lhs, rhs }
-        | DivGeneric { lhs, rhs }
-        | ModGeneric { lhs, rhs }
-        | PowGeneric { lhs, rhs }
-        | BitAnd { lhs, rhs }
-        | BitOr { lhs, rhs }
-        | BitXor { lhs, rhs }
-        | Shl { lhs, rhs }
-        | Shr { lhs, rhs }
-        | UShr { lhs, rhs }
-        | AddNumber { lhs, rhs }
-        | SubNumber { lhs, rhs }
-        | MulNumber { lhs, rhs }
-        | AddInt32 { lhs, rhs }
-        | SubInt32 { lhs, rhs }
-        | MulInt32 { lhs, rhs }
-        | ConcatStr { lhs, rhs }
-        | LogAnd { lhs, rhs }
-        | LogOr { lhs, rhs }
-        | Eq { lhs, rhs }
-        | StrictEq { lhs, rhs }
-        | Lt { lhs, rhs }
-        | Le { lhs, rhs } => {
-            f(lhs);
-            f(rhs);
-        }
-        Not { operand } | BitNot { operand } => f(operand),
-        LoadProp { obj, .. } => f(obj),
-        StoreProp { obj, val, .. } => {
-            f(obj);
-            f(val);
-        }
-        LoadIndex { obj, index, .. } => {
-            f(obj);
-            f(index);
-        }
-        StoreIndex {
-            obj, index, val, ..
-        } => {
-            f(obj);
-            f(index);
-            f(val);
-        }
-        AllocObject | AllocArray { .. } | AllocRegExp { .. } => {}
-        AllocClosure { captures, .. } => {
-            for c in captures {
-                f(c);
-            }
-        }
-        Call { callee, args } => {
-            f(callee);
-            for a in args {
-                f(a);
-            }
-        }
-        CallSpread { callee, args, .. } => {
-            f(callee);
-            for a in args {
-                f(a);
-            }
-        }
-        CallMethod { obj, args, .. } => {
-            f(obj);
-            for a in args {
-                f(a);
-            }
-        }
-        CallMethodSpread { obj, args, .. } => {
-            f(obj);
-            for a in args {
-                f(a);
-            }
-        }
-        ArrayWithSpread { elements, .. } => {
-            for e in elements {
-                f(e);
-            }
-        }
-        ObjectWithSpread { keys, vals } => {
-            for k in keys {
-                if let Some(ir::ssa::SpreadObjectKey::Computed(op)) = k {
-                    f(op);
-                }
-            }
-            for v in vals {
-                f(v);
-            }
-        }
-        Construct { ctor, args } => {
-            f(ctor);
-            for a in args {
-                f(a);
-            }
-        }
-        ToNumber { val }
-        | ToString { val }
-        | ToBool { val }
-        | ToInt32 { val }
-        | Typeof { val }
-        | OpaqueEval { source: val } => f(val),
-        Instanceof { obj, ctor } => {
-            f(obj);
-            f(ctor);
-        }
-        In { key, obj } => {
-            f(key);
-            f(obj);
-        }
-        CatchValue => {} // no operands
-        ForInInit { obj } => f(obj),
-        ForInDone { iter } | ForInNext { iter } => f(iter),
-    }
-}
-
-fn walk_term_operands_mut(t: &mut Terminator, f: &mut impl FnMut(&mut Operand)) {
-    match t {
-        Terminator::Branch { args, .. } => {
-            for a in args {
-                f(a);
-            }
-        }
-        Terminator::CondBranch {
-            cond,
-            then_args,
-            else_args,
-            ..
-        } => {
-            f(cond);
-            for a in then_args {
-                f(a);
-            }
-            for a in else_args {
-                f(a);
-            }
-        }
-        Terminator::Switch {
-            val,
-            cases,
-            default_args,
-            ..
-        } => {
-            f(val);
-            for c in cases {
-                for a in &mut c.args {
-                    f(a);
-                }
-            }
-            for a in default_args {
-                f(a);
-            }
-        }
-        Terminator::Return { val: Some(v) } => f(v),
-        Terminator::Return { val: None } => {}
-        Terminator::Throw { val } => f(val),
-        Terminator::Try { try_args, .. } => {
-            for a in try_args {
-                f(a);
-            }
-        }
-        Terminator::Unreachable => {}
-    }
-}
 
 // Silence dead-code lint on `BasicBlock` import — currently re-exported only
 // because `walk_*_mut` and helpers may grow to need direct access in future

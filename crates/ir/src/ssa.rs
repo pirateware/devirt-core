@@ -1439,7 +1439,7 @@ fn const_eq(a: &Constant, b: &Constant) -> bool {
     }
 }
 
-fn walk_inst_operands(kind: &InstKind, mut f: impl FnMut(&Operand)) {
+pub fn walk_inst_operands(kind: &InstKind, mut f: impl FnMut(&Operand)) {
     use InstKind::*;
     match kind {
         AddGeneric { lhs, rhs }
@@ -1558,7 +1558,7 @@ fn walk_inst_operands(kind: &InstKind, mut f: impl FnMut(&Operand)) {
     }
 }
 
-fn walk_term_operands(t: &Terminator, mut f: impl FnMut(&Operand)) {
+pub fn walk_term_operands(t: &Terminator, mut f: impl FnMut(&Operand)) {
     match t {
         Terminator::Branch { args, .. } => {
             for a in args {
@@ -1732,7 +1732,216 @@ fn write_inst(out: &mut String, iid: InstId, func: &LoweredBody, m: &Module) {
     push_with_comment(out, &line, comment.as_deref());
 }
 
-fn find_value_for_inst(func: &LoweredBody, iid: InstId) -> Value {
+/// Mutable counterpart to `walk_inst_operands`. Used by passes that
+/// substitute operands in-place (e.g., constant folding, copy propagation).
+pub fn walk_inst_operands_mut(kind: &mut InstKind, f: &mut impl FnMut(&mut Operand)) {
+    use InstKind::*;
+    match kind {
+        AddGeneric { lhs, rhs }
+        | SubGeneric { lhs, rhs }
+        | MulGeneric { lhs, rhs }
+        | DivGeneric { lhs, rhs }
+        | ModGeneric { lhs, rhs }
+        | PowGeneric { lhs, rhs }
+        | BitAnd { lhs, rhs }
+        | BitOr { lhs, rhs }
+        | BitXor { lhs, rhs }
+        | Shl { lhs, rhs }
+        | Shr { lhs, rhs }
+        | UShr { lhs, rhs }
+        | AddNumber { lhs, rhs }
+        | SubNumber { lhs, rhs }
+        | MulNumber { lhs, rhs }
+        | AddInt32 { lhs, rhs }
+        | SubInt32 { lhs, rhs }
+        | MulInt32 { lhs, rhs }
+        | ConcatStr { lhs, rhs }
+        | LogAnd { lhs, rhs }
+        | LogOr { lhs, rhs }
+        | Eq { lhs, rhs }
+        | StrictEq { lhs, rhs }
+        | Lt { lhs, rhs }
+        | Le { lhs, rhs } => {
+            f(lhs);
+            f(rhs);
+        }
+        Not { operand } | BitNot { operand } => f(operand),
+        LoadProp { obj, .. } => f(obj),
+        StoreProp { obj, val, .. } => {
+            f(obj);
+            f(val);
+        }
+        LoadIndex { obj, index, .. } => {
+            f(obj);
+            f(index);
+        }
+        StoreIndex { obj, index, val, .. } => {
+            f(obj);
+            f(index);
+            f(val);
+        }
+        AllocObject | AllocArray { .. } | AllocRegExp { .. } => {}
+        AllocClosure { captures, .. } => {
+            for c in captures {
+                f(c);
+            }
+        }
+        Call { callee, args } => {
+            f(callee);
+            for a in args {
+                f(a);
+            }
+        }
+        CallSpread { callee, args, .. } => {
+            f(callee);
+            for a in args {
+                f(a);
+            }
+        }
+        CallMethod { obj, args, .. } => {
+            f(obj);
+            for a in args {
+                f(a);
+            }
+        }
+        CallMethodSpread { obj, args, .. } => {
+            f(obj);
+            for a in args {
+                f(a);
+            }
+        }
+        ArrayWithSpread { elements, .. } => {
+            for e in elements {
+                f(e);
+            }
+        }
+        ObjectWithSpread { keys, vals } => {
+            for k in keys {
+                if let Some(SpreadObjectKey::Computed(op)) = k {
+                    f(op);
+                }
+            }
+            for v in vals {
+                f(v);
+            }
+        }
+        Construct { ctor, args } => {
+            f(ctor);
+            for a in args {
+                f(a);
+            }
+        }
+        ToNumber { val }
+        | ToString { val }
+        | ToBool { val }
+        | ToInt32 { val }
+        | Typeof { val }
+        | OpaqueEval { source: val } => f(val),
+        Instanceof { obj, ctor } => {
+            f(obj);
+            f(ctor);
+        }
+        In { key, obj } => {
+            f(key);
+            f(obj);
+        }
+        CatchValue => {}
+        ForInInit { obj } => f(obj),
+        ForInDone { iter } | ForInNext { iter } => f(iter),
+    }
+}
+
+/// Mutable counterpart to `walk_term_operands`.
+pub fn walk_term_operands_mut(t: &mut Terminator, f: &mut impl FnMut(&mut Operand)) {
+    match t {
+        Terminator::Branch { args, .. } => {
+            for a in args {
+                f(a);
+            }
+        }
+        Terminator::CondBranch {
+            cond,
+            then_args,
+            else_args,
+            ..
+        } => {
+            f(cond);
+            for a in then_args {
+                f(a);
+            }
+            for a in else_args {
+                f(a);
+            }
+        }
+        Terminator::Switch {
+            val,
+            cases,
+            default_args,
+            ..
+        } => {
+            f(val);
+            for c in cases {
+                for a in &mut c.args {
+                    f(a);
+                }
+            }
+            for a in default_args {
+                f(a);
+            }
+        }
+        Terminator::Return { val: Some(v) } => f(v),
+        Terminator::Return { val: None } => {}
+        Terminator::Throw { val } => f(val),
+        Terminator::Try { try_args, .. } => {
+            for a in try_args {
+                f(a);
+            }
+        }
+        Terminator::Unreachable => {}
+    }
+}
+
+impl LoweredBody {
+    /// Substitute every use of `old` (as `Operand::Value(old)`) with
+    /// `new` across all instruction operands and terminator operands
+    /// in this body. Used by SSA passes (constant folding, copy
+    /// propagation, etc.) and by the converter's trivial-param
+    /// elimination. Linear in the size of the body — sufficient for
+    /// corpus-scale functions; if a pass profiles slow on this, build
+    /// a use-list index in a follow-up ticket.
+    ///
+    /// Note: this updates only operands stored in the IR. Converter-
+    /// internal state (e.g., `current_def`) and Function-level metadata
+    /// (e.g., `captured_by_passthrough`) need separate handling at the
+    /// caller.
+    pub fn replace_value_uses(&mut self, old: Value, new: Operand) {
+        for inst in &mut self.instructions {
+            walk_inst_operands_mut(&mut inst.kind, &mut |op| {
+                if let Operand::Value(v) = op
+                    && *v == old
+                {
+                    *op = new;
+                }
+            });
+        }
+        for blk in &mut self.blocks {
+            walk_term_operands_mut(&mut blk.terminator, &mut |op| {
+                if let Operand::Value(v) = op
+                    && *v == old
+                {
+                    *op = new;
+                }
+            });
+        }
+    }
+}
+
+/// Returns the `Value` that names the result of instruction `iid` in
+/// the given lowered body. Panics if the instruction has no value-def
+/// (i.e., a void instruction like `StoreProp`); callers must check
+/// `InstKind::is_void()` before calling for instructions that may be
+/// void.
+pub fn find_value_for_inst(func: &LoweredBody, iid: InstId) -> Value {
     for (i, def) in func.values.iter().enumerate() {
         if let ValueDefKind::Inst(j) = &def.kind
             && *j == iid
