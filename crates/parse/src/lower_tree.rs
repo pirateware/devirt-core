@@ -1557,45 +1557,14 @@ impl LowerCtx<'_> {
         let binding_name = self.name_for(next_value).to_string();
         let obj_expr = self.operand_to_expr(&pat.obj);
 
-        // Body: walk body_b until reaching `header` (back-edge stop),
-        // skipping the leading `ForInNext` inst (consumed by this
-        // pattern; emit_inst's dispatch panics if it sees ForInNext as
-        // a free instruction, so we skip explicitly).
+        // Body: walk body_b until reaching `header` (back-edge stop).
+        // The leading `ForInNext` inst is suppressed by emit_inst's
+        // ForInInit/Done/Next match (set in commit 1), so the standard
+        // `walk` machinery handles bodies with internal control flow
+        // (nested if / loop / switch / etc.) naturally.
         let mut body_stmts = Vec::new();
         self.loop_headers_open.push(header);
-        self.emit_block_insts_skip_first(info.body_b, &mut body_stmts);
-        // Walk the rest of the body's CFG starting at body_b's
-        // terminator. body_b may have a complex CFG inside; the walk
-        // stops at the back-edge to `header`.
-        let body_blk = &self.func.lowered().blocks[info.body_b.0 as usize];
-        let term = body_blk.terminator.clone();
-        match term {
-            Terminator::Branch { target, .. } if target == header => {
-                // body_b's terminator IS the back-edge — body has only
-                // straight-line content. Already handled.
-            }
-            _ => {
-                // body_b has more CFG; walk it from body_b. The walk
-                // helper re-emits body_b's instructions, so to avoid
-                // duplicating the leading ForInNext + binding write,
-                // we walk from body_b's terminator's successor (or
-                // recurse with a stop). Simpler: call walk(info.body_b,
-                // Some(header), …) but skip the already-emitted first
-                // inst by scanning past it. The walk's emit_block_insts
-                // would re-emit ForInNext — work around by using the
-                // continue-from-tail pattern below.
-                //
-                // For Phase A of ForIn, the corpus shape is
-                // straight-line body with a single back-edge — assert
-                // the simple case and fail loudly on anything more
-                // complex.
-                panic!(
-                    "lower_tree: ForIn body bb{} has non-back-edge terminator {term:?}; \
-                     ForIn-with-control-flow-inside-body not yet supported",
-                    info.body_b.0
-                );
-            }
-        }
+        self.walk(info.body_b, Some(header), &mut body_stmts);
         let popped = self.loop_headers_open.pop();
         debug_assert_eq!(popped, Some(header));
 
@@ -1612,16 +1581,6 @@ impl LowerCtx<'_> {
             obj: Box::new(obj_expr),
             body: body_stmts,
         });
-    }
-
-    /// Same as `emit_block_insts` but skips the first instruction.
-    /// Used by `emit_for_in` to drop the leading `ForInNext` (consumed
-    /// by the surrounding `Stmt::ForIn`).
-    fn emit_block_insts_skip_first(&self, bb: BlockId, out: &mut Vec<Stmt>) {
-        let blk = &self.func.lowered().blocks[bb.0 as usize];
-        for &iid in blk.instructions.iter().skip(1) {
-            self.emit_inst(iid, out);
-        }
     }
 
     /// If the header's cond is the result of a single instruction in the
