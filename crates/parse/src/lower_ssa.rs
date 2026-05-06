@@ -1082,16 +1082,14 @@ fn body_needs_ssa_fallback(stmts: &[Stmt]) -> bool {
             _ => false,
         }
     }
-    // `Expr::This` flows through SSA as `Constant::This`, which works
-    // for simple uses but exposes a latent CFG-reconstruction bug in
-    // `lower_tree::loop_info` on certain back-edge shapes (visible on
-    // `lodash_cloneDeep.high.js`). Until that's fixed, route any
-    // function whose body references `this` to the same SSA-fallback
-    // path used by Try/ForIn/Throw — disposition still classifies the
-    // function as Lowered, so coverage counts the unlock.
+    // `Expr::This` flows through SSA as `Constant::This`. It used to
+    // route through SSA-fallback because `lower_tree::loop_info`
+    // reported phantom back-edges on stale predecessor entries — fixed
+    // upstream by adding the reachability precondition to
+    // `dominates`. `Expr::This` no longer needs special-casing.
     fn visit_expr(e: &Expr) -> bool {
         match e {
-            Expr::This => true,
+            Expr::This => false,
             Expr::Binary { lhs, rhs, .. } => visit_expr(lhs) || visit_expr(rhs),
             Expr::Unary { operand, .. } => visit_expr(operand),
             Expr::Call { callee, args } | Expr::New { callee, args } => {
