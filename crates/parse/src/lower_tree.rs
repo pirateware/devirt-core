@@ -341,6 +341,12 @@ struct LowerCtx<'a> {
     /// shadows the loop's header-stop and walk recurses through the
     /// back-edge forever.
     loop_headers_open: Vec<BlockId>,
+    /// Active enclosing switch join blocks. When the walker encounters a
+    /// `Branch { target }` where `target` matches the top of this stack,
+    /// the branch encodes `break;` from the surrounding source-level
+    /// switch — emitted as `Stmt::Break { label: None }` and walking
+    /// stops. Mirrors `loop_headers_open`'s role for `Stmt::Continue`.
+    switch_break_targets: Vec<BlockId>,
 }
 
 const WALK_STACK_LIMIT: usize = 50_000;
@@ -373,6 +379,7 @@ impl<'a> LowerCtx<'a> {
             visit_counts: HashMap::new(),
             walk_total_visits: 0,
             loop_headers_open: Vec::new(),
+            switch_break_targets: Vec::new(),
         }
     }
 
@@ -638,6 +645,16 @@ impl LowerCtx<'_> {
                 }
                 Terminator::Branch { target, args } => {
                     self.emit_edge_copies(target, &args, out);
+                    // Branch into the innermost open switch's join is
+                    // a source-level `break;`. Recognize this BEFORE
+                    // the generic stop check, since the switch
+                    // reconstructor passes its join as `stop` and
+                    // would otherwise return silently, dropping the
+                    // `break` from the case body.
+                    if self.switch_break_targets.last() == Some(&target) {
+                        out.push(Stmt::Break { label: None });
+                        return;
+                    }
                     if Some(target) == stop {
                         return;
                     }
@@ -651,7 +668,7 @@ impl LowerCtx<'_> {
                     else_args,
                 } => {
                     let cond_expr = self.operand_to_expr(&cond);
-                    let inner_stop = self.find_diamond_join(then_b, else_b, stop);
+                    let inner_stop = self.find_diamond_join(cur, then_b, else_b, stop);
                     let pass_through_stop = inner_stop.or(stop);
 
                     let mut then_stmts = Vec::new();
@@ -675,12 +692,60 @@ impl LowerCtx<'_> {
                         None => return,
                     }
                 }
-                Terminator::Switch { .. } => {
-                    panic!(
-                        "Switch terminator at bb{} — out-of-SSA does not yet lower switches; \
-                         this is a TODO once tree-IR grows a Switch statement.",
-                        cur.0
-                    );
+                Terminator::Switch {
+                    val,
+                    cases,
+                    default,
+                    default_args,
+                    join,
+                } => {
+                    let disc_expr = self.operand_to_expr(&val);
+                    let mut tree_cases: Vec<tree::SwitchCase> = Vec::with_capacity(cases.len() + 1);
+
+                    // Push the switch frame so case bodies that end
+                    // in `break;` get reconstructed as `Stmt::Break`
+                    // (see Terminator::Branch arm above).
+                    self.switch_break_targets.push(join);
+
+                    for c in &cases {
+                        let mut body_stmts = Vec::new();
+                        self.emit_edge_copies(c.target, &c.args, &mut body_stmts);
+                        self.walk(c.target, Some(join), &mut body_stmts);
+                        let test = self.constant_to_expr(&c.key);
+                        tree_cases.push(tree::SwitchCase {
+                            test: Some(test),
+                            body: body_stmts,
+                        });
+                    }
+
+                    // Source `default:` clause iff the default edge
+                    // points at a real default-body block (not the
+                    // join). Source-default-less switches lower with
+                    // `default = join`, so this check round-trips
+                    // exactly.
+                    if default != join {
+                        let mut default_body = Vec::new();
+                        self.emit_edge_copies(default, &default_args, &mut default_body);
+                        self.walk(default, Some(join), &mut default_body);
+                        tree_cases.push(tree::SwitchCase {
+                            test: None,
+                            body: default_body,
+                        });
+                    }
+
+                    self.switch_break_targets.pop();
+
+                    out.push(Stmt::Switch {
+                        discriminant: disc_expr,
+                        cases: tree_cases,
+                    });
+
+                    // Continue walking from the join. If join is the
+                    // current stop, we're done.
+                    if Some(join) == stop {
+                        return;
+                    }
+                    cur = join;
                 }
             }
         }
@@ -1274,7 +1339,6 @@ impl LowerCtx<'_> {
             Terminator::CondBranch { then_b, else_b, .. } => (*then_b, *else_b),
             _ => return None,
         };
-
         // Back-edge test: is there a predecessor dominated by `b`? Only then
         // is `b` a loop header in the standard sense. Without this guard, a
         // cbr inside a loop body whose successors transitively reach the
@@ -1285,8 +1349,21 @@ impl LowerCtx<'_> {
             return None;
         }
 
-        let then_reaches_b = self.reaches(then_b, b);
-        let else_reaches_b = self.reaches(else_b, b);
+        // Reachability for loop-shape detection must stay inside the
+        // header's dominated subgraph. A naïve forward-reach on
+        // `else_b` (the loop's exit branch) can transitively re-enter
+        // the header through some OUTER loop iterating around the
+        // current one — e.g., `case 2: while (inner) { if (c) return;
+        // else x; }; continue;` inside `while (true) { switch (...)
+        // {...} break; }`. The inner-while's exit edges to the outer-
+        // while's header, which then re-enters the switch and the
+        // case body, transitively reaching the inner header. That
+        // path is not a back-edge of the inner loop — it leaves the
+        // inner loop's dominated subgraph and re-enters from outside.
+        // Bounding the BFS by `dominates(b, succ)` confines the
+        // analysis to the loop being classified.
+        let then_reaches_b = self.reaches_within_dom(then_b, b, b);
+        let else_reaches_b = self.reaches_within_dom(else_b, b, b);
         match (then_reaches_b, else_reaches_b) {
             (true, false) => Some(LoopInfo {
                 body_b: then_b,
@@ -1379,6 +1456,47 @@ impl LowerCtx<'_> {
         r.contains(&target)
     }
 
+    /// Reachability bounded to the dominated subgraph of `dominator`.
+    /// Walks forward from `start`, only enqueuing successors that
+    /// `dominator` dominates. Used by loop-shape detection so paths
+    /// that exit the loop's region and re-enter through an outer
+    /// loop's iteration don't masquerade as back-edges. Not cached —
+    /// the dominator parameter would expand the cache key beyond the
+    /// hot path.
+    fn reaches_within_dom(
+        &mut self,
+        start: BlockId,
+        target: BlockId,
+        dominator: BlockId,
+    ) -> bool {
+        if start == target {
+            return true;
+        }
+        let mut visited: HashSet<BlockId> = HashSet::new();
+        let mut stack = vec![start];
+        while let Some(b) = stack.pop() {
+            if !visited.insert(b) {
+                continue;
+            }
+            if b == target {
+                return true;
+            }
+            for (succ, _) in self.func.lowered().blocks[b.0 as usize]
+                .terminator
+                .successors()
+            {
+                // Stay inside the loop's dominated subgraph. The
+                // header itself is self-dominated, so the back-edge
+                // succ == target is allowed and triggers the next-
+                // iteration `b == target` check.
+                if self.dominates(dominator, succ) {
+                    stack.push(succ);
+                }
+            }
+        }
+        false
+    }
+
     fn forward_reachable(&mut self, start: BlockId) -> HashSet<BlockId> {
         if let Some(s) = self.reachable_cache.get(&start) {
             return s.clone();
@@ -1407,6 +1525,7 @@ impl LowerCtx<'_> {
     /// after the if statement returns control).
     fn find_diamond_join(
         &mut self,
+        peak: BlockId,
         b1: BlockId,
         b2: BlockId,
         parent_stop: Option<BlockId>,
@@ -1421,12 +1540,19 @@ impl LowerCtx<'_> {
         // the parent's responsibility, not an if-internal join. Also
         // exclude `b1` and `b2` themselves: a block reaches itself
         // trivially (distance=0), which would make a branch block win
-        // over the actual join. This case fires when an `if/continue`
-        // body sits inside a loop — both branches eventually reach
-        // both each other and the join through the back-edge.
+        // over the actual join.
+        //
+        // Also exclude `peak` (the cbr's own source block): when the
+        // cbr sits inside a loop body, both branches transitively
+        // reach `peak` via the loop's back-edge. Without this
+        // exclusion `peak` ends up in `common` with the same score
+        // as the legitimate join. Tie-breaking ("first wins" over
+        // hashset iteration order) is non-deterministic, so the
+        // walker sometimes picks `peak` itself, sets `cur = peak`,
+        // and infinitely revisits the cbr.
         let candidates: Vec<BlockId> = common
             .into_iter()
-            .filter(|b| Some(*b) != parent_stop && *b != b1 && *b != b2)
+            .filter(|b| Some(*b) != parent_stop && *b != b1 && *b != b2 && *b != peak)
             .collect();
         if candidates.is_empty() {
             return None;

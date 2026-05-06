@@ -545,8 +545,24 @@ pub enum Terminator {
     Switch {
         val: Operand,
         cases: Vec<SwitchCase>,
+        /// Branch taken when no case key matches `val`. When the source
+        /// has no `default:` clause, this points directly at `join` (no
+        /// synthesized intermediate block). When the source has a
+        /// `default:`, this points at the default-body block, which
+        /// itself terminates in break/return/throw/continue — the same
+        /// rule that applies to every case body.
         default: BlockId,
         default_args: Vec<Operand>,
+        /// The post-switch landing block — where execution lands when
+        /// any case breaks out of the switch. Tracked as a landmark
+        /// because it is not always derivable from `default` (when
+        /// source has a `default:` clause, `default != join`) and not
+        /// always reachable (when every case path terminates in
+        /// return/throw/continue, `join` is dead but still serves as
+        /// the converter's current_block for code after the switch).
+        /// Not a successor edge — the walker / successors() / edge_args
+        /// helpers don't traverse it.
+        join: BlockId,
     },
     Return {
         val: Option<Operand>,
@@ -1900,6 +1916,7 @@ fn write_terminator(out: &mut String, t: &Terminator, _func: &LoweredBody, m: &M
             cases,
             default,
             default_args,
+            join,
         } => {
             line.push_str("switch ");
             write_operand(&mut line, val, m);
@@ -1915,6 +1932,7 @@ fn write_terminator(out: &mut String, t: &Terminator, _func: &LoweredBody, m: &M
             }
             let mut tail = String::from("    ] default ");
             write_block_target(&mut tail, *default, default_args, m);
+            write!(&mut tail, " join bb{}", join.0).unwrap();
             push_with_comment(out, &tail, None);
             return;
         }
