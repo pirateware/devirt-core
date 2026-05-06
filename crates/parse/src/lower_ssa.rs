@@ -3915,6 +3915,22 @@ fn edge_args(t: &Terminator, dst: BlockId) -> Option<&[Operand]> {
                 None
             }
         }
+        Terminator::Try {
+            try_entry,
+            try_args,
+            catch_entry,
+            ..
+        } => {
+            if *try_entry == dst {
+                Some(try_args.as_slice())
+            } else if *catch_entry == dst {
+                // Catch entry takes no edge args (CatchValue inst supplies
+                // the exception value).
+                Some([].as_slice())
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -3950,6 +3966,19 @@ fn push_edge_arg(t: &mut Terminator, dst: BlockId, op: Operand) {
             if *default == dst {
                 default_args.push(op);
             }
+        }
+        Terminator::Try {
+            try_entry,
+            try_args,
+            ..
+        } if *try_entry == dst => {
+            try_args.push(op);
+        }
+        Terminator::Try { catch_entry, .. } if *catch_entry == dst => {
+            panic!(
+                "push_edge_arg: catch_entry takes no edge args; use CatchValue \
+                 instruction at the catch entry instead"
+            );
         }
         _ => panic!("push_edge_arg: terminator does not target bb{}", dst.0),
     }
@@ -3988,6 +4017,13 @@ fn remove_edge_arg(t: &mut Terminator, dst: BlockId, index: usize) {
             if *default == dst {
                 default_args.remove(index);
             }
+        }
+        Terminator::Try {
+            try_entry,
+            try_args,
+            ..
+        } if *try_entry == dst => {
+            try_args.remove(index);
         }
         _ => panic!("remove_edge_arg: terminator does not target bb{}", dst.0),
     }
@@ -4111,6 +4147,7 @@ fn walk_inst_operands_mut(kind: &mut InstKind, f: &mut impl FnMut(&mut Operand))
             f(key);
             f(obj);
         }
+        CatchValue => {} // no operands
     }
 }
 
@@ -4154,6 +4191,11 @@ fn walk_term_operands_mut(t: &mut Terminator, f: &mut impl FnMut(&mut Operand)) 
         Terminator::Return { val: Some(v) } => f(v),
         Terminator::Return { val: None } => {}
         Terminator::Throw { val } => f(val),
+        Terminator::Try { try_args, .. } => {
+            for a in try_args {
+                f(a);
+            }
+        }
         Terminator::Unreachable => {}
     }
 }

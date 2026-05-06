@@ -433,6 +433,7 @@ impl<'a> LowerCtx<'a> {
                 Terminator::Switch { .. } => "Switch",
                 Terminator::Return { .. } => "Return",
                 Terminator::Throw { .. } => "Throw",
+                Terminator::Try { .. } => "Try",
                 Terminator::Unreachable => "Unreachable",
             };
             let preds: Vec<String> = self.func.lowered().blocks[b.0 as usize]
@@ -641,6 +642,17 @@ impl LowerCtx<'_> {
                         args: vec![],
                     }));
                     return;
+                }
+                Terminator::Try { .. } => {
+                    // Filled in by commit 3 of Try Phase A. At commit 1,
+                    // no construction site for Terminator::Try exists, so
+                    // this arm is unreachable in practice. The
+                    // unimplemented! is a tripwire — if it fires before
+                    // commit 3 lands, construction was wired prematurely.
+                    unimplemented!(
+                        "lower_tree: Terminator::Try reconstruction lands in \
+                         Try-Phase-A commit 3"
+                    );
                 }
                 Terminator::Branch { target, args } => {
                     self.emit_edge_copies(target, &args, out);
@@ -1011,6 +1023,15 @@ impl LowerCtx<'_> {
                 callee: Box::new(Expr::Ident("eval".to_string())),
                 args: vec![self.operand_to_expr(source)],
             },
+            // CatchValue is reconstructed in commit 3 by binding the
+            // catch-param name at catch_entry and resugaring the
+            // CatchValue inst's result-name use as the bare param. At
+            // commit 1 the inst is never emitted because no construction
+            // site exists; surface a clear panic if it leaks through.
+            CatchValue => unimplemented!(
+                "lower_tree: CatchValue reconstruction lands in \
+                 Try-Phase-A commit 3"
+            ),
         }
     }
 
