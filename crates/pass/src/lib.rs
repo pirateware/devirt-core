@@ -23,17 +23,25 @@ pub mod branch_fold;
 pub mod const_fold;
 pub mod copy_prop;
 pub mod dce;
+pub mod identity_fn_inline;
 pub mod refine_arith;
 pub mod refine_purity;
 
-/// A single function-local pass. Returns `true` iff `func` was mutated.
-///
-/// Function-local only by design. Inter-procedural work is far enough off
-/// that a separate `ModulePass` trait will land alongside the first pass
-/// that actually needs it.
+/// A single function-local pass. Returns `true` iff the targeted
+/// function was mutated. Receives `&mut Module` for shared state
+/// (string interner, function-summary lookups) but conventionally
+/// touches only `module.functions[fid]`.
 pub trait FunctionPass {
     fn name(&self) -> &'static str;
     fn run(&mut self, module: &mut Module, fid: FuncId) -> Result<bool, Error>;
+}
+
+/// A module-wide pass. Returns `true` iff anything was mutated. Used
+/// for inter-procedural work — call-site rewriting, function-summary
+/// based inlining, etc. — where reasoning crosses function boundaries.
+pub trait ModulePass {
+    fn name(&self) -> &'static str;
+    fn run(&mut self, module: &mut Module) -> Result<bool, Error>;
 }
 
 /// Hook for emitting per-pass IR snapshots. The manager invokes this after
@@ -60,6 +68,7 @@ impl DumpSink for StderrDumpSink {
 
 pub struct PassManager {
     passes: Vec<Box<dyn FunctionPass>>,
+    module_passes: Vec<Box<dyn ModulePass>>,
     max_iterations: usize,
     validate_between: bool,
     dump_between: Option<Box<dyn DumpSink>>,
@@ -74,6 +83,7 @@ impl PassManager {
     pub fn new() -> Self {
         Self {
             passes: Vec::new(),
+            module_passes: Vec::new(),
             max_iterations: Self::DEFAULT_MAX_ITERATIONS,
             validate_between: cfg!(debug_assertions),
             dump_between: None,
@@ -82,6 +92,16 @@ impl PassManager {
 
     pub fn add_pass(&mut self, pass: Box<dyn FunctionPass>) {
         self.passes.push(pass);
+    }
+
+    /// Register a module-wide pass. Module passes run once per
+    /// `run_module` invocation, before the per-function fixed-point
+    /// loop. If a module pass needs to react to changes the function
+    /// passes make, run another `run_module` (PassManager doesn't
+    /// currently wrap module + function passes in a shared outer
+    /// fixed point — add one when a use case demands it).
+    pub fn add_module_pass(&mut self, pass: Box<dyn ModulePass>) {
+        self.module_passes.push(pass);
     }
 
     pub fn with_max_iterations(mut self, n: usize) -> Self {
@@ -141,6 +161,18 @@ impl PassManager {
     /// PassThrough functions are skipped — their bodies are
     /// source-preserved and never inspected by passes.
     pub fn run_module(&mut self, module: &mut Module) -> Result<(), Error> {
+        // Module passes run first — once each. They typically rewrite
+        // call sites or attach summaries that the function passes
+        // exploit. Validate after each one, same as function passes.
+        for mp in self.module_passes.iter_mut() {
+            mp.run(module)?;
+            if self.validate_between && let Err(errs) = module.validate() {
+                return Err(Error::PassValidationFailed {
+                    pass: mp.name(),
+                    inner: Box::new(Error::Malformed(format!("{errs:#?}"))),
+                });
+            }
+        }
         for i in 0..module.functions.len() {
             if module.functions[i].is_pass_through() {
                 continue;
