@@ -24,6 +24,7 @@ pub mod const_fold;
 pub mod copy_prop;
 pub mod dce;
 pub mod dead_fn_elim;
+pub mod forward_loads;
 pub mod identity_fn_inline;
 pub mod refine_arith;
 pub mod refine_purity;
