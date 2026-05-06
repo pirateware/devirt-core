@@ -366,18 +366,6 @@ fn discover_module<'a>(tm: &'a tree::Module) -> Vec<PendingFunction<'a>> {
                     captures: Vec::new(),
                     parent: None,
                 });
-                // If this function is going to take the SSA-fallback
-                // path (body contains Try/ForIn/Throw/This), its body
-                // is preserved as a verbatim source slice and inner
-                // literals inside it stay opaque — just like the
-                // already-PassThrough case below. Skip body recursion
-                // so we don't allocate FuncIds for inner literals
-                // we'll never emit, which would also misalign
-                // top-level FuncIds.
-                if body_needs_ssa_fallback(&f.body) {
-                    captures_by_fid.insert(fid, Vec::new());
-                    continue;
-                }
                 // Build outer-body context: reassigned-name set + an
                 // empty bindings-seen-so-far set (params and the
                 // function's own name are bound at body entry).
@@ -1193,117 +1181,6 @@ fn push_passthrough_function(sm: &mut ssa::Module, lit: &tree::FuncLiteral) {
     });
 }
 
-/// True if the body contains a `Stmt::ForIn` or `Stmt::Try` at any
-/// depth (not descending into nested function literals — those have
-/// their own disposition). These constructs cannot be expressed in
-/// SSA form, so we route enclosing functions through the PassThrough
-/// path using a stashed source slice. The disposition walker has
-/// already classified the function as `Lowered` (no blocker), so the
-/// coverage metric still counts the unlock.
-fn body_needs_ssa_fallback(stmts: &[Stmt]) -> bool {
-    fn visit_stmt(s: &Stmt) -> bool {
-        match s {
-            // ForIn is now lowered through real SSA via the four-block
-            // pattern (ForInInit/Done/Next + standard while-loop CFG).
-            // Walk the body for any nested fallback-trigger.
-            Stmt::ForIn { obj, body, .. } => {
-                visit_expr(obj) || body.iter().any(visit_stmt)
-            }
-            // Phase B: all three try shapes (try+catch, try+catch+finally,
-            // try+finally) lower through real SSA. The pathological
-            // `try { } { }` (no catch, no finally — illegal JS) can't
-            // reach the IR. Walk all three sub-bodies for nested
-            // fallback-triggers.
-            Stmt::Try { body, catch, finally } => {
-                body.iter().any(visit_stmt)
-                    || catch
-                        .as_ref()
-                        .is_some_and(|(_, cb)| cb.iter().any(visit_stmt))
-                    || finally
-                        .as_ref()
-                        .is_some_and(|fb| fb.iter().any(visit_stmt))
-            }
-            // Throw is now lowered through Terminator::Throw and no
-            // longer triggers fallback. Walk its expression so any
-            // fallback-trigger nested inside the thrown value still
-            // routes the function correctly.
-            Stmt::Throw(e) => visit_expr(e),
-            // Switch and Break are now lowered through real SSA
-            // (Terminator::Switch + break-target stack). They no
-            // longer trigger fallback. Recurse into their children
-            // so any remaining fallback-trigger nested inside a
-            // case body still routes the function correctly.
-            Stmt::Switch { discriminant, cases } => {
-                visit_expr(discriminant)
-                    || cases.iter().any(|c| {
-                        c.test.as_ref().is_some_and(visit_expr)
-                            || c.body.iter().any(visit_stmt)
-                    })
-            }
-            Stmt::Break { .. } => false,
-            Stmt::If { cond, then_body, else_body, .. } => {
-                visit_expr(cond)
-                    || then_body.iter().any(visit_stmt)
-                    || else_body.as_ref().is_some_and(|b| b.iter().any(visit_stmt))
-            }
-            Stmt::While { cond, body } => {
-                visit_expr(cond) || body.iter().any(visit_stmt)
-            }
-            Stmt::For { body, init, cond, step } => {
-                init.as_deref().is_some_and(visit_stmt)
-                    || cond.as_ref().is_some_and(visit_expr)
-                    || step.as_ref().is_some_and(visit_expr)
-                    || body.iter().any(visit_stmt)
-            }
-            Stmt::ForOf { iterable, body, .. } => {
-                visit_expr(iterable) || body.iter().any(visit_stmt)
-            }
-            Stmt::Block(body) => body.iter().any(visit_stmt),
-            // Nested function literals have their own disposition.
-            Stmt::FuncDecl(_) => false,
-            Stmt::Let { init: Some(e), .. } | Stmt::Const { init: e, .. }
-            | Stmt::ExprStmt(e) | Stmt::Return(Some(e)) => visit_expr(e),
-            Stmt::Assign { target, value } => visit_expr(target) || visit_expr(value),
-            _ => false,
-        }
-    }
-    // `Expr::This` flows through SSA as `Constant::This`. It used to
-    // route through SSA-fallback because `lower_tree::loop_info`
-    // reported phantom back-edges on stale predecessor entries — fixed
-    // upstream by adding the reachability precondition to
-    // `dominates`. `Expr::This` no longer needs special-casing.
-    fn visit_expr(e: &Expr) -> bool {
-        match e {
-            Expr::This => false,
-            Expr::Binary { lhs, rhs, .. } => visit_expr(lhs) || visit_expr(rhs),
-            Expr::Unary { operand, .. } => visit_expr(operand),
-            Expr::Call { callee, args } | Expr::New { callee, args } => {
-                visit_expr(callee) || args.iter().any(visit_expr)
-            }
-            Expr::Member { obj, .. } => visit_expr(obj),
-            Expr::Index { obj, index } => visit_expr(obj) || visit_expr(index),
-            Expr::Ternary { cond, then_branch, else_branch } => {
-                visit_expr(cond) || visit_expr(then_branch) || visit_expr(else_branch)
-            }
-            Expr::Array { elements } => elements.iter().any(visit_expr),
-            Expr::Object { props } => props.iter().any(|p| visit_expr(&p.value)),
-            Expr::Sequence { exprs } | Expr::Template { exprs, .. } => {
-                exprs.iter().any(visit_expr)
-            }
-            Expr::Assign { target, value } => visit_expr(target) || visit_expr(value),
-            Expr::CompoundAssign { target, value, .. } => {
-                visit_expr(target) || visit_expr(value)
-            }
-            Expr::Update { target, .. } => visit_expr(target),
-            Expr::Spread(inner) => visit_expr(inner),
-            // Nested function literals have their own disposition; their
-            // body's `this` is independent of the enclosing function.
-            Expr::Func(_) => false,
-            _ => false,
-        }
-    }
-    stmts.iter().any(visit_stmt)
-}
 
 /// Collect every identifier name that appears as the target of an
 /// `Expr::Assign` anywhere in `stmts`, NOT descending into nested
@@ -1427,36 +1304,6 @@ fn collect_assign_expr_target_names(stmts: &[Stmt]) -> std::collections::HashSet
     out
 }
 
-/// Push a PassThrough SSA function synthesized from an `IrFunction`
-/// (which the disposition walker considered Lowered, but contains a
-/// construct SSA can't handle). Mirrors `push_passthrough_function`
-/// but takes its source from `IrFunction.source`.
-fn push_top_level_passthrough_from_lowered(sm: &mut ssa::Module, f: &tree::IrFunction) {
-    let source = f.source.clone().unwrap_or_default();
-    let function_name_id = Some(sm.strings.get_or_intern(&f.name));
-    let param_names: Vec<ssa::StrId> = f
-        .params
-        .iter()
-        .map(|p| sm.strings.get_or_intern(p))
-        .collect();
-    sm.functions.push(ssa::Function {
-        name: f.name.clone(),
-        capture_count: 0,
-        captured_by_passthrough: Vec::new(),
-        captures_pass_through_onward: Vec::new(),
-        forced_let_decls: Vec::new(),
-        body: ssa::FunctionBody::PassThrough(ssa::PassThroughBody {
-            source,
-            param_names,
-            function_name: function_name_id,
-            is_async: false,
-            is_generator: false,
-            is_arrow: false,
-            body_is_expression: false,
-        }),
-    });
-}
-
 fn lower_top_level_function(
     sm: &mut ssa::Module,
     f: &tree::IrFunction,
@@ -1465,16 +1312,6 @@ fn lower_top_level_function(
     passthrough_fids: &HashSet<FuncId>,
     pt_referenced_names: HashSet<String>,
 ) {
-    // SSA-fallback short-circuit: if the body contains ForIn or Try,
-    // route through PassThrough using the stashed source slice. The
-    // disposition walker has already classified the function as
-    // Lowered (no blocker reported), so this is invisible to coverage
-    // metrics — the function counts as unlocked even though SSA
-    // optimization passes don't run on it.
-    if body_needs_ssa_fallback(&f.body) {
-        push_top_level_passthrough_from_lowered(sm, f);
-        return;
-    }
     // Merge try-address-taken names into pt_referenced_names. The two
     // sets share an identical "force memory residence" effect on the
     // lowering — a write that needs to be visible across either an
@@ -1534,23 +1371,7 @@ fn lower_inner_literal(
     }
 
     match &lit.body {
-        FuncBody::Stmts(stmts) => {
-            // SSA-fallback short-circuit (see body_needs_ssa_fallback):
-            // if the body contains ForIn or Try, route through
-            // PassThrough using the lit's stashed source slice.
-            if body_needs_ssa_fallback(stmts)
-                && let Some(src) = &lit.passthrough_source
-            {
-                push_inner_passthrough_function_with_source(
-                    sm,
-                    lit,
-                    captures.len(),
-                    src.clone(),
-                );
-                return;
-            }
-        }
-        FuncBody::Expression(_) => {}
+        FuncBody::Stmts(_) | FuncBody::Expression(_) => {}
         FuncBody::PassThrough(_) => {
             push_inner_passthrough_function(sm, lit, 0);
             return;
@@ -2843,8 +2664,8 @@ impl<'b, 'm> Converter<'b, 'm> {
     /// switch case key. Handles string literals by interning at the
     /// Converter (which `expr_to_constant` can't do as a free
     /// function). Returns `None` for non-constant expressions —
-    /// `lower_switch` panics in that case, expecting disposition /
-    /// `body_needs_ssa_fallback` to have routed the function out.
+    /// `lower_switch` panics in that case, expecting disposition to
+    /// have routed the function out via PassThrough.
     fn case_key_constant(&mut self, e: &Expr) -> Option<Constant> {
         if let Expr::String(s) = e {
             return Some(Constant::String(self.builder.intern(s)));
@@ -2913,8 +2734,8 @@ impl<'b, 'm> Converter<'b, 'm> {
                         panic!(
                             "switch case key is not a constant: {test_expr:?}. Arbitrary \
                              case expressions are deferred per ticket §6 / \
-                             docs/COVERAGE_AUDIT.md. Disposition / body_needs_ssa_fallback \
-                             should have routed this function to PassThrough."
+                             docs/COVERAGE_AUDIT.md. Disposition should have routed \
+                             this function to PassThrough."
                         )
                     });
                     ssa_cases.push(ssa::SwitchCase {
