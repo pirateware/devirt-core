@@ -34,6 +34,12 @@ pub mod refine_arith;
 pub mod refine_forin_effect;
 pub mod refine_purity;
 
+/// Symbolic execution + Z3 SMT backend (issue #50). Gated behind the
+/// `smt` Cargo feature so default builds do not require libz3 on the
+/// host. Not registered in the default pipeline — opt-in only.
+#[cfg(feature = "smt")]
+pub mod symex;
+
 /// A single function-local pass. Returns `true` iff the targeted
 /// function was mutated. Receives `&mut Module` for shared state
 /// (string interner, function-summary lookups) but conventionally
