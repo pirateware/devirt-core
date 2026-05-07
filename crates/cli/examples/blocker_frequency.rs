@@ -337,14 +337,15 @@ mod tests {
         let mut f = fs::File::create(&path).unwrap();
         // Two PT functions, each with a distinct, easy-to-name blocker:
         //   - `f` has a default parameter (DefaultParam)
-        //   - `g` has a do-while loop (DoWhileStmt)
+        //   - `g` has a for-in loop (ForInStmt)
         writeln!(
             f,
             r#"
             function f(x = 1) {{ return x; }}
-            function g(n) {{
-                do {{ n = n - 1; }} while (n > 0);
-                return n;
+            function g(o) {{
+                var s = 0;
+                for (var k in o) {{ s = s + 1; }}
+                return s;
             }}
             "#,
         )
@@ -365,12 +366,12 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(dp_hits, 1, "DefaultParam hits: {:?}", report.by_kind);
         assert_eq!(dp_occ, 1);
-        let (dw_hits, _) = report
+        let (fi_hits, _) = report
             .by_kind
-            .get(&BlockerKind::DoWhileStmt)
+            .get(&BlockerKind::ForInStmt)
             .copied()
             .unwrap_or_default();
-        assert_eq!(dw_hits, 1, "DoWhileStmt hits: {:?}", report.by_kind);
+        assert_eq!(fi_hits, 1, "ForInStmt hits: {:?}", report.by_kind);
 
         // Cleanup.
         let _ = fs::remove_dir_all(&dir);

@@ -380,6 +380,18 @@ struct ForInPattern {
     next_iid: InstId,
 }
 
+/// Operands captured during `detect_do_while` and used by
+/// `emit_do_while` to reconstruct `Stmt::DoWhile { body, cond }`.
+#[derive(Clone, Copy, Debug)]
+struct DoWhilePattern {
+    /// The block carrying the test-after-body `CondBranch(cond, header, exit)`.
+    /// Its terminator's `cond` operand is the do-while's condition; its
+    /// instructions evaluate before the cond is read.
+    test_b: BlockId,
+    /// The cond operand on `test_b`'s terminating CondBranch.
+    test_cond: Operand,
+}
+
 impl<'a> LowerCtx<'a> {
     fn new(
         sm: &'a ssa::Module,
@@ -668,10 +680,13 @@ impl LowerCtx<'_> {
                 // Try the ForIn pattern first — it's a special-case
                 // four-block loop (pre-header / header / body / exit)
                 // distinguished by ForInInit/Done/Next instructions.
-                // Falls through to the generic while-loop emission if
-                // the pattern doesn't match.
+                // Then try the DoWhile pattern (test-after-body shape
+                // emitted by `lower_do_while`). Falls through to the
+                // generic while-loop emission if neither matches.
                 if let Some(pat) = self.detect_forin_loop(cur, info) {
                     self.emit_for_in(cur, info, pat, out);
+                } else if let Some(pat) = self.detect_do_while(cur, info) {
+                    self.emit_do_while(cur, info, pat, out);
                 } else {
                     self.emit_loop(cur, info, out);
                 }
@@ -1608,6 +1623,116 @@ impl LowerCtx<'_> {
             obj: Box::new(obj_expr),
             body: body_stmts,
         });
+    }
+
+    /// Pattern detected at a loop header that distinguishes a `do { ... }
+    /// while (cond)` test-after-body loop from a generic top-test
+    /// while loop. Carries the `test_b` block whose terminator carries
+    /// the do-while condition.
+    fn detect_do_while(&mut self, header: BlockId, info: LoopInfo) -> Option<DoWhilePattern> {
+        // Header shape produced by `lower_do_while`:
+        //   header: CondBranch(true, body_b, exit_b)
+        // i.e. the cond is the literal boolean `true`. The header has
+        // exactly one back-edge predecessor (`test_b`) whose terminator
+        // is `CondBranch(test_cond, header, exit_b)`.
+        //
+        // The check is structural — we only rely on shape produced by
+        // `lower_do_while`, never on source-level hints.
+        let header_blk = &self.func.lowered().blocks[header.0 as usize];
+        // Header must carry no straight-line instructions (lower_do_while
+        // emits the header as a bare CondBranch on the constant `true`).
+        if !header_blk.instructions.is_empty() {
+            return None;
+        }
+        let (cond_op, then_b, else_b) = match &header_blk.terminator {
+            Terminator::CondBranch { cond, then_b, else_b, .. } => (*cond, *then_b, *else_b),
+            _ => return None,
+        };
+        // Cond must be the literal `true`. (`false` would mean the loop
+        // body is unreachable — not a do-while shape.)
+        if !matches!(cond_op, Operand::Const(Constant::Bool(true))) {
+            return None;
+        }
+        if then_b != info.body_b || else_b != info.exit_b {
+            return None;
+        }
+
+        // Find the unique back-edge predecessor — `test_b`. The back-edge
+        // predecessor is the predecessor of `header` that is dominated
+        // by `header` (the pre-header is not).
+        let mut back_edge_preds: Vec<BlockId> = header_blk
+            .predecessors
+            .iter()
+            .copied()
+            .filter(|p| self.is_back_edge_pred(*p, header))
+            .collect();
+        if back_edge_preds.len() != 1 {
+            return None;
+        }
+        let test_b = back_edge_preds.pop().unwrap();
+        let test_blk = &self.func.lowered().blocks[test_b.0 as usize];
+        let (test_cond, t_then, t_else) = match &test_blk.terminator {
+            Terminator::CondBranch { cond, then_b, else_b, .. } => (*cond, *then_b, *else_b),
+            _ => return None,
+        };
+        // test_b must branch back to header on truth and out to the
+        // loop's exit on falsity. (lower_do_while emits exactly that
+        // shape: CondBranch(cond, header, exit).)
+        if t_then != header || t_else != info.exit_b {
+            return None;
+        }
+        Some(DoWhilePattern { test_b, test_cond })
+    }
+
+    /// Emit `Stmt::DoWhile { body, cond }` for a detected test-after-body
+    /// loop. The body walks from `info.body_b` up to `test_b` (the
+    /// natural fall-through stop); the cond is the operand of `test_b`'s
+    /// terminating CondBranch, inlined when possible.
+    fn emit_do_while(
+        &mut self,
+        header: BlockId,
+        info: LoopInfo,
+        pat: DoWhilePattern,
+        out: &mut Vec<Stmt>,
+    ) {
+        // Walk the body. Stop at `test_b` — its instructions and
+        // terminator carry the loop's test, which we splice into the
+        // do-while's `cond` rather than into the body.
+        //
+        // Push `test_b` (not `header`) onto `loop_headers_open`: a
+        // continue inside a nested if/else lowers to `Branch(test_b)`,
+        // and walk re-emits that as `Stmt::Continue`. The natural tail
+        // fall-through to test_b stops silently via the `stop` check
+        // (which fires before the loop_headers_open check), so we don't
+        // accidentally tack a redundant `continue` on every body tail.
+        let mut body_stmts = Vec::new();
+        self.emit_edge_copies(info.body_b, &[], &mut body_stmts);
+        self.loop_headers_open.push(pat.test_b);
+        self.walk(info.body_b, Some(pat.test_b), &mut body_stmts);
+        let popped = self.loop_headers_open.pop();
+        debug_assert_eq!(popped, Some(pat.test_b));
+
+        // Cond expression: inline a single-instruction test_b body just
+        // like emit_loop does for top-test while headers. If the test
+        // block carries multiple instructions, fall back to emitting
+        // them at the body's tail (they evaluate before the test runs)
+        // and reading the cond Value name in the do-while header.
+        let (cond_expr, test_insts_handled_inline) =
+            self.try_inline_cond(pat.test_b, &pat.test_cond);
+        if !test_insts_handled_inline {
+            self.emit_block_insts(pat.test_b, &mut body_stmts);
+        }
+
+        out.push(Stmt::DoWhile {
+            body: body_stmts,
+            cond: cond_expr,
+        });
+
+        // Header has no instructions and carries CondBranch(true, ...)
+        // by detect_do_while's invariant; nothing more to emit. The
+        // exit-edge from header has no args (lower_do_while emits empty
+        // edge args), so no edge-copy emission is needed either.
+        let _ = header;
     }
 
     /// If the header's cond is the result of a single instruction in the

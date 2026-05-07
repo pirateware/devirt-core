@@ -1733,19 +1733,73 @@ fn item_kind_name(it: &ir::tree::Item) -> &'static str {
 // ----------------------------------------------------------------------
 
 #[test]
-fn issue33_do_while_passthrough_roundtrips() {
-    // Disposition keeps DoWhileStmt blocked (relooper can't yet
-    // recognize test-after-body); the function should round-trip as
-    // a PassThroughFunction with the verbatim source preserved.
+fn issue33_do_while_lowers_and_roundtrips() {
+    // Issue #46 grew the SSA→tree relooper to recognise the
+    // test-after-body shape produced by `lower_do_while`. The
+    // function now lowers to a structured `Stmt::DoWhile` and
+    // round-trips through SSA without panicking.
     let src = "function f() { let i = 0; do { i = i + 1; } while (i < 10); return i; }";
     use ir::tree::Item;
     let m = parse_and_lower(src).expect("parse_and_lower");
     assert!(
-        matches!(m.items[0], Item::PassThroughFunction(_)),
-        "do-while must remain PassThrough until relooper supports it"
+        matches!(m.items[0], Item::Function(_)),
+        "do-while must lower (issue #46): {:?}", m.items[0]
     );
-    let out = roundtrip(src);
-    assert!(out.contains("do") && out.contains("while"), "emit preserves do-while source: {out}");
+    let out = ssa_roundtrip(src);
+    assert!(out.contains("do") && out.contains("while"), "emit preserves do-while: {out}");
+}
+
+#[test]
+fn issue46_do_while_param_test_lowers_and_roundtrips() {
+    // Spec example from the issue: parameter-bounded counter.
+    let src = "function f(x) { var i = 0; do { i = i + 1; } while (i < x); return i; }";
+    use ir::tree::Item;
+    let m = parse_and_lower(src).expect("parse_and_lower");
+    assert!(
+        matches!(m.items[0], Item::Function(_)),
+        "do-while w/ param test must lower: {:?}", m.items[0]
+    );
+    let out = ssa_roundtrip(src);
+    assert!(out.contains("do") && out.contains("while"), "emit preserves do-while: {out}");
+}
+
+#[test]
+fn issue46_nested_do_while_lowers_and_roundtrips() {
+    // Two test-after-body loops nested. The relooper must classify
+    // each header independently — the inner loop's exit edges to the
+    // outer loop's body, and the inner body's back-edge is via the
+    // inner test_b. Disposition's nested walk surfaces inner blockers
+    // (none here), so both lower.
+    let src = "
+        function f(n, m) {
+            var i = 0;
+            var s = 0;
+            do {
+                var j = 0;
+                do {
+                    s = s + 1;
+                    j = j + 1;
+                } while (j < m);
+                i = i + 1;
+            } while (i < n);
+            return s;
+        }
+    ";
+    use ir::tree::Item;
+    let m = parse_and_lower(src).expect("parse_and_lower");
+    assert!(
+        matches!(m.items[0], Item::Function(_)),
+        "nested do-while must lower: {:?}", m.items[0]
+    );
+    let out = ssa_roundtrip(src);
+    // Both loops must survive the round-trip — at minimum two `do`
+    // tokens and two `while` tokens.
+    let n_do = out.matches("do").count();
+    let n_while = out.matches("while").count();
+    assert!(
+        n_do >= 2 && n_while >= 2,
+        "nested do-while round-trip must preserve both loops: do×{n_do} while×{n_while} in {out}"
+    );
 }
 
 #[test]

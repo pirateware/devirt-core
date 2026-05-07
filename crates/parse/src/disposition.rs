@@ -228,19 +228,13 @@ fn collect_stmt_blockers(stmt: &js::Statement, blockers: &mut BTreeSet<BlockerKi
         }
         DoWhileStatement(s) => {
             // `do { body } while (cond);` lowers to `Stmt::DoWhile` in
-            // tree-IR and the SSA layer desugars it into a top-test
-            // loop with a tail-branch to enforce test-after-body
-            // semantics. Out-of-SSA reconstruction relooper does not
-            // yet recognize the test-after-body pattern, so the
-            // round-trip would not preserve do-while shape; leaving
-            // the disposition path as Lowered would panic the
-            // relooper. For now we keep DoWhileStmt as a blocker,
-            // routing such functions to PassThrough where the
-            // verbatim source slice is preserved verbatim. The IR
-            // variant `Stmt::DoWhile` is in place so a later pass
-            // (relooper extension) can lift this without further IR
-            // churn.
-            blockers.insert(BlockerKind::DoWhileStmt);
+            // tree-IR. The SSA→tree relooper recognises the
+            // test-after-body shape produced by `lower_do_while`
+            // (header CondBranch(true, body, exit) with a back-edge
+            // from a `test_b` block whose terminator is
+            // CondBranch(cond, header, exit)) — see
+            // `LowerCtx::detect_do_while`. No blocker: walk inner
+            // expressions and the body for nested blockers only.
             collect_expr_blockers(&s.test, blockers);
             collect_stmt_blockers(&s.body, blockers);
         }

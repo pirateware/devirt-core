@@ -415,15 +415,14 @@ fn multi_declarator_in_for_init_var_is_lowered() {
 // ----------------------------------------------------------------------
 
 #[test]
-fn do_while_still_blocked() {
-    // do-while lowers to `Stmt::DoWhile` in tree-IR (the IR variant
-    // and lower_ssa support exist), but the SSA→tree relooper can't
-    // yet reconstruct test-after-body loops without an upstream
-    // round-trip regression. Disposition keeps DoWhileStmt blocked
-    // until the relooper grows test-after-body recognition; the
-    // groundwork is in place for that follow-up.
-    let b = blockers_of("function f() { let i = 0; do { i = i + 1; } while (i < 10); }");
-    assert!(b.contains(&BlockerKind::DoWhileStmt), "{b:?}");
+fn do_while_is_lowered() {
+    // do-while lowers to `Stmt::DoWhile` in tree-IR; the SSA→tree
+    // relooper recognises the test-after-body shape via
+    // `detect_do_while` (issue #46), so no blocker fires.
+    assert_eq!(
+        decide_first_fn("function f() { let i = 0; do { i = i + 1; } while (i < 10); }"),
+        Disposition::Lowered
+    );
 }
 
 #[test]
