@@ -561,5 +561,10 @@ fn expr_kind(e: &Expr) -> &'static str {
         Expr::Sequence { .. } => "Sequence",
         Expr::Assign { .. } => "Assign",
         Expr::CompoundAssign { .. } => "CompoundAssign",
+        Expr::NullishCoalesce { .. } => "NullishCoalesce",
+        Expr::LogicalAssign { .. } => "LogicalAssign",
+        Expr::OptionalChain { .. } => "OptionalChain",
+        Expr::DeleteProp { .. } => "DeleteProp",
+        Expr::DeleteIndex { .. } => "DeleteIndex",
     }
 }

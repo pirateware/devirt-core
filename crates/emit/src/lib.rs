@@ -744,6 +744,78 @@ impl Printer<'_> {
                 self.expr(value);
                 self.buf.push(')');
             }
+            Expr::NullishCoalesce { lhs, rhs } => {
+                self.buf.push('(');
+                self.expr(lhs);
+                self.buf.push_str(" ?? ");
+                self.expr(rhs);
+                self.buf.push(')');
+            }
+            Expr::LogicalAssign { op, target, value } => {
+                self.buf.push('(');
+                self.expr(target);
+                let s = match op {
+                    ir::tree::LogicalAssignOp::And => " &&= ",
+                    ir::tree::LogicalAssignOp::Or => " ||= ",
+                    ir::tree::LogicalAssignOp::Nullish => " ??= ",
+                };
+                self.buf.push_str(s);
+                self.expr(value);
+                self.buf.push(')');
+            }
+            Expr::OptionalChain { base, segments } => {
+                use ir::tree::OptChainKind;
+                self.buf.push('(');
+                self.expr(base);
+                for seg in segments {
+                    match &seg.kind {
+                        OptChainKind::Member(name) => {
+                            if seg.optional {
+                                self.buf.push_str("?.");
+                            } else {
+                                self.buf.push('.');
+                            }
+                            self.buf.push_str(name);
+                        }
+                        OptChainKind::Index(idx) => {
+                            if seg.optional {
+                                self.buf.push_str("?.");
+                            }
+                            self.buf.push('[');
+                            self.expr(idx);
+                            self.buf.push(']');
+                        }
+                        OptChainKind::Call(args) => {
+                            if seg.optional {
+                                self.buf.push_str("?.");
+                            }
+                            self.buf.push('(');
+                            for (i, a) in args.iter().enumerate() {
+                                if i > 0 {
+                                    self.buf.push_str(", ");
+                                }
+                                self.expr(a);
+                            }
+                            self.buf.push(')');
+                        }
+                    }
+                }
+                self.buf.push(')');
+            }
+            Expr::DeleteProp { obj, prop } => {
+                self.buf.push_str("(delete ");
+                self.expr(obj);
+                self.buf.push('.');
+                self.buf.push_str(prop);
+                self.buf.push(')');
+            }
+            Expr::DeleteIndex { obj, index } => {
+                self.buf.push_str("(delete ");
+                self.expr(obj);
+                self.buf.push('[');
+                self.expr(index);
+                self.buf.push_str("])");
+            }
             Expr::Template { quasis, exprs } => {
                 self.buf.push('`');
                 let mut quasis_iter = quasis.iter();

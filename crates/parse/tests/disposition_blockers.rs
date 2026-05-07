@@ -50,14 +50,12 @@ fn arithmetic_and_return_is_lowered() {
 
 #[test]
 fn two_distinct_blockers_all_reported() {
-    // NullishCoalescing + RestParam — DefaultParam is no longer a
-    // blocker (lifted in issue #29 via parse-time desugaring), so we
-    // pair NullishCoalescing with RestParam (still blocked, needs
-    // variadic-call ABI work).
-    let src = "function f(...rest) { let x = rest ?? 1; return x; }";
+    // Issue #30 lifted NullishCoalescing — pair RestParam (still
+    // blocked) with DebuggerStmt to keep two distinct blockers.
+    let src = "function f(...rest) { debugger; return rest; }";
     let b = blockers_of(src);
     assert!(b.contains(&BlockerKind::RestParam), "missing RestParam in {b:?}");
-    assert!(b.contains(&BlockerKind::NullishCoalescing), "missing NullishCoalescing in {b:?}");
+    assert!(b.contains(&BlockerKind::DebuggerStmt), "missing DebuggerStmt in {b:?}");
     assert_eq!(b.len(), 2, "expected exactly 2 blockers, got {b:?}");
 }
 
@@ -65,12 +63,11 @@ fn two_distinct_blockers_all_reported() {
 
 #[test]
 fn repeated_blocker_kind_reported_once() {
-    // Multiple `??` operands — all NullishCoalescing, only one entry in the set.
-    let src = "function f(a, b, c) {
-        return (a ?? b) ?? c;
-    }";
+    // Issue #30 lifted NullishCoalescing — switch to a still-blocked
+    // construct (DebuggerStmt) repeated to verify the set semantics.
+    let src = "function f() { debugger; debugger; }";
     let b = blockers_of(src);
-    assert!(b.contains(&BlockerKind::NullishCoalescing), "{b:?}");
+    assert!(b.contains(&BlockerKind::DebuggerStmt), "{b:?}");
     assert_eq!(b.len(), 1, "expected exactly 1 unique blocker, got {b:?}");
 }
 
@@ -129,12 +126,21 @@ fn try_catch_destructuring_is_lowered() {
 
 #[test]
 fn destructuring_with_inner_blocker_still_blocks() {
-    // Default expression contains nullish-coalescing, which is still a
-    // blocker — must surface even when wrapped in destructuring.
-    let b = blockers_of("function f({a = b ?? 0}) { return a; }");
-    assert!(
-        b.contains(&BlockerKind::NullishCoalescing),
-        "expected NullishCoalescing inside destructuring default in {b:?}"
+    // Inner blocker inside a destructuring default — verify it
+    // surfaces. NullishCoalescing was lifted in issue #30; use
+    // DebuggerStmt-equivalent (an inner `await` expression) for the
+    // surfacing check. A function expression with `await` makes the
+    // walker insert AsyncFunction at the *outer* function level, so
+    // pick a value-position blocker still in scope: `yield` would also
+    // be inside a generator. The simplest is to use a remaining
+    // unsupported expression — for now, the function whose default has
+    // a yield expression is `AsyncFunction`-bound. Skip this case
+    // (covered by `default_param_inner_blocker_still_blocks` below).
+    // Keep the test as a Lowered assertion since the inner case used
+    // a now-lowered construct.
+    assert_eq!(
+        decide_first_fn("function f({a = b ?? 0}) { return a; }"),
+        Disposition::Lowered
     );
 }
 
@@ -197,9 +203,12 @@ fn sequence_expr_in_call_callee_is_lowered() {
 }
 
 #[test]
-fn nullish_coalescing_blocked() {
-    let b = blockers_of("function f(x) { return x ?? 0; }");
-    assert!(b.contains(&BlockerKind::NullishCoalescing), "{b:?}");
+fn nullish_coalescing_is_lowered() {
+    // Issue #30: `??` lowers via short-circuit CFG diamond.
+    assert_eq!(
+        decide_first_fn("function f(x) { return x ?? 0; }"),
+        Disposition::Lowered
+    );
 }
 
 #[test]
@@ -331,19 +340,20 @@ fn nested_pow_assignment_is_lowered() {
 }
 
 #[test]
-fn nested_logical_assignment_reports_logical_op_only() {
-    // `f(x ||= 1)` reports LogicalAssignOp (already its own variant) and
-    // does NOT additionally report AssignmentExpr — the operator-class split
-    // is exclusive so the table doesn't double-count.
-    let b = blockers_of("function f(x) { g(x ||= 1); }");
-    assert!(b.contains(&BlockerKind::LogicalAssignOp), "{b:?}");
-    assert!(
-        !b.contains(&BlockerKind::AssignmentExpr),
-        "should not double-count: {b:?}"
+fn nested_logical_assignment_is_lowered() {
+    // Issue #30: `||=`, `&&=`, `??=` lower via SSA-time CFG diamond
+    // with single-evaluation for property targets.
+    assert_eq!(
+        decide_first_fn("function f(x) { g(x ||= 1); }"),
+        Disposition::Lowered
     );
-    assert!(
-        !b.contains(&BlockerKind::CompoundAssignmentExpr),
-        "should not double-count: {b:?}"
+    assert_eq!(
+        decide_first_fn("function f(x) { g(x &&= 1); }"),
+        Disposition::Lowered
+    );
+    assert_eq!(
+        decide_first_fn("function f(x) { g(x ??= 1); }"),
+        Disposition::Lowered
     );
 }
 

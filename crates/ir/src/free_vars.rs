@@ -341,6 +341,33 @@ impl Ctx<'_> {
                 self.walk_expr(target);
                 self.walk_expr(value);
             }
+            Expr::NullishCoalesce { lhs, rhs } => {
+                self.walk_expr(lhs);
+                self.walk_expr(rhs);
+            }
+            Expr::LogicalAssign { target, value, .. } => {
+                self.walk_expr(target);
+                self.walk_expr(value);
+            }
+            Expr::OptionalChain { base, segments } => {
+                self.walk_expr(base);
+                for seg in segments {
+                    match &seg.kind {
+                        crate::tree::OptChainKind::Member(_) => {}
+                        crate::tree::OptChainKind::Index(idx) => self.walk_expr(idx),
+                        crate::tree::OptChainKind::Call(args) => {
+                            for a in args {
+                                self.walk_expr(a);
+                            }
+                        }
+                    }
+                }
+            }
+            Expr::DeleteProp { obj, .. } => self.walk_expr(obj),
+            Expr::DeleteIndex { obj, index } => {
+                self.walk_expr(obj);
+                self.walk_expr(index);
+            }
         }
     }
 

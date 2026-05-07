@@ -443,6 +443,25 @@ pub enum InstKind {
         obj: Operand,
     },
 
+    /// `delete obj.key` — removes the property `key` from `obj`.
+    /// Returns Bool (`true` on success, including when `obj` has no
+    /// such own/proto property). Throws on non-configurable property
+    /// in strict mode, or on a non-object `obj`. Mutates the heap and
+    /// may throw — modeled as Opaque (matches the Purity tier used
+    /// for property stores).
+    DeleteProp {
+        obj: Operand,
+        key: StrId,
+    },
+    /// `delete obj[index]` — same semantics as `DeleteProp` but with
+    /// a runtime-computed key. The key expression is coerced to a
+    /// property key (which may itself throw on Symbol/object
+    /// coercion).
+    DeleteIndex {
+        obj: Operand,
+        index: Operand,
+    },
+
     // Escape hatch — opaque, blocks all reordering and analysis.
     OpaqueEval {
         source: Operand,
@@ -547,6 +566,13 @@ impl InstKind {
             // Opaque (setter can do anything) unless an analysis proves
             // narrower behavior.
             StoreProp { purity, .. } | StoreIndex { purity, .. } => purity.store_effect(),
+
+            // Deletes: WRITES_HEAP | MAY_THROW. Modeled at the Opaque
+            // tier (the tightest existing store-effect bound) — same
+            // shape as a property store with no per-site Purity tier
+            // because delete is rarer than store and per-site refinement
+            // would not recover meaningful precision in any current pass.
+            DeleteProp { .. } | DeleteIndex { .. } => Effect::OPAQUE,
 
             // Calls: opaque by default. A future analysis can refine specific calls.
             Call { .. }
@@ -1667,6 +1693,11 @@ pub fn walk_inst_operands(kind: &InstKind, mut f: impl FnMut(&Operand)) {
             f(key);
             f(obj);
         }
+        DeleteProp { obj, .. } => f(obj),
+        DeleteIndex { obj, index } => {
+            f(obj);
+            f(index);
+        }
         CatchValue => {} // no operands
         ForInInit { obj } => f(obj),
         ForInDone { iter } | ForInNext { iter } => f(iter),
@@ -1960,6 +1991,11 @@ pub fn walk_inst_operands_mut(kind: &mut InstKind, f: &mut impl FnMut(&mut Opera
             f(key);
             f(obj);
         }
+        DeleteProp { obj, .. } => f(obj),
+        DeleteIndex { obj, index } => {
+            f(obj);
+            f(index);
+        }
         CatchValue => {}
         ForInInit { obj } => f(obj),
         ForInDone { iter } | ForInNext { iter } => f(iter),
@@ -2252,6 +2288,8 @@ fn inst_result_type(
         | Instanceof { .. }
         | In { .. }
         | ToBool { .. }
+        | DeleteProp { .. }
+        | DeleteIndex { .. }
         | ForInDone { .. } => ValueType::Bool,
 
         // AddGeneric: Number unless either side could be String, in which
@@ -2717,6 +2755,18 @@ fn write_inst_kind(out: &mut String, kind: &InstKind, m: &Module) {
         Typeof { val } => unop(out, "typeof", val, m),
         Instanceof { obj, ctor } => write_binop(out, "instanceof", obj, ctor, m),
         In { key, obj } => write_binop(out, "in", key, obj, m),
+        DeleteProp { obj, key } => {
+            out.push_str("delete_prop ");
+            write_operand(out, obj, m);
+            out.push_str(", ");
+            write_string_literal(out, m.strings.resolve(key));
+        }
+        DeleteIndex { obj, index } => {
+            out.push_str("delete_index ");
+            write_operand(out, obj, m);
+            out.push_str(", ");
+            write_operand(out, index, m);
+        }
         OpaqueEval { source } => unop(out, "opaque_eval", source, m),
         CatchValue => out.push_str("catch_value"),
         ForInInit { obj } => unop(out, "for_in_init", obj, m),

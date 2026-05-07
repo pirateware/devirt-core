@@ -50,6 +50,16 @@ fn default_undefined_assign(name: &str, default_expr: Expr) -> Stmt {
 
 /// Convert a source-level compound assignment operator into the
 /// underlying binary operator.
+fn logical_assign_op(op: js::AssignmentOperator) -> Option<ir::tree::LogicalAssignOp> {
+    use ir::tree::LogicalAssignOp;
+    match op {
+        js::AssignmentOperator::LogicalAnd => Some(LogicalAssignOp::And),
+        js::AssignmentOperator::LogicalOr => Some(LogicalAssignOp::Or),
+        js::AssignmentOperator::LogicalNullish => Some(LogicalAssignOp::Nullish),
+        _ => None,
+    }
+}
+
 fn compound_to_binop(op: js::AssignmentOperator) -> Result<BinOp, Error> {
     use js::AssignmentOperator as A;
     Ok(match op {
@@ -131,7 +141,7 @@ impl<'src> Lowerer<'src> {
 /// ConstructorFnInline).
 pub const TOP_INIT_NAME: &str = "__top_init__";
 
-impl Lowerer<'_> {
+impl<'src> Lowerer<'src> {
     fn lower_program_with_decider(
         &self,
         prog: &js::Program,
@@ -1346,6 +1356,23 @@ impl Lowerer<'_> {
                 let value = self.lower_expr(&a.right)?;
                 return Ok(Stmt::Assign { target, value });
             }
+            if let Some(lop) = logical_assign_op(a.operator) {
+                // `target lop= rhs` at statement position: lower as the
+                // expression-form `Expr::LogicalAssign` wrapped in
+                // ExprStmt. SSA build-time materializes the CFG diamond
+                // with single-evaluation semantics for property
+                // targets. Keeping the expression form here (rather
+                // than desugaring to if/else statements) lets the
+                // expression-position case (`f(a ??= b)`) share the
+                // exact same SSA lowering.
+                let target = self.lower_assign_target(&a.left)?;
+                let value = self.lower_expr(&a.right)?;
+                return Ok(Stmt::ExprStmt(Expr::LogicalAssign {
+                    op: lop,
+                    target: Box::new(target),
+                    value: Box::new(value),
+                }));
+            }
             // Compound assignment: x op= rhs
             // For an identifier target, the equivalent is `x = x op rhs`.
             // For property targets, the receiver and key must each be
@@ -1534,16 +1561,21 @@ impl Lowerer<'_> {
                 rhs: Box::new(self.lower_expr(&b.right)?),
             }),
             js::Expression::LogicalExpression(l) => {
-                let op = match l.operator {
-                    js::LogicalOperator::And => BinOp::LogAnd,
-                    js::LogicalOperator::Or => BinOp::LogOr,
-                    _ => return Err(Error::Unsupported("nullish coalescing (??)")),
-                };
-                Ok(Expr::Binary {
-                    op,
-                    lhs: Box::new(self.lower_expr(&l.left)?),
-                    rhs: Box::new(self.lower_expr(&l.right)?),
-                })
+                let lhs = Box::new(self.lower_expr(&l.left)?);
+                let rhs = Box::new(self.lower_expr(&l.right)?);
+                match l.operator {
+                    js::LogicalOperator::And => Ok(Expr::Binary {
+                        op: BinOp::LogAnd,
+                        lhs,
+                        rhs,
+                    }),
+                    js::LogicalOperator::Or => Ok(Expr::Binary {
+                        op: BinOp::LogOr,
+                        lhs,
+                        rhs,
+                    }),
+                    js::LogicalOperator::Coalesce => Ok(Expr::NullishCoalesce { lhs, rhs }),
+                }
             }
             js::Expression::UnaryExpression(u) => {
                 // `-0` source folds to `Number(-0.0)` directly. The JS
@@ -1562,6 +1594,27 @@ impl Lowerer<'_> {
                     && n.value == 0.0
                 {
                     return Ok(Expr::Number(-0.0));
+                }
+                if matches!(u.operator, js::UnaryOperator::Delete) {
+                    // `delete x.k` / `delete x[k]`. `delete x` (bare
+                    // ident) is sloppy-mode-only; reject so the walker
+                    // stays conservative. Parenthesized targets unwrap
+                    // through `lower_expr` already.
+                    let target_e = match &u.argument {
+                        js::Expression::ParenthesizedExpression(p) => &p.expression,
+                        other => other,
+                    };
+                    return match target_e {
+                        js::Expression::StaticMemberExpression(m) => Ok(Expr::DeleteProp {
+                            obj: Box::new(self.lower_expr(&m.object)?),
+                            prop: m.property.name.to_string(),
+                        }),
+                        js::Expression::ComputedMemberExpression(m) => Ok(Expr::DeleteIndex {
+                            obj: Box::new(self.lower_expr(&m.object)?),
+                            index: Box::new(self.lower_expr(&m.expression)?),
+                        }),
+                        _ => Err(Error::Unsupported("delete of non-property target")),
+                    };
                 }
                 let op = match u.operator {
                     js::UnaryOperator::UnaryNegation => UnOp::Neg,
@@ -1758,10 +1811,14 @@ impl Lowerer<'_> {
                         value: Box::new(value),
                     });
                 }
-                // Compound (`+=`, `-=`, ...). Logical-assign (`||=`,
-                // `&&=`, `??=`) is still blocked at the walker; if
-                // `compound_to_binop` rejects, the walker is too
-                // permissive — surface as Unsupported.
+                if let Some(lop) = logical_assign_op(a.operator) {
+                    return Ok(Expr::LogicalAssign {
+                        op: lop,
+                        target: Box::new(target),
+                        value: Box::new(value),
+                    });
+                }
+                // Compound (`+=`, `-=`, ...).
                 let op = compound_to_binop(a.operator)?;
                 Ok(Expr::CompoundAssign {
                     op,
@@ -1770,8 +1827,120 @@ impl Lowerer<'_> {
                 })
             }
 
+            js::Expression::ChainExpression(ce) => self.lower_chain_expression(ce),
+
             _ => Err(Error::Unsupported("expression kind")),
         }
+    }
+
+    /// Lower an optional-chain expression. The OXC `ChainExpression`
+    /// wraps a single tail expression (the rightmost member/call); the
+    /// chain is encoded as nested member/call expressions whose
+    /// `optional` field is `true` at each `?.` boundary.
+    /// We flatten this into a `base` expression plus an ordered list of
+    /// `OptChainSegment`s — left-to-right access order. SSA build-time
+    /// materializes the short-circuit CFG.
+    fn lower_chain_expression(
+        &self,
+        ce: &js::ChainExpression,
+    ) -> Result<Expr, Error> {
+        use ir::tree::OptChainSegment;
+        // Walk the chain right-to-left, accumulating segments, until
+        // we hit something that isn't a member/call (the base).
+        let mut segments: Vec<OptChainSegment> = Vec::new();
+        let mut current: &js::Expression = match &ce.expression {
+            js::ChainElement::CallExpression(c) => {
+                self.collect_chain_call(c, &mut segments)?
+            }
+            js::ChainElement::ComputedMemberExpression(m) => {
+                self.collect_chain_computed(m, &mut segments)?
+            }
+            js::ChainElement::StaticMemberExpression(m) => {
+                self.collect_chain_static(m, &mut segments)?
+            }
+            js::ChainElement::PrivateFieldExpression(_) => {
+                return Err(Error::Unsupported("private field in optional chain"));
+            }
+            _ => return Err(Error::Unsupported("non-standard chain element")),
+        };
+        loop {
+            match current {
+                js::Expression::StaticMemberExpression(m) => {
+                    current = self.collect_chain_static(m, &mut segments)?;
+                }
+                js::Expression::ComputedMemberExpression(m) => {
+                    current = self.collect_chain_computed(m, &mut segments)?;
+                }
+                js::Expression::CallExpression(c) => {
+                    current = self.collect_chain_call(c, &mut segments)?;
+                }
+                js::Expression::ParenthesizedExpression(p) => {
+                    current = &p.expression;
+                }
+                _ => break,
+            }
+        }
+        segments.reverse();
+        let base = self.lower_expr(current)?;
+        debug_assert!(segments.iter().any(|s| s.optional));
+        Ok(Expr::OptionalChain {
+            base: Box::new(base),
+            segments,
+        })
+    }
+
+    fn collect_chain_static<'a>(
+        &self,
+        m: &'a js::StaticMemberExpression<'src>,
+        segments: &mut Vec<ir::tree::OptChainSegment>,
+    ) -> Result<&'a js::Expression<'src>, Error> {
+        use ir::tree::{OptChainKind, OptChainSegment};
+        segments.push(OptChainSegment {
+            optional: m.optional,
+            kind: OptChainKind::Member(m.property.name.to_string()),
+        });
+        Ok(&m.object)
+    }
+
+    fn collect_chain_computed<'a>(
+        &self,
+        m: &'a js::ComputedMemberExpression<'src>,
+        segments: &mut Vec<ir::tree::OptChainSegment>,
+    ) -> Result<&'a js::Expression<'src>, Error> {
+        use ir::tree::{OptChainKind, OptChainSegment};
+        let idx = self.lower_expr(&m.expression)?;
+        segments.push(OptChainSegment {
+            optional: m.optional,
+            kind: OptChainKind::Index(Box::new(idx)),
+        });
+        Ok(&m.object)
+    }
+
+    fn collect_chain_call<'a>(
+        &self,
+        c: &'a js::CallExpression<'src>,
+        segments: &mut Vec<ir::tree::OptChainSegment>,
+    ) -> Result<&'a js::Expression<'src>, Error> {
+        use ir::tree::{OptChainKind, OptChainSegment};
+        let mut args = Vec::with_capacity(c.arguments.len());
+        for a in &c.arguments {
+            match a {
+                js::Argument::SpreadElement(s) => {
+                    args.push(Expr::Spread(Box::new(self.lower_expr(&s.argument)?)));
+                }
+                other => {
+                    let e = other
+                        .as_expression()
+                        .ok_or(Error::Unsupported("non-expression chain arg"))?;
+                    args.push(self.lower_expr(e)?);
+                }
+            }
+        }
+        segments.push(OptChainSegment {
+            optional: c.optional,
+            kind: OptChainKind::Call(args),
+        });
+        Ok(&c.callee)
     }
 }
 

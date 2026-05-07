@@ -543,6 +543,35 @@ pub fn collect_try_address_taken_names(stmts: &[Stmt]) -> HashSet<String> {
                 for p in props { walk_expr(&p.value, out); }
             }
             Expr::Spread(inner) => walk_expr(inner, out),
+            Expr::LogicalAssign { target, value, .. } => {
+                if let Expr::Ident(n) = target.as_ref() {
+                    out.insert(n.clone());
+                }
+                walk_expr(value, out);
+            }
+            Expr::NullishCoalesce { lhs, rhs } => {
+                walk_expr(lhs, out);
+                walk_expr(rhs, out);
+            }
+            Expr::OptionalChain { base, segments } => {
+                walk_expr(base, out);
+                for seg in segments {
+                    match &seg.kind {
+                        ir::tree::OptChainKind::Member(_) => {}
+                        ir::tree::OptChainKind::Index(idx) => walk_expr(idx, out),
+                        ir::tree::OptChainKind::Call(args) => {
+                            for a in args {
+                                walk_expr(a, out);
+                            }
+                        }
+                    }
+                }
+            }
+            Expr::DeleteProp { obj, .. } => walk_expr(obj, out),
+            Expr::DeleteIndex { obj, index } => {
+                walk_expr(obj, out);
+                walk_expr(index, out);
+            }
             // Nested function literals have their own scope; their writes
             // don't affect the enclosing try.
             Expr::Func(_) => {}
@@ -710,6 +739,37 @@ fn walk_reassigned_in_expr(e: &Expr, out: &mut HashSet<String>) {
             }
             walk_reassigned_in_expr(target, out);
             walk_reassigned_in_expr(value, out);
+        }
+        Expr::NullishCoalesce { lhs, rhs } => {
+            walk_reassigned_in_expr(lhs, out);
+            walk_reassigned_in_expr(rhs, out);
+        }
+        Expr::LogicalAssign { target, value, .. } => {
+            // `x &&= rhs` / `x ||= rhs` / `x ??= rhs` may write to `x`.
+            if let Expr::Ident(n) = target.as_ref() {
+                out.insert(n.clone());
+            }
+            walk_reassigned_in_expr(target, out);
+            walk_reassigned_in_expr(value, out);
+        }
+        Expr::OptionalChain { base, segments } => {
+            walk_reassigned_in_expr(base, out);
+            for seg in segments {
+                match &seg.kind {
+                    ir::tree::OptChainKind::Member(_) => {}
+                    ir::tree::OptChainKind::Index(idx) => walk_reassigned_in_expr(idx, out),
+                    ir::tree::OptChainKind::Call(args) => {
+                        for a in args {
+                            walk_reassigned_in_expr(a, out);
+                        }
+                    }
+                }
+            }
+        }
+        Expr::DeleteProp { obj, .. } => walk_reassigned_in_expr(obj, out),
+        Expr::DeleteIndex { obj, index } => {
+            walk_reassigned_in_expr(obj, out);
+            walk_reassigned_in_expr(index, out);
         }
     }
 }
@@ -1041,6 +1101,37 @@ fn discover_expr<'a>(
             discover_expr(target, pending, captures_by_fid, seen, reassigned, parent_fid);
             discover_expr(value, pending, captures_by_fid, seen, reassigned, parent_fid);
         }
+        Expr::NullishCoalesce { lhs, rhs } => {
+            discover_expr(lhs, pending, captures_by_fid, seen, reassigned, parent_fid);
+            discover_expr(rhs, pending, captures_by_fid, seen, reassigned, parent_fid);
+        }
+        Expr::LogicalAssign { target, value, .. } => {
+            discover_expr(target, pending, captures_by_fid, seen, reassigned, parent_fid);
+            discover_expr(value, pending, captures_by_fid, seen, reassigned, parent_fid);
+        }
+        Expr::OptionalChain { base, segments } => {
+            discover_expr(base, pending, captures_by_fid, seen, reassigned, parent_fid);
+            for seg in segments {
+                match &seg.kind {
+                    ir::tree::OptChainKind::Member(_) => {}
+                    ir::tree::OptChainKind::Index(idx) => discover_expr(
+                        idx, pending, captures_by_fid, seen, reassigned, parent_fid,
+                    ),
+                    ir::tree::OptChainKind::Call(args) => {
+                        for a in args {
+                            discover_expr(a, pending, captures_by_fid, seen, reassigned, parent_fid);
+                        }
+                    }
+                }
+            }
+        }
+        Expr::DeleteProp { obj, .. } => {
+            discover_expr(obj, pending, captures_by_fid, seen, reassigned, parent_fid);
+        }
+        Expr::DeleteIndex { obj, index } => {
+            discover_expr(obj, pending, captures_by_fid, seen, reassigned, parent_fid);
+            discover_expr(index, pending, captures_by_fid, seen, reassigned, parent_fid);
+        }
     }
 }
 
@@ -1291,6 +1382,36 @@ fn collect_assign_expr_target_names(stmts: &[Stmt]) -> std::collections::HashSet
             Expr::Update { target, .. } => visit_expr(target, out),
             Expr::Spread(inner) => visit_expr(inner, out),
             Expr::Template { exprs, .. } => for e in exprs { visit_expr(e, out); },
+            Expr::NullishCoalesce { lhs, rhs } => {
+                visit_expr(lhs, out);
+                visit_expr(rhs, out);
+            }
+            Expr::LogicalAssign { target, value, .. } => {
+                if let Expr::Ident(n) = target.as_ref() {
+                    out.insert(n.clone());
+                }
+                visit_expr(target, out);
+                visit_expr(value, out);
+            }
+            Expr::OptionalChain { base, segments } => {
+                visit_expr(base, out);
+                for seg in segments {
+                    match &seg.kind {
+                        ir::tree::OptChainKind::Member(_) => {}
+                        ir::tree::OptChainKind::Index(idx) => visit_expr(idx, out),
+                        ir::tree::OptChainKind::Call(args) => {
+                            for a in args {
+                                visit_expr(a, out);
+                            }
+                        }
+                    }
+                }
+            }
+            Expr::DeleteProp { obj, .. } => visit_expr(obj, out),
+            Expr::DeleteIndex { obj, index } => {
+                visit_expr(obj, out);
+                visit_expr(index, out);
+            }
             // Stop at function literals — nested scope.
             Expr::Func(_) => {}
             Expr::Number(_) | Expr::String(_) | Expr::Bool(_) | Expr::Null
@@ -3332,6 +3453,26 @@ impl<'b, 'm> Converter<'b, 'm> {
                     ),
                 }
             }
+            Expr::NullishCoalesce { lhs, rhs } => self.convert_nullish_coalesce(lhs, rhs),
+            Expr::LogicalAssign { op, target, value } => {
+                self.convert_logical_assign(*op, target, value)
+            }
+            Expr::OptionalChain { base, segments } => {
+                self.convert_optional_chain(base, segments)
+            }
+            Expr::DeleteProp { obj, prop } => {
+                let obj_op = self.convert_expr(obj);
+                let key = self.builder.intern(prop);
+                self.emit(InstKind::DeleteProp { obj: obj_op, key })
+            }
+            Expr::DeleteIndex { obj, index } => {
+                let obj_op = self.convert_expr(obj);
+                let idx_op = self.convert_expr(index);
+                self.emit(InstKind::DeleteIndex {
+                    obj: obj_op,
+                    index: idx_op,
+                })
+            }
             Expr::Template { quasis, exprs } => {
                 // Desugar `` `a${x}b${y}c` `` to a chain of AddGeneric:
                 //   "a" + x -> ("a" + x) + "b" -> (("a" + x) + "b") + y -> ...
@@ -3790,6 +3931,460 @@ impl<'b, 'm> Converter<'b, 'm> {
         self.sealed.insert(join_b);
         self.builder.switch_to_block(join_b);
         Operand::Value(result)
+    }
+
+    /// Lower `lhs ?? rhs`. Short-circuit: if `lhs` is non-nullish
+    /// (neither `null` nor `undefined`), yields `lhs`; else evaluates
+    /// and yields `rhs`. Tested via `lhs == null` — JS loose equality
+    /// against `null` is true exactly for the two nullish values.
+    /// Same CFG-diamond shape as `convert_short_circuit`.
+    fn convert_nullish_coalesce(&mut self, lhs: &Expr, rhs: &Expr) -> Operand {
+        let lhs_op = self.convert_expr(lhs);
+        // Test: lhs == null  (true iff lhs is null or undefined).
+        let cond = self.emit(InstKind::Eq {
+            lhs: lhs_op.clone(),
+            rhs: Operand::Const(Constant::Null),
+        });
+
+        let rhs_b = self.builder.new_block();
+        let skip_b = self.builder.new_block();
+        let join_b = self.builder.new_block();
+
+        // cond true (nullish) -> evaluate rhs; cond false -> forward lhs.
+        self.builder.set_terminator(Terminator::CondBranch {
+            cond,
+            then_b: rhs_b,
+            then_args: vec![],
+            else_b: skip_b,
+            else_args: vec![],
+        });
+        self.sealed.insert(rhs_b);
+        self.sealed.insert(skip_b);
+
+        // rhs evaluation block
+        self.builder.switch_to_block(rhs_b);
+        let rhs_op = self.convert_expr(rhs);
+        let rhs_end = self.current_block();
+        self.builder.body.blocks[rhs_end.0 as usize].terminator = Terminator::Branch {
+            target: join_b,
+            args: vec![rhs_op],
+        };
+
+        // skip block — forwards lhs unchanged
+        self.builder.switch_to_block(skip_b);
+        self.builder.set_terminator(Terminator::Branch {
+            target: join_b,
+            args: vec![lhs_op],
+        });
+
+        let result = self.builder.add_block_param(join_b);
+        self.sealed.insert(join_b);
+        self.builder.switch_to_block(join_b);
+        Operand::Value(result)
+    }
+
+    /// Lower `target lop= value` (`&&=`, `||=`, `??=`). Short-circuit:
+    /// `value` and the store run only on the "miss" path.
+    /// - `&&=` stores when current value is truthy.
+    /// - `||=` stores when current value is falsy.
+    /// - `??=` stores when current value is nullish.
+    /// Property targets single-evaluate the receiver/key once at the
+    /// top, mirroring `Expr::CompoundAssign`'s pattern.
+    fn convert_logical_assign(
+        &mut self,
+        op: ir::tree::LogicalAssignOp,
+        target: &Expr,
+        value: &Expr,
+    ) -> Operand {
+        use ir::tree::LogicalAssignOp;
+        // Centralize the test on the loaded `current` value.
+        // For each op, choose (truthy_branch_takes_value, build_cond) so:
+        //   if cond holds → evaluate rhs+store; else → forward current.
+        // - &&=: store when current is truthy → cond = ToBool(current)
+        // - ||=: store when current is falsy → cond = !ToBool(current)
+        // - ??=: store when current is nullish → cond = (current == null)
+        match target {
+            Expr::Ident(name) => {
+                let sym_opt = self.lookup(name);
+                // Step 1: read current.
+                let current = if let Some(sym) = sym_opt {
+                    let cb = self.current_block();
+                    self.read_variable(sym, cb)
+                } else {
+                    let key = self.builder.intern(name);
+                    self.emit(InstKind::LoadProp {
+                        obj: Operand::Const(Constant::GlobalThis),
+                        key,
+                        purity: Purity::Throws,
+                    })
+                };
+                // Step 2: build the test.
+                let cond = self.build_logical_assign_cond(op, current.clone());
+                // Step 3: branch.
+                let store_b = self.builder.new_block();
+                let skip_b = self.builder.new_block();
+                let join_b = self.builder.new_block();
+                self.builder.set_terminator(Terminator::CondBranch {
+                    cond,
+                    then_b: store_b,
+                    then_args: vec![],
+                    else_b: skip_b,
+                    else_args: vec![],
+                });
+                self.sealed.insert(store_b);
+                self.sealed.insert(skip_b);
+                // Store path: evaluate value, write through to the binding.
+                self.builder.switch_to_block(store_b);
+                let new_v = self.convert_expr(value);
+                if let Some(sym) = sym_opt {
+                    self.tag_binding_source_name(new_v.clone(), name);
+                    let cb = self.current_block();
+                    self.write_variable(sym, cb, new_v.clone());
+                    self.builder.mark_forced_let_decl(name);
+                    let key = self.builder.intern(name);
+                    self.builder.add_inst(InstKind::StoreProp {
+                        obj: Operand::Const(Constant::GlobalThis),
+                        key,
+                        val: new_v.clone(),
+                        purity: Purity::Throws,
+                    });
+                } else {
+                    let key = self.builder.intern(name);
+                    self.builder.add_inst(InstKind::StoreProp {
+                        obj: Operand::Const(Constant::GlobalThis),
+                        key,
+                        val: new_v.clone(),
+                        purity: Purity::Throws,
+                    });
+                }
+                let store_end = self.current_block();
+                self.builder.body.blocks[store_end.0 as usize].terminator = Terminator::Branch {
+                    target: join_b,
+                    args: vec![new_v],
+                };
+                // Skip path: forward current unchanged.
+                self.builder.switch_to_block(skip_b);
+                self.builder.set_terminator(Terminator::Branch {
+                    target: join_b,
+                    args: vec![current],
+                });
+                // Join: result is the block param.
+                let result = self.builder.add_block_param(join_b);
+                self.sealed.insert(join_b);
+                self.builder.switch_to_block(join_b);
+                // Logical-assign at statement position discards the
+                // returned value; at expression position the caller
+                // uses it. Either way, the propagated value is correct.
+                let _ = match op {
+                    LogicalAssignOp::And | LogicalAssignOp::Or | LogicalAssignOp::Nullish => (),
+                };
+                Operand::Value(result)
+            }
+            Expr::Member { obj, prop } => {
+                // Single-evaluate `obj`. Then load, branch, optionally store, join.
+                let obj_op = self.convert_expr(obj);
+                let key = self.builder.intern(prop);
+                let purity = property_access_purity(&obj_op);
+                let current = self.emit(InstKind::LoadProp {
+                    obj: obj_op.clone(),
+                    key,
+                    purity,
+                });
+                let cond = self.build_logical_assign_cond(op, current.clone());
+                let store_b = self.builder.new_block();
+                let skip_b = self.builder.new_block();
+                let join_b = self.builder.new_block();
+                self.builder.set_terminator(Terminator::CondBranch {
+                    cond,
+                    then_b: store_b,
+                    then_args: vec![],
+                    else_b: skip_b,
+                    else_args: vec![],
+                });
+                self.sealed.insert(store_b);
+                self.sealed.insert(skip_b);
+                self.builder.switch_to_block(store_b);
+                let new_v = self.convert_expr(value);
+                self.builder.add_inst(InstKind::StoreProp {
+                    obj: obj_op,
+                    key,
+                    val: new_v.clone(),
+                    purity,
+                });
+                let store_end = self.current_block();
+                self.builder.body.blocks[store_end.0 as usize].terminator = Terminator::Branch {
+                    target: join_b,
+                    args: vec![new_v],
+                };
+                self.builder.switch_to_block(skip_b);
+                self.builder.set_terminator(Terminator::Branch {
+                    target: join_b,
+                    args: vec![current],
+                });
+                let result = self.builder.add_block_param(join_b);
+                self.sealed.insert(join_b);
+                self.builder.switch_to_block(join_b);
+                Operand::Value(result)
+            }
+            Expr::Index { obj, index } => {
+                let obj_op = self.convert_expr(obj);
+                let idx_op = self.convert_expr(index);
+                let purity = property_access_purity(&obj_op);
+                let current = self.emit(InstKind::LoadIndex {
+                    obj: obj_op.clone(),
+                    index: idx_op.clone(),
+                    purity,
+                });
+                let cond = self.build_logical_assign_cond(op, current.clone());
+                let store_b = self.builder.new_block();
+                let skip_b = self.builder.new_block();
+                let join_b = self.builder.new_block();
+                self.builder.set_terminator(Terminator::CondBranch {
+                    cond,
+                    then_b: store_b,
+                    then_args: vec![],
+                    else_b: skip_b,
+                    else_args: vec![],
+                });
+                self.sealed.insert(store_b);
+                self.sealed.insert(skip_b);
+                self.builder.switch_to_block(store_b);
+                let new_v = self.convert_expr(value);
+                self.builder.add_inst(InstKind::StoreIndex {
+                    obj: obj_op,
+                    index: idx_op,
+                    val: new_v.clone(),
+                    purity,
+                });
+                let store_end = self.current_block();
+                self.builder.body.blocks[store_end.0 as usize].terminator = Terminator::Branch {
+                    target: join_b,
+                    args: vec![new_v],
+                };
+                self.builder.switch_to_block(skip_b);
+                self.builder.set_terminator(Terminator::Branch {
+                    target: join_b,
+                    args: vec![current],
+                });
+                let result = self.builder.add_block_param(join_b);
+                self.sealed.insert(join_b);
+                self.builder.switch_to_block(join_b);
+                Operand::Value(result)
+            }
+            _ => panic!("LogicalAssign target must be Ident/Member/Index, got: {target:?}"),
+        }
+    }
+
+    fn build_logical_assign_cond(
+        &mut self,
+        op: ir::tree::LogicalAssignOp,
+        current: Operand,
+    ) -> Operand {
+        use ir::tree::LogicalAssignOp;
+        match op {
+            // &&=: store when current is truthy → cond = ToBool(current)
+            LogicalAssignOp::And => self.emit(InstKind::ToBool { val: current }),
+            // ||=: store when current is falsy → cond = !ToBool(current)
+            LogicalAssignOp::Or => {
+                let b = self.emit(InstKind::ToBool { val: current });
+                self.emit(InstKind::Not { operand: b })
+            }
+            // ??=: store when current is nullish → cond = (current == null)
+            LogicalAssignOp::Nullish => self.emit(InstKind::Eq {
+                lhs: current,
+                rhs: Operand::Const(Constant::Null),
+            }),
+        }
+    }
+
+    /// Lower `base segments...` where any optional segment short-circuits
+    /// the chain to `undefined` if its receiver is nullish. We process
+    /// segments left-to-right, threading a single SSA value `current`.
+    /// The first segment whose `optional` is true creates a "live"
+    /// short-circuit: a join block whose param is the chain's overall
+    /// result. Each later optional segment branches into the same join
+    /// (passing `Undefined`) if its receiver is nullish.
+    fn convert_optional_chain(
+        &mut self,
+        base: &Expr,
+        segments: &[ir::tree::OptChainSegment],
+    ) -> Operand {
+        use ir::tree::OptChainKind;
+        // For a CallExpression segment of the form `recv.method(args)` or
+        // `recv?.method(args)`, the call must bind `this` to `recv`. The
+        // chain walker collapses member-then-call into two segments
+        // (Member, Call) with the call at the next position, so we need
+        // to track whether the *previous* segment was a Member access on
+        // an object operand we still hold — and emit `CallMethod`
+        // instead of plain `Call`. We do this by remembering the
+        // pre-load receiver alongside the post-load value.
+        let mut current = self.convert_expr(base);
+        // `pending_method`: when `Some((recv, key))`, the chain has just
+        // passed through a non-optional `.name` access and `current` is
+        // not yet realized — we delay the load so a following Call can
+        // emit CallMethod and preserve `this` binding. None means the
+        // current value is concrete in `current`.
+        let mut pending_method: Option<(Operand, ir::ssa::StrId)> = None;
+        // The shared "join block + result param" pair, materialized on
+        // the first optional segment. Once present, every later optional
+        // segment branches into it on a nullish-receiver miss.
+        struct Join {
+            block: BlockId,
+            result: Value,
+        }
+        let mut join: Option<Join> = None;
+        // The first "miss" creates the join. After that, every
+        // optional-segment miss branches into it.
+
+        for (i, seg) in segments.iter().enumerate() {
+            // Realize any pending_method into a concrete `current` if
+            // the next segment isn't a Call. (CallMethod fast path is
+            // only used when a Member is immediately followed by a Call.)
+            if let Some((recv, key)) = pending_method.clone() {
+                let needs_method_form = matches!(seg.kind, OptChainKind::Call(_));
+                if !needs_method_form {
+                    // Realize the deferred load.
+                    let purity = property_access_purity(&recv);
+                    current = self.emit(InstKind::LoadProp {
+                        obj: recv,
+                        key,
+                        purity,
+                    });
+                    pending_method = None;
+                }
+            }
+
+            // If this segment is optional, gate it: branch on `current
+            // == null`. On null, branch into join with `Undefined`. On
+            // non-null, fall through to the access.
+            if seg.optional {
+                let cond = self.emit(InstKind::Eq {
+                    lhs: current.clone(),
+                    rhs: Operand::Const(Constant::Null),
+                });
+                let cont_b = self.builder.new_block();
+                self.sealed.insert(cont_b);
+                let (jblk, jres) = match &join {
+                    Some(j) => (j.block, j.result),
+                    None => {
+                        let b = self.builder.new_block();
+                        let r = self.builder.add_block_param(b);
+                        // Join block has multiple incoming edges added
+                        // over the loop; seal once we're done.
+                        join = Some(Join { block: b, result: r });
+                        (b, r)
+                    }
+                };
+                let _ = jres;
+                // cond true (nullish) → join with Undefined; false → cont.
+                self.builder.set_terminator(Terminator::CondBranch {
+                    cond,
+                    then_b: jblk,
+                    then_args: vec![Operand::Const(Constant::Undefined)],
+                    else_b: cont_b,
+                    else_args: vec![],
+                });
+                self.builder.switch_to_block(cont_b);
+            }
+
+            // Apply the access.
+            match &seg.kind {
+                OptChainKind::Member(name) => {
+                    let key = self.builder.intern(name);
+                    // Defer the load; if the next segment is a Call, we
+                    // will emit CallMethod instead.
+                    if i + 1 < segments.len() {
+                        pending_method = Some((current.clone(), key));
+                    } else {
+                        let purity = property_access_purity(&current);
+                        current = self.emit(InstKind::LoadProp {
+                            obj: current,
+                            key,
+                            purity,
+                        });
+                        pending_method = None;
+                    }
+                }
+                OptChainKind::Index(idx_e) => {
+                    let idx_op = self.convert_expr(idx_e);
+                    let purity = property_access_purity(&current);
+                    current = self.emit(InstKind::LoadIndex {
+                        obj: current,
+                        index: idx_op,
+                        purity,
+                    });
+                    pending_method = None;
+                }
+                OptChainKind::Call(args) => {
+                    // If we have a pending method (last segment was a
+                    // Member), emit CallMethod with the held receiver
+                    // — preserves `this` binding through the chain
+                    // exactly like the non-optional method-call path.
+                    let has_spread = args.iter().any(|a| matches!(a, Expr::Spread(_)));
+                    let mut arg_ops = Vec::with_capacity(args.len());
+                    let mut spread_mask = Vec::with_capacity(args.len());
+                    for a in args {
+                        if let Expr::Spread(inner) = a {
+                            arg_ops.push(self.convert_expr(inner));
+                            spread_mask.push(true);
+                        } else {
+                            arg_ops.push(self.convert_expr(a));
+                            spread_mask.push(false);
+                        }
+                    }
+                    current = if let Some((recv, key)) = pending_method.take() {
+                        if has_spread {
+                            self.emit(InstKind::CallMethodSpread {
+                                obj: recv,
+                                method: key,
+                                args: arg_ops,
+                                spread_mask,
+                            })
+                        } else {
+                            self.emit(InstKind::CallMethod {
+                                obj: recv,
+                                method: key,
+                                args: arg_ops,
+                            })
+                        }
+                    } else if has_spread {
+                        self.emit(InstKind::CallSpread {
+                            callee: current,
+                            args: arg_ops,
+                            spread_mask,
+                        })
+                    } else {
+                        self.emit(InstKind::Call {
+                            callee: current,
+                            args: arg_ops,
+                        })
+                    };
+                }
+            }
+        }
+        // Realize any trailing pending_method (segment ends on a Member).
+        if let Some((recv, key)) = pending_method {
+            let purity = property_access_purity(&recv);
+            current = self.emit(InstKind::LoadProp {
+                obj: recv,
+                key,
+                purity,
+            });
+        }
+
+        match join {
+            None => current,
+            Some(j) => {
+                // Branch the success path into join with `current`.
+                self.builder.set_terminator(Terminator::Branch {
+                    target: j.block,
+                    args: vec![current],
+                });
+                self.seal_block(j.block);
+                self.builder.switch_to_block(j.block);
+                Operand::Value(j.result)
+            }
+        }
     }
 
     fn convert_unary(&mut self, op: UnOp, operand: &Expr) -> Operand {

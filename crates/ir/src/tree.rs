@@ -403,6 +403,87 @@ pub enum Expr {
         target: Box<Expr>,
         value: Box<Expr>,
     },
+    /// `a ?? b` — short-circuit nullish-coalescing. Yields `a` when `a`
+    /// is non-nullish (neither `null` nor `undefined`); else evaluates
+    /// and yields `b`. Distinct from `||` because `0`, `""`, `false`,
+    /// `NaN` are non-nullish (so `0 ?? 1 === 0`). SSA lowers via a CFG
+    /// diamond branched on `a == null` (loose equality matches both
+    /// `null` and `undefined` and only those).
+    NullishCoalesce {
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
+    /// Logical assignment in expression position: `a &&= b`, `a ||= b`,
+    /// `a ??= b`. Short-circuit semantics: `b` and the store are only
+    /// evaluated when the test on `a` says so.
+    /// - `&&=`: stores when `a` is truthy.
+    /// - `||=`: stores when `a` is falsy.
+    /// - `??=`: stores when `a` is nullish (null or undefined).
+    /// Property targets single-evaluate the receiver/key. Lowered at
+    /// SSA-build time to a CFG diamond.
+    LogicalAssign {
+        op: LogicalAssignOp,
+        target: Box<Expr>,
+        value: Box<Expr>,
+    },
+    /// Optional chain `a?.b`, `a?.[k]`, `a?.()`. The chain starts at
+    /// `base` and applies `segments` left to right. Any segment whose
+    /// `optional == true` short-circuits the entire chain to
+    /// `undefined` if the value at that point is nullish. Non-optional
+    /// segments perform the access unconditionally (they are part of
+    /// the chain because at least one earlier segment was `?.`).
+    OptionalChain {
+        base: Box<Expr>,
+        segments: Vec<OptChainSegment>,
+    },
+    /// `delete obj.key` / `delete obj[key]`. Returns boolean. Only
+    /// property-target deletes are representable; `delete x` of a bare
+    /// identifier is sloppy-mode-only and is rejected at lower-time.
+    DeleteProp {
+        obj: Box<Expr>,
+        prop: String,
+    },
+    DeleteIndex {
+        obj: Box<Expr>,
+        index: Box<Expr>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogicalAssignOp {
+    /// `&&=`
+    And,
+    /// `||=`
+    Or,
+    /// `??=`
+    Nullish,
+}
+
+pub fn logical_assign_op_str(op: LogicalAssignOp) -> &'static str {
+    match op {
+        LogicalAssignOp::And => "&&=",
+        LogicalAssignOp::Or => "||=",
+        LogicalAssignOp::Nullish => "??=",
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OptChainSegment {
+    /// True if this segment uses `?.` (short-circuits on nullish).
+    /// False for plain `.` or `[]` or `()` segments that follow an
+    /// earlier `?.` in the same chain expression.
+    pub optional: bool,
+    pub kind: OptChainKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum OptChainKind {
+    /// `.name` or `?.name`
+    Member(String),
+    /// `[expr]` or `?.[expr]`
+    Index(Box<Expr>),
+    /// `(args)` or `?.(args)`
+    Call(Vec<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -851,6 +932,48 @@ fn dump_expr(e: &Expr) -> String {
                 binop_str(*op),
                 dump_expr(value)
             )
+        }
+        Expr::NullishCoalesce { lhs, rhs } => {
+            format!("({} ?? {})", dump_expr(lhs), dump_expr(rhs))
+        }
+        Expr::LogicalAssign { op, target, value } => format!(
+            "({} {} {})",
+            dump_expr(target),
+            logical_assign_op_str(*op),
+            dump_expr(value)
+        ),
+        Expr::OptionalChain { base, segments } => {
+            let mut s = dump_expr(base);
+            for seg in segments {
+                let dot = if seg.optional { "?." } else { "." };
+                match &seg.kind {
+                    OptChainKind::Member(name) => {
+                        s.push_str(dot);
+                        s.push_str(name);
+                    }
+                    OptChainKind::Index(idx) => {
+                        if seg.optional {
+                            s.push_str("?.");
+                        }
+                        s.push('[');
+                        s.push_str(&dump_expr(idx));
+                        s.push(']');
+                    }
+                    OptChainKind::Call(args) => {
+                        if seg.optional {
+                            s.push_str("?.");
+                        }
+                        s.push('(');
+                        s.push_str(&args.iter().map(dump_expr).collect::<Vec<_>>().join(", "));
+                        s.push(')');
+                    }
+                }
+            }
+            s
+        }
+        Expr::DeleteProp { obj, prop } => format!("(delete {}.{prop})", dump_expr(obj)),
+        Expr::DeleteIndex { obj, index } => {
+            format!("(delete {}[{}])", dump_expr(obj), dump_expr(index))
         }
     }
 }

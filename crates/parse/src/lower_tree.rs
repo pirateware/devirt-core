@@ -1162,6 +1162,14 @@ impl LowerCtx<'_> {
                 lhs: Box::new(self.operand_to_expr(key)),
                 rhs: Box::new(self.operand_to_expr(obj)),
             },
+            DeleteProp { obj, key } => Expr::DeleteProp {
+                obj: Box::new(self.operand_to_expr(obj)),
+                prop: self.sm.strings.resolve(key).to_string(),
+            },
+            DeleteIndex { obj, index } => Expr::DeleteIndex {
+                obj: Box::new(self.operand_to_expr(obj)),
+                index: Box::new(self.operand_to_expr(index)),
+            },
             OpaqueEval { source } => Expr::Call {
                 callee: Box::new(Expr::Ident("eval".to_string())),
                 args: vec![self.operand_to_expr(source)],
@@ -2327,6 +2335,59 @@ fn render_expr_to_string(e: &Expr) -> String {
             out.push('`');
             out
         }
+        Expr::NullishCoalesce { lhs, rhs } => format!(
+            "({}??{})",
+            render_expr_to_string(lhs),
+            render_expr_to_string(rhs)
+        ),
+        Expr::LogicalAssign { op, target, value } => format!(
+            "({}{}{})",
+            render_expr_to_string(target),
+            ir::tree::logical_assign_op_str(*op),
+            render_expr_to_string(value)
+        ),
+        Expr::OptionalChain { base, segments } => {
+            let mut s = render_expr_to_string(base);
+            for seg in segments {
+                let dot = if seg.optional { "?." } else { "." };
+                match &seg.kind {
+                    ir::tree::OptChainKind::Member(name) => {
+                        s.push_str(dot);
+                        s.push_str(name);
+                    }
+                    ir::tree::OptChainKind::Index(idx) => {
+                        if seg.optional {
+                            s.push_str("?.");
+                        }
+                        s.push('[');
+                        s.push_str(&render_expr_to_string(idx));
+                        s.push(']');
+                    }
+                    ir::tree::OptChainKind::Call(args) => {
+                        if seg.optional {
+                            s.push_str("?.");
+                        }
+                        s.push('(');
+                        s.push_str(
+                            &args.iter()
+                                .map(render_expr_to_string)
+                                .collect::<Vec<_>>()
+                                .join(","),
+                        );
+                        s.push(')');
+                    }
+                }
+            }
+            s
+        }
+        Expr::DeleteProp { obj, prop } => {
+            format!("(delete {}.{prop})", render_expr_to_string(obj))
+        }
+        Expr::DeleteIndex { obj, index } => format!(
+            "(delete {}[{}])",
+            render_expr_to_string(obj),
+            render_expr_to_string(index)
+        ),
     }
 }
 

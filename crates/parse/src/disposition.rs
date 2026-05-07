@@ -499,17 +499,32 @@ fn collect_expr_blockers(expr: &js::Expression, blockers: &mut BTreeSet<BlockerK
         }
 
         LogicalExpression(l) => {
-            match l.operator {
-                js::LogicalOperator::And | js::LogicalOperator::Or => {}
-                _ => {
-                    blockers.insert(BlockerKind::NullishCoalescing);
-                }
-            }
+            // `&&`, `||` and `??` are all lowerable. Walk children
+            // for any inner blockers.
+            let _ = l.operator;
             collect_expr_blockers(&l.left, blockers);
             collect_expr_blockers(&l.right, blockers);
         }
 
         UnaryExpression(u) => {
+            if matches!(u.operator, js::UnaryOperator::Delete) {
+                // `delete obj.k` and `delete obj[k]` are lowerable.
+                // Bare-ident `delete x` is sloppy-mode-only and
+                // unsupported. Look through parens.
+                let target = match &u.argument {
+                    js::Expression::ParenthesizedExpression(p) => &p.expression,
+                    other => other,
+                };
+                match target {
+                    js::Expression::StaticMemberExpression(_)
+                    | js::Expression::ComputedMemberExpression(_) => {}
+                    _ => {
+                        blockers.insert(BlockerKind::UnsupportedUnaryOp);
+                    }
+                }
+                collect_expr_blockers(&u.argument, blockers);
+                return;
+            }
             if !unop_lowerable(u.operator) {
                 blockers.insert(BlockerKind::UnsupportedUnaryOp);
             }
@@ -642,8 +657,38 @@ fn collect_expr_blockers(expr: &js::Expression, blockers: &mut BTreeSet<BlockerK
         TaggedTemplateExpression(_) => {
             blockers.insert(BlockerKind::TaggedTemplateExpr);
         }
-        ChainExpression(_) => {
-            blockers.insert(BlockerKind::ChainExpr);
+        ChainExpression(c) => {
+            // Optional chain (`a?.b`, `a?.()`, `a?.[k]`) is
+            // lowerable. Walk children so any inner blockers (e.g.,
+            // `a?.b()` where `a` itself contains an unsupported
+            // construct) still surface.
+            match &c.expression {
+                js::ChainElement::CallExpression(ce) => {
+                    collect_expr_blockers(&ce.callee, blockers);
+                    for a in &ce.arguments {
+                        match a {
+                            js::Argument::SpreadElement(s) => {
+                                collect_expr_blockers(&s.argument, blockers);
+                            }
+                            other => {
+                                if let Some(e) = other.as_expression() {
+                                    collect_expr_blockers(e, blockers);
+                                }
+                            }
+                        }
+                    }
+                }
+                js::ChainElement::ComputedMemberExpression(m) => {
+                    collect_expr_blockers(&m.object, blockers);
+                    collect_expr_blockers(&m.expression, blockers);
+                }
+                js::ChainElement::StaticMemberExpression(m) => {
+                    collect_expr_blockers(&m.object, blockers);
+                }
+                _ => {
+                    blockers.insert(BlockerKind::ChainExpr);
+                }
+            }
         }
         ImportExpression(_) => {
             blockers.insert(BlockerKind::ImportExpr);
@@ -699,6 +744,9 @@ fn assignment_op_lowerable(op: js::AssignmentOperator) -> bool {
             | BitwiseAnd
             | BitwiseOR
             | BitwiseXOR
+            | LogicalAnd
+            | LogicalOr
+            | LogicalNullish
     )
 }
 
