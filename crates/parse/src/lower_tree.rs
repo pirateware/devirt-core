@@ -2392,10 +2392,20 @@ impl LowerCtx<'_> {
 ///     `MAY_DIVERGE` (READS_HEAP and MAY_THROW are allowed — relocating
 ///     them by zero instructions doesn't change observable behavior),
 ///   - has exactly one IR-visible use,
-///   - that single use is the IMMEDIATELY-NEXT instruction in the same
-///     block (zero intervening insts), OR the block's terminator with
-///     zero insts after the def. Strict adjacency ensures heap reads
-///     and throw-points don't shift across any other operation.
+///   - the single use is in the SAME block as the def, AND no
+///     intervening instruction (between def and use, exclusive) has
+///     an effect that conflicts with the def's effect. Specifically:
+///     * PURE defs: any intervening insts are fine.
+///     * READS_HEAP defs: bail if any intervening inst WRITES_HEAP
+///       (could change what we'd read).
+///     * MAY_THROW defs: bail if any intervening inst WRITES_HEAP,
+///       MAY_DIVERGE, or OPAQUE (moving the throw across them would
+///       change observable behaviour).
+///     The original strict-adjacency rule (def_ix + 1) was a
+///     conservative special case of this. Relaxed v2 handles the
+///     case where SSA materialization creates a chain like
+///     `_t1 = parseInt; _t2 = ...; _t3 = _t1(_t2)` where _t1 is
+///     used at distance 2, but no intervening inst conflicts.
 ///   - has no `source_name` (preserve names the source supplied),
 ///   - is not in `Function.captured_by_passthrough` (PassThrough bodies
 ///     reference these by lexical name; inlining would lose the binding),
@@ -2491,14 +2501,45 @@ fn compute_inlinable_values(func: &Function, cfg: &EmitConfig) -> HashSet<u32> {
             None => continue,
         };
         let block_len = body.blocks[def_block.0 as usize].instructions.len();
-        let adjacent = match single_use.get(&v) {
-            Some(UseSite::Inst(b, ux)) => *b == def_block && *ux == def_ix + 1,
-            // Terminator is "adjacent" only when the def is the last
-            // instruction in its block (no intervening insts).
-            Some(UseSite::Terminator(b)) => *b == def_block && def_ix + 1 == block_len,
-            None => false,
+        // Determine the use position: same-block check first.
+        let use_pos = match single_use.get(&v) {
+            Some(UseSite::Inst(b, ux)) if *b == def_block => Some(*ux),
+            Some(UseSite::Terminator(b)) if *b == def_block => Some(block_len),
+            _ => None,
         };
-        if !adjacent {
+        let Some(use_ix) = use_pos else {
+            continue;
+        };
+        if use_ix <= def_ix {
+            // Use precedes def — defensive (shouldn't happen for SSA),
+            // bail to preserve order.
+            continue;
+        }
+        // Check intervening instructions for effect conflicts.
+        let def_effect = kind.effect();
+        let conflicts = if def_effect.contains(Effect::MAY_THROW) {
+            // MAY_THROW: bail on any side-effecting intervening inst.
+            Effect::WRITES_HEAP | Effect::MAY_DIVERGE | Effect::OPAQUE
+        } else if def_effect.contains(Effect::READS_HEAP) {
+            // READS_HEAP: bail only on writes.
+            Effect::WRITES_HEAP
+        } else {
+            // PURE (or empty): no intervening inst can affect us.
+            Effect::empty()
+        };
+        let block = &body.blocks[def_block.0 as usize];
+        let mut conflicted = false;
+        if !conflicts.is_empty() {
+            for ix in (def_ix + 1)..use_ix {
+                let mid_iid = block.instructions[ix];
+                let mid_eff = body.instructions[mid_iid.0 as usize].kind.effect();
+                if mid_eff.intersects(conflicts) {
+                    conflicted = true;
+                    break;
+                }
+            }
+        }
+        if conflicted {
             continue;
         }
         inlinable.insert(v);
