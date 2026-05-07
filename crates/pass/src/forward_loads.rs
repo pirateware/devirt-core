@@ -48,8 +48,8 @@ use std::collections::HashMap;
 
 use ir::error::Error;
 use ir::ssa::{
-    Constant, Effect, FuncId, InstKind, LoweredBody, Module, Operand, Purity, Value, ValueDef,
-    ValueDefKind, find_value_for_inst, operand_bit_eq, walk_inst_operands_mut,
+    Constant, Effect, FuncId, InstId, InstKind, LoweredBody, Module, Operand, Purity, Value,
+    ValueDef, ValueDefKind, find_value_for_inst, operand_bit_eq, walk_inst_operands_mut,
 };
 
 use crate::FunctionPass;
@@ -123,9 +123,30 @@ fn shapes_equal(a: &Shape, b: &Shape) -> bool {
     true
 }
 
-/// Apply a single instruction's effect to the running shape. Returns
-/// the new shape (caller-owned). Used by both analysis and transform.
-fn apply_inst(shape: &mut Shape, body: &LoweredBody, kind: &InstKind) {
+/// Apply a single instruction's effect to the running shape.
+///
+/// Pure-load CSE: a `Pure` `LoadProp/LoadIndex` on a tracked alloc
+/// whose key isn't yet in the shape *seeds* the shape with the load's
+/// own result Value. Subsequent reads of the same `(alloc, key)` then
+/// forward to the first load — both intra-block (during transform's
+/// running-shape walk) and cross-block (the seeded entry flows out
+/// through the analysis lattice and into successors' in-shapes).
+///
+/// Soundness: Pure loads are guaranteed unaliased and side-effect-free
+/// (`RefinePurityPass` is the gate), so two Pure reads of the same
+/// `(alloc, key)` with no intervening store produce the same value.
+/// If a Store later writes that key, the existing shape-update logic
+/// overwrites the entry with the stored Operand — the seeded load's
+/// Value is invalidated *only* for reads after the store, which is
+/// correct.
+///
+/// Stale-Value safety: the load that seeded an entry is never retired
+/// in the same transform pass. The transform reads `shape.get(...)`
+/// *before* `apply_inst`, so it forwards based on the pre-add view; if
+/// the lookup misses, the load isn't forwarded (stays alive in IR), and
+/// only THEN does `apply_inst` add the load's Value to the shape.
+/// Successor blocks read the same Value; it's still live.
+fn apply_inst(shape: &mut Shape, body: &LoweredBody, iid: InstId, kind: &InstKind) {
     match kind {
         InstKind::StoreProp { obj, key, val, .. } => {
             if let Operand::Value(a) = obj
@@ -156,7 +177,36 @@ fn apply_inst(shape: &mut Shape, body: &LoweredBody, kind: &InstKind) {
         | InstKind::AllocArray { .. }
         | InstKind::AllocClosure { .. }
         | InstKind::AllocRegExp { .. } => {}
-        // Loads don't change the shape (they read it). Pure or not.
+        InstKind::LoadProp {
+            obj,
+            key,
+            purity: Purity::Pure,
+        } => {
+            if let Operand::Value(a) = obj
+                && is_tracked_alloc(body, *a)
+            {
+                let k = key_from_str(*key);
+                shape.entry((a.0, k)).or_insert_with(|| {
+                    Operand::Value(find_value_for_inst(body, iid))
+                });
+            }
+        }
+        InstKind::LoadIndex {
+            obj,
+            index,
+            purity: Purity::Pure,
+        } => {
+            if let Operand::Value(a) = obj
+                && is_tracked_alloc(body, *a)
+                && let Some(k) = key_from_index_operand(index)
+            {
+                shape.entry((a.0, k)).or_insert_with(|| {
+                    Operand::Value(find_value_for_inst(body, iid))
+                });
+            }
+        }
+        // Throws-purity loads: don't seed (different exception
+        // semantics across calls; not safe to dedupe).
         InstKind::LoadProp { .. } | InstKind::LoadIndex { .. } => {}
         // Anything else: WRITES_HEAP-bearing insts (calls, OpaqueEval)
         // could touch any heap state we're tracking — flush.
@@ -174,7 +224,7 @@ fn transfer(in_shape: &Shape, body: &LoweredBody, bi: usize) -> Shape {
     let mut shape = in_shape.clone();
     for &iid in &body.blocks[bi].instructions {
         let kind = &body.instructions[iid.0 as usize].kind;
-        apply_inst(&mut shape, body, kind);
+        apply_inst(&mut shape, body, iid, kind);
     }
     shape
 }
@@ -295,15 +345,22 @@ impl FunctionPass for ForwardLoadsPass {
                     _ => None,
                 };
                 if let Some(stored) = forward {
-                    let v = find_value_for_inst(body, ir::ssa::InstId(iid));
-                    body.replace_value_uses(v, stored);
-                    body.values[v.0 as usize] = ValueDef::removed();
-                    to_unhook.push(iid);
-                    changed = true;
-                    // Forwarded load doesn't change shape; skip apply.
-                    continue;
+                    let v = find_value_for_inst(body, InstId(iid));
+                    // Self-forward guard: shape's entry for this load
+                    // could be Operand::Value(load_v) when this same
+                    // load was the seed in a prior analysis step that
+                    // somehow flowed back here (back-edge of a loop
+                    // whose only writer is this load). Don't replace
+                    // the load with itself.
+                    if !matches!(stored, Operand::Value(sv) if sv == v) {
+                        body.replace_value_uses(v, stored);
+                        body.values[v.0 as usize] = ValueDef::removed();
+                        to_unhook.push(iid);
+                        changed = true;
+                        continue;
+                    }
                 }
-                apply_inst(&mut shape, body, kind);
+                apply_inst(&mut shape, body, InstId(iid), kind);
             }
             if !to_unhook.is_empty() {
                 let unhook_set: std::collections::HashSet<u32> =
@@ -879,6 +936,205 @@ mod tests {
             !body_load_remaining,
             "loop-invariant store should let body load forward"
         );
+    }
+
+    /// CSE: two Pure loads of the same `(alloc, key)` in the same block
+    /// with no intervening store — the second forwards to the first.
+    /// No store ever happens, so neither resolves to a constant.
+    #[test]
+    fn cse_redundant_loads_same_block() {
+        let mut module = Module::new();
+        let mut b = FunctionBuilder::new(&mut module, "f", 0);
+        let key_x = b.intern("x");
+        let bb0 = b.new_block();
+        b.switch_to_block(bb0);
+        let alloc = b.add_inst(InstKind::AllocObject).unwrap();
+        let load1 = b
+            .add_inst(InstKind::LoadProp {
+                obj: Operand::Value(alloc),
+                key: key_x,
+                purity: Purity::Pure,
+            })
+            .unwrap();
+        let load2 = b
+            .add_inst(InstKind::LoadProp {
+                obj: Operand::Value(alloc),
+                key: key_x,
+                purity: Purity::Pure,
+            })
+            .unwrap();
+        // Use both loads so neither is dead.
+        let sum = b
+            .add_inst(InstKind::AddGeneric {
+                lhs: Operand::Value(load1),
+                rhs: Operand::Value(load2),
+            })
+            .unwrap();
+        b.set_terminator(Terminator::Return {
+            val: Some(Operand::Value(sum)),
+        });
+        b.finish();
+
+        let mut pm = PassManager::new();
+        pm.add_pass(Box::new(ForwardLoadsPass));
+        pm.run(&mut module, FuncId(0)).unwrap();
+
+        let body = module.functions[0].lowered();
+        let entry = body.entry;
+        let load_count = body.blocks[entry.0 as usize]
+            .instructions
+            .iter()
+            .filter(|iid| matches!(
+                body.instructions[iid.0 as usize].kind,
+                InstKind::LoadProp { .. }
+            ))
+            .count();
+        assert_eq!(load_count, 1, "second redundant load should be CSE'd");
+        // The AddGeneric should now have both lhs and rhs equal to the
+        // remaining load's Value.
+        let add_kind = body.blocks[entry.0 as usize]
+            .instructions
+            .iter()
+            .find_map(|iid| match &body.instructions[iid.0 as usize].kind {
+                k @ InstKind::AddGeneric { .. } => Some(k.clone()),
+                _ => None,
+            })
+            .expect("AddGeneric must remain");
+        if let InstKind::AddGeneric { lhs, rhs } = add_kind {
+            assert!(
+                operand_bit_eq(&lhs, &rhs),
+                "both add operands must reference same load: {lhs:?} vs {rhs:?}"
+            );
+        }
+    }
+
+    /// CSE across blocks: load in entry, load of same `(a, k)` in
+    /// successor — successor forwards to entry's load.
+    #[test]
+    fn cse_redundant_load_across_blocks() {
+        let mut module = Module::new();
+        let mut b = FunctionBuilder::new(&mut module, "f", 0);
+        let key_x = b.intern("x");
+        let bb1 = b.new_block();
+        let bb0 = b.new_block();
+        b.switch_to_block(bb0);
+        let alloc = b.add_inst(InstKind::AllocObject).unwrap();
+        let load1 = b
+            .add_inst(InstKind::LoadProp {
+                obj: Operand::Value(alloc),
+                key: key_x,
+                purity: Purity::Pure,
+            })
+            .unwrap();
+        let _ = load1;
+        b.set_terminator(Terminator::Branch {
+            target: bb1,
+            args: vec![],
+        });
+        b.switch_to_block(bb1);
+        let load2 = b
+            .add_inst(InstKind::LoadProp {
+                obj: Operand::Value(alloc),
+                key: key_x,
+                purity: Purity::Pure,
+            })
+            .unwrap();
+        b.set_terminator(Terminator::Return {
+            val: Some(Operand::Value(load2)),
+        });
+        b.finish();
+        module.functions[0].lowered_mut().entry = bb0;
+        module.functions[0].lowered_mut().rebuild_predecessors();
+
+        let mut pm = PassManager::new();
+        pm.add_pass(Box::new(ForwardLoadsPass));
+        pm.run(&mut module, FuncId(0)).unwrap();
+
+        let body = module.functions[0].lowered();
+        let bb1_loads = body.blocks[bb1.0 as usize]
+            .instructions
+            .iter()
+            .filter(|iid| matches!(
+                body.instructions[iid.0 as usize].kind,
+                InstKind::LoadProp { .. }
+            ))
+            .count();
+        assert_eq!(bb1_loads, 0, "successor load must forward to entry load");
+        // Entry's load should still be there.
+        let entry_loads = body.blocks[bb0.0 as usize]
+            .instructions
+            .iter()
+            .filter(|iid| matches!(
+                body.instructions[iid.0 as usize].kind,
+                InstKind::LoadProp { .. }
+            ))
+            .count();
+        assert_eq!(entry_loads, 1, "entry load must remain alive");
+    }
+
+    /// Store invalidates seeded load entry: load1, store(a, k, 5),
+    /// load2 → load2 forwards to Const(5), not load1.
+    #[test]
+    fn store_after_seeding_load_overrides() {
+        let mut module = Module::new();
+        let mut b = FunctionBuilder::new(&mut module, "f", 0);
+        let key_x = b.intern("x");
+        let bb0 = b.new_block();
+        b.switch_to_block(bb0);
+        let alloc = b.add_inst(InstKind::AllocObject).unwrap();
+        let load1 = b
+            .add_inst(InstKind::LoadProp {
+                obj: Operand::Value(alloc),
+                key: key_x,
+                purity: Purity::Pure,
+            })
+            .unwrap();
+        b.add_inst(InstKind::StoreProp {
+            obj: Operand::Value(alloc),
+            key: key_x,
+            val: Operand::Const(Constant::Number(5.0)),
+            purity: Purity::Pure,
+        });
+        let load2 = b
+            .add_inst(InstKind::LoadProp {
+                obj: Operand::Value(alloc),
+                key: key_x,
+                purity: Purity::Pure,
+            })
+            .unwrap();
+        // Use load1 so it's not DCE bait.
+        let sum = b
+            .add_inst(InstKind::AddGeneric {
+                lhs: Operand::Value(load1),
+                rhs: Operand::Value(load2),
+            })
+            .unwrap();
+        b.set_terminator(Terminator::Return {
+            val: Some(Operand::Value(sum)),
+        });
+        b.finish();
+
+        let mut pm = PassManager::new();
+        pm.add_pass(Box::new(ForwardLoadsPass));
+        pm.run(&mut module, FuncId(0)).unwrap();
+
+        let body = module.functions[0].lowered();
+        let entry = body.entry;
+        // load2 should forward to Const(5).
+        let add_kind = body.blocks[entry.0 as usize]
+            .instructions
+            .iter()
+            .find_map(|iid| match &body.instructions[iid.0 as usize].kind {
+                k @ InstKind::AddGeneric { .. } => Some(k.clone()),
+                _ => None,
+            })
+            .expect("AddGeneric must remain");
+        if let InstKind::AddGeneric { rhs, .. } = add_kind {
+            assert!(
+                matches!(rhs, Operand::Const(Constant::Number(n)) if n == 5.0),
+                "load2 should forward to Const(5), got {rhs:?}"
+            );
+        }
     }
 
     /// Counter-loop: body stores a different const each iteration
