@@ -743,6 +743,7 @@ impl Printer<'_> {
                 // semantics identical for ident-shaped keys.
                 if let Expr::String(s) = index.as_ref()
                     && is_js_identifier(s)
+                    && !matches!(obj.as_ref(), Expr::Number(_))
                 {
                     self.expr(obj);
                     write!(self.buf, ".{s}").unwrap();

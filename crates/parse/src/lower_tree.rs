@@ -536,43 +536,74 @@ fn try_merge_let_into_stmt(s: &mut Stmt, name: &str) -> bool {
         }
         Stmt::Block(b) => merge_let_at_first_write(b, name),
         Stmt::Labeled { stmt, .. } => try_merge_let_into_stmt(stmt, name),
-        // Conservative: don't touch Try/Switch/ForIn/ForOf — scoping
-        // and control-flow there are subtle.
+        Stmt::Switch { discriminant, cases } => {
+            if expr_refs_name(discriminant, name) {
+                return false;
+            }
+            let mut idx: Option<usize> = None;
+            for (i, c) in cases.iter().enumerate() {
+                let in_test = c.test.as_ref().is_some_and(|e| expr_refs_name(e, name));
+                let in_body = c.body.iter().any(|s| stmt_refs_name(s, name));
+                if in_test {
+                    return false;
+                }
+                if in_body {
+                    if idx.is_some() {
+                        return false;
+                    }
+                    idx = Some(i);
+                }
+            }
+            match idx {
+                Some(i) => merge_let_at_first_write(&mut cases[i].body, name),
+                None => false,
+            }
+        }
+        // Conservative: don't touch Try/ForIn/ForOf — scoping there is subtle.
         _ => false,
     }
 }
 
-/// Walk `body`, find the first Stmt that's `name = value;`, replace it
-/// with `let name = value;` and return true. Bail (false) if any read
-/// of `name` precedes the first write, or if no write exists.
+/// Walk `body`, find the first Stmt that references `name` and merge
+/// the `let name = value;` declaration there:
+///   - If the first ref is `Stmt::Assign { target = Ident(name), value }`
+///     at this scope: replace with `let name = value;` and return true.
+///   - If the first ref is a nested block-bearing Stmt (the only ref in
+///     this scope), recurse into it via `try_merge_let_into_stmt`.
+///   - If the first ref is a non-block-bearing Stmt (e.g., a Return),
+///     can't tighten further — bail.
+/// Bail also if multiple Stmts at this scope reference `name`.
 fn merge_let_at_first_write(body: &mut Vec<Stmt>, name: &str) -> bool {
-    for j in 0..body.len() {
-        match &body[j] {
-            Stmt::Assign {
-                target: Expr::Ident(t),
-                value,
-            } if t == name => {
-                if expr_refs_name(value, name) {
-                    return false;
-                }
-                let new = match std::mem::replace(&mut body[j], Stmt::Continue) {
-                    Stmt::Assign { value, .. } => Stmt::Let {
-                        name: name.to_string(),
-                        init: Some(value),
-                    },
-                    _ => unreachable!(),
-                };
-                body[j] = new;
-                return true;
-            }
-            other => {
-                if stmt_refs_name(other, name) {
-                    return false;
-                }
-            }
+    let mut first_ref: Option<usize> = None;
+    for (j, s) in body.iter().enumerate() {
+        if stmt_refs_name(s, name) {
+            first_ref = Some(j);
+            break;
         }
     }
-    false
+    let Some(j) = first_ref else {
+        return false;
+    };
+    // Direct assign at this scope.
+    if let Stmt::Assign {
+        target: Expr::Ident(t),
+        value,
+    } = &body[j]
+        && t == name
+        && !expr_refs_name(value, name)
+    {
+        let new = match std::mem::replace(&mut body[j], Stmt::Continue) {
+            Stmt::Assign { value, .. } => Stmt::Let {
+                name: name.to_string(),
+                init: Some(value),
+            },
+            _ => unreachable!(),
+        };
+        body[j] = new;
+        return true;
+    }
+    // Otherwise, recurse into the ref-bearing Stmt.
+    try_merge_let_into_stmt(&mut body[j], name)
 }
 
 fn drop_unused_top_level_lets(body: &mut Vec<Stmt>) {
