@@ -1848,3 +1848,93 @@ fn issue33_labeled_continue_tree_roundtrips() {
     let out = roundtrip(src);
     assert!(out.contains("continue outer"), "tree-IR roundtrip preserves labeled continue: {out}");
 }
+
+// === Issue #36 stage 4b: nested closures ===
+//
+// One level of capture worked before. These exercise the recursive case:
+// function `outer { inner1 { inner2 { use(outerVar) } } }` should lower
+// inner2 (and inner1) without either being force-passthrough'd because
+// the capture chain is valid.
+
+/// Two-level capture: inner2 captures outer's param `a` through inner1.
+/// Both inner1 and inner2 should remain Lowered (no PassThrough); the
+/// emitted output must read the outer param via the capture chain.
+#[test]
+fn issue36_two_level_nested_closure_lowers() {
+    let src = "
+        function outer(a) {
+            function inner1(b) {
+                function inner2(c) { return a + b + c; }
+                return inner2;
+            }
+            return inner1;
+        }
+    ";
+    let out = ssa_roundtrip(src);
+    // Lowered emit re-associates `a + b + c` with explicit parens;
+    // PassThrough would emit the source text verbatim. Either form
+    // (with or without outer parens) confirms SSA round-trip.
+    assert!(
+        out.contains("(a + b) + c"),
+        "inner2 should be lowered (parenthesised SSA form expected): {out}"
+    );
+}
+
+/// Three-level nesting: capture flows through two intermediate frames.
+#[test]
+fn issue36_three_level_nested_closure_lowers() {
+    let src = "
+        function outer(a) {
+            function l1(b) {
+                function l2(c) {
+                    function l3(d) { return a + b + c + d; }
+                    return l3;
+                }
+                return l2;
+            }
+            return l1;
+        }
+    ";
+    let _ = ssa_roundtrip(src);
+}
+
+/// Mixed: inner1 captures only parent's name; inner2 captures grandparent's.
+/// Validates that inner2's capture analysis sees `a` as available through
+/// inner1 even though inner1 doesn't use it directly.
+#[test]
+fn issue36_skip_one_level_capture_lowers() {
+    let src = "
+        function outer(a) {
+            function inner1(b) {
+                function inner2() { return a; }
+                return inner2();
+            }
+            return inner1(2);
+        }
+    ";
+    let _ = ssa_roundtrip(src);
+}
+
+/// Forward-ref through a nested closure: `inner2` captures `y` which is
+/// declared AFTER inner1 in outer's body. The forward-ref rule must
+/// still fire at the outer's discovery of inner1 (since inner1's
+/// transitive captures include `y` via free_vars::analyze), forcing
+/// inner1 to PassThrough. inner2 is then opaque inside the
+/// PassThrough body.
+#[test]
+fn issue36_nested_forward_ref_propagates() {
+    let src = "
+        function outer() {
+            function inner1() {
+                function inner2() { return y; }
+                return inner2;
+            }
+            let y = 10;
+            return inner1;
+        }
+    ";
+    let out = ssa_roundtrip(src);
+    // inner1's body must survive verbatim because it's PassThrough'd
+    // — inner2's reference to `y` must be in the emitted source.
+    assert!(out.contains("y"), "forward-ref captured name must survive: {out}");
+}

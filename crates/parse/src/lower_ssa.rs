@@ -1190,7 +1190,16 @@ fn discover_literal<'a>(
         FuncBody::Stmts(ss) => collect_reassigned_names(ss),
         FuncBody::Expression(_) | FuncBody::PassThrough(_) => HashSet::new(),
     };
-    let mut inner_seen: HashSet<String> = HashSet::new();
+    // Seed with the enclosing function's available names so that nested
+    // closures of nested closures (issue #36 stage 4b) can reference names
+    // from any ancestor scope without the inner literal being flagged as
+    // forward-ref. The check that the OUTER literal still gets right is
+    // performed separately at the post-order step using `outer_seen` —
+    // this seeding only affects how inner-of-inner literals validate
+    // their own captures. Lexically, every name available in the outer
+    // (its params, hoisted FuncDecls, ancestor captures) is also available
+    // inside this function's body.
+    let mut inner_seen: HashSet<String> = outer_seen.clone();
     if let Some(n) = &lit.name {
         inner_seen.insert(n.clone());
     }
