@@ -46,17 +46,17 @@ fn arithmetic_and_return_is_lowered() {
     );
 }
 
-// --- Three distinct blockers all reported ---
+// --- Distinct blockers all reported ---
 
 #[test]
 fn two_distinct_blockers_all_reported() {
-    // NullishCoalescing + DefaultParam — two constructs still blocked
-    // after the switch/break lowering ticket. (BreakStmt and SwitchStmt
-    // are no longer blockers; they lower syntactically and route
-    // through the SSA-fallback path, same as Throw/Try/ForIn.)
-    let src = "function f(a = 1) { let x = a ?? 1; return x; }";
+    // NullishCoalescing + RestParam — DefaultParam is no longer a
+    // blocker (lifted in issue #29 via parse-time desugaring), so we
+    // pair NullishCoalescing with RestParam (still blocked, needs
+    // variadic-call ABI work).
+    let src = "function f(...rest) { let x = rest ?? 1; return x; }";
     let b = blockers_of(src);
-    assert!(b.contains(&BlockerKind::DefaultParam), "missing DefaultParam in {b:?}");
+    assert!(b.contains(&BlockerKind::RestParam), "missing RestParam in {b:?}");
     assert!(b.contains(&BlockerKind::NullishCoalescing), "missing NullishCoalescing in {b:?}");
     assert_eq!(b.len(), 2, "expected exactly 2 blockers, got {b:?}");
 }
@@ -78,20 +78,72 @@ fn repeated_blocker_kind_reported_once() {
 
 #[test]
 fn rest_param_blocked() {
+    // RestParam still blocked — needs variadic-call ABI (deferred
+    // beyond issue #29).
     let b = blockers_of("function f(...args) {}");
     assert!(b.contains(&BlockerKind::RestParam), "{b:?}");
 }
 
 #[test]
-fn destructuring_param_blocked() {
-    let b = blockers_of("function f({a, b}) { return a + b; }");
-    assert!(b.contains(&BlockerKind::DestructuringParam), "{b:?}");
+fn destructuring_param_is_lowered() {
+    // Issue #29: object/array destructuring params lift via parse-time
+    // desugaring (synthetic identifier param + body prologue).
+    assert_eq!(
+        decide_first_fn("function f({a, b}) { return a + b; }"),
+        Disposition::Lowered
+    );
+    assert_eq!(
+        decide_first_fn("function f([a, b]) { return a + b; }"),
+        Disposition::Lowered
+    );
 }
 
 #[test]
-fn default_param_blocked() {
-    let b = blockers_of("function f(x = 1) { return x; }");
-    assert!(b.contains(&BlockerKind::DefaultParam), "{b:?}");
+fn default_param_is_lowered() {
+    // Issue #29: default-value params lift via parse-time desugaring
+    // (`if (x === undefined) x = expr;` prologue).
+    assert_eq!(
+        decide_first_fn("function f(x = 1) { return x; }"),
+        Disposition::Lowered
+    );
+}
+
+#[test]
+fn destructuring_with_default_is_lowered() {
+    // `function f({a, b} = {})` — default + destructuring combined.
+    assert_eq!(
+        decide_first_fn("function f({a, b} = {}) { return a + b; }"),
+        Disposition::Lowered
+    );
+}
+
+#[test]
+fn try_catch_destructuring_is_lowered() {
+    // Issue #29: `catch ({message})` lifts via the same destructuring
+    // desugaring as DestructuringParam.
+    assert_eq!(
+        decide_first_fn("function f() { try { g(); } catch ({message}) { return message; } }"),
+        Disposition::Lowered
+    );
+}
+
+#[test]
+fn destructuring_with_inner_blocker_still_blocks() {
+    // Default expression contains nullish-coalescing, which is still a
+    // blocker — must surface even when wrapped in destructuring.
+    let b = blockers_of("function f({a = b ?? 0}) { return a; }");
+    assert!(
+        b.contains(&BlockerKind::NullishCoalescing),
+        "expected NullishCoalescing inside destructuring default in {b:?}"
+    );
+}
+
+#[test]
+fn object_rest_in_destructuring_param_still_blocks() {
+    // `{a, ...rest}` needs variadic-extraction (same machinery as
+    // RestParam) — keep blocked under RestParam.
+    let b = blockers_of("function f({a, ...rest}) { return a; }");
+    assert!(b.contains(&BlockerKind::RestParam), "{b:?}");
 }
 
 #[test]

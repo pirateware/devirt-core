@@ -31,6 +31,23 @@ use ir::error::Error;
 use crate::disposition::{Disposition, decide, decide_arrow};
 use ir::tree::*;
 
+/// Build `if (name === undefined) name = default_expr;` — used by the
+/// param-list desugaring (issue #29) for default values.
+fn default_undefined_assign(name: &str, default_expr: Expr) -> Stmt {
+    Stmt::If {
+        cond: Expr::Binary {
+            op: BinOp::StrictEq,
+            lhs: Box::new(Expr::Ident(name.to_string())),
+            rhs: Box::new(Expr::Undefined),
+        },
+        then_body: vec![Stmt::Assign {
+            target: Expr::Ident(name.to_string()),
+            value: default_expr,
+        }],
+        else_body: None,
+    }
+}
+
 /// Convert a source-level compound assignment operator into the
 /// underlying binary operator.
 fn compound_to_binop(op: js::AssignmentOperator) -> Result<BinOp, Error> {
@@ -501,21 +518,14 @@ impl Lowerer<'_> {
         f: &js::Function,
         body: &js::FunctionBody,
     ) -> Result<Item, Error> {
-        let mut params = Vec::with_capacity(f.params.items.len());
-        for p in &f.params.items {
-            match &p.pattern.kind {
-                js::BindingPatternKind::BindingIdentifier(id) => {
-                    params.push(id.name.to_string());
-                }
-                _ => {
-                    // Disposition should have routed this to PassThrough.
-                    // Reaching here means walker-too-permissive.
-                    return Err(Error::Unsupported("destructuring or default parameter"));
-                }
-            }
-        }
+        // Lower the parameter list, picking up any prologue stmts the
+        // desugaring needs (issue #29: default + destructuring params
+        // become identifier params + a body prologue).
+        let (params, mut prologue) = self.lower_param_list(&f.params)?;
 
-        let stmts = self.lower_stmts_list(&body.statements)?;
+        let body_stmts = self.lower_stmts_list(&body.statements)?;
+        prologue.extend(body_stmts);
+        let stmts = prologue;
 
         // Stash the body source slice so `lower_ssa` can fall back to
         // a PassThrough function if the body contains a construct that
@@ -630,6 +640,237 @@ impl Lowerer<'_> {
     }
 
     // ------------------------------------------------------------------
+    // Parameter-list desugaring (issue #29)
+    // ------------------------------------------------------------------
+    //
+    // Default, destructuring, and try/catch destructuring params lower
+    // by *desugaring at parse time* into a simple-identifier param list
+    // plus a prologue of statements that materialize the original
+    // bindings. The function's arity is preserved (one slot per source
+    // parameter); only the *binding shape* changes from
+    // pattern-on-param to identifier-on-param + body-prologue stmts.
+    //
+    // Evaluation order: prologue statements are emitted in source-param
+    // order, with the default-undefined check immediately before the
+    // destructuring expansion. This matches ES2015 §9.2.10
+    // (FunctionDeclarationInstantiation) — defaults evaluate left-to-
+    // right and may reference earlier params.
+    //
+    // Strict-mode note: ES2015 forbids `arguments` from tracking param
+    // mutation when the function has any non-simple parameter. Our
+    // desugaring doesn't surface `arguments` at all, so this is a
+    // non-issue (the SSA layer doesn't model `arguments` either).
+    //
+    // RestParam (`...args`) is *not* lifted by this helper — it requires
+    // a variadic call ABI we don't yet model. Disposition still rejects
+    // RestParam at the param-list level.
+
+    /// Lower a parameter list. Returns the simple-identifier param names
+    /// and a prologue of `Stmt`s that the caller must prepend to the
+    /// function body (or wrap in a Block before the body, in the arrow
+    /// expression-body case where there is no body to prepend to).
+    ///
+    /// Identifier-only params produce no prologue. Default and
+    /// destructuring params produce prologue stmts.
+    fn lower_param_list(
+        &self,
+        params: &js::FormalParameters,
+    ) -> Result<(Vec<String>, Vec<Stmt>), Error> {
+        // RestParam is still a disposition blocker; if we reach here
+        // something is wrong with the walker.
+        if params.rest.is_some() {
+            return Err(Error::Unsupported("rest parameter (`...args`)"));
+        }
+        let mut names = Vec::with_capacity(params.items.len());
+        let mut prologue: Vec<Stmt> = Vec::new();
+        for (i, p) in params.items.iter().enumerate() {
+            self.lower_one_param(i, &p.pattern, &mut names, &mut prologue)?;
+        }
+        Ok((names, prologue))
+    }
+
+    /// Lower one formal parameter. The slot's name (either the original
+    /// identifier or a synthesized `__p<i>` placeholder) is pushed to
+    /// `names`; any prologue statements needed to bind the original
+    /// pattern's identifiers go to `prologue`.
+    fn lower_one_param(
+        &self,
+        slot: usize,
+        pat: &js::BindingPattern,
+        names: &mut Vec<String>,
+        prologue: &mut Vec<Stmt>,
+    ) -> Result<(), Error> {
+        match &pat.kind {
+            js::BindingPatternKind::BindingIdentifier(id) => {
+                names.push(id.name.to_string());
+                Ok(())
+            }
+            js::BindingPatternKind::AssignmentPattern(ap) => {
+                // `name = expr` or `pattern = expr`.
+                let default_expr = self.lower_expr(&ap.right)?;
+                match &ap.left.kind {
+                    js::BindingPatternKind::BindingIdentifier(id) => {
+                        // Simple default param: `function f(x = E)`.
+                        // Emit `if (x === undefined) x = E;`.
+                        let name = id.name.to_string();
+                        names.push(name.clone());
+                        prologue.push(default_undefined_assign(&name, default_expr));
+                        Ok(())
+                    }
+                    _ => {
+                        // Destructuring with a default: `function f({a} = {})`.
+                        // Bind a synthetic param, default it, then
+                        // destructure.
+                        let slot_name = format!("__p{slot}");
+                        names.push(slot_name.clone());
+                        prologue.push(default_undefined_assign(&slot_name, default_expr));
+                        self.emit_destructure_into(
+                            &ap.left,
+                            Expr::Ident(slot_name),
+                            prologue,
+                        )?;
+                        Ok(())
+                    }
+                }
+            }
+            js::BindingPatternKind::ObjectPattern(_) | js::BindingPatternKind::ArrayPattern(_) => {
+                // `function f({a, b})` / `function f([a, b])`. Bind a
+                // synthetic param then destructure into the original
+                // names.
+                let slot_name = format!("__p{slot}");
+                names.push(slot_name.clone());
+                self.emit_destructure_into(pat, Expr::Ident(slot_name), prologue)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Emit prologue `let`-declarations that destructure `source` into
+    /// the bindings of `pat`. `source` should be a side-effect-free
+    /// reference (typically a fresh identifier — the caller binds the
+    /// destructured value to a temp first if its source has effects).
+    fn emit_destructure_into(
+        &self,
+        pat: &js::BindingPattern,
+        source: Expr,
+        out: &mut Vec<Stmt>,
+    ) -> Result<(), Error> {
+        match &pat.kind {
+            js::BindingPatternKind::BindingIdentifier(id) => {
+                out.push(Stmt::Let {
+                    name: id.name.to_string(),
+                    init: Some(source),
+                });
+                Ok(())
+            }
+            js::BindingPatternKind::AssignmentPattern(ap) => {
+                // Pattern-with-default: bind the source, default if
+                // undefined, then continue destructuring the inner
+                // pattern. We need a fresh temp because `source` may
+                // be referenced multiple times and could be a member
+                // load with effects in a nested destructuring.
+                let tmp = self.fresh_temp();
+                out.push(Stmt::Let {
+                    name: tmp.clone(),
+                    init: Some(source),
+                });
+                let default_expr = self.lower_expr(&ap.right)?;
+                out.push(default_undefined_assign(&tmp, default_expr));
+                self.emit_destructure_into(&ap.left, Expr::Ident(tmp), out)
+            }
+            js::BindingPatternKind::ObjectPattern(op) => {
+                if op.rest.is_some() {
+                    return Err(Error::Unsupported("object rest in destructuring"));
+                }
+                // Bind source to a temp so each property load reuses
+                // the same value (avoiding double-evaluation if the
+                // source is a member access later in a recursive
+                // destructure — though at the param level it's an
+                // identifier and the temp is technically unnecessary,
+                // it keeps the lowering uniform).
+                let (root_expr, maybe_temp) = self.bind_destructure_source(source, out);
+                for prop in &op.properties {
+                    let key_expr = self.binding_property_load(prop, root_expr.clone())?;
+                    self.emit_destructure_into(&prop.value, key_expr, out)?;
+                }
+                drop(maybe_temp);
+                Ok(())
+            }
+            js::BindingPatternKind::ArrayPattern(ap) => {
+                if ap.rest.is_some() {
+                    return Err(Error::Unsupported("array rest in destructuring"));
+                }
+                let (root_expr, maybe_temp) = self.bind_destructure_source(source, out);
+                for (i, el) in ap.elements.iter().enumerate() {
+                    if let Some(p) = el {
+                        let load = Expr::Index {
+                            obj: Box::new(root_expr.clone()),
+                            index: Box::new(Expr::Number(i as f64)),
+                        };
+                        self.emit_destructure_into(p, load, out)?;
+                    }
+                    // Elision: skip the slot.
+                }
+                drop(maybe_temp);
+                Ok(())
+            }
+        }
+    }
+
+    /// If `source` is already a plain identifier, just return it
+    /// (cloning is cheap). Otherwise bind it to a fresh temp and return
+    /// the temp identifier so subsequent property loads reuse the same
+    /// SSA value once the IR lowers.
+    fn bind_destructure_source(
+        &self,
+        source: Expr,
+        out: &mut Vec<Stmt>,
+    ) -> (Expr, Option<String>) {
+        if let Expr::Ident(_) = source {
+            return (source, None);
+        }
+        let tmp = self.fresh_temp();
+        out.push(Stmt::Let {
+            name: tmp.clone(),
+            init: Some(source),
+        });
+        (Expr::Ident(tmp.clone()), Some(tmp))
+    }
+
+    /// Build the property load expression for one BindingProperty.
+    fn binding_property_load(
+        &self,
+        prop: &js::BindingProperty,
+        root: Expr,
+    ) -> Result<Expr, Error> {
+        if prop.computed {
+            let e = prop
+                .key
+                .as_expression()
+                .ok_or(Error::Unsupported("non-expression computed destructuring key"))?;
+            return Ok(Expr::Index {
+                obj: Box::new(root),
+                index: Box::new(self.lower_expr(e)?),
+            });
+        }
+        match &prop.key {
+            js::PropertyKey::StaticIdentifier(id) => Ok(Expr::Member {
+                obj: Box::new(root),
+                prop: id.name.to_string(),
+            }),
+            js::PropertyKey::StringLiteral(s) => Ok(Expr::Member {
+                obj: Box::new(root),
+                prop: s.value.to_string(),
+            }),
+            js::PropertyKey::NumericLiteral(n) => Ok(Expr::Index {
+                obj: Box::new(root),
+                index: Box::new(Expr::Number(n.value)),
+            }),
+            _ => Err(Error::Unsupported("destructuring key kind")),
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Function-shaped helpers (Stream B)
     // ------------------------------------------------------------------
 
@@ -657,19 +898,11 @@ impl Lowerer<'_> {
             return self.passthrough_literal(name, f, body, blockers);
         }
 
-        let mut params = Vec::with_capacity(f.params.items.len());
-        for p in &f.params.items {
-            match &p.pattern.kind {
-                js::BindingPatternKind::BindingIdentifier(id) => {
-                    params.push(id.name.to_string());
-                }
-                _ => {
-                    return Err(Error::Unsupported("destructuring or default parameter"));
-                }
-            }
-        }
+        let (params, mut prologue) = self.lower_param_list(&f.params)?;
 
-        let stmts = self.lower_stmts_list(&body.statements)?;
+        let body_stmts = self.lower_stmts_list(&body.statements)?;
+        prologue.extend(body_stmts);
+        let stmts = prologue;
 
         // Stash the body's source slice so pass 1 of SSA lowering can
         // re-classify this literal to PassThrough cheaply if the
@@ -700,22 +933,18 @@ impl Lowerer<'_> {
             return self.passthrough_arrow(a, blockers);
         }
 
-        let mut params = Vec::with_capacity(a.params.items.len());
-        for p in &a.params.items {
-            match &p.pattern.kind {
-                js::BindingPatternKind::BindingIdentifier(id) => {
-                    params.push(id.name.to_string());
-                }
-                _ => {
-                    return Err(Error::Unsupported("destructuring or default parameter"));
-                }
-            }
-        }
+        let (params, mut prologue) = self.lower_param_list(&a.params)?;
 
         // Arrow body in OXC is always wrapped in a `FunctionBody`. When
         // `a.expression` is true, body.statements has exactly one
         // ExpressionStatement (synthesized by the parser to host the
         // expression body); otherwise it's a regular block.
+        //
+        // If the param list produced a prologue (default / destructuring
+        // desugaring per issue #29), we cannot keep an expression-body
+        // arrow — the prologue stmts have nowhere to live in
+        // `FuncBody::Expression`. Convert to `FuncBody::Stmts` with a
+        // synthetic `return <expr>;` after the prologue.
         let (body, passthrough_source) = if a.expression {
             let stmt = a.body.statements.first().ok_or_else(|| {
                 Error::Malformed("expression-body arrow missing statement".into())
@@ -733,14 +962,18 @@ impl Lowerer<'_> {
             let pt = self
                 .slice_span(expr_inner.span())
                 .map(|s| format!("return {};", s));
-            (
-                FuncBody::Expression(Box::new(self.lower_expr(expr_inner)?)),
-                pt,
-            )
+            let lowered = self.lower_expr(expr_inner)?;
+            if prologue.is_empty() {
+                (FuncBody::Expression(Box::new(lowered)), pt)
+            } else {
+                prologue.push(Stmt::Return(Some(lowered)));
+                (FuncBody::Stmts(prologue), pt)
+            }
         } else {
-            let stmts = self.lower_stmts_list(&a.body.statements)?;
+            let body_stmts = self.lower_stmts_list(&a.body.statements)?;
+            prologue.extend(body_stmts);
             let pt = self.slice_body_inner(a.body.span()).map(|s| s.to_string());
-            (FuncBody::Stmts(stmts), pt)
+            (FuncBody::Stmts(prologue), pt)
         };
 
         Ok(FuncLiteral {
@@ -1017,16 +1250,36 @@ impl Lowerer<'_> {
         let catch = match &t.handler {
             None => None,
             Some(handler) => {
-                // Extract the catch parameter name if present (plain identifier only;
-                // disposition already rejected destructuring).
-                let param_name = handler.param.as_ref().map(|p| {
-                    match &p.pattern.kind {
-                        js::BindingPatternKind::BindingIdentifier(id) => id.name.to_string(),
-                        _ => unreachable!("disposition rejected non-identifier catch param"),
-                    }
-                });
+                // Identifier params bind directly. Destructuring catch
+                // params (issue #29: `catch ({message})`) desugar by
+                // binding a fresh synthetic catch name and emitting a
+                // destructuring prologue at the top of the catch body —
+                // mirrors the function-param desugaring path.
+                let (param_name, mut prologue) = match handler.param.as_ref() {
+                    None => (None, Vec::new()),
+                    Some(p) => match &p.pattern.kind {
+                        js::BindingPatternKind::BindingIdentifier(id) => {
+                            (Some(id.name.to_string()), Vec::new())
+                        }
+                        _ => {
+                            // Synthesize a catch-binding name that
+                            // wouldn't collide with user code, then
+                            // destructure into the original pattern's
+                            // identifiers.
+                            let slot = self.fresh_temp();
+                            let mut prologue: Vec<Stmt> = Vec::new();
+                            self.emit_destructure_into(
+                                &p.pattern,
+                                Expr::Ident(slot.clone()),
+                                &mut prologue,
+                            )?;
+                            (Some(slot), prologue)
+                        }
+                    },
+                };
                 let catch_body = self.lower_stmts_list(&handler.body.body)?;
-                Some((param_name, catch_body))
+                prologue.extend(catch_body);
+                Some((param_name, prologue))
             }
         };
 

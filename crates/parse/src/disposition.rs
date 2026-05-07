@@ -84,17 +84,74 @@ pub fn decide_arrow(arrow: &js::ArrowFunctionExpression) -> Disposition {
 // ----------------------------------------------------------------------
 
 fn collect_param_blockers(params: &js::FormalParameters, blockers: &mut BTreeSet<BlockerKind>) {
+    // RestParam (`function f(...args)`) still requires a variadic-call
+    // ABI we don't model. Keep it blocked. The destructuring/default
+    // shapes lift via parse-time desugaring (issue #29) — we still walk
+    // into them here so any *inner* blocker (e.g. `function f({a = b ?? 0})`
+    // contains NullishCoalescing) still surfaces.
     if params.rest.is_some() {
         blockers.insert(BlockerKind::RestParam);
     }
     for p in &params.items {
-        match &p.pattern.kind {
-            js::BindingPatternKind::BindingIdentifier(_) => {}
-            js::BindingPatternKind::ObjectPattern(_) | js::BindingPatternKind::ArrayPattern(_) => {
-                blockers.insert(BlockerKind::DestructuringParam);
+        collect_binding_pattern_blockers(&p.pattern, blockers);
+    }
+}
+
+/// Walk a binding pattern (used for both function parameters and the
+/// catch handler param) and surface any blockers inside default
+/// expressions or nested destructuring.
+fn collect_binding_pattern_blockers(
+    pat: &js::BindingPattern,
+    blockers: &mut BTreeSet<BlockerKind>,
+) {
+    match &pat.kind {
+        js::BindingPatternKind::BindingIdentifier(_) => {}
+        js::BindingPatternKind::AssignmentPattern(ap) => {
+            // Default expression — walk it for any inner blockers.
+            collect_expr_blockers(&ap.right, blockers);
+            collect_binding_pattern_blockers(&ap.left, blockers);
+        }
+        js::BindingPatternKind::ObjectPattern(op) => {
+            // Object rest in destructuring (`{a, ...rest}`) needs the
+            // same variadic-extraction machinery as RestParam — keep
+            // blocked under RestParam for consistency.
+            if op.rest.is_some() {
+                blockers.insert(BlockerKind::RestParam);
             }
-            js::BindingPatternKind::AssignmentPattern(_) => {
-                blockers.insert(BlockerKind::DefaultParam);
+            for prop in &op.properties {
+                if prop.computed {
+                    // Computed destructuring keys are valid JS but the
+                    // desugared `LoadIndex(t, key)` form needs the key
+                    // expression evaluated at the destructuring site;
+                    // surface inner blockers and refuse if the key
+                    // shape isn't lowerable.
+                    match prop.key.as_expression() {
+                        Some(e) => collect_expr_blockers(e, blockers),
+                        None => {
+                            blockers.insert(BlockerKind::UnsupportedExpr);
+                        }
+                    }
+                } else {
+                    match &prop.key {
+                        js::PropertyKey::StaticIdentifier(_)
+                        | js::PropertyKey::StringLiteral(_)
+                        | js::PropertyKey::NumericLiteral(_) => {}
+                        _ => {
+                            blockers.insert(BlockerKind::UnsupportedExpr);
+                        }
+                    }
+                }
+                collect_binding_pattern_blockers(&prop.value, blockers);
+            }
+        }
+        js::BindingPatternKind::ArrayPattern(ap) => {
+            if ap.rest.is_some() {
+                blockers.insert(BlockerKind::RestParam);
+            }
+            for el in &ap.elements {
+                if let Some(p) = el {
+                    collect_binding_pattern_blockers(p, blockers);
+                }
             }
         }
     }
@@ -223,9 +280,10 @@ fn collect_try_stmt_blockers(t: &js::TryStatement, blockers: &mut BTreeSet<Block
     }
     if let Some(handler) = &t.handler {
         if let Some(param) = &handler.param {
-            if !matches!(param.pattern.kind, js::BindingPatternKind::BindingIdentifier(_)) {
-                blockers.insert(BlockerKind::TryCatchDestructuringParam);
-            }
+            // Catch destructuring (`catch ({message})`) lifts via the
+            // same parse-time desugaring as DestructuringParam (issue #29).
+            // Walk the pattern so inner blockers still surface.
+            collect_binding_pattern_blockers(&param.pattern, blockers);
         }
         for stmt in &handler.body.body {
             collect_stmt_blockers(stmt, blockers);
