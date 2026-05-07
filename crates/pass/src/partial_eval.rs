@@ -22,13 +22,23 @@
 //!
 //! ## Soundness
 //!
-//! - Admissibility gate is `is_inlinable_shape` from
-//!   `constructor_fn_inline`. That predicate already guarantees the
-//!   body's per-instruction effect is a subset of `PURE | MAY_THROW`
-//!   and rejects loops, `Try`, and side-effecting instructions.
-//!   Replaying that body with const args therefore produces the same
-//!   observable as the original Call (mod identity-per-call for fresh
-//!   allocs, which can't escape past a `Return(Const)` anyway).
+//! - Admissibility is no longer gated by `is_inlinable_shape`. We
+//!   sandbox ANY `Lowered` callee whose body fits the size caps and
+//!   rely on the **converged-Const** check at the sandbox exit as the
+//!   real soundness gate: every reachable `Return` terminator must
+//!   carry the SAME `Operand::Const(_)`. If the body has external
+//!   side effects, those effects materialise as live operations whose
+//!   results flow into `Return`s as `Operand::Value(_)` (or
+//!   `Operand::Capture(_)`), failing the gate. Equivalently:
+//!     * A `Return` that depends on a heap load that the sandbox
+//!       couldn't const-fold ⇒ value is `Operand::Value(_)` ⇒ bail.
+//!     * A `Return` that depends on a Call result that didn't
+//!       const-fold ⇒ same outcome ⇒ bail.
+//!     * A `Return` that's just `Const(c)` ⇒ safe to apply at the
+//!       call site.
+//!   This also rules out `Throw` paths automatically: a reachable
+//!   `Throw` is not a `Return(Const)` terminator, so any Throw-only
+//!   exit fails the all-Returns-Const gate.
 //! - The sandbox shares the input module's string interner (cloned).
 //!   `try_const_fold_in_module` for `ConcatStr` resolves StrIds against
 //!   the sandbox interner, then writes its `Const::String` result back
@@ -73,7 +83,6 @@ use ir::ssa::{
 
 use crate::branch_fold::BranchFoldPass;
 use crate::const_fold::ConstFoldPass;
-use crate::constructor_fn_inline::is_inlinable_shape;
 use crate::dce::DcePass;
 use crate::forward_loads::ForwardLoadsPass;
 use crate::{ModulePass, PassManager};
@@ -137,17 +146,19 @@ impl ModulePass for PartialEvalPass {
             };
 
             for (call_iid, target_fid, const_args) in candidates {
-                // Gate: callee must be a shape we'd be willing to
-                // physically inline. Shape predicate also rejects
-                // PassThrough bodies and loops/try.
+                // Gate: callee must be `Lowered` and fit size caps.
+                // The `is_inlinable_shape` predicate is intentionally
+                // NOT used: real-world decoders / wrappers / multi-
+                // block helpers fail it for benign reasons (e.g.
+                // captures, calls to non-clonable helpers, opaque
+                // stores). Soundness is enforced at the sandbox exit
+                // by the all-reachable-Returns-yield-the-same-Const
+                // check — any external side effect in the body shows
+                // up as a non-Const operand on a Return value.
                 let target_idx = target_fid.0 as usize;
                 if target_idx >= module.functions.len() {
                     continue;
                 }
-                if !is_inlinable_shape(&module.functions[target_idx]) {
-                    continue;
-                }
-                // Size caps.
                 let target_body = match &module.functions[target_idx].body {
                     FunctionBody::Lowered(b) => b,
                     FunctionBody::PassThrough(_) => continue,
@@ -299,6 +310,41 @@ fn sandbox_evaluate(
             stack.push(succ);
         }
     }
+    // Side-effect scan: any reachable instruction whose effect is
+    // not exactly `PURE` is a real side effect we'd erase by
+    // replacing the Call with a Const. The all-Returns-Const gate
+    // alone is NOT sufficient — two failure modes the gate misses:
+    //   (a) Standalone non-removable side effects, e.g.
+    //       `globalThis.counter = 1; return 5;` produces
+    //       `Return Const(5)` after sandbox folding while still
+    //       carrying a `StoreProp` (non-removable, `WRITES_HEAP`).
+    //       Erasing the Call would erase the store. Bail.
+    //   (b) `MAY_THROW`-bearing operations whose result is dead.
+    //       `Eq`/`Lt`/`AddGeneric`/`LoadProp_throws` are
+    //       non-removable when unused (`MAY_THROW` blocks DCE), so
+    //       they survive in the sandbox even if the converged Const
+    //       answer doesn't depend on them. Erasing the Call would
+    //       erase a potential throw. Bail.
+    // If the body genuinely converges to a Const result, ConstFold
+    // collapses arithmetic / comparisons on Const inputs and DCE
+    // removes the now-pure dead computations — so a true partial-
+    // eval candidate is `PURE`-only after sandbox convergence. This
+    // is strictly stricter than v1's `is_inlinable_shape` gate
+    // (which only checked the matcher's structural shape, not
+    // residual effects), and stricter is the right direction for a
+    // soundness gate that didn't previously exist explicitly.
+    for (bi, blk) in body.blocks.iter().enumerate() {
+        if !reachable[bi] {
+            continue;
+        }
+        for &iid in &blk.instructions {
+            let eff = body.instructions[iid.0 as usize].kind.effect();
+            if eff != ir::ssa::Effect::PURE {
+                return None;
+            }
+        }
+    }
+
     let mut answer: Option<Constant> = None;
     for (bi, blk) in body.blocks.iter().enumerate() {
         if !reachable[bi] {
@@ -310,7 +356,23 @@ fn sandbox_evaluate(
                 Some(prev) if ir::ssa::const_bit_eq(&prev, c) => {}
                 Some(_) => return None,
             },
+            // Any non-Const Return value (Operand::Value / Capture /
+            // Arg / etc.) means the body's result depends on a
+            // computation the sandbox couldn't fold — likely a
+            // surviving heap load, an unfoldable Call, or a captured
+            // operand. Bail; this is the load-bearing soundness gate.
             Terminator::Return { .. } => return None,
+            // A reachable `Throw` would mean the call site can throw
+            // an observable exception we cannot prove away. Even if
+            // some other reachable block returns a Const, the call
+            // semantics include the throw path; replacing the Call
+            // result with a Const would erase that observable. Bail.
+            Terminator::Throw { .. } => return None,
+            // Try framing — bail conservatively. The sandbox doesn't
+            // attempt to reason about exception flow.
+            Terminator::Try { .. } => return None,
+            // Branch / CondBranch / Switch are interior terminators;
+            // they don't define the call's return value on their own.
             _ => {}
         }
     }
@@ -536,8 +598,11 @@ mod tests {
     }
 
     /// Side-effecting callee — partial eval should decline. The
-    /// callee writes to a captured object, an escaping write that
-    /// `is_inlinable_shape` (and the matcher) reject.
+    /// callee writes to a captured object then returns a Const. The
+    /// post-pipeline side-effect scan must catch the residual
+    /// `WRITES_HEAP` `StoreProp` and bail, even though every Return
+    /// is `Const(1)`. (Without that scan, the v2 relaxation would
+    /// erase the store by replacing the Call with `Const(1)`.)
     #[test]
     fn declines_side_effecting_callee() {
         let mut module = Module::new();
@@ -588,6 +653,273 @@ mod tests {
             InstKind::Call { .. } => {}
             other => panic!("call should still be present, got {other:?}"),
         }
+    }
+
+    /// Multi-block callee whose dead branch contains an operand
+    /// `is_inlinable_shape` rejects (a `Capture`). Under v1 the
+    /// shape predicate rejected the WHOLE body; under v2 we sandbox
+    /// the body, BranchFold prunes the Capture-using branch via the
+    /// const-arg specialisation, the side-effect scan sees only the
+    /// reachable `PURE` blocks, and we resolve to a Const.
+    ///
+    /// `function f(x) { if (x === 1) return 42; return capturedThing; }`
+    /// `f(1)` -> 42.
+    #[test]
+    fn relaxed_v2_collapses_with_unreachable_capture_path() {
+        let mut module = Module::new();
+        {
+            let mut b =
+                ir::ssa::FunctionBuilder::new_with_captures(&mut module, "f", 1, 1);
+            let x = b.body.params[0];
+            let entry = b.new_block();
+            let then_b = b.new_block();
+            let else_b = b.new_block();
+            b.switch_to_block(entry);
+            let cmp = b
+                .add_inst(InstKind::StrictEq {
+                    lhs: Operand::Value(x),
+                    rhs: Operand::Const(Constant::Int32(1)),
+                })
+                .unwrap();
+            b.set_terminator(Terminator::CondBranch {
+                cond: Operand::Value(cmp),
+                then_b,
+                then_args: vec![],
+                else_b,
+                else_args: vec![],
+            });
+            b.switch_to_block(then_b);
+            b.set_terminator(Terminator::Return {
+                val: Some(Operand::Const(Constant::Int32(42))),
+            });
+            b.switch_to_block(else_b);
+            // Return a captured opaque value — the shape predicate
+            // rejects bodies referencing `Capture(_)` outside its
+            // narrow recognised forms, so v1 declined this body.
+            b.set_terminator(Terminator::Return {
+                val: Some(Operand::Capture(0)),
+            });
+            b.finish();
+        }
+        {
+            let mut b = FunctionBuilder::new(&mut module, "caller", 0);
+            let bb0 = b.new_block();
+            b.switch_to_block(bb0);
+            let call_v = b
+                .add_inst(InstKind::Call {
+                    callee: Operand::Const(Constant::Func(FuncId(0))),
+                    args: vec![Operand::Const(Constant::Int32(1))],
+                })
+                .unwrap();
+            b.set_terminator(Terminator::Return {
+                val: Some(Operand::Value(call_v)),
+            });
+            b.finish();
+        }
+
+        let mut pass = PartialEvalPass;
+        let changed = pass.run(&mut module).unwrap();
+        assert!(
+            changed,
+            "v2 partial-eval should fold f(1) -> 42 even though the dead else-branch references a Capture"
+        );
+        let body = module.functions[1].lowered();
+        match &body.blocks[0].terminator {
+            Terminator::Return { val: Some(Operand::Const(Constant::Int32(42))) } => {}
+            other => panic!("expected Return Int32(42), got {other:?}"),
+        }
+    }
+
+    /// Multi-block callee where every reachable branch returns the
+    /// SAME Const but via different paths — this is the convergence
+    /// case the relaxation enables. Build a 4-block body:
+    /// `function f(x) { if (x > 10) { if (x > 100) return 7; return 7; } return 7; }`
+    /// All paths converge to 7. With non-const `x`, the sandbox can't
+    /// prune branches but the gate ("every reachable Return == same
+    /// Const") still applies — we test with a const arg so the
+    /// pipeline does the standard collapse.
+    #[test]
+    fn relaxed_v2_multi_block_converging_returns() {
+        let mut module = Module::new();
+        {
+            let mut b = FunctionBuilder::new(&mut module, "f", 1);
+            let x = b.body.params[0];
+            let entry = b.new_block();
+            let outer_then = b.new_block();
+            let inner_then = b.new_block();
+            let inner_else = b.new_block();
+            let outer_else = b.new_block();
+            b.switch_to_block(entry);
+            let cmp1 = b
+                .add_inst(InstKind::Lt {
+                    lhs: Operand::Const(Constant::Int32(10)),
+                    rhs: Operand::Value(x),
+                })
+                .unwrap();
+            b.set_terminator(Terminator::CondBranch {
+                cond: Operand::Value(cmp1),
+                then_b: outer_then,
+                then_args: vec![],
+                else_b: outer_else,
+                else_args: vec![],
+            });
+            b.switch_to_block(outer_then);
+            let cmp2 = b
+                .add_inst(InstKind::Lt {
+                    lhs: Operand::Const(Constant::Int32(100)),
+                    rhs: Operand::Value(x),
+                })
+                .unwrap();
+            b.set_terminator(Terminator::CondBranch {
+                cond: Operand::Value(cmp2),
+                then_b: inner_then,
+                then_args: vec![],
+                else_b: inner_else,
+                else_args: vec![],
+            });
+            b.switch_to_block(inner_then);
+            b.set_terminator(Terminator::Return {
+                val: Some(Operand::Const(Constant::Int32(7))),
+            });
+            b.switch_to_block(inner_else);
+            b.set_terminator(Terminator::Return {
+                val: Some(Operand::Const(Constant::Int32(7))),
+            });
+            b.switch_to_block(outer_else);
+            b.set_terminator(Terminator::Return {
+                val: Some(Operand::Const(Constant::Int32(7))),
+            });
+            b.finish();
+        }
+        {
+            let mut b = FunctionBuilder::new(&mut module, "caller", 0);
+            let bb0 = b.new_block();
+            b.switch_to_block(bb0);
+            let call_v = b
+                .add_inst(InstKind::Call {
+                    callee: Operand::Const(Constant::Func(FuncId(0))),
+                    args: vec![Operand::Const(Constant::Int32(50))],
+                })
+                .unwrap();
+            b.set_terminator(Terminator::Return {
+                val: Some(Operand::Value(call_v)),
+            });
+            b.finish();
+        }
+
+        let mut pass = PartialEvalPass;
+        let changed = pass.run(&mut module).unwrap();
+        assert!(changed, "all-paths-return-7 callee should partial-eval to 7");
+        let body = module.functions[1].lowered();
+        match &body.blocks[0].terminator {
+            Terminator::Return { val: Some(Operand::Const(Constant::Int32(7))) } => {}
+            other => panic!("expected Return Int32(7), got {other:?}"),
+        }
+    }
+
+    /// Multi-Return callee where the const-arg specialisation does
+    /// NOT collapse all paths to the same Const — gate must bail.
+    /// `function f(x) { if (x > 0) return 1; return 2; } f(unknown)`.
+    /// We can't quite call with non-const, but we can make returns
+    /// differ AND have an unfoldable branch. Easier: have a branch
+    /// whose condition the sandbox can't fold, and the two arms
+    /// return different Consts. Use a `Capture` as the condition.
+    #[test]
+    fn relaxed_v2_diverging_returns_bails() {
+        let mut module = Module::new();
+        {
+            let mut b =
+                ir::ssa::FunctionBuilder::new_with_captures(&mut module, "f", 0, 1);
+            let entry = b.new_block();
+            let then_b = b.new_block();
+            let else_b = b.new_block();
+            b.switch_to_block(entry);
+            b.set_terminator(Terminator::CondBranch {
+                cond: Operand::Capture(0),
+                then_b,
+                then_args: vec![],
+                else_b,
+                else_args: vec![],
+            });
+            b.switch_to_block(then_b);
+            b.set_terminator(Terminator::Return {
+                val: Some(Operand::Const(Constant::Int32(1))),
+            });
+            b.switch_to_block(else_b);
+            b.set_terminator(Terminator::Return {
+                val: Some(Operand::Const(Constant::Int32(2))),
+            });
+            b.finish();
+        }
+        {
+            let mut b = FunctionBuilder::new(&mut module, "caller", 0);
+            let bb0 = b.new_block();
+            b.switch_to_block(bb0);
+            let call_v = b
+                .add_inst(InstKind::Call {
+                    callee: Operand::Const(Constant::Func(FuncId(0))),
+                    args: vec![],
+                })
+                .unwrap();
+            b.set_terminator(Terminator::Return {
+                val: Some(Operand::Value(call_v)),
+            });
+            b.finish();
+        }
+
+        let mut pass = PartialEvalPass;
+        let changed = pass.run(&mut module).unwrap();
+        assert!(!changed, "diverging Return Consts must bail");
+    }
+
+    /// Reachable `Throw` must bail even when another reachable path
+    /// returns a Const.
+    #[test]
+    fn relaxed_v2_reachable_throw_bails() {
+        let mut module = Module::new();
+        {
+            let mut b =
+                ir::ssa::FunctionBuilder::new_with_captures(&mut module, "f", 0, 1);
+            let entry = b.new_block();
+            let then_b = b.new_block();
+            let else_b = b.new_block();
+            b.switch_to_block(entry);
+            b.set_terminator(Terminator::CondBranch {
+                cond: Operand::Capture(0),
+                then_b,
+                then_args: vec![],
+                else_b,
+                else_args: vec![],
+            });
+            b.switch_to_block(then_b);
+            b.set_terminator(Terminator::Return {
+                val: Some(Operand::Const(Constant::Int32(1))),
+            });
+            b.switch_to_block(else_b);
+            b.set_terminator(Terminator::Throw {
+                val: Operand::Const(Constant::Int32(99)),
+            });
+            b.finish();
+        }
+        {
+            let mut b = FunctionBuilder::new(&mut module, "caller", 0);
+            let bb0 = b.new_block();
+            b.switch_to_block(bb0);
+            let call_v = b
+                .add_inst(InstKind::Call {
+                    callee: Operand::Const(Constant::Func(FuncId(0))),
+                    args: vec![],
+                })
+                .unwrap();
+            b.set_terminator(Terminator::Return {
+                val: Some(Operand::Value(call_v)),
+            });
+            b.finish();
+        }
+
+        let mut pass = PartialEvalPass;
+        let changed = pass.run(&mut module).unwrap();
+        assert!(!changed, "reachable Throw must bail to preserve throw observability");
     }
 
     /// Non-const arg — partial eval declines (the whole point of the
