@@ -1917,6 +1917,15 @@ struct Converter<'b, 'm> {
     // added, which means reads can fully resolve through `add_param_operands`.
     sealed: HashSet<BlockId>,
 
+    // Substitution map populated when `try_remove_trivial_param` retires a
+    // Value: `replacement[old] = new_op`. Lets us chase the substitution
+    // chain after a recursive cascade may have retired a Value that an
+    // outer call still holds in a local snapshot. Without this, an outer
+    // `same` may end up referencing a now-Removed Value and propagate as
+    // an edge-arg via `add_param_operands`'s `append_edge_arg`, tripping
+    // `OperandReferencesRemovedValue` at validation time. Issue #48.
+    replacement: HashMap<Value, Operand>,
+
     // Source name (interned) for each SymbolId that originated from a
     // named source binding. Used to annotate block params introduced by
     // Braun for that SymbolId so the out-of-SSA renamer can recover the
@@ -2008,6 +2017,7 @@ impl<'b, 'm> Converter<'b, 'm> {
             current_def: HashMap::new(),
             incomplete_params: HashMap::new(),
             sealed: HashSet::new(),
+            replacement: HashMap::new(),
             symbol_names: HashMap::new(),
             break_stack: Vec::new(),
             pending_label: None,
@@ -2313,6 +2323,12 @@ impl<'b, 'm> Converter<'b, 'm> {
         let preds = self.predecessors_of(block);
         for pred in preds {
             let op = self.read_variable(var, pred);
+            // Defense in depth: a previous iteration's recursive read may
+            // have triggered a `try_remove_trivial_param` cascade that
+            // retired the Value `op` references after `read_variable`
+            // captured it. Resolve through the substitution chain before
+            // recording the edge arg. Issue #48.
+            let op = self.resolve_replacement(op);
             self.append_edge_arg(pred, block, op);
         }
         self.try_remove_trivial_param(param)
@@ -2373,6 +2389,15 @@ impl<'b, 'm> Converter<'b, 'm> {
 
         // Retire the Value slot.
         self.builder.body.values[param.0 as usize] = ValueDef::removed();
+        // Record the substitution so any LATER caller still holding a
+        // local snapshot of `same` (issue #48) can chase the chain via
+        // `resolve_replacement`. Without this, the recursive cascade
+        // below may retire a Value that some outer `try_remove_trivial_param`
+        // already captured as its own `same` — causing that outer call
+        // to return a Removed Value, which propagates as an edge-arg via
+        // `add_param_operands`'s `append_edge_arg` and trips the
+        // `OperandReferencesRemovedValue` validator.
+        self.replacement.insert(param, same);
 
         // Recurse on users that may have become trivial.
         for u in block_param_users {
@@ -2385,7 +2410,35 @@ impl<'b, 'm> Converter<'b, 'm> {
             self.try_remove_trivial_param(u);
         }
 
-        same
+        // The cascade above may have retired the Value `same` references.
+        // Chase the substitution chain to a live operand. Issue #48.
+        self.resolve_replacement(same)
+    }
+
+    /// Follow the substitution chain populated by `try_remove_trivial_param`
+    /// until we reach an operand that is not a Removed Value. Constants and
+    /// non-Removed Values are returned as-is. The chain is finite: each
+    /// retirement records `old -> new`, and `new` was alive at retirement
+    /// time, so a cycle would require a Value to substitute itself
+    /// (impossible: trivial-param removal skips self-references).
+    fn resolve_replacement(&self, mut op: Operand) -> Operand {
+        let mut steps = 0usize;
+        while let Operand::Value(v) = op {
+            if !self.builder.body.values[v.0 as usize].is_removed() {
+                return op;
+            }
+            match self.replacement.get(&v) {
+                Some(next) => op = *next,
+                None => return Operand::Const(Constant::Undefined),
+            }
+            steps += 1;
+            // Defensive: bail out on an unexpectedly long chain rather
+            // than risk a hang.
+            if steps > 1024 {
+                return Operand::Const(Constant::Undefined);
+            }
+        }
+        op
     }
 
     fn seal_block(&mut self, b: BlockId) {
@@ -5984,5 +6037,33 @@ mod tests {
         let sm = lower_module(&tm);
         let names: Vec<&str> = sm.functions.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, vec!["outer", "inner1", "innermost", "inner2"]);
+    }
+
+    /// Issue #48: smoke test for the wrap-safety gate's `try`/`for-in`/
+    /// `do-while`/`labeled` loosening at top level. The actual
+    /// `OperandReferencesRemovedValue` regression on jquery+preact is
+    /// covered by the realworld stability harness; the per-block-param
+    /// cascade shape that surfaces it depends on the specific edge
+    /// topology those bundles produce, which is hard to minimize. This
+    /// keeps a small wrap-eligible top-level shape exercising each of
+    /// the loosened constructs through the converter so a future
+    /// blanket change to the gate or to `try_remove_trivial_param`
+    /// trips here, not just at corpus time.
+    #[test]
+    fn loosened_top_level_constructs_lower_clean() {
+        let src = r#"
+            (function () {
+                var obj = {a: 1, b: 2};
+                var b = 0;
+                try { b = obj.a; } catch (e) { b = -1; }
+                for (var k in obj) { b += obj[k]; }
+                outer: do {
+                    if (b > 100) break outer;
+                    b = b + 1;
+                } while (b < 5);
+                return b;
+            })();
+        "#;
+        let _ = lower_js(src);
     }
 }

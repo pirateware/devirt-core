@@ -2502,10 +2502,36 @@ fn walk_for_wrap_blockers(stmt: &js::Statement, blocked: &mut bool) {
         // to wrap files that contain any of these shapes — they keep
         // the un-wrapped PassThroughStmt fallback that worked before
         // issue #32.
-        S::TryStatement(_) => { *blocked = true; }
-        S::ForInStatement(_) => { *blocked = true; }
-        S::DoWhileStatement(_) => { *blocked = true; }
-        S::LabeledStatement(_) => { *blocked = true; }
+        S::TryStatement(t) => {
+            // Walk the try / catch / finally blocks. Disposition handles
+            // try at the function level; the conservative gate exists
+            // only because of pass-level invariant fragility, not
+            // because lowering itself is unsound.
+            for st in &t.block.body {
+                walk_for_wrap_blockers(st, blocked);
+            }
+            if let Some(handler) = &t.handler {
+                for st in &handler.body.body {
+                    walk_for_wrap_blockers(st, blocked);
+                }
+            }
+            if let Some(fin) = &t.finalizer {
+                for st in &fin.body {
+                    walk_for_wrap_blockers(st, blocked);
+                }
+            }
+        }
+        S::ForInStatement(s) => {
+            walk_for_wrap_blockers_in_expr_required(&s.right, blocked);
+            walk_for_wrap_blockers(&s.body, blocked);
+        }
+        S::DoWhileStatement(s) => {
+            walk_for_wrap_blockers_in_expr_required(&s.test, blocked);
+            walk_for_wrap_blockers(&s.body, blocked);
+        }
+        S::LabeledStatement(s) => {
+            walk_for_wrap_blockers(&s.body, blocked);
+        }
         S::ClassDeclaration(c) => {
             // Class is wrap-eligible iff it desugars cleanly. Blocked
             // shapes (private members, static blocks, decorators) leave
