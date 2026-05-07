@@ -15,6 +15,7 @@
 //! `Expr::Func(FuncLiteral)`; un-lowerable ones become FuncLiteral
 //! with `FuncBody::PassThrough(slice)`.
 
+pub mod class_desugar;
 pub mod disposition;
 pub mod lower_ssa;
 pub mod lower_tree;
@@ -107,6 +108,7 @@ pub fn parse_and_lower_with_decider(
     let lowerer = Lowerer {
         source,
         temp_counter: std::cell::Cell::new(0),
+        super_ctx: std::cell::RefCell::new(Vec::new()),
     };
     lowerer.lower_program_with_decider(&ret.program, decider)
 }
@@ -122,6 +124,13 @@ struct Lowerer<'src> {
     /// reserved for this pass; collisions with user code are
     /// theoretically possible but vanishingly unlikely.
     temp_counter: std::cell::Cell<usize>,
+    /// Stack of class-desugar `super` contexts. Pushed when lowering
+    /// a method body of a `class Foo extends Bar { ... }`; popped when
+    /// the method body completes. `lower_expr` consults the top of the
+    /// stack to rewrite `super.foo` / `super(...)` references into the
+    /// equivalent ES5 prototype-chain form. Empty outside a class
+    /// method body. See `class_desugar.rs` for the rewrite contract.
+    super_ctx: std::cell::RefCell<Vec<class_desugar::SuperCtx>>,
 }
 
 impl<'src> Lowerer<'src> {
@@ -129,6 +138,11 @@ impl<'src> Lowerer<'src> {
         let n = self.temp_counter.get();
         self.temp_counter.set(n + 1);
         format!("__t{n}__")
+    }
+
+    /// Read-only access to the innermost `super` context, if any.
+    pub(crate) fn current_super(&self) -> Option<class_desugar::SuperCtx> {
+        self.super_ctx.borrow().last().cloned()
     }
 }
 
@@ -1342,6 +1356,14 @@ impl<'src> Lowerer<'src> {
         for s in stmts {
             if let js::Statement::VariableDeclaration(decl) = s {
                 out.extend(self.lower_var_decl(decl)?);
+            } else if let js::Statement::ClassDeclaration(c) = s {
+                let name = c
+                    .id
+                    .as_ref()
+                    .ok_or(Error::Unsupported("anonymous class declaration"))?
+                    .name
+                    .to_string();
+                out.extend(self.desugar_class(c, &name)?);
             } else {
                 out.push(self.lower_stmt(s)?);
             }
@@ -1471,6 +1493,21 @@ impl<'src> Lowerer<'src> {
             self.lower_stmts_list(&b.body)
         } else if let js::Statement::VariableDeclaration(decl) = stmt {
             self.lower_var_decl(decl)
+        } else if let js::Statement::ClassDeclaration(c) = stmt {
+            // Class declaration produces a sequence (constructor +
+            // prototype hookup + method assignments). When used in a
+            // single-statement slot (e.g. `if (cond) class Foo { ... }`,
+            // illegal in strict mode but parseable), we wrap in a
+            // block so callers that expect a single Stmt see a tidy
+            // unit. lower_stmts_list-callers flatten via the dedicated
+            // path below.
+            let name = c
+                .id
+                .as_ref()
+                .ok_or(Error::Unsupported("anonymous class declaration"))?
+                .name
+                .to_string();
+            self.desugar_class(c, &name)
         } else {
             Ok(vec![self.lower_stmt(stmt)?])
         }
@@ -1508,6 +1545,84 @@ impl<'src> Lowerer<'src> {
             }),
             _ => Err(Error::Unsupported("complex assignment target")),
         }
+    }
+
+    /// Detect `super.method(args)` / `super[k](args)` callees and
+    /// rewrite to the prototype-chain `.call(this, ...)` form so the
+    /// runtime `this` binding matches the spec. Returns `None` if the
+    /// callee isn't a super-member access — caller falls through to
+    /// the regular call path.
+    fn try_rewrite_super_method_call(
+        &self,
+        callee: &js::Expression,
+        lowered_args: &[Expr],
+    ) -> Result<Option<Expr>, Error> {
+        let (key_expr, computed) = match callee {
+            js::Expression::StaticMemberExpression(m)
+                if matches!(&m.object, js::Expression::Super(_)) =>
+            {
+                (
+                    Expr::Member {
+                        // Placeholder owner; replaced below once we
+                        // have the SuperCtx in hand.
+                        obj: Box::new(Expr::Undefined),
+                        prop: m.property.name.to_string(),
+                    },
+                    false,
+                )
+            }
+            js::Expression::ComputedMemberExpression(m)
+                if matches!(&m.object, js::Expression::Super(_)) =>
+            {
+                (
+                    Expr::Index {
+                        obj: Box::new(Expr::Undefined),
+                        index: Box::new(self.lower_expr(&m.expression)?),
+                    },
+                    true,
+                )
+            }
+            _ => return Ok(None),
+        };
+        let ctx = self.current_super().ok_or(Error::Unsupported(
+            "`super.x(...)` outside a class method",
+        ))?;
+        let owner = if ctx.is_static {
+            ctx.super_ref
+        } else {
+            Expr::Member {
+                obj: Box::new(ctx.super_ref),
+                prop: "prototype".into(),
+            }
+        };
+        let method_ref = match (key_expr, computed) {
+            (Expr::Member { prop, .. }, false) => Expr::Member {
+                obj: Box::new(owner),
+                prop,
+            },
+            (Expr::Index { index, .. }, true) => Expr::Index {
+                obj: Box::new(owner),
+                index,
+            },
+            _ => unreachable!(),
+        };
+        let mut call_args = vec![Expr::This];
+        call_args.extend(lowered_args.iter().cloned());
+        Ok(Some(Expr::Call {
+            callee: Box::new(Expr::Member {
+                obj: Box::new(method_ref),
+                prop: "call".into(),
+            }),
+            args: call_args,
+        }))
+    }
+
+    /// Counter for synthesized class-expression bindings (`__cls<n>__`).
+    /// Reuses `temp_counter` for namespace cleanliness.
+    fn fresh_temp_id(&self) -> usize {
+        let n = self.temp_counter.get();
+        self.temp_counter.set(n + 1);
+        n
     }
 
     fn lower_expr(&self, expr: &js::Expression) -> Result<Expr, Error> {
@@ -1632,35 +1747,142 @@ impl<'src> Lowerer<'src> {
             }
 
             js::Expression::CallExpression(c) => {
-                let callee = self.lower_expr(&c.callee)?;
-                let mut args = Vec::with_capacity(c.arguments.len());
+                // === Class-desugar: `super(...)` and `super.method(...)`
+                // rewrites. See class_desugar.rs for the contract. The
+                // rewrite happens here so we can splice `this` /
+                // `.call`/`.apply` into the call shape directly without
+                // needing a tree-IR representation of `super`.
+                let mut lowered_args = Vec::with_capacity(c.arguments.len());
                 for a in &c.arguments {
                     match a {
                         js::Argument::SpreadElement(s) => {
-                            args.push(Expr::Spread(Box::new(self.lower_expr(&s.argument)?)));
+                            lowered_args.push(Expr::Spread(Box::new(self.lower_expr(&s.argument)?)));
                         }
                         other => {
                             let e = other
                                 .as_expression()
                                 .ok_or(Error::Unsupported("non-expression argument"))?;
-                            args.push(self.lower_expr(e)?);
+                            lowered_args.push(self.lower_expr(e)?);
                         }
                     }
                 }
+                // `super(args)` in a constructor: rewrite to
+                //   <super>.call(this, args...)
+                if matches!(&c.callee, js::Expression::Super(_)) {
+                    let ctx = self.current_super().ok_or(Error::Unsupported(
+                        "`super(...)` outside a class constructor",
+                    ))?;
+                    let mut call_args = vec![Expr::This];
+                    call_args.extend(lowered_args);
+                    return Ok(Expr::Call {
+                        callee: Box::new(Expr::Member {
+                            obj: Box::new(ctx.super_ref),
+                            prop: "call".into(),
+                        }),
+                        args: call_args,
+                    });
+                }
+                // `super.m(args)` / `super[k](args)`: rewrite to
+                //   <super>.prototype.m.call(this, args)   (instance)
+                //   <super>.m.call(this, args)             (static)
+                if let Some(rewritten) =
+                    self.try_rewrite_super_method_call(&c.callee, &lowered_args)?
+                {
+                    return Ok(rewritten);
+                }
+                let callee = self.lower_expr(&c.callee)?;
                 Ok(Expr::Call {
                     callee: Box::new(callee),
-                    args,
+                    args: lowered_args,
+                })
+            }
+            js::Expression::Super(_) => {
+                // Bare `super` outside a call is invalid JS (only valid
+                // as the receiver of a member access or the callee of
+                // a call). The member/call paths above intercept those
+                // shapes before reaching here.
+                Err(Error::Unsupported("bare `super` reference"))
+            }
+            js::Expression::ClassExpression(c) => {
+                // Class expression: desugar to an IIFE returning the
+                // constructor. The desugar produces a sequence of
+                // statements (constructor decl + prototype hookup +
+                // method assignments); we wrap in a `function(){...;
+                // return Foo;}()`.
+                let class_name = c
+                    .id
+                    .as_ref()
+                    .map(|id| id.name.to_string())
+                    .unwrap_or_else(|| format!("__cls{}__", self.fresh_temp_id()));
+                let mut stmts = self.desugar_class(c, &class_name)?;
+                stmts.push(Stmt::Return(Some(Expr::Ident(class_name))));
+                let iife = FuncLiteral {
+                    name: None,
+                    params: Vec::new(),
+                    is_async: false,
+                    is_generator: false,
+                    is_arrow: false,
+                    body: FuncBody::Stmts(stmts),
+                    func_id: std::cell::Cell::new(None),
+                    passthrough_source: None,
+                    force_passthrough: std::cell::Cell::new(false),
+                    blockers: BTreeSet::new(),
+                };
+                Ok(Expr::Call {
+                    callee: Box::new(Expr::Func(Box::new(iife))),
+                    args: Vec::new(),
                 })
             }
 
-            js::Expression::StaticMemberExpression(m) => Ok(Expr::Member {
-                obj: Box::new(self.lower_expr(&m.object)?),
-                prop: m.property.name.to_string(),
-            }),
-            js::Expression::ComputedMemberExpression(m) => Ok(Expr::Index {
-                obj: Box::new(self.lower_expr(&m.object)?),
-                index: Box::new(self.lower_expr(&m.expression)?),
-            }),
+            js::Expression::StaticMemberExpression(m) => {
+                // `super.foo` — instance method context rewrites to
+                // `<super>.prototype.foo`; static context rewrites to
+                // `<super>.foo`. See class_desugar.rs.
+                if matches!(&m.object, js::Expression::Super(_)) {
+                    let ctx = self.current_super().ok_or(Error::Unsupported(
+                        "`super.x` outside a class method",
+                    ))?;
+                    let owner = if ctx.is_static {
+                        ctx.super_ref
+                    } else {
+                        Expr::Member {
+                            obj: Box::new(ctx.super_ref),
+                            prop: "prototype".into(),
+                        }
+                    };
+                    return Ok(Expr::Member {
+                        obj: Box::new(owner),
+                        prop: m.property.name.to_string(),
+                    });
+                }
+                Ok(Expr::Member {
+                    obj: Box::new(self.lower_expr(&m.object)?),
+                    prop: m.property.name.to_string(),
+                })
+            }
+            js::Expression::ComputedMemberExpression(m) => {
+                if matches!(&m.object, js::Expression::Super(_)) {
+                    let ctx = self.current_super().ok_or(Error::Unsupported(
+                        "`super[x]` outside a class method",
+                    ))?;
+                    let owner = if ctx.is_static {
+                        ctx.super_ref
+                    } else {
+                        Expr::Member {
+                            obj: Box::new(ctx.super_ref),
+                            prop: "prototype".into(),
+                        }
+                    };
+                    return Ok(Expr::Index {
+                        obj: Box::new(owner),
+                        index: Box::new(self.lower_expr(&m.expression)?),
+                    });
+                }
+                Ok(Expr::Index {
+                    obj: Box::new(self.lower_expr(&m.object)?),
+                    index: Box::new(self.lower_expr(&m.expression)?),
+                })
+            }
 
             js::Expression::FunctionExpression(f) => {
                 Ok(Expr::Func(Box::new(self.lower_function_literal(f, false)?)))
@@ -2098,7 +2320,15 @@ fn walk_for_wrap_blockers(stmt: &js::Statement, blocked: &mut bool) {
         S::ForInStatement(_) => { *blocked = true; }
         S::DoWhileStatement(_) => { *blocked = true; }
         S::LabeledStatement(_) => { *blocked = true; }
-        S::ClassDeclaration(_) => { *blocked = true; }
+        S::ClassDeclaration(c) => {
+            // Class is wrap-eligible iff it desugars cleanly. Blocked
+            // shapes (private members, static blocks, decorators) leave
+            // the file un-wrapped — they round-trip as PassThroughStmt
+            // exactly as before issue #31.
+            if c.id.is_none() || !crate::class_desugar::class_blockers(c).is_empty() {
+                *blocked = true;
+            }
+        }
         S::DebuggerStatement(_) => { *blocked = true; }
         S::WithStatement(_) => { *blocked = true; }
         S::ExpressionStatement(es) => {
@@ -2244,6 +2474,20 @@ fn walk_for_wrap_blockers_in_expr_required(e: &js::Expression, blocked: &mut boo
         E::ComputedMemberExpression(m) => {
             walk_for_wrap_blockers_in_expr_required(&m.object, blocked);
             walk_for_wrap_blockers_in_expr_required(&m.expression, blocked);
+        }
+        E::ClassExpression(c) => {
+            // Class expressions wrap-eligibly iff they desugar.
+            // Anonymous class expressions (no `id`) are allowed —
+            // unlike declarations, they don't need a name to be
+            // wrap-eligible (the desugar synthesizes one).
+            if !crate::class_desugar::class_blockers(c).is_empty() {
+                *blocked = true;
+            }
+        }
+        E::Super(_) => {
+            // `super` only appears as the receiver of a member access
+            // or call inside a method body — both already walked
+            // through the surrounding shape. Treat as a leaf.
         }
         // Anything we haven't enumerated: be conservative.
         _ => { *blocked = true; }

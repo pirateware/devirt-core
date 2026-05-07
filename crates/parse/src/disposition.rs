@@ -265,8 +265,19 @@ fn collect_stmt_blockers(stmt: &js::Statement, blockers: &mut BTreeSet<BlockerKi
         DebuggerStatement(_) => {
             blockers.insert(BlockerKind::DebuggerStmt);
         }
-        ClassDeclaration(_) => {
-            blockers.insert(BlockerKind::ClassDecl);
+        ClassDeclaration(c) => {
+            // Plain class shapes desugar at parse time to a `function`
+            // + prototype assignments; they do NOT block. Only shapes
+            // the desugar can't represent (private members, static
+            // blocks, decorators) leave the function PassThrough.
+            // `class_blockers` enumerates them.
+            //
+            // Anonymous class declaration (`class { ... }`) is a parse
+            // error in JS, but be defensive.
+            if c.id.is_none() {
+                blockers.insert(BlockerKind::ClassDecl);
+            }
+            blockers.extend(crate::class_desugar::class_blockers(c));
         }
         _ => {
             blockers.insert(BlockerKind::UnsupportedStmt);
@@ -708,6 +719,22 @@ fn collect_expr_blockers(expr: &js::Expression, blockers: &mut BTreeSet<BlockerK
             // flows through SSA as `Constant::This`. Correct because
             // expressions stay inside their producing function body
             // (no boundary-crossing pass exists today).
+        }
+        ClassExpression(c) => {
+            // Same desugar as `ClassDeclaration`; only un-desugarable
+            // shapes block.
+            blockers.extend(crate::class_desugar::class_blockers(c));
+        }
+        Super(_) => {
+            // Bare `super` reaches here only as a leaf — the
+            // surrounding member-expression / call-expression cases
+            // walk into the object/callee, hitting Super here. The
+            // super itself is fine; the lowering rewrites it into the
+            // captured-superclass binding when it has a SuperCtx, and
+            // refuses with `Error::Unsupported` otherwise. The walker
+            // can't easily check whether a SuperCtx will be present at
+            // lower time, so we permit it here unconditionally and
+            // rely on lowering's safety net.
         }
         AssignmentExpression(a) => {
             // Plain `=` and arithmetic/bitwise compound (+=, -=, *=,

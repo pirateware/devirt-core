@@ -138,19 +138,24 @@ fn nested_if_with_continue_in_loop_does_not_recurse_forever() {
     assert!(out.contains("while"), "SSA round-trip must emit a loop: {out}");
 }
 
-/// Top-level `class` / `for` and other constructs the lowering can't
-/// represent are now preserved as verbatim source slices via
-/// `Item::PassThroughStmt` — the same fallback strategy used for
-/// un-lowerable function bodies. The "errors loudly on unsupported"
-/// guarantee still applies inside Lowered function bodies (via
-/// `disposition::decide`); top-level passthrough is the safer default
-/// when the alternative is silent data loss (see
-/// `top_level_iife_survives_ssa_roundtrip` for the bug this prevents).
+/// Top-level `class` lowers via the ES5 prototype-chain desugar
+/// (issue #31). The output no longer contains the `class` keyword —
+/// instead a `function Foo` declaration carrying the same bindings
+/// appears. The behavior round-trips: re-parsing the emitted source
+/// must succeed.
 #[test]
-fn top_level_class_passthrough() {
+fn top_level_class_lowers() {
     let src = "class Foo {}";
     let out = roundtrip(src);
-    assert!(out.contains("class Foo"), "class must survive: {out}");
+    // After desugar there's a `function Foo` somewhere in the output
+    // (either as a top-level item, inside the `__top_init__` wrapper,
+    // or both). The literal `class Foo` keyword form must NOT appear.
+    assert!(out.contains("Foo"), "class name must survive: {out}");
+    assert!(
+        !out.contains("class Foo"),
+        "class keyword should be desugared away: {out}"
+    );
+    parse_and_lower(&out).expect("emitted JS must re-parse");
 }
 
 #[test]
@@ -160,19 +165,42 @@ fn top_level_for_passthrough() {
     assert!(out.contains("for"), "for must survive: {out}");
 }
 
-/// Function body containing a class — disposition routes the function
-/// to PassThrough. The class itself is preserved verbatim in the
-/// emitted output via the source-slice round-trip.
+/// Function body containing a class — issue #31 desugars the class
+/// to the ES5 prototype-chain shape so the enclosing function lowers
+/// through SSA instead of routing to PassThrough. The output no
+/// longer contains the `class` keyword.
 #[test]
-fn passthrough_class_in_function_body() {
+fn class_in_function_body_lowers() {
     let src = "function makeFoo() { class Foo { greet() { return 1; } } return new Foo(); }";
+    let m = parse_and_lower(src).expect("class should desugar");
+    // The enclosing function must now be Lowered, not PassThrough.
+    for item in &m.items {
+        if let ir::tree::Item::PassThroughFunction(lit) = item {
+            panic!(
+                "expected makeFoo to lower; got PassThrough(name={:?}, blockers={:?})",
+                lit.name, lit.blockers
+            );
+        }
+    }
+    let out = emit(&m);
+    assert!(out.contains("Foo"), "class name must survive: {out}");
+    assert!(out.contains("greet"), "method name must survive: {out}");
+    assert!(
+        !out.contains("class Foo"),
+        "class keyword should be desugared away: {out}"
+    );
+    parse_and_lower(&out).expect("emitted JS must re-parse");
+}
+
+/// Class with private member — still routes to PassThrough because
+/// the ES5 desugar can't represent the WeakMap-of-instance identity
+/// the spec requires.
+#[test]
+fn passthrough_private_class_member() {
+    let src = "function makeFoo() { class Foo { #x = 1; greet() { return this.#x; } } return new Foo(); }";
     let m = parse_and_lower(src).expect("PassThrough should not error");
     let out = emit(&m);
-    assert!(
-        out.contains("class Foo"),
-        "class body should survive: {out}"
-    );
-    assert!(out.contains("greet"), "method name should survive: {out}");
+    assert!(out.contains("class Foo"), "class body should survive: {out}");
     parse_and_lower(&out).expect("emitted JS must re-parse");
 }
 
@@ -544,20 +572,20 @@ fn always_passthrough(_p: &js::FormalParameters, _b: &js::FunctionBody) -> Dispo
     Disposition::PassThrough(std::collections::BTreeSet::new())
 }
 
-/// Walker too permissive: it claims `class Foo {}` is lowerable. The
-/// real lowering can't represent a class declaration, so it returns
+/// Walker too permissive: it claims a class with a private member is
+/// lowerable. The real lowering can't desugar a private member to ES5
+/// (no WeakMap-of-instance encoding yet), so it returns
 /// `Error::Unsupported`. The debug-only cross-check must convert that
 /// into a panic naming the construct.
+///
+/// Plain `class Foo {}` no longer blocks (issue #31 lifted it via the
+/// ES5 desugar); we now use the private-member shape to exercise the
+/// cross-check.
 #[test]
 #[cfg(debug_assertions)]
 #[should_panic(expected = "T2 cross-check")]
 fn cross_check_panics_when_walker_too_permissive() {
-    // Class declaration inside a function body is the canonical case:
-    // the honest walker would route this to PassThrough, but our
-    // `always_lowered` liar forces the Lowered path. The lowering hits
-    // `Error::Unsupported("class declaration")` and the cross-check
-    // panics.
-    let src = "function makeFoo() { class Foo {} return new Foo(); }";
+    let src = "function makeFoo() { class Foo { #x = 1; greet() { return this.#x; } } return new Foo(); }";
     let _ = parse_and_lower_with_decider(src, always_lowered);
 }
 
@@ -567,7 +595,7 @@ fn cross_check_panics_when_walker_too_permissive() {
 #[cfg(debug_assertions)]
 #[should_panic(expected = "function `makeFoo`")]
 fn cross_check_panic_message_names_function() {
-    let src = "function makeFoo() { class Foo {} }";
+    let src = "function makeFoo() { class Foo { #x = 1; } }";
     let _ = parse_and_lower_with_decider(src, always_lowered);
 }
 
@@ -590,9 +618,10 @@ fn cross_check_does_not_fire_when_walker_too_conservative() {
     assert!(out.contains("a + b"), "body survives verbatim: {out}");
 }
 
-/// A program with one Lowered function (fully optimizable) and one
-/// PassThrough function (contains a class). The pipeline must not
-/// abort, and both functions must appear in the output.
+/// A program with one fully-lowerable function and one whose class
+/// triggered PassThrough before issue #31. After the lift, both
+/// lower through SSA — but the class's identifier still appears in
+/// the output (as the constructor function).
 #[test]
 fn mixed_lowered_and_passthrough_in_module() {
     let src = r#"
@@ -603,7 +632,8 @@ fn mixed_lowered_and_passthrough_in_module() {
     let out = emit(&m);
     assert!(out.contains("function add"));
     assert!(out.contains("function makeWidget"));
-    assert!(out.contains("class Widget"));
+    // `Widget` survives as the constructor-function name.
+    assert!(out.contains("Widget"));
     parse_and_lower(&out).expect("emitted JS must re-parse");
 }
 

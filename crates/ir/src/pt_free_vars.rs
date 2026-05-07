@@ -98,6 +98,13 @@ pub fn analyze_passthrough(
     for p in params {
         ctx.bind(p);
     }
+    // `arguments` is implicitly bound in every ordinary (non-arrow)
+    // function. PassThrough bodies wrap into a synthetic
+    // `(function () { ... })` for re-parsing, so we always treat the
+    // outer function as ordinary and pre-bind `arguments` to keep
+    // intra-body references local. See free_vars.rs for the matching
+    // tree-IR rule.
+    ctx.bind("arguments");
     // Hoist `var` and function declarations into the function scope
     // before walking, matching JS semantics.
     ctx.hoist_function_scope_decls(&body.statements);

@@ -76,6 +76,18 @@ impl Ctx<'_> {
         for p in &lit.params {
             s.insert(p.clone());
         }
+        // `arguments` is implicitly bound inside every ordinary
+        // (non-arrow) function. Without this, references to it in the
+        // body would surface as captures of an undeclared outer name —
+        // breaking the SSA AllocClosure invariant. The class-decl
+        // ES5 desugar (issue #31) emits `__super__.apply(this,
+        // arguments)` for implicit constructors; this binding is what
+        // keeps that reference local. Arrow functions inherit
+        // `arguments` from their enclosing function and are therefore
+        // NOT pre-bound here — capture is the correct behavior.
+        if !lit.is_arrow {
+            s.insert("arguments".to_string());
+        }
         self.scopes.push(s);
     }
     fn enter_block_scope(&mut self) {

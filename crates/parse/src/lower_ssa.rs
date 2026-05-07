@@ -370,6 +370,7 @@ fn discover_module<'a>(tm: &'a tree::Module) -> Vec<PendingFunction<'a>> {
                 let reassigned = collect_reassigned_names(&f.body);
                 let mut seen: HashSet<String> = HashSet::new();
                 seen.insert(f.name.clone());
+                seen.insert("arguments".to_string());
                 for p in &f.params {
                     seen.insert(p.clone());
                 }
@@ -1169,6 +1170,18 @@ fn discover_literal<'a>(
     }
     for p in &lit.params {
         inner_seen.insert(p.clone());
+    }
+    // `arguments` is implicitly bound inside every ordinary (non-arrow)
+    // function. The class-decl desugar (issue #31) emits implicit
+    // constructors that forward to `super.apply(this, arguments)`,
+    // and without this the synthesized `arguments` reference would
+    // surface as a forward-ref capture, panicking the
+    // re-classification path. Arrow functions inherit `arguments`
+    // from the enclosing function — capturing is correct in that
+    // case, so we don't pre-bind here. Generators/async are still
+    // routed to PassThrough by disposition.
+    if !lit.is_arrow {
+        inner_seen.insert("arguments".to_string());
     }
     match &lit.body {
         FuncBody::Stmts(ss) => {

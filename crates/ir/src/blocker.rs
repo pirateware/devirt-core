@@ -33,8 +33,24 @@ pub enum BlockerKind {
     LabeledContinue,
     /// `debugger`
     DebuggerStmt,
-    /// `class Foo { ... }` inside a function body
+    /// `class Foo { ... }` inside a function body that uses a class
+    /// shape we cannot desugar to ES5 (private members, static blocks,
+    /// decorators, etc.). Plain class shapes are desugared at parse
+    /// time to `function` + prototype assignments and do NOT block.
     ClassDecl,
+    /// `class Foo { #x = 1; #m() {} }` — private fields/methods. The
+    /// ES5 desugar can't represent the WeakMap-based identity required
+    /// by the spec, so any class containing a private member stays
+    /// PassThrough. Tracked separately from `ClassDecl` so the
+    /// frequency table makes the residual visible.
+    ClassPrivateMember,
+    /// `class Foo { static { ... } }` — class static initialization
+    /// block. Has access to private members and runs at class
+    /// definition time with the class object as `this`. Defer.
+    ClassStaticBlock,
+    /// `@decorator class Foo {}` / `@decorator method()` — decorators.
+    /// Stage-3 proposal with non-trivial semantics; defer.
+    ClassDecorator,
     /// Any other statement kind not recognized above
     UnsupportedStmt,
 
@@ -123,6 +139,9 @@ impl fmt::Display for BlockerKind {
             Self::LabeledContinue => "LabeledContinue",
             Self::DebuggerStmt => "DebuggerStmt",
             Self::ClassDecl => "ClassDecl",
+            Self::ClassPrivateMember => "ClassPrivateMember",
+            Self::ClassStaticBlock => "ClassStaticBlock",
+            Self::ClassDecorator => "ClassDecorator",
             Self::UnsupportedStmt => "UnsupportedStmt",
             Self::ForAwaitOf => "ForAwaitOf",
             Self::ForOfDestructuringBinding => "ForOfDestructuringBinding",
