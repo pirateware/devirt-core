@@ -1081,6 +1081,7 @@ impl ValueDef {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct Function {
     pub name: String,
     /// Number of captures this function takes from its enclosing scope.
@@ -1117,11 +1118,13 @@ pub struct Function {
     pub forced_let_decls: Vec<StrId>,
 }
 
+#[derive(Clone, Debug)]
 pub enum FunctionBody {
     Lowered(LoweredBody),
     PassThrough(PassThroughBody),
 }
 
+#[derive(Clone, Debug)]
 pub struct LoweredBody {
     pub params: Vec<Value>,
     pub blocks: Vec<BasicBlock>,
@@ -1145,6 +1148,7 @@ pub struct LoweredBody {
 /// braces themselves), plus enough metadata to synthesize the function
 /// header at emit time. Captured operands live on the `AllocClosure` in
 /// the outer function — they are NOT stored here.
+#[derive(Clone, Debug)]
 pub struct PassThroughBody {
     pub source: String,
     pub param_names: Vec<StrId>,
@@ -1194,6 +1198,7 @@ impl Function {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct Module {
     pub functions: Vec<Function>,
     pub strings: Rodeo,

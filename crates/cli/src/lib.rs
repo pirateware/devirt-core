@@ -52,6 +52,10 @@ pub fn process(source: &str) -> Result<String, error::Error> {
     pm.add_module_pass(Box::new(
         ::pass::constructor_fn_inline::ConstructorFnInlinePass,
     ));
+    // Issue #49: partial-eval picks up Calls the physical inliner
+    // rejected (e.g. multi-block bodies whose const-arg specialisation
+    // collapses to a single Const).
+    pm.add_module_pass(Box::new(::pass::partial_eval::PartialEvalPass));
     pm.add_module_pass(Box::new(::pass::dead_fn_elim::DeadFnElimPass));
     pm.add_pass(Box::new(::pass::refine_purity::RefinePurityPass));
     pm.add_pass(Box::new(::pass::escape_analysis::EscapeAnalysisPass));

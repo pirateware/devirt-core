@@ -109,6 +109,7 @@ fn main() -> ExitCode {
         pm.add_module_pass(Box::new(
             ::pass::constructor_fn_inline::ConstructorFnInlinePass,
         ));
+        pm.add_module_pass(Box::new(::pass::partial_eval::PartialEvalPass));
         pm.add_module_pass(Box::new(::pass::dead_fn_elim::DeadFnElimPass));
         pm.add_pass(Box::new(::pass::refine_purity::RefinePurityPass));
         pm.add_pass(Box::new(::pass::escape_analysis::EscapeAnalysisPass));
