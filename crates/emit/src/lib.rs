@@ -10,6 +10,12 @@ use ir::tree::{
     unop_str,
 };
 
+/// Reserved name used by the parse layer (issue #32) to mark the
+/// synthesized top-level wrapper. Kept in sync with
+/// `parse::TOP_INIT_NAME` — duplicated here rather than imported to
+/// avoid an `emit -> parse` dep cycle.
+const TOP_INIT_NAME: &str = "__top_init__";
+
 /// Re-parse a PassThrough body via `oxc_parser` and serialize it back
 /// with `oxc_codegen`, producing `{ ... }` text. The wrapper around the
 /// body synthesizes a function whose form (regular / async /
@@ -122,6 +128,24 @@ impl Printer<'_> {
 
     fn item(&mut self, item: &Item) {
         match item {
+            Item::Function(f) if f.name == TOP_INIT_NAME => {
+                // Synthetic wrapper from issue #32: emit as a no-arg
+                // anonymous IIFE `(function () { ... })();`. The
+                // wrapper exists only as an IR convenience so SSA
+                // passes can see inside non-function top-level
+                // statements; the IIFE shape preserves that any `return`
+                // statements inside the body remain syntactically
+                // legal (they would not be at file top-level).
+                //
+                // The parse layer recognizes the same shape on
+                // re-parse and unwraps it before applying its own
+                // wrapping pass, so the structural roundtrip is
+                // symmetric.
+                self.pad();
+                self.buf.push_str("(function () ");
+                self.write_function_block(f);
+                self.buf.push_str(")();\n");
+            }
             Item::Function(f) => {
                 self.function(f);
                 self.buf.push('\n');
@@ -162,7 +186,14 @@ impl Printer<'_> {
             }
             self.buf.push_str(p);
         }
-        self.buf.push_str(") {\n");
+        self.buf.push_str(") ");
+        self.write_function_block(f);
+    }
+
+    /// Emit just the `{ ... }` block of a function — used by both the
+    /// regular `function name() {...}` path and the top-init IIFE path.
+    fn write_function_block(&mut self, f: &IrFunction) {
+        self.buf.push_str("{\n");
         self.indent += 1;
         for s in &f.body {
             self.pad();

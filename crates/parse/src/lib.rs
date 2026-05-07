@@ -105,16 +105,281 @@ impl<'src> Lowerer<'src> {
     }
 }
 
+/// Reserved name for the synthesized top-level wrapper function. The
+/// emit layer recognizes this name and renders the function as an IIFE
+/// (`(function __top_init__(){ ... })();`) instead of a plain decl.
+/// Issue #32: wrapping non-function top-level statements so the
+/// optimizer sees inside them (without it, top-level IIFEs and the
+/// expressions inside them are invisible to general passes like
+/// ConstructorFnInline).
+pub const TOP_INIT_NAME: &str = "__top_init__";
+
 impl Lowerer<'_> {
     fn lower_program_with_decider(
         &self,
         prog: &js::Program,
         decider: fn(&js::FormalParameters, &js::FunctionBody) -> Disposition,
     ) -> Result<Module, Error> {
-        let mut items = Vec::with_capacity(prog.body.len());
-        for stmt in &prog.body {
-            items.push(self.lower_top_stmt(stmt, decider)?);
+        // Decide whether to synthesize `__top_init__` (issue #32).
+        //
+        // We wrap when there's at least one non-function top-level
+        // statement we know how to lower into the IR, AND there are no
+        // top-level `let` / `const` declarations (whose TDZ scoping
+        // would change visibility once they become function-locals).
+        // Otherwise fall back to the historical per-stmt routing where
+        // non-function tops become `Item::PassThroughStmt`.
+        //
+        // `var`-decls at top level are split: their *declarations* are
+        // hoisted out as `var x;` PassThroughStmt entries before the
+        // wrapper (so other top-level functions can still see the
+        // binding via `globalThis`), and the *initializers* become bare
+        // assignments inside the wrapper (which the SSA layer routes
+        // through `StoreProp(GlobalThis, name, val)` — exactly the
+        // sloppy-mode `var x = ...` semantics we want at top level).
+        //
+        // Directive prologue (`"use strict";` etc.) is preserved as
+        // PassThroughStmt at file top, before everything else.
+        let mut items: Vec<Item> = Vec::with_capacity(prog.body.len() + prog.directives.len());
+
+        // === 1. Pull leading directive prologue ===
+        // OXC stores directives in `prog.directives`, separate from
+        // `prog.body`. Preserve each as a `PassThroughStmt` at file
+        // top so re-emit produces them verbatim. The `body` may also
+        // start with `ExpressionStatement(StringLiteral)` entries that
+        // were demoted to non-directive statements (parser lookahead
+        // already classified them); we still treat any leading
+        // string-literal-expression-statement as a directive shape so
+        // the round-trip lands them at the top in either case.
+        for d in &prog.directives {
+            let span = d.span;
+            let src = self
+                .slice_span(span)
+                .ok_or(Error::Malformed(
+                    "directive prologue source span out of range".into(),
+                ))?
+                .to_string();
+            items.push(Item::PassThroughStmt(src));
         }
+        let mut idx = 0usize;
+        while idx < prog.body.len() && is_directive_prologue(&prog.body[idx]) {
+            let span = prog.body[idx].span();
+            let src = self
+                .slice_span(span)
+                .ok_or(Error::Malformed(
+                    "directive prologue source span out of range".into(),
+                ))?
+                .to_string();
+            items.push(Item::PassThroughStmt(src));
+            idx += 1;
+        }
+
+        // === 1b. Recognize a synthetic-wrapper IIFE re-emit and
+        // flatten it before applying eligibility / wrapping. The emit
+        // layer renders `__top_init__` as `(function () { ... })();`,
+        // so when re-parsing our own output we'd otherwise wrap a body
+        // that's just one IIFE — losing the structural symmetry the
+        // round-trip check enforces.
+        //
+        // Collect a borrowed slice of "wrap candidates" (`Statement`
+        // nodes from the OXC arena) using owned-Vec-of-borrows; if a
+        // candidate matches the synthetic IIFE shape, splice in its
+        // function body's statements instead. This only fires for the
+        // exact emit shape (anonymous, no params, no args, not
+        // async/generator), so user code that happens to write the
+        // same pattern is also flattened — which is fine, the
+        // observable semantics are identical.
+        // Each candidate is `(stmt, from_synthetic_iife)`. Statements
+        // that came from inside a synthetic IIFE were already
+        // function-local in the original source, so their `let`/`const`
+        // bindings carry no top-level visibility implications and must
+        // not block the wrap path. Top-level `let`/`const` (the other
+        // case) genuinely changes scope semantics if wrapped, so it
+        // remains a hard wrap-blocker.
+        let candidates: Vec<(&js::Statement, bool)> = {
+            let mut out: Vec<(&js::Statement, bool)> = Vec::with_capacity(prog.body.len() - idx);
+            for stmt in prog.body.iter().skip(idx) {
+                if let Some(inner) = synthetic_top_init_iife_body(stmt) {
+                    for s in inner {
+                        out.push((s, true));
+                    }
+                } else {
+                    out.push((stmt, false));
+                }
+            }
+            out
+        };
+
+        // === 2. Decide wrap eligibility ===
+        //
+        // Wrap-eligible candidates split into three groups:
+        //  - `FunctionDeclaration`: stays as a top-level item
+        //    (function decls hoist; not part of `__top_init__`).
+        //  - `VariableDeclaration` (var only): split into a global
+        //    `var x;` hoist + bare assignment inside `__top_init__`.
+        //    `let`/`const` block wrapping (TDZ scoping changes).
+        //  - Anything else that's "wrap-safe" (no fallthrough switch,
+        //    no try/forIn/class/etc.) is lowered as a normal statement
+        //    inside the wrapper body.
+        let mut has_top_init_body = false;
+        let mut has_let_or_const = false;
+        let mut all_wrappable = true;
+        for (stmt, from_iife) in candidates.iter().copied() {
+            match stmt {
+                js::Statement::FunctionDeclaration(_) => {}
+                js::Statement::VariableDeclaration(d) => {
+                    has_top_init_body = true;
+                    match d.kind {
+                        js::VariableDeclarationKind::Let
+                        | js::VariableDeclarationKind::Const => {
+                            // Only the genuinely top-level `let`/`const`
+                            // gates wrapping; ones spliced out of a
+                            // synthetic IIFE were already function-
+                            // scoped and stay function-scoped.
+                            if !from_iife {
+                                has_let_or_const = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                    if !stmt_wrap_safe(stmt) {
+                        all_wrappable = false;
+                    }
+                }
+                _ => {
+                    has_top_init_body = true;
+                    if !stmt_wrap_safe(stmt) {
+                        all_wrappable = false;
+                    }
+                }
+            }
+        }
+        let do_wrap = has_top_init_body && !has_let_or_const && all_wrappable;
+
+        if !do_wrap {
+            // Important: when bailing, walk the *original* program body
+            // (not `candidates`) so the un-wrapped re-emission keeps
+            // each top-level statement's source slice intact. The
+            // synthetic-IIFE flattening is only meaningful inside the
+            // wrap path.
+            for stmt in prog.body.iter().skip(idx) {
+                items.push(self.lower_top_stmt(stmt, decider)?);
+            }
+            return Ok(Module { items });
+        }
+
+        // === 3. Wrap path ===
+        // Collect var-decl names for hoisting; lower top-init stmts
+        // into a single body. Function decls stay as their own items at
+        // their original source position relative to the wrapper.
+        // Run this in a closure so any `Error::Unsupported` raised by
+        // the deeper lowering (e.g. an inner `object method` we still
+        // can't represent) can fall back to the un-wrapped form
+        // instead of failing the whole parse.
+        let wrap_attempt: Result<(Vec<Item>, Vec<String>, Vec<Stmt>), Error> = (|| {
+            let mut wrap_items: Vec<Item> = Vec::new();
+            let mut hoisted_var_names: Vec<String> = Vec::new();
+            let mut top_init_body: Vec<Stmt> = Vec::new();
+
+            for (stmt, from_iife) in candidates.iter().copied() {
+                match stmt {
+                    js::Statement::FunctionDeclaration(f) => {
+                        wrap_items.push(self.lower_top_function_with_decider(&**f, decider)?);
+                    }
+                    // Top-level `var` only — spliced var-decls from an
+                    // IIFE are already function-locals; keep them as
+                    // regular Stmt::Let lowerings rather than hoisting.
+                    js::Statement::VariableDeclaration(decl)
+                        if !from_iife && matches!(decl.kind, js::VariableDeclarationKind::Var) =>
+                    {
+                        // Top-level `var`: split into global `var x;`
+                        // hoist plus bare assignments inside the
+                        // wrapper. The bare assignment routes through
+                        // GlobalThis at the SSA layer — same observable
+                        // effect as sloppy-mode top-level `var`.
+                        for d in &decl.declarations {
+                            let name = match &d.id.kind {
+                                js::BindingPatternKind::BindingIdentifier(id) => {
+                                    id.name.to_string()
+                                }
+                                _ => return Err(Error::Unsupported("destructuring binding")),
+                            };
+                            hoisted_var_names.push(name.clone());
+                            if let Some(init_expr) = &d.init {
+                                let init = self.lower_expr(init_expr)?;
+                                top_init_body.push(Stmt::Assign {
+                                    target: Expr::Ident(name),
+                                    value: init,
+                                });
+                            }
+                        }
+                    }
+                    // Everything else: route through the regular
+                    // statement lowering.
+                    other => {
+                        let stmts = self.lower_stmts_list(std::slice::from_ref(other))?;
+                        top_init_body.extend(stmts);
+                    }
+                }
+            }
+            Ok((wrap_items, hoisted_var_names, top_init_body))
+        })();
+
+        let (wrap_items, hoisted_var_names, top_init_body) = match wrap_attempt {
+            Ok(parts) => parts,
+            Err(Error::Unsupported(_)) => {
+                // The wrap path tripped on a construct the lowering
+                // can't represent yet (e.g. object method shorthand
+                // inside an inner literal). Bail to the historical
+                // un-wrapped form: every non-function top-level
+                // statement becomes an `Item::PassThroughStmt`. We've
+                // already collected the directive prologue into
+                // `items`; redo the rest from `prog.body`.
+                for stmt in prog.body.iter().skip(idx) {
+                    items.push(self.lower_top_stmt(stmt, decider)?);
+                }
+                return Ok(Module { items });
+            }
+            Err(e) => return Err(e),
+        };
+
+        items.extend(wrap_items);
+
+        // Hoist `var` declarations as a single PassThroughStmt placed
+        // just before the wrapper. Preserves global visibility for any
+        // top-level function that reads these names.
+        if !hoisted_var_names.is_empty() {
+            // Insert the var hoist at the position where the wrapper
+            // will land — i.e., right before the wrapper. We append
+            // first; the wrapper goes after.
+            let var_decl = format!("var {};", hoisted_var_names.join(", "));
+            // Place hoist after directive prologue but before any top
+            // function decl so the binding is visible everywhere.
+            // Functions hoist textually anyway, so order between them
+            // and the var hoist is observationally indistinguishable —
+            // we put the hoist at the directive position for simplicity.
+            // To preserve original ordering (function decls placed where
+            // they textually appeared), we append the wrapper at the end
+            // and put the hoist directly before the wrapper. Both are
+            // function-scoped/var-hoisted so visibility is preserved.
+            items.push(Item::PassThroughStmt(var_decl));
+        }
+
+        // Always emit the wrapper, even if `top_init_body` is empty —
+        // the eligibility check guaranteed `has_top_init_body`, so
+        // body must be non-empty here. Sanity-check.
+        debug_assert!(
+            !top_init_body.is_empty() || !hoisted_var_names.is_empty(),
+            "wrap path entered with empty body and no hoisted vars"
+        );
+        if !top_init_body.is_empty() {
+            items.push(Item::Function(IrFunction {
+                name: TOP_INIT_NAME.to_string(),
+                params: Vec::new(),
+                body: top_init_body,
+                source: None,
+            }));
+        }
+
         Ok(Module { items })
     }
 
@@ -135,6 +400,10 @@ impl Lowerer<'_> {
                 // including IIFEs, top-level expressions, classes,
                 // `for`, etc. This is the top-level analogue of the
                 // per-function PassThrough fallback.
+                //
+                // After issue #32 this path is taken only for files
+                // that were not eligible for `__top_init__` wrapping
+                // (top-level let/const, or class/for/etc. at top level).
                 let span = other.span();
                 let src = self
                     .slice_span(span)
@@ -1279,6 +1548,305 @@ fn lower_binop(op: js::BinaryOperator) -> Result<BinOp, Error> {
         B::In => BinOp::In,
         B::Instanceof => BinOp::Instanceof,
     })
+}
+
+/// If `stmt` is the exact emit shape of a synthetic `__top_init__`
+/// IIFE — `(function () { ... })();` (anonymous, no params, no args,
+/// not async/generator) — return the inner body's statements so the
+/// re-parse path can splice them in place of the wrapper before
+/// applying its own wrapping. This is what keeps the structural
+/// roundtrip symmetric: emit produces the IIFE, re-parse strips it.
+fn synthetic_top_init_iife_body<'a, 'src>(
+    stmt: &'a js::Statement<'src>,
+) -> Option<&'a [js::Statement<'src>]> {
+    let es = match stmt {
+        js::Statement::ExpressionStatement(es) => es,
+        _ => return None,
+    };
+    let call = match &es.expression {
+        js::Expression::CallExpression(c) => c,
+        _ => return None,
+    };
+    if !call.arguments.is_empty() {
+        return None;
+    }
+    // Callee may be parenthesized.
+    let callee = match &call.callee {
+        js::Expression::ParenthesizedExpression(p) => &p.expression,
+        other => other,
+    };
+    let func = match callee {
+        js::Expression::FunctionExpression(f) => f,
+        _ => return None,
+    };
+    if func.id.is_some() || func.r#async || func.generator || !func.params.items.is_empty() {
+        return None;
+    }
+    if func.params.rest.is_some() {
+        return None;
+    }
+    let body = func.body.as_ref()?;
+    Some(body.statements.as_slice())
+}
+
+/// True iff `stmt` is a directive-prologue entry — a top-level
+/// expression statement whose expression is a string literal. Per
+/// ECMA-262 14.1.1, only string-literal expression statements at the
+/// start of a program/function body are directives. We only check the
+/// shape; any positional pruning is the caller's responsibility.
+fn is_directive_prologue(stmt: &js::Statement) -> bool {
+    match stmt {
+        js::Statement::ExpressionStatement(es) => {
+            matches!(&es.expression, js::Expression::StringLiteral(_))
+        }
+        _ => false,
+    }
+}
+
+/// Conservative "is this statement wrap-safe for `__top_init__`?" walker.
+///
+/// The SSA layer panics on `switch` cases that fall through to the
+/// next case (no `break`/`return`/`continue`/`throw` at the case body's
+/// tail). Disposition still classifies such functions as Lowered, and
+/// inner function literals lowered along with `__top_init__`'s body
+/// would hit the panic too. Without a per-function PassThrough fallback
+/// for the synthesized wrapper, the only safe move is to detect
+/// fallthrough at AST time and refuse to wrap if any sub-tree (nested
+/// through expressions, statements, AND inner function bodies) has it.
+///
+/// We approximate by walking every `SwitchStatement` reachable from
+/// `stmt` (including inside function expressions / arrow bodies / inner
+/// function declarations) and rejecting if any case body fails to end
+/// in a clear terminator. Other constructs disposition would block at
+/// the function level (`for-await`, `with`, etc.) are also rejected
+/// here for the same reason.
+fn stmt_wrap_safe(stmt: &js::Statement) -> bool {
+    let mut blocked = false;
+    walk_for_wrap_blockers(stmt, &mut blocked);
+    !blocked
+}
+
+fn walk_for_wrap_blockers(stmt: &js::Statement, blocked: &mut bool) {
+    use js::Statement as S;
+    if *blocked {
+        return;
+    }
+    match stmt {
+        S::SwitchStatement(s) => {
+            // Each case body must terminate cleanly. `default` at the
+            // end is fine if its last stmt terminates; otherwise it
+            // falls through to switch-exit, which the SSA layer can't
+            // model yet (panics in `lower_switch`).
+            for case in &s.cases {
+                let last_terminates = case
+                    .consequent
+                    .last()
+                    .is_some_and(|st| stmt_terminates(st));
+                let is_last_case = std::ptr::eq(case, s.cases.last().unwrap());
+                if !last_terminates && !is_last_case {
+                    *blocked = true;
+                    return;
+                }
+                if !last_terminates && is_last_case && !case.consequent.is_empty() {
+                    // Last case without termination falls through to
+                    // switch-exit. SSA's `lower_switch` panics here too.
+                    *blocked = true;
+                    return;
+                }
+                for st in &case.consequent {
+                    walk_for_wrap_blockers(st, blocked);
+                }
+                if let Some(t) = &case.test {
+                    walk_for_wrap_blockers_in_expr_required(t, blocked);
+                }
+                if *blocked { return; }
+            }
+            walk_for_wrap_blockers_in_expr_required(&s.discriminant, blocked);
+        }
+        // Constructs that, while disposition-allowed, can still
+        // surface SSA-level panics or invariant violations when the
+        // wrapper exposes them to the optimizer (e.g. a nested
+        // function whose captures get rewritten by an enclosing
+        // `try` / `for-in` / labeled break in ways the SSA invariant
+        // checker doesn't expect). The conservative gate is to refuse
+        // to wrap files that contain any of these shapes — they keep
+        // the un-wrapped PassThroughStmt fallback that worked before
+        // issue #32.
+        S::TryStatement(_) => { *blocked = true; }
+        S::ForInStatement(_) => { *blocked = true; }
+        S::DoWhileStatement(_) => { *blocked = true; }
+        S::LabeledStatement(_) => { *blocked = true; }
+        S::ClassDeclaration(_) => { *blocked = true; }
+        S::DebuggerStatement(_) => { *blocked = true; }
+        S::WithStatement(_) => { *blocked = true; }
+        S::ExpressionStatement(es) => {
+            walk_for_wrap_blockers_in_expr_required(&es.expression, blocked);
+        }
+        S::VariableDeclaration(d) => {
+            for decl in &d.declarations {
+                if let Some(init) = &decl.init {
+                    walk_for_wrap_blockers_in_expr_required(init, blocked);
+                }
+            }
+        }
+        S::IfStatement(s) => {
+            walk_for_wrap_blockers_in_expr_required(&s.test, blocked);
+            walk_for_wrap_blockers(&s.consequent, blocked);
+            if let Some(alt) = &s.alternate {
+                walk_for_wrap_blockers(alt, blocked);
+            }
+        }
+        S::BlockStatement(b) => {
+            for st in &b.body { walk_for_wrap_blockers(st, blocked); }
+        }
+        S::WhileStatement(s) => {
+            walk_for_wrap_blockers_in_expr_required(&s.test, blocked);
+            walk_for_wrap_blockers(&s.body, blocked);
+        }
+        S::ForStatement(s) => {
+            if let Some(init) = &s.init {
+                if let Some(e) = init.as_expression() {
+                    walk_for_wrap_blockers_in_expr_required(e, blocked);
+                }
+            }
+            if let Some(t) = &s.test { walk_for_wrap_blockers_in_expr_required(t, blocked); }
+            if let Some(u) = &s.update { walk_for_wrap_blockers_in_expr_required(u, blocked); }
+            walk_for_wrap_blockers(&s.body, blocked);
+        }
+        S::ForOfStatement(s) => {
+            walk_for_wrap_blockers_in_expr_required(&s.right, blocked);
+            walk_for_wrap_blockers(&s.body, blocked);
+        }
+        S::ReturnStatement(r) => {
+            if let Some(arg) = &r.argument {
+                walk_for_wrap_blockers_in_expr_required(arg, blocked);
+            }
+        }
+        S::ThrowStatement(t) => {
+            walk_for_wrap_blockers_in_expr_required(&t.argument, blocked);
+        }
+        S::FunctionDeclaration(f) => {
+            if let Some(body) = &f.body {
+                for st in &body.statements {
+                    walk_for_wrap_blockers(st, blocked);
+                }
+            }
+        }
+        S::BreakStatement(_) | S::ContinueStatement(_) | S::EmptyStatement(_) => {}
+        _ => { *blocked = true; }
+    }
+}
+
+fn walk_for_wrap_blockers_in_expr_required(e: &js::Expression, blocked: &mut bool) {
+    use js::Expression as E;
+    if *blocked { return; }
+    match e {
+        E::FunctionExpression(f) => {
+            if let Some(body) = &f.body {
+                for st in &body.statements {
+                    walk_for_wrap_blockers(st, blocked);
+                }
+            }
+        }
+        E::ArrowFunctionExpression(a) => {
+            for st in &a.body.statements {
+                walk_for_wrap_blockers(st, blocked);
+            }
+        }
+        E::CallExpression(c) => {
+            walk_for_wrap_blockers_in_expr_required(&c.callee, blocked);
+            for arg in &c.arguments {
+                if let Some(ex) = arg.as_expression() {
+                    walk_for_wrap_blockers_in_expr_required(ex, blocked);
+                }
+            }
+        }
+        E::NewExpression(n) => {
+            walk_for_wrap_blockers_in_expr_required(&n.callee, blocked);
+            for arg in &n.arguments {
+                if let Some(ex) = arg.as_expression() {
+                    walk_for_wrap_blockers_in_expr_required(ex, blocked);
+                }
+            }
+        }
+        E::ParenthesizedExpression(p) => {
+            walk_for_wrap_blockers_in_expr_required(&p.expression, blocked);
+        }
+        E::SequenceExpression(s) => {
+            for ex in &s.expressions {
+                walk_for_wrap_blockers_in_expr_required(ex, blocked);
+            }
+        }
+        E::AssignmentExpression(a) => {
+            walk_for_wrap_blockers_in_expr_required(&a.right, blocked);
+        }
+        E::BinaryExpression(b) => {
+            walk_for_wrap_blockers_in_expr_required(&b.left, blocked);
+            walk_for_wrap_blockers_in_expr_required(&b.right, blocked);
+        }
+        E::LogicalExpression(l) => {
+            walk_for_wrap_blockers_in_expr_required(&l.left, blocked);
+            walk_for_wrap_blockers_in_expr_required(&l.right, blocked);
+        }
+        E::ConditionalExpression(c) => {
+            walk_for_wrap_blockers_in_expr_required(&c.test, blocked);
+            walk_for_wrap_blockers_in_expr_required(&c.consequent, blocked);
+            walk_for_wrap_blockers_in_expr_required(&c.alternate, blocked);
+        }
+        E::UnaryExpression(u) => walk_for_wrap_blockers_in_expr_required(&u.argument, blocked),
+        E::UpdateExpression(_)
+        | E::Identifier(_)
+        | E::NumericLiteral(_)
+        | E::StringLiteral(_)
+        | E::BooleanLiteral(_)
+        | E::NullLiteral(_)
+        | E::ThisExpression(_)
+        | E::RegExpLiteral(_)
+        | E::TemplateLiteral(_)
+        | E::BigIntLiteral(_) => {}
+        E::ArrayExpression(arr) => {
+            for el in &arr.elements {
+                if let Some(ex) = el.as_expression() {
+                    walk_for_wrap_blockers_in_expr_required(ex, blocked);
+                }
+            }
+        }
+        E::ObjectExpression(obj) => {
+            for prop in &obj.properties {
+                if let js::ObjectPropertyKind::ObjectProperty(p) = prop {
+                    walk_for_wrap_blockers_in_expr_required(&p.value, blocked);
+                }
+            }
+        }
+        E::StaticMemberExpression(m) => walk_for_wrap_blockers_in_expr_required(&m.object, blocked),
+        E::ComputedMemberExpression(m) => {
+            walk_for_wrap_blockers_in_expr_required(&m.object, blocked);
+            walk_for_wrap_blockers_in_expr_required(&m.expression, blocked);
+        }
+        // Anything we haven't enumerated: be conservative.
+        _ => { *blocked = true; }
+    }
+}
+
+/// True iff `stmt`'s control flow always terminates the enclosing
+/// case-body without falling through. Used by the wrap-safety check
+/// to rule out switches whose case bodies fall through to the next
+/// case (or to switch-exit).
+fn stmt_terminates(stmt: &js::Statement) -> bool {
+    use js::Statement as S;
+    match stmt {
+        S::ReturnStatement(_)
+        | S::BreakStatement(_)
+        | S::ContinueStatement(_)
+        | S::ThrowStatement(_) => true,
+        S::BlockStatement(b) => b.body.last().is_some_and(stmt_terminates),
+        S::IfStatement(s) => {
+            s.alternate.as_ref().is_some_and(|alt| {
+                stmt_terminates(&s.consequent) && stmt_terminates(alt)
+            })
+        }
+        _ => false,
+    }
 }
 
 fn stmt_kind(s: &js::Statement) -> &'static str {
