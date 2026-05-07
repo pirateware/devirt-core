@@ -289,30 +289,7 @@ fn lower_function(sm: &ssa::Module, _id: FuncId, func: &Function, cfg: &EmitConf
 
     ctx.walk(func.lowered().entry, None, &mut body);
 
-    // Cosmetic codegen pass: `let X;` followed (at the same scope) by
-    // `X = expr;` with no intervening reference to X collapses into
-    // `let X = expr;` at the assign's position. The let-declaration
-    // moves DOWN, so no reordering of evaluation. Only top-level
-    // function-body scope; nested-block lets are not touched (their
-    // scope semantics differ).
-    sink_top_level_let_init(&mut body);
-
-    // Drop trivial `X = X;` self-assignments at any nesting depth (relooper
-    // artifact from SSA→tree phi resolution that simplified to a no-op).
-    drop_trivial_self_assigns(&mut body);
-
-    // Drop `let X;` declarations whose name is never referenced anywhere
-    // in the body (DCE didn't catch them because they live at the tree-IR
-    // level, not SSA). Function-top scope only.
-    drop_unused_top_level_lets(&mut body);
-
-    // Tighten scope: if a function-top `let X;` has all its references
-    // inside exactly one nested top-level Stmt, drop the function-top
-    // let and recursively merge with the first write inside that nested
-    // scope. JS-semantically safe because `name` was never visible
-    // outside that scope to begin with — the function-top `let` was
-    // overly conservative hoisting.
-    tighten_top_level_let_scopes(&mut body);
+    run_lower_tree_let_passes(&mut body);
 
     let rest_param = func
         .lowered()
@@ -342,6 +319,91 @@ fn lower_function(sm: &ssa::Module, _id: FuncId, func: &Function, cfg: &EmitConf
 // the declaration DOWN to the assign site (no evaluation reordering since
 // only the *declaration* moves, not the value). Same scope → identical
 // JS scoping semantics. Reduces tier3 output from 368 lines to ~263.
+
+/// Function-body cosmetic passes: collapse `let X; ... X = e;` into
+/// `let X = e;`, drop trivial `X = X;`, drop unused top-level lets,
+/// and tighten lets whose refs all live inside one nested Stmt.
+/// Applied to every lowered function body — outer and inner.
+fn run_lower_tree_let_passes(body: &mut Vec<Stmt>) {
+    sink_top_level_let_init(body);
+    drop_trivial_self_assigns(body);
+    drop_unused_top_level_lets(body);
+    tighten_top_level_let_scopes(body);
+    inline_let_into_immediate_return(body);
+}
+
+/// Collapse `let X = expr; return X;` (adjacent at any block scope)
+/// into `return expr;`. Restricted to synthetic `_tN` temporaries —
+/// source-level let names are preserved so the user-visible binding
+/// survives the round-trip. Recurses through nested blocks.
+fn inline_let_into_immediate_return(body: &mut Vec<Stmt>) {
+    for s in body.iter_mut() {
+        recurse_inline_let_into_return(s);
+    }
+    let mut i = 0;
+    while i + 1 < body.len() {
+        let collapse = matches!(
+            (&body[i], &body[i + 1]),
+            (
+                Stmt::Let { name, init: Some(_) },
+                Stmt::Return(Some(Expr::Ident(rn))),
+            ) if name == rn && is_synthetic_temp_name(name)
+        );
+        if collapse {
+            let init = match std::mem::replace(&mut body[i], Stmt::Continue) {
+                Stmt::Let { init: Some(e), .. } => e,
+                _ => unreachable!(),
+            };
+            body[i + 1] = Stmt::Return(Some(init));
+            body.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// True for synthetic intermediate names produced by SSA→tree lowering:
+/// `_t` followed by one-or-more digits. Source-level names never match
+/// (they don't start with the `_t` prefix verbatim).
+fn is_synthetic_temp_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("_t") else {
+        return false;
+    };
+    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn recurse_inline_let_into_return(s: &mut Stmt) {
+    match s {
+        Stmt::If { then_body, else_body, .. } => {
+            inline_let_into_immediate_return(then_body);
+            if let Some(eb) = else_body {
+                inline_let_into_immediate_return(eb);
+            }
+        }
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::For { body, .. }
+        | Stmt::ForIn { body, .. }
+        | Stmt::ForOf { body, .. }
+        | Stmt::Block(body) => inline_let_into_immediate_return(body),
+        Stmt::Switch { cases, .. } => {
+            for c in cases.iter_mut() {
+                inline_let_into_immediate_return(&mut c.body);
+            }
+        }
+        Stmt::Try { body, catch, finally } => {
+            inline_let_into_immediate_return(body);
+            if let Some((_, cb)) = catch {
+                inline_let_into_immediate_return(cb);
+            }
+            if let Some(f) = finally {
+                inline_let_into_immediate_return(f);
+            }
+        }
+        Stmt::Labeled { stmt, .. } => recurse_inline_let_into_return(stmt),
+        _ => {}
+    }
+}
 
 fn sink_top_level_let_init(body: &mut Vec<Stmt>) {
     let mut i = 0;
@@ -1900,6 +1962,8 @@ impl LowerCtx<'_> {
                     });
                 }
                 ctx.walk(inner.lowered().entry, None, &mut body);
+
+                run_lower_tree_let_passes(&mut body);
 
                 // Detect arrow-shaped output? Inner Lowered functions
                 // came from either a function expression or an arrow.
