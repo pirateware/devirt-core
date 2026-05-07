@@ -1,0 +1,14 @@
+{
+  "_comment": "Cross-check spec for 10_closure.js (counter pattern). Inner closure mutates a captured `let n`, exercising the inner-reassigned-capture rule that routes the inner to PassThrough so cross-call mutation survives.",
+  "skip": false,
+  "timeout_secs": 10,
+  "cases": [
+    {
+      "name": "default"
+    },
+    {
+      "name": "extra_invocations",
+      "harness": "var d = makeCounter(); console.log(d()); console.log(d()); console.log(d()); console.log(c());"
+    }
+  ]
+}

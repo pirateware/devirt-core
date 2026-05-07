@@ -1,0 +1,10 @@
+{
+  "_comment": "Cross-check spec for 13_closure_nested.js. Two-level nested closure (issue #36 stage 4b). inner2 captures both `a` (grandparent) and `b` (parent); pre-stage-4b inner2 was force-passthrough'd because `a` looked forward-referenced in inner1's scope.",
+  "skip": false,
+  "timeout_secs": 10,
+  "cases": [
+    {
+      "name": "default"
+    }
+  ]
+}
