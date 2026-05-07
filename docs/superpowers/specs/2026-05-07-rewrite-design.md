@@ -152,8 +152,8 @@ A harness that pulls 100 random npm packages and runs the pipeline gives more co
 
 | Component | Lines (est.) | Purpose |
 |---|---|---|
-| SSA IR core | ~2,000 | leaner than today; one IR layer, not two |
-| Lift oxc AST → SSA | ~2,000 | replaces `parse/lower_tree` + `parse/lower_ssa` |
+| SSA IR core (with `define_ir!` macro) | ~800 | one IR; macro emits printer/walker/substitutor/validator from a single op declaration |
+| Lift oxc AST → SSA (Braun's algorithm) | ~700 | "Simple and Efficient Construction of Static Single Assignment Form" — no dominance frontiers; on-the-fly phi insertion |
 | **Partial-evaluation engine** | ~3,000 | the actual deobfuscator; small in code, dense in design |
 | Function summaries / interproc | ~1,000 | computed lazily, cached, invalidated on heap-effect propagation |
 | Effect / alias / escape model | ~1,000 | from day 1, not bolted on |
@@ -161,9 +161,23 @@ A harness that pulls 100 random npm packages and runs the pipeline gives more co
 | SSA → oxc AST (relooper wrapper) | ~1,500 | calls the published relooper, builds oxc nodes |
 | CLI + corpus harness | ~2,000 | |
 | Tests + fixtures | ~3,000 | mostly differential + property-based |
-| **Total** | **~16,000** | ~⅓ of current 45k |
+| **Total** | **~13,500** | ~30% of current 45k |
 
 Every line is *the actual research problem*, not plumbing.
+
+### Hard cap on SSA-related code
+
+> **SSA core + lift = 2,500 lines. Total. Hard cap.**
+
+If we're pushing past it, we're either reinventing complexity (the failure mode of the current project) or building features without a concrete pass demanding them. Three rules to keep this true:
+
+1. **Use Braun et al's algorithm — not Cytron's classical one.** Braun is ~200 lines, no dominance frontiers, builds SSA on the fly during the lift. Cytron is the textbook version that everyone cargo-cults; bigger, more bug-prone, doesn't earn its theoretical guarantees here.
+2. **Macro-generate every per-op boilerplate.** A `define_ir! { Add(lhs, rhs); Load(obj, key); Call(fn, args); ... }` macro emits the enum, printer, walker, substitutor, validator, snapshot helper. Adding an op is one line. Without this rule, every new op ripples into 5–8 files exactly like the current project.
+3. **Don't add SSA features speculatively.** No incremental SSA updates, no fancy phi optimization, no edge-splitting for critical edges, no SSA-on-memory (heap is a separate model). Real compilers need these; we don't, until a concrete pass demands one. The current project's SSA layer accumulated complexity for hypothetical future passes that never showed up.
+
+### Why we don't outsource SSA
+
+There's no off-the-shelf SSA library that fits source-level JS. **Cranelift** and **LLVM** are designed for low-level codegen with C-like type systems (i32/i64/f64); JS values don't lift cleanly into them. **MLIR** with a custom JS dialect is the only "right" answer if we want someone else to own SSA — but it's a half-project commitment to the MLIR ecosystem (C++ at the core, ~6 months ramp). Not worth it. Our own SSA at ≤2.5k lines is cheaper than the MLIR runway.
 
 ---
 
@@ -179,19 +193,52 @@ These are all backed by saved memory entries; they survive the rewrite unchanged
 
 ---
 
-## Migration / cutover
+## Migration: clean delete, not side-by-side
 
-This is a *clean rewrite*, not a refactor. New project lives alongside the existing one until the new one's corpus pass-rate exceeds the old one's. Then old one is deleted in one commit.
+Side-by-side dual-maintenance has no audience here — there's no production user, no green-test obligation, no one depending on the current pipeline. **Delete the legacy implementation in one commit, then build the new one in the same paths.** This is the cleanest mental model and matches the user's stated preference.
 
-- New project at `crates/v2/` (or a sibling repo — TBD)
-- Same corpus harness format → both can be benchmarked head-to-head
-- Cutover gate: new project ≥ old project on:
-  1. semantic-equivalence pass-rate on the corpus (differential test, must be ≥ 99%)
-  2. tier3 output line count (must be ≤ current)
-  3. the long-tail JS feature surface (must be ≥ — measured by oxc-transformer subsumption, not BlockerKind count)
-- After cutover: delete `crates/parse`, `crates/pass`, `crates/ir`, `crates/emit` (current implementations).
+### Sequence
 
-Estimated time to cutover: **6–8 weeks of focused work**, dominated by the PE engine and the lift-from-oxc layer. Infrastructure (parser/codegen/transform/scope) is hours, not weeks, because we're not writing it.
+1. **Freeze v0 as a benchmark baseline.** Before deletion, run the full corpus through the current pipeline and snapshot every output to `tests/baselines/v0/`. Capture coverage stats too. These artifacts are read-only after this point and serve as the regression baseline for the new project.
+2. **Tag the commit.** `git tag v0-final` so the old implementation is recoverable if any specific behavior needs to be referenced during the rewrite.
+3. **Delete in one commit.** `git rm -r crates/parse crates/pass crates/ir crates/emit`. Keep `crates/cli` (driver shell) and `tests/` (corpus, fixtures, harness). Commit message: `rewrite: delete legacy implementation; baseline frozen at v0-final`.
+4. **Bootstrap a trivial round-trip.** First commit on the new code: `oxc parse → identity transform → oxc codegen` that round-trips a JS file. No analysis. The harness runs and reports "0 changes," which is correct.
+5. **Layer in components in dependency order** (see Implementation Layers below).
+6. **Reactivate the corpus harness incrementally** — once the new pipeline can ingest a file end-to-end, run it against the v0 baselines and track convergence.
+
+### Implementation layers (strict dependency order)
+
+Each layer ships with a hard gate. No layer is merged until its gate passes. No layer starts until the prior one is done.
+
+| # | Layer | Gate |
+|---|---|---|
+| 1 | oxc parse → oxc codegen identity round-trip | Random sample of 100 npm dist files round-trip byte-identical (modulo formatting) |
+| 2 | oxc-transformer integration (input → kernel JS) | All tier1/tier2/tier3 corpus parse cleanly into kernel form; no `BlockerKind` analog needed |
+| 3 | SSA IR core + `define_ir!` macro | IR fits in ≤800 lines; smoke-test SSA constructed by hand prints back identically |
+| 4 | Lift kernel-AST → SSA (Braun's algorithm) | Lift fits in ≤700 lines; lift+lower round-trips all corpus through SSA without analysis (semantic equivalence in differential harness) |
+| 5 | Heap / effect / alias / escape model (data structures only, no algorithm yet) | Types defined; PE engine in layer 6 can plumb through without retrofit |
+| 6 | PE engine: concrete-only constant folding | Folds basic arithmetic / string ops / known-array indexing on a hand-curated 20-fixture set |
+| 7 | Function summaries (lazy, cached) | Cross-call concrete folding works on a small fixture set; v0 baselines for tier1 samples reach within 2× line count |
+| 8 | Embedded JS engine (rquickjs/Boa/rust_v8) for opaque-effect spec calls | `Math.floor(424/16)`, `"abc".charAt(2)`, `JSON.parse('{"a":1}').a` all fold without spec re-implementation |
+| 9 | Symbolic execution: branches with concrete conditions, loop unrolling on concrete carried state | A hand-built JS-VM dispatcher fixture (concrete state table) dissolves into straight-line code |
+| 10 | Differential testing harness | Random program generator + run-original-vs-deobfuscated equivalence check; stays green on ≥99% of generated programs |
+| 11 | Renamer | Source-level names preserved where they exist; synthetic temps named consistently |
+| 12 | Corpus reactivation + v0 head-to-head | New pipeline meets-or-beats v0 on: (a) differential semantic equivalence ≥99%, (b) tier3 output line count ≤ v0, (c) JS feature surface (any sample v0 lowered, new pipeline must also lower) |
+
+### Anti-scope-creep mechanisms
+
+The current project got out of hand because features accumulated faster than the architecture could absorb them. Mechanisms to prevent recurrence:
+
+- **One feature at a time, gate before merge.** No layer starts until the previous one's gate is green.
+- **Hard cap on SSA-related code (2,500 lines).** Tracked in CI; PR that pushes past it requires a "why this op needs to exist now, not speculatively" justification in the commit message.
+- **No speculative passes.** PE engine starts dumb (concrete folding only). Each subsequent capability (summaries, symbolic, unrolling) is added when the prior layer's gate exposes a class of input it can't handle — not before.
+- **No "future-proofing" abstractions.** If something has one caller, it's a function, not a trait. Generalize when the second caller appears, not before.
+- **2x-time stop rule.** If any layer is taking >2x its estimated time, stop and re-plan. Don't push through; that's how the current project compounded.
+- **Periodic stop-and-measure.** Every 2 weeks, run the full corpus, dump line-count + semantic-equivalence stats, compare against the prior measurement. If we're not converging on the v0 baseline, stop and reassess.
+
+### Estimated time to cutover
+
+**6–8 weeks of focused work**, dominated by the PE engine (layers 6, 7, 9). Infrastructure (parser/transform/scope/codegen — layers 1, 2) is hours per layer, not weeks, because we're not writing it. SSA + lift (layers 3, 4) is ~1 week if we hold the cap. Differential testing + corpus reactivation (layers 10, 12) is a few days each.
 
 ---
 
