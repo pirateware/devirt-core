@@ -411,6 +411,7 @@ mod tests {
         Item::Function(IrFunction {
             name: name.into(),
             params: params.into_iter().map(String::from).collect(),
+            rest_param: None,
             body,
             source: None,
         })

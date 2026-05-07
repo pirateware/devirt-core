@@ -84,13 +84,18 @@ pub fn decide_arrow(arrow: &js::ArrowFunctionExpression) -> Disposition {
 // ----------------------------------------------------------------------
 
 fn collect_param_blockers(params: &js::FormalParameters, blockers: &mut BTreeSet<BlockerKind>) {
-    // RestParam (`function f(...args)`) still requires a variadic-call
-    // ABI we don't model. Keep it blocked. The destructuring/default
-    // shapes lift via parse-time desugaring (issue #29) — we still walk
-    // into them here so any *inner* blocker (e.g. `function f({a = b ?? 0})`
-    // contains NullishCoalescing) still surfaces.
-    if params.rest.is_some() {
-        blockers.insert(BlockerKind::RestParam);
+    // Function-level rest param (`function f(..., ...rest)`) lowers
+    // through SSA via `InstKind::RestArgs` — issue #45. Only a
+    // *destructured* rest target (`...{a, b}`) remains rejected; that
+    // would need destructuring-rest semantics on the gathered array
+    // and is a separate ticket. Identifier rest targets are accepted.
+    if let Some(rest) = &params.rest {
+        if !matches!(
+            rest.argument.kind,
+            js::BindingPatternKind::BindingIdentifier(_)
+        ) {
+            blockers.insert(BlockerKind::RestParam);
+        }
     }
     for p in &params.items {
         collect_binding_pattern_blockers(&p.pattern, blockers);
@@ -112,11 +117,21 @@ fn collect_binding_pattern_blockers(
             collect_binding_pattern_blockers(&ap.left, blockers);
         }
         js::BindingPatternKind::ObjectPattern(op) => {
-            // Object rest in destructuring (`{a, ...rest}`) needs the
-            // same variadic-extraction machinery as RestParam — keep
-            // blocked under RestParam for consistency.
-            if op.rest.is_some() {
-                blockers.insert(BlockerKind::RestParam);
+            // Object rest in destructuring (`{a, ...rest}`) lowers via
+            // parse-time desugaring (issue #45): bind a shallow copy
+            // via object-spread, then `delete` each captured sibling
+            // key. Computed sibling keys are still blocked because
+            // they cannot be excluded statically.
+            if let Some(rest) = &op.rest {
+                if !matches!(
+                    rest.argument.kind,
+                    js::BindingPatternKind::BindingIdentifier(_)
+                ) {
+                    blockers.insert(BlockerKind::RestParam);
+                }
+                if op.properties.iter().any(|p| p.computed) {
+                    blockers.insert(BlockerKind::RestParam);
+                }
             }
             for prop in &op.properties {
                 if prop.computed {
@@ -145,8 +160,17 @@ fn collect_binding_pattern_blockers(
             }
         }
         js::BindingPatternKind::ArrayPattern(ap) => {
-            if ap.rest.is_some() {
-                blockers.insert(BlockerKind::RestParam);
+            // Array rest in destructuring (`[a, b, ...rest]`) lowers
+            // via parse-time desugaring (issue #45): the rest binding
+            // becomes `let rest = source.slice(N);`. Only a destructured
+            // rest target remains blocked.
+            if let Some(rest) = &ap.rest {
+                if !matches!(
+                    rest.argument.kind,
+                    js::BindingPatternKind::BindingIdentifier(_)
+                ) {
+                    blockers.insert(BlockerKind::RestParam);
+                }
             }
             for el in &ap.elements {
                 if let Some(p) = el {

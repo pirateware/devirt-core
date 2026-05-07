@@ -43,6 +43,16 @@ pub enum Item {
 pub struct IrFunction {
     pub name: String,
     pub params: Vec<String>,
+    /// Optional rest parameter name. When `Some(name)`, the function
+    /// signature emits as `function f(p0, p1, ..., ...name) { ... }`.
+    /// The rest array is materialised at function entry by an
+    /// `InstKind::RestArgs { from_index = params.len() }` in the SSA
+    /// body; downstream passes treat it as opaque (PURE alloc whose
+    /// contents depend on the actual call-site argument list). At
+    /// codegen the JS engine handles the runtime gather — we simply
+    /// re-emit the `...name` syntax so the engine sees the same shape
+    /// the source had. Issue #45.
+    pub rest_param: Option<String>,
     pub body: Vec<Stmt>,
     /// Verbatim body source slice (between `{` and `}`, exclusive).
     /// Populated at AST→tree-IR time. Used by the SSA layer to fall
@@ -243,6 +253,9 @@ pub struct FuncLiteral {
     /// expressions; `None` for anonymous expressions and arrows.
     pub name: Option<String>,
     pub params: Vec<String>,
+    /// Optional rest parameter name; mirrors `IrFunction.rest_param`.
+    /// Issue #45.
+    pub rest_param: Option<String>,
     pub is_async: bool,
     pub is_generator: bool,
     pub is_arrow: bool,

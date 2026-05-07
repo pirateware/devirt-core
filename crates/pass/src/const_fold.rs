@@ -213,6 +213,7 @@ mod tests {
         module.functions[0].body = FunctionBody::PassThrough(PassThroughBody {
             source: "function f(){}".to_string(),
             param_names: vec![],
+            rest_param: None,
             function_name: None,
             is_async: false,
             is_generator: false,

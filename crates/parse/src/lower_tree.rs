@@ -192,6 +192,9 @@ fn passthrough_to_literal(
             .iter()
             .map(|n| sm.strings.resolve(n).to_string())
             .collect(),
+        rest_param: pt
+            .rest_param
+            .map(|n| sm.strings.resolve(&n).to_string()),
         is_async: pt.is_async,
         is_generator: pt.is_generator,
         is_arrow: pt.is_arrow,
@@ -286,9 +289,15 @@ fn lower_function(sm: &ssa::Module, _id: FuncId, func: &Function, cfg: &EmitConf
 
     ctx.walk(func.lowered().entry, None, &mut body);
 
+    let rest_param = func
+        .lowered()
+        .rest_param
+        .map(|n| sm.strings.resolve(&n).to_string());
+
     IrFunction {
         name: func.name.clone(),
         params: param_names,
+        rest_param,
         body,
         // Source slice is meaningless for tree-IR reconstructed from
         // SSA — the SSA round-trip is lossy and the original slice no
@@ -926,6 +935,15 @@ impl LowerCtx<'_> {
         ) {
             return;
         }
+        // RestArgs is the function-entry rest-array materialiser
+        // (issue #45). The binding it produces is re-rendered as a
+        // `...name` token in the function header by `lower_function`
+        // / `to_func_literal`; suppress the inst's per-statement
+        // emission here. References to the value resolve through
+        // `name_for` to the rest-param's source name.
+        if matches!(kind, InstKind::RestArgs { .. }) {
+            return;
+        }
         if kind.is_void() {
             // Stores produce no value. Emit as a side-effecting statement.
             match kind {
@@ -1211,6 +1229,12 @@ impl LowerCtx<'_> {
                  pattern in `walk` should have consumed it. See \
                  docs/design-forin.md."
             ),
+            RestArgs { .. } => unreachable!(
+                "lower_tree: RestArgs reached inst_kind_to_expr — \
+                 emit_inst should have suppressed it. The rest \
+                 parameter is re-rendered as `...name` in the \
+                 function header; references resolve via name_for."
+            ),
         }
     }
 
@@ -1304,6 +1328,9 @@ impl LowerCtx<'_> {
                     .iter()
                     .map(|n| self.sm.strings.resolve(n).to_string())
                     .collect(),
+                rest_param: pt
+                    .rest_param
+                    .map(|n| self.sm.strings.resolve(&n).to_string()),
                 is_async: pt.is_async,
                 is_generator: pt.is_generator,
                 is_arrow: pt.is_arrow,
@@ -1350,9 +1377,14 @@ impl LowerCtx<'_> {
                 } else {
                     None
                 };
+                let rest_param = inner
+                    .lowered()
+                    .rest_param
+                    .map(|n| self.sm.strings.resolve(&n).to_string());
                 tree::FuncLiteral {
                     name,
                     params: param_names,
+                    rest_param,
                     is_async: false,
                     is_generator: false,
                     is_arrow: false,
@@ -2151,6 +2183,7 @@ fn compute_inlinable_values(func: &Function, cfg: &EmitConfig) -> HashSet<u32> {
                 | InstKind::ForInDone { .. }
                 | InstKind::ForInNext { .. }
                 | InstKind::CatchValue
+                | InstKind::RestArgs { .. }
         ) {
             continue;
         }
@@ -2255,7 +2288,7 @@ fn assign_names(
                 );
                 final_names.insert(vi, chosen);
             }
-            ValueDefKind::Inst(_) | ValueDefKind::BlockParam { .. } => {
+            ValueDefKind::Inst(iid) => {
                 let preferred = def.source_name.map(|s| sm.strings.resolve(&s).to_string());
                 let chosen = pick_name(
                     preferred,
@@ -2270,6 +2303,31 @@ fn assign_names(
                 // The name is still allocated as a fallback in case the
                 // inliner misses (e.g. a structural construct consumes
                 // the operand without going through `operand_to_expr`).
+                //
+                // RestArgs (issue #45) is the function-entry rest-param
+                // materialiser. The binding is already declared by the
+                // function-header `...name` token; do NOT hoist it as a
+                // body-level `let name;` (which would either shadow the
+                // param or be a SyntaxError on ident reuse).
+                let is_rest = matches!(
+                    func.lowered().instructions[iid.0 as usize].kind,
+                    ssa::InstKind::RestArgs { .. }
+                );
+                if !inlinable.contains(&vi) && !is_rest {
+                    hoisted.push(chosen.clone());
+                }
+                final_names.insert(vi, chosen);
+            }
+            ValueDefKind::BlockParam { .. } => {
+                let preferred = def.source_name.map(|s| sm.strings.resolve(&s).to_string());
+                let chosen = pick_name(
+                    preferred,
+                    &mut committed,
+                    vi,
+                    &pinned_names,
+                    &mut t_counter,
+                    true,
+                );
                 if !inlinable.contains(&vi) {
                     hoisted.push(chosen.clone());
                 }

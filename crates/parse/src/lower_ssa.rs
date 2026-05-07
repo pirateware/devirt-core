@@ -1523,6 +1523,7 @@ fn push_passthrough_function(sm: &mut ssa::Module, lit: &tree::FuncLiteral) {
         .iter()
         .map(|p| sm.strings.get_or_intern(p))
         .collect();
+    let rest_param = lit.rest_param.as_ref().map(|n| sm.strings.get_or_intern(n));
     sm.functions.push(ssa::Function {
         name,
         capture_count: 0,
@@ -1532,6 +1533,7 @@ fn push_passthrough_function(sm: &mut ssa::Module, lit: &tree::FuncLiteral) {
         body: ssa::FunctionBody::PassThrough(ssa::PassThroughBody {
             source,
             param_names,
+            rest_param,
             function_name: function_name_id,
             is_async: lit.is_async,
             is_generator: lit.is_generator,
@@ -1830,6 +1832,7 @@ fn push_inner_passthrough_function_with_source(
         .iter()
         .map(|p| sm.strings.get_or_intern(p))
         .collect();
+    let rest_param = lit.rest_param.as_ref().map(|n| sm.strings.get_or_intern(n));
     sm.functions.push(ssa::Function {
         name,
         capture_count,
@@ -1839,6 +1842,7 @@ fn push_inner_passthrough_function_with_source(
         body: ssa::FunctionBody::PassThrough(ssa::PassThroughBody {
             source,
             param_names,
+            rest_param,
             function_name: function_name_id,
             is_async: lit.is_async,
             is_generator: lit.is_generator,
@@ -2048,6 +2052,9 @@ impl<'b, 'm> Converter<'b, 'm> {
     fn lower_top_level(&mut self, f: &tree::IrFunction) {
         let entry = self.setup_entry_with_module_scope();
         self.lower_params(&f.params, entry);
+        if let Some(name) = &f.rest_param {
+            self.lower_rest_param(name, f.params.len() as u32, entry);
+        }
         for stmt in &f.body {
             self.lower_stmt(stmt);
         }
@@ -2094,6 +2101,9 @@ impl<'b, 'm> Converter<'b, 'm> {
 
         self.push_scope();
         self.lower_params(&lit.params, entry);
+        if let Some(name) = &lit.rest_param {
+            self.lower_rest_param(name, lit.params.len() as u32, entry);
+        }
 
         match &lit.body {
             FuncBody::Stmts(stmts) => {
@@ -2153,6 +2163,25 @@ impl<'b, 'm> Converter<'b, 'm> {
             self.builder.set_source_name(arg_val, name_id);
             self.write_variable(sym, entry, Operand::Value(arg_val));
         }
+    }
+
+    /// Materialise the rest-parameter array at the function's entry
+    /// block. Emits `InstKind::RestArgs { from_index }` as the first
+    /// instruction of `entry`, binds the resulting Value to `name` in
+    /// the param scope, and records `name` on the body's `rest_param`
+    /// field so the SSA→tree reconstructor can re-render `...name`
+    /// in the function header. Issue #45.
+    fn lower_rest_param(&mut self, name: &str, from_index: u32, entry: BlockId) {
+        let v = self
+            .builder
+            .add_inst(InstKind::RestArgs { from_index })
+            .expect("RestArgs produces a Value");
+        let name_id = self.builder.intern(name);
+        self.builder.set_source_name(v, name_id);
+        self.builder.body.rest_param = Some(name_id);
+        let sym = self.fresh_symbol();
+        self.bind_in_top_scope(name.to_string(), sym);
+        self.write_variable(sym, entry, Operand::Value(v));
     }
 
     /// Pop the param + module scopes and emit an implicit `return
@@ -5798,6 +5827,7 @@ mod tests {
         FuncLiteral {
             name: name.map(String::from),
             params: params.into_iter().map(String::from).collect(),
+            rest_param: None,
             is_async: false,
             is_generator: false,
             is_arrow: false,
@@ -5834,6 +5864,7 @@ mod tests {
         let outer = tree::IrFunction {
             name: "outer".to_string(),
             params: vec!["x".to_string()],
+            rest_param: None,
             body: outer_body,
             source: None,
         };
@@ -5910,6 +5941,7 @@ mod tests {
         let outer = tree::IrFunction {
             name: "outer".to_string(),
             params: vec!["a".to_string()],
+            rest_param: None,
             body: vec![
                 Stmt::Let {
                     name: "f".to_string(),
@@ -5942,6 +5974,7 @@ mod tests {
         let outer = tree::IrFunction {
             name: "outer".to_string(),
             params: vec![],
+            rest_param: None,
             body: vec![Stmt::FuncDecl(inner1), Stmt::FuncDecl(inner2)],
             source: None,
         };

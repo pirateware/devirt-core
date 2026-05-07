@@ -50,13 +50,14 @@ fn arithmetic_and_return_is_lowered() {
 
 #[test]
 fn two_distinct_blockers_all_reported() {
-    // Issue #33 lifted DebuggerStmt — pair RestParam (still blocked)
-    // with MetaProperty (`new.target`, still blocked) to keep two
-    // distinct blockers.
-    let src = "function f(...rest) { var a = new.target; return rest; }";
+    // Issue #33 lifted DebuggerStmt; issue #45 lifted RestParam.
+    // Pair MetaProperty (`new.target`, still blocked) with
+    // ImportExpr (`import(...)`, still blocked) — both reachable
+    // from an ordinary function.
+    let src = "function f() { var a = new.target; return import('x'); }";
     let b = blockers_of(src);
-    assert!(b.contains(&BlockerKind::RestParam), "missing RestParam in {b:?}");
     assert!(b.contains(&BlockerKind::MetaProperty), "missing MetaProperty in {b:?}");
+    assert!(b.contains(&BlockerKind::ImportExpr), "missing ImportExpr in {b:?}");
     assert_eq!(b.len(), 2, "expected exactly 2 blockers, got {b:?}");
 }
 
@@ -75,11 +76,14 @@ fn repeated_blocker_kind_reported_once() {
 // --- Individual blocker kinds ---
 
 #[test]
-fn rest_param_blocked() {
-    // RestParam still blocked — needs variadic-call ABI (deferred
-    // beyond issue #29).
-    let b = blockers_of("function f(...args) {}");
-    assert!(b.contains(&BlockerKind::RestParam), "{b:?}");
+fn rest_param_lowers() {
+    // Issue #45: RestParam now lowers via `InstKind::RestArgs` at
+    // function entry. Identifier rest targets are accepted; only
+    // destructured rest targets (`...{a, b}`) remain blocked.
+    assert_eq!(
+        decide_first_fn("function f(...args) {}"),
+        Disposition::Lowered
+    );
 }
 
 #[test]
@@ -146,11 +150,13 @@ fn destructuring_with_inner_blocker_still_blocks() {
 }
 
 #[test]
-fn object_rest_in_destructuring_param_still_blocks() {
-    // `{a, ...rest}` needs variadic-extraction (same machinery as
-    // RestParam) — keep blocked under RestParam.
-    let b = blockers_of("function f({a, ...rest}) { return a; }");
-    assert!(b.contains(&BlockerKind::RestParam), "{b:?}");
+fn object_rest_in_destructuring_param_lowers() {
+    // Issue #45: object rest (`{a, ...rest}`) lowers via parse-time
+    // desugaring (`let rest = {...src}; delete rest.a;`).
+    assert_eq!(
+        decide_first_fn("function f({a, ...rest}) { return a; }"),
+        Disposition::Lowered
+    );
 }
 
 #[test]

@@ -324,7 +324,7 @@ impl<'src> Lowerer<'src> {
                 let func = &*ctor.value;
                 // Lower params and body inside a super context so
                 // `super(args)` and `super.x` rewrites apply.
-                let (params, mut prologue) = self.lower_param_list(&func.params)?;
+                let (params, rest_param, mut prologue) = self.lower_param_list(&func.params)?;
                 let body = func.body.as_ref().ok_or(Error::Unsupported(
                     "class constructor without a body",
                 ))?;
@@ -338,6 +338,7 @@ impl<'src> Lowerer<'src> {
                 Ok(FuncLiteral {
                     name: Some(class_name.into()),
                     params,
+                    rest_param,
                     is_async: false,
                     is_generator: false,
                     is_arrow: false,
@@ -368,6 +369,7 @@ impl<'src> Lowerer<'src> {
                 Ok(FuncLiteral {
                     name: Some(class_name.into()),
                     params: Vec::new(),
+                    rest_param: None,
                     is_async: false,
                     is_generator: false,
                     is_arrow: false,

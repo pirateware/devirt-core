@@ -52,7 +52,14 @@ fn reparse_and_codegen_body(lit: &FuncLiteral, src: &str) -> String {
     use oxc_parser::Parser;
     use oxc_span::SourceType;
 
-    let params_joined = lit.params.join(", ");
+    let mut params_joined = lit.params.join(", ");
+    if let Some(rname) = &lit.rest_param {
+        if !params_joined.is_empty() {
+            params_joined.push_str(", ");
+        }
+        params_joined.push_str("...");
+        params_joined.push_str(rname);
+    }
     let keyword = if lit.is_async {
         if lit.is_generator {
             "async function*"
@@ -238,6 +245,14 @@ impl Printer<'_> {
                 self.buf.push_str(", ");
             }
             self.buf.push_str(p);
+        }
+        // Issue #45: rest parameter trails the positional list as `...name`.
+        if let Some(name) = &f.rest_param {
+            if !f.params.is_empty() {
+                self.buf.push_str(", ");
+            }
+            self.buf.push_str("...");
+            self.buf.push_str(name);
         }
         self.buf.push_str(") ");
         self.write_function_block(f);
@@ -558,6 +573,13 @@ impl Printer<'_> {
                 }
                 self.buf.push_str(p);
             }
+            if let Some(rname) = &lit.rest_param {
+                if !lit.params.is_empty() {
+                    self.buf.push_str(", ");
+                }
+                self.buf.push_str("...");
+                self.buf.push_str(rname);
+            }
             self.buf.push(')');
             return;
         }
@@ -578,6 +600,13 @@ impl Printer<'_> {
                 self.buf.push_str(", ");
             }
             self.buf.push_str(p);
+        }
+        if let Some(rname) = &lit.rest_param {
+            if !lit.params.is_empty() {
+                self.buf.push_str(", ");
+            }
+            self.buf.push_str("...");
+            self.buf.push_str(rname);
         }
         self.buf.push(')');
     }

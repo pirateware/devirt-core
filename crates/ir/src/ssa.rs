@@ -548,6 +548,31 @@ pub enum InstKind {
     ///
     /// See `ForInInit::shape` for the shape semantics.
     ForInNext { iter: Operand, shape: ForInIterShape },
+
+    /// Materialise the rest-parameter array from the actual call-site
+    /// arguments at indices `from_index..arity`. Always the FIRST
+    /// instruction of the function's entry block when the function
+    /// declares a rest parameter (`function f(...rest)` or
+    /// `function f(a, b, ...rest)`); the resulting Value's
+    /// `source_name` is the rest binding name. The tree-IR
+    /// reconstructor suppresses this inst and re-renders `...name` in
+    /// the function header.
+    ///
+    /// Effect: PURE. The rest array is a fresh allocation with no
+    /// observable side effects (no user code runs to materialise it).
+    /// Its *contents* are not knowable from the SSA body — they
+    /// depend on the call site — but every other allocation node
+    /// (`AllocObject`, `AllocArray`) has the same opacity at v1, so
+    /// PURE is honest. A future analysis can refine this to "fresh
+    /// array of length `caller_argc - from_index` with element types
+    /// from the caller's argument operands" once we have caller-aware
+    /// inlining; until then, downstream passes see the result Value
+    /// as an unknown but pure allocation.
+    ///
+    /// No operands. The variadic-call ABI is implicit: the JS engine
+    /// gathers the trailing arguments at runtime; the SSA layer never
+    /// names them as Values, only the gathered array. Issue #45.
+    RestArgs { from_index: u32 },
 }
 
 /// Per-site refinement of a ForIn iteration's may-observe-getters
@@ -588,6 +613,7 @@ impl InstKind {
             | AllocArray { .. }
             | AllocClosure { .. }
             | AllocRegExp { .. }
+            | RestArgs { .. }
             | ToBool { .. }
             | Typeof { .. } => Effect::PURE,
 
@@ -1102,6 +1128,16 @@ pub struct LoweredBody {
     pub instructions: Vec<Instruction>,
     pub values: Vec<ValueDef>,
     pub entry: BlockId,
+    /// Optional rest-parameter binding name. When `Some(name)`, the
+    /// function declares `function f(p0, ..., ...name)` in source. The
+    /// rest array is materialised at function entry by the FIRST
+    /// instruction of `entry`, which MUST be
+    /// `InstKind::RestArgs { from_index: params.len() as u32 }` (the
+    /// resulting Value's `source_name` equals this name). Issue #45.
+    /// Downstream passes treat the RestArgs value as opaque; the
+    /// tree-reconstructor (`lower_tree`) suppresses the inst's
+    /// emission and re-renders `...name` in the function header.
+    pub rest_param: Option<StrId>,
 }
 
 /// Source-preserved function body. We hold an owned slice of the original
@@ -1112,6 +1148,10 @@ pub struct LoweredBody {
 pub struct PassThroughBody {
     pub source: String,
     pub param_names: Vec<StrId>,
+    /// Optional rest parameter name. When `Some(id)`, the re-emitted
+    /// header renders `(p0, p1, ..., ...name)`. Mirrors
+    /// `tree::FuncLiteral.rest_param`. Issue #45.
+    pub rest_param: Option<StrId>,
     pub function_name: Option<StrId>,
     pub is_async: bool,
     pub is_generator: bool,
@@ -1240,6 +1280,7 @@ impl<'m> FunctionBuilder<'m> {
             instructions: Vec::new(),
             values: Vec::new(),
             entry: BlockId(0),
+            rest_param: None,
         };
         for i in 0..num_args {
             let v = Value(body.values.len() as u32);
@@ -1853,6 +1894,7 @@ pub fn walk_inst_operands(kind: &InstKind, mut f: impl FnMut(&Operand)) {
         ForInInit { obj, .. } => f(obj),
         ForInDone { iter } => f(iter),
         ForInNext { iter, .. } => f(iter),
+        RestArgs { .. } => {} // no operands; gathers actual args at runtime
     }
 }
 
@@ -2161,6 +2203,7 @@ pub fn walk_inst_operands_mut(kind: &mut InstKind, f: &mut impl FnMut(&mut Opera
         ForInInit { obj, .. } => f(obj),
         ForInDone { iter } => f(iter),
         ForInNext { iter, .. } => f(iter),
+        RestArgs { .. } => {}
     }
 }
 
@@ -2956,6 +2999,9 @@ fn write_inst_kind(out: &mut String, kind: &InstKind, m: &Module) {
                 ForInIterShape::PlainData => "for_in_next_plain",
             };
             unop(out, name, iter, m);
+        }
+        RestArgs { from_index } => {
+            write!(out, "rest_args from={}", from_index).unwrap();
         }
     }
 }

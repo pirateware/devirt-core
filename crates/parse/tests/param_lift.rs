@@ -1,7 +1,9 @@
 //! Tests for parse-time desugaring of non-simple function parameters
-//! (issue #29). DefaultParam, DestructuringParam, and
+//! (issues #29 and #45). DefaultParam, DestructuringParam, and
 //! TryCatchDestructuringParam all lower into simple-identifier params
-//! plus a body prologue. RestParam remains blocked (needs variadic ABI).
+//! plus a body prologue. RestParam (issue #45) lowers via
+//! `InstKind::RestArgs` at function entry; nested array/object rest in
+//! destructuring lowers via parse-time desugaring (slice / spread+delete).
 
 use emit::emit;
 use ir::tree::{Item, Stmt};
@@ -206,19 +208,42 @@ fn catch_destructuring_round_trip() {
 }
 
 // --------------------------------------------------------------------
-// RestParam still blocked
+// RestParam now lowers (issue #45) via InstKind::RestArgs at entry.
 // --------------------------------------------------------------------
 
 #[test]
-fn rest_param_still_routes_to_passthrough() {
-    let m = parse_and_lower("function f(...args) { return args; }").expect("parse");
-    let mut saw_pt = false;
-    for item in &m.items {
-        if matches!(item, Item::PassThroughFunction(_)) {
-            saw_pt = true;
-        }
-    }
-    assert!(saw_pt, "RestParam should still route to PassThroughFunction");
+fn rest_param_lowers_through_ssa() {
+    let src = "function f(...args) { return args.length; }";
+    assert_top_is_lowered(src);
+    ssa_roundtrip_emit(src);
+}
+
+#[test]
+fn rest_param_after_positional_lowers() {
+    let src = "function f(a, b, ...rest) { return rest[0]; }";
+    assert_top_is_lowered(src);
+    ssa_roundtrip_emit(src);
+}
+
+#[test]
+fn rest_param_emits_dotdotdot_in_header() {
+    let src = "function f(a, ...rest) { return rest; }";
+    let out = ssa_roundtrip_emit(src);
+    assert!(out.contains("...rest"), "missing rest token in emit:\n{out}");
+}
+
+#[test]
+fn array_rest_in_destructuring_lowers() {
+    let src = "function f([a, b, ...tail]) { return tail; }";
+    assert_top_is_lowered(src);
+    ssa_roundtrip_emit(src);
+}
+
+#[test]
+fn object_rest_in_destructuring_lowers() {
+    let src = "function f({ a, b, ...rest }) { return rest; }";
+    assert_top_is_lowered(src);
+    ssa_roundtrip_emit(src);
 }
 
 // --------------------------------------------------------------------

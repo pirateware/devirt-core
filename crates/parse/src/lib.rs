@@ -416,6 +416,7 @@ impl<'src> Lowerer<'src> {
             items.push(Item::Function(IrFunction {
                 name: TOP_INIT_NAME.to_string(),
                 params: Vec::new(),
+                rest_param: None,
                 body: top_init_body,
                 source: None,
             }));
@@ -544,8 +545,10 @@ impl<'src> Lowerer<'src> {
     ) -> Result<Item, Error> {
         // Lower the parameter list, picking up any prologue stmts the
         // desugaring needs (issue #29: default + destructuring params
-        // become identifier params + a body prologue).
-        let (params, mut prologue) = self.lower_param_list(&f.params)?;
+        // become identifier params + a body prologue) and the optional
+        // rest parameter name (issue #45: surfaced through to tree-IR
+        // and re-emitted as `...name` after positional params).
+        let (params, rest_param, mut prologue) = self.lower_param_list(&f.params)?;
 
         let body_stmts = self.lower_stmts_list(&body.statements)?;
         prologue.extend(body_stmts);
@@ -564,6 +567,7 @@ impl<'src> Lowerer<'src> {
         Ok(Item::Function(IrFunction {
             name: name.to_string(),
             params,
+            rest_param,
             body: stmts,
             source,
         }))
@@ -604,6 +608,10 @@ impl<'src> Lowerer<'src> {
                 }
             }
         }
+        let rest_param = f.params.rest.as_ref().and_then(|r| match &r.argument.kind {
+            js::BindingPatternKind::BindingIdentifier(id) => Some(id.name.to_string()),
+            _ => self.slice_span(r.argument.span()).map(|s| s.to_string()),
+        });
 
         let body_span = body.span();
         let inner = self
@@ -616,6 +624,7 @@ impl<'src> Lowerer<'src> {
         Ok(FuncLiteral {
             name,
             params: param_names,
+            rest_param,
             is_async: f.r#async,
             is_generator: f.generator,
             is_arrow: false,
@@ -699,18 +708,31 @@ impl<'src> Lowerer<'src> {
     fn lower_param_list(
         &self,
         params: &js::FormalParameters,
-    ) -> Result<(Vec<String>, Vec<Stmt>), Error> {
-        // RestParam is still a disposition blocker; if we reach here
-        // something is wrong with the walker.
-        if params.rest.is_some() {
-            return Err(Error::Unsupported("rest parameter (`...args`)"));
-        }
+    ) -> Result<(Vec<String>, Option<String>, Vec<Stmt>), Error> {
         let mut names = Vec::with_capacity(params.items.len());
         let mut prologue: Vec<Stmt> = Vec::new();
         for (i, p) in params.items.iter().enumerate() {
             self.lower_one_param(i, &p.pattern, &mut names, &mut prologue)?;
         }
-        Ok((names, prologue))
+        // Rest parameter (`function f(..., ...rest)`). Issue #45: the
+        // rest array is materialised at function entry by an
+        // `InstKind::RestArgs { from_index = names.len() }` in SSA;
+        // emit re-renders `...name` after the positional params. The
+        // disposition walker rejects rest patterns it can't lift
+        // (e.g. `...{a, b}` — a destructured rest target — would have
+        // surfaced as a non-identifier `BindingRestElement.argument`,
+        // which we refuse here).
+        let rest_param = if let Some(rest) = &params.rest {
+            match &rest.argument.kind {
+                js::BindingPatternKind::BindingIdentifier(id) => {
+                    Some(id.name.to_string())
+                }
+                _ => return Err(Error::Unsupported("destructured rest parameter")),
+            }
+        } else {
+            None
+        };
+        Ok((names, rest_param, prologue))
     }
 
     /// Lower one formal parameter. The slot's name (either the original
@@ -803,9 +825,6 @@ impl<'src> Lowerer<'src> {
                 self.emit_destructure_into(&ap.left, Expr::Ident(tmp), out)
             }
             js::BindingPatternKind::ObjectPattern(op) => {
-                if op.rest.is_some() {
-                    return Err(Error::Unsupported("object rest in destructuring"));
-                }
                 // Bind source to a temp so each property load reuses
                 // the same value (avoiding double-evaluation if the
                 // source is a member access later in a recursive
@@ -813,6 +832,55 @@ impl<'src> Lowerer<'src> {
                 // identifier and the temp is technically unnecessary,
                 // it keeps the lowering uniform).
                 let (root_expr, maybe_temp) = self.bind_destructure_source(source, out);
+                // Object rest (`{a, b, ...rest}`) — issue #45. Bind a
+                // shallow copy of the source object via object-spread,
+                // then `delete` each statically-named captured property
+                // so `rest` holds only the leftover keys. Computed-key
+                // captures cannot be excluded statically; reject for v1.
+                if let Some(rest) = &op.rest {
+                    let rest_name = match &rest.argument.kind {
+                        js::BindingPatternKind::BindingIdentifier(id) => id.name.to_string(),
+                        _ => return Err(Error::Unsupported(
+                            "destructured object-rest target",
+                        )),
+                    };
+                    // Verify all captured keys are static identifiers /
+                    // string-literals / numeric-literals (no computed
+                    // keys), so we can name them in `delete`.
+                    for prop in &op.properties {
+                        if prop.computed {
+                            return Err(Error::Unsupported(
+                                "object rest with computed sibling key",
+                            ));
+                        }
+                    }
+                    // `let rest = {...root};`
+                    out.push(Stmt::Let {
+                        name: rest_name.clone(),
+                        init: Some(Expr::Object {
+                            props: vec![ir::tree::ObjectProp {
+                                key: ir::tree::ObjectKey::Spread,
+                                value: root_expr.clone(),
+                            }],
+                        }),
+                    });
+                    // `delete rest.k;` for each captured key.
+                    for prop in &op.properties {
+                        let key_str = match &prop.key {
+                            js::PropertyKey::StaticIdentifier(id) => id.name.to_string(),
+                            js::PropertyKey::StringLiteral(s) => s.value.to_string(),
+                            js::PropertyKey::NumericLiteral(n) => n.value.to_string(),
+                            _ => return Err(Error::Unsupported(
+                                "object rest with non-static sibling key",
+                            )),
+                        };
+                        let del: Expr = Expr::DeleteProp {
+                            obj: Box::new(Expr::Ident(rest_name.clone())),
+                            prop: key_str,
+                        };
+                        out.push(Stmt::ExprStmt(del));
+                    }
+                }
                 for prop in &op.properties {
                     let key_expr = self.binding_property_load(prop, root_expr.clone())?;
                     self.emit_destructure_into(&prop.value, key_expr, out)?;
@@ -821,9 +889,6 @@ impl<'src> Lowerer<'src> {
                 Ok(())
             }
             js::BindingPatternKind::ArrayPattern(ap) => {
-                if ap.rest.is_some() {
-                    return Err(Error::Unsupported("array rest in destructuring"));
-                }
                 let (root_expr, maybe_temp) = self.bind_destructure_source(source, out);
                 for (i, el) in ap.elements.iter().enumerate() {
                     if let Some(p) = el {
@@ -834,6 +899,28 @@ impl<'src> Lowerer<'src> {
                         self.emit_destructure_into(p, load, out)?;
                     }
                     // Elision: skip the slot.
+                }
+                // Array rest (`[a, b, ...rest]`) — issue #45. Lower as
+                // `let rest = root.slice(N);` where N is the number of
+                // captured leading positional slots (including elisions).
+                if let Some(rest) = &ap.rest {
+                    let rest_name = match &rest.argument.kind {
+                        js::BindingPatternKind::BindingIdentifier(id) => id.name.to_string(),
+                        _ => return Err(Error::Unsupported(
+                            "destructured array-rest target",
+                        )),
+                    };
+                    let from_index = ap.elements.len();
+                    out.push(Stmt::Let {
+                        name: rest_name,
+                        init: Some(Expr::Call {
+                            callee: Box::new(Expr::Member {
+                                obj: Box::new(root_expr.clone()),
+                                prop: "slice".into(),
+                            }),
+                            args: vec![Expr::Number(from_index as f64)],
+                        }),
+                    });
                 }
                 drop(maybe_temp);
                 Ok(())
@@ -922,7 +1009,7 @@ impl<'src> Lowerer<'src> {
             return self.passthrough_literal(name, f, body, blockers);
         }
 
-        let (params, mut prologue) = self.lower_param_list(&f.params)?;
+        let (params, rest_param, mut prologue) = self.lower_param_list(&f.params)?;
 
         let body_stmts = self.lower_stmts_list(&body.statements)?;
         prologue.extend(body_stmts);
@@ -936,6 +1023,7 @@ impl<'src> Lowerer<'src> {
         Ok(FuncLiteral {
             name,
             params,
+            rest_param,
             is_async: f.r#async,
             is_generator: f.generator,
             is_arrow: false,
@@ -957,7 +1045,7 @@ impl<'src> Lowerer<'src> {
             return self.passthrough_arrow(a, blockers);
         }
 
-        let (params, mut prologue) = self.lower_param_list(&a.params)?;
+        let (params, rest_param, mut prologue) = self.lower_param_list(&a.params)?;
 
         // Arrow body in OXC is always wrapped in a `FunctionBody`. When
         // `a.expression` is true, body.statements has exactly one
@@ -1003,6 +1091,7 @@ impl<'src> Lowerer<'src> {
         Ok(FuncLiteral {
             name: None,
             params,
+            rest_param,
             is_async: a.r#async,
             is_generator: false,
             is_arrow: true,
@@ -1036,6 +1125,10 @@ impl<'src> Lowerer<'src> {
                 }
             }
         }
+        let rest_param = a.params.rest.as_ref().and_then(|r| match &r.argument.kind {
+            js::BindingPatternKind::BindingIdentifier(id) => Some(id.name.to_string()),
+            _ => self.slice_span(r.argument.span()).map(|s| s.to_string()),
+        });
 
         let inner = if a.expression {
             // Slice the expression text and wrap it in `return ...;`
@@ -1069,6 +1162,7 @@ impl<'src> Lowerer<'src> {
         Ok(FuncLiteral {
             name: None,
             params: param_names,
+            rest_param,
             is_async: a.r#async,
             is_generator: false,
             is_arrow: true,
@@ -1874,6 +1968,7 @@ impl<'src> Lowerer<'src> {
                 let iife = FuncLiteral {
                     name: None,
                     params: Vec::new(),
+                    rest_param: None,
                     is_async: false,
                     is_generator: false,
                     is_arrow: false,
