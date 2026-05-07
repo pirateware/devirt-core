@@ -34,6 +34,7 @@ pub mod partial_eval;
 pub mod refine_arith;
 pub mod refine_forin_effect;
 pub mod refine_purity;
+pub mod sroa;
 
 /// Symbolic execution + Z3 SMT backend (issue #50). Gated behind the
 /// `smt` Cargo feature so default builds do not require libz3 on the
