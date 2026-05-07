@@ -903,6 +903,28 @@ pub struct BasicBlock {
     pub instructions: Vec<InstId>,
     pub terminator: Terminator,
     pub predecessors: Vec<BlockId>,
+    /// LLVM-`invoke`-style per-block exception edge. `Some(target)`
+    /// when this block is lexically inside a `try` body — `target` is
+    /// the enclosing `try`'s catch_entry (preferred) or finally_entry
+    /// (when no catch). The target block carries no edge args (mirrors
+    /// the existing `Terminator::Try`'s catch/finally edge contract —
+    /// the exception value is read by `InstKind::CatchValue` at the
+    /// catch entry).
+    ///
+    /// Set on every block created during try-body lowering, not just
+    /// blocks containing may-throw insts: passes that motion or insert
+    /// instructions need the edge to remain valid if they introduce a
+    /// may-throw site into a previously side-effect-free block. For
+    /// purely-pure blocks the extra edge is sound (over-approximate).
+    ///
+    /// This edge IS included in `rebuild_predecessors`. Walking
+    /// `block.predecessors` therefore observes both normal-control and
+    /// exceptional-control predecessors. Passes that need to
+    /// distinguish can consult `exception_target` of the predecessor.
+    ///
+    /// Issue #34. Additive to `Terminator::Try`'s structural framing,
+    /// not a replacement.
+    pub exception_target: Option<BlockId>,
 }
 
 #[derive(Clone, Debug)]
@@ -1205,6 +1227,7 @@ impl<'m> FunctionBuilder<'m> {
             instructions: Vec::new(),
             terminator: Terminator::Unreachable,
             predecessors: Vec::new(),
+            exception_target: None,
         });
         if self.body.blocks.len() == 1 {
             self.body.entry = id;
@@ -1397,6 +1420,49 @@ impl Function {
             });
         }
 
+        // (8) Exception target (issue #34). If set: must point to an
+        // existing block, and the target must list this block as a
+        // predecessor. Exception edges carry no args (mirror of the
+        // catch/finally edge contract on Terminator::Try).
+        for (src_idx, src_blk) in body.blocks.iter().enumerate() {
+            let src = BlockId(src_idx as u32);
+            if let Some(et) = src_blk.exception_target {
+                if (et.0 as usize) >= block_count {
+                    errors.push(ValidationError {
+                        func: fid,
+                        kind: ValidationErrorKind::DanglingBlock { block: et },
+                    });
+                } else {
+                    let dst = &body.blocks[et.0 as usize];
+                    if !dst.predecessors.contains(&src) {
+                        errors.push(ValidationError {
+                            func: fid,
+                            kind: ValidationErrorKind::PredecessorMismatch {
+                                from: src,
+                                to: et,
+                                direction: "forward exception edge (target missing predecessor)",
+                            },
+                        });
+                    }
+                    // Exception target receives no edge args. Conservative:
+                    // any block-params at the catch/finally entry are
+                    // intended to be filled by normal predecessors, not by
+                    // exceptional control flow.
+                    if !dst.params.is_empty() {
+                        errors.push(ValidationError {
+                            func: fid,
+                            kind: ValidationErrorKind::EdgeArityMismatch {
+                                from: src,
+                                to: et,
+                                expected: dst.params.len(),
+                                got: 0,
+                            },
+                        });
+                    }
+                }
+            }
+        }
+
         // (1, 2 forward, 3) Forward edges: predecessors and arity match.
         for (src_idx, src_blk) in body.blocks.iter().enumerate() {
             let src = BlockId(src_idx as u32);
@@ -1449,7 +1515,8 @@ impl Function {
                     .terminator
                     .successors()
                     .iter()
-                    .any(|(t, _)| *t == dst);
+                    .any(|(t, _)| *t == dst)
+                    || pred_blk.exception_target == Some(dst);
                 if !actually {
                     errors.push(ValidationError {
                         func: fid,
@@ -1862,6 +1929,15 @@ fn write_block(out: &mut String, id: BlockId, blk: &BasicBlock, func: &LoweredBo
     }
     push_with_comment(out, &header, Some(&preds));
 
+    // Issue #34: surface the per-block exception edge in the dump,
+    // formatted as a comment line so existing snapshot readers see it
+    // explicitly.
+    if let Some(et) = blk.exception_target {
+        let line = format!("    ; exception -> bb{}", et.0);
+        out.push_str(&line);
+        out.push('\n');
+    }
+
     for &iid in &blk.instructions {
         write_inst(out, iid, func, m);
     }
@@ -2083,12 +2159,19 @@ impl LoweredBody {
         }
         for src_idx in 0..n {
             let src = BlockId(src_idx as u32);
-            let succs: Vec<BlockId> = self.blocks[src_idx]
+            // Normal control-flow successors via the terminator.
+            let mut succs: Vec<BlockId> = self.blocks[src_idx]
                 .terminator
                 .successors()
                 .iter()
                 .map(|(t, _)| *t)
                 .collect();
+            // Per-block exception edge (issue #34). Treated as a
+            // first-class predecessor so passes that walk preds see
+            // exceptional control flow naturally.
+            if let Some(et) = self.blocks[src_idx].exception_target {
+                succs.push(et);
+            }
             for t in succs {
                 if (t.0 as usize) < n {
                     let preds = &mut self.blocks[t.0 as usize].predecessors;
@@ -3114,6 +3197,57 @@ mod tests {
         assert!(!Effect::WRITES_HEAP.removable_when_unused());
         assert!(!Effect::MAY_DIVERGE.removable_when_unused());
         assert!(!Effect::OPAQUE.removable_when_unused());
+    }
+
+    #[test]
+    fn exception_target_appears_in_predecessors_after_rebuild() {
+        // Issue #34. A block stamped with `exception_target = Some(t)`
+        // must appear as a predecessor of `t` after
+        // `rebuild_predecessors`, even though no terminator successor
+        // points there.
+        let mut module = Module::new();
+        let mut b = FunctionBuilder::new(&mut module, "f", 0);
+        let bb0 = b.new_block();
+        let handler = b.new_block();
+        b.switch_to_block(bb0);
+        b.set_terminator(Terminator::Return { val: None });
+        b.switch_to_block(handler);
+        // CatchValue marks this as a catch-style handler entry.
+        let _cv = b.add_inst(InstKind::CatchValue);
+        b.set_terminator(Terminator::Return { val: None });
+        // Stamp the exception edge directly; bypass the converter
+        // (this is a low-level IR test).
+        b.body.blocks[bb0.0 as usize].exception_target = Some(handler);
+        b.finish();
+
+        let body = module.functions[0].lowered();
+        assert!(
+            body.blocks[handler.0 as usize].predecessors.contains(&bb0),
+            "handler must list bb0 as a predecessor via the exception edge"
+        );
+        // And the validator accepts this CFG.
+        module.validate().expect("exception edge alone is valid");
+    }
+
+    #[test]
+    fn validator_catches_dangling_exception_target() {
+        let mut module = Module::new();
+        let mut b = FunctionBuilder::new(&mut module, "f", 0);
+        let bb0 = b.new_block();
+        b.switch_to_block(bb0);
+        b.set_terminator(Terminator::Return { val: None });
+        // Out-of-range exception_target.
+        b.body.blocks[bb0.0 as usize].exception_target = Some(BlockId(99));
+        b.finish();
+
+        let errs = module.validate().unwrap_err();
+        assert!(
+            errs.iter().any(|e| matches!(
+                e.kind,
+                ValidationErrorKind::DanglingBlock { .. }
+            )),
+            "expected DanglingBlock for out-of-range exception_target, got {errs:?}"
+        );
     }
 
     #[test]

@@ -1708,6 +1708,14 @@ struct Converter<'b, 'm> {
     /// loop's `BreakFrame` without weaving the label parameter through
     /// every loop-lowering helper.
     pending_label: Option<String>,
+
+    /// Active enclosing try handlers, innermost on top. Each entry is
+    /// the BlockId that exceptional control flow reaches (catch_entry
+    /// when present, otherwise finally_entry). Every block created via
+    /// `new_try_body_block` while this stack is non-empty has its
+    /// `exception_target` stamped to `*self.try_handler_stack.last()`.
+    /// See issue #34.
+    try_handler_stack: Vec<BlockId>,
 }
 
 #[derive(Debug, Clone)]
@@ -1767,6 +1775,7 @@ impl<'b, 'm> Converter<'b, 'm> {
             symbol_names: HashMap::new(),
             break_stack: Vec::new(),
             pending_label: None,
+            try_handler_stack: Vec::new(),
         }
     }
 
@@ -1775,6 +1784,21 @@ impl<'b, 'm> Converter<'b, 'm> {
     /// loop/switch lowering helper when constructing its `BreakFrame`.
     fn take_pending_label(&mut self) -> Option<String> {
         self.pending_label.take()
+    }
+
+    /// Allocate a fresh block; if we are currently inside a try-body
+    /// (i.e. `try_handler_stack` is non-empty), stamp the new block's
+    /// `exception_target` to the innermost enclosing try-handler. The
+    /// caller is responsible for calling this only when the new block
+    /// is itself part of the lexical try-body (not a catch / finally /
+    /// post-try block — those live OUTSIDE the try and are handed an
+    /// outer-handler edge by their own enclosing try, if any).
+    fn new_try_body_block(&mut self) -> BlockId {
+        let b = self.builder.new_block();
+        if let Some(&handler) = self.try_handler_stack.last() {
+            self.builder.body_mut().blocks[b.0 as usize].exception_target = Some(handler);
+        }
+        b
     }
 
     /// Walk the break stack inward → outward to find the nearest
@@ -1853,7 +1877,7 @@ impl<'b, 'm> Converter<'b, 'm> {
     /// scope 0. Returns the entry BlockId so the caller can write
     /// captures/params against it.
     fn setup_entry_with_module_scope(&mut self) -> BlockId {
-        let entry = self.builder.new_block();
+        let entry = self.new_try_body_block();
         self.builder.switch_to_block(entry);
         self.sealed.insert(entry);
 
@@ -2118,7 +2142,7 @@ impl<'b, 'm> Converter<'b, 'm> {
         // dead code; downstream DCE can prune it.
         let cb = self.current_block();
         if self.is_terminated(cb) {
-            let dead = self.builder.new_block();
+            let dead = self.new_try_body_block();
             self.sealed.insert(dead);
             self.builder.switch_to_block(dead);
         }
@@ -2394,9 +2418,9 @@ impl<'b, 'm> Converter<'b, 'm> {
 
     fn lower_if(&mut self, cond: &Expr, then_body: &[Stmt], else_body: Option<&[Stmt]>) {
         let cond_op = self.convert_expr(cond);
-        let then_b = self.builder.new_block();
-        let else_b = self.builder.new_block();
-        let join_b = self.builder.new_block();
+        let then_b = self.new_try_body_block();
+        let else_b = self.new_try_body_block();
+        let join_b = self.new_try_body_block();
 
         self.builder.set_terminator(Terminator::CondBranch {
             cond: cond_op,
@@ -2449,9 +2473,9 @@ impl<'b, 'm> Converter<'b, 'm> {
     }
 
     fn lower_while(&mut self, cond: &Expr, body: &[Stmt]) {
-        let header_b = self.builder.new_block();
-        let body_b = self.builder.new_block();
-        let exit_b = self.builder.new_block();
+        let header_b = self.new_try_body_block();
+        let body_b = self.new_try_body_block();
+        let exit_b = self.new_try_body_block();
 
         // Branch from current to header. Header has at least one pred (us);
         // a back-edge from body will be added later. We must NOT seal
@@ -2660,10 +2684,10 @@ impl<'b, 'm> Converter<'b, 'm> {
             self.lower_stmt(init);
         }
 
-        let header_b = self.builder.new_block();
-        let body_b = self.builder.new_block();
-        let step_b = self.builder.new_block();
-        let exit_b = self.builder.new_block();
+        let header_b = self.new_try_body_block();
+        let body_b = self.new_try_body_block();
+        let step_b = self.new_try_body_block();
+        let exit_b = self.new_try_body_block();
 
         self.builder.set_terminator(Terminator::Branch {
             target: header_b,
@@ -2792,9 +2816,9 @@ impl<'b, 'm> Converter<'b, 'm> {
         self.write_variable(iter_sym, cb, iter_val);
 
         // CFG: pre → header → (body | exit). Same shape as while.
-        let header_b = self.builder.new_block();
-        let body_b = self.builder.new_block();
-        let exit_b = self.builder.new_block();
+        let header_b = self.new_try_body_block();
+        let body_b = self.new_try_body_block();
+        let exit_b = self.new_try_body_block();
 
         self.builder.set_terminator(Terminator::Branch {
             target: header_b,
@@ -2916,9 +2940,9 @@ impl<'b, 'm> Converter<'b, 'm> {
         self.write_variable(iter_sym, cb, iter_val);
 
         // CFG: pre → header → (body | exit). Same shape as while.
-        let header_b = self.builder.new_block();
-        let body_b = self.builder.new_block();
-        let exit_b = self.builder.new_block();
+        let header_b = self.new_try_body_block();
+        let body_b = self.new_try_body_block();
+        let exit_b = self.new_try_body_block();
 
         self.builder.set_terminator(Terminator::Branch {
             target: header_b,
@@ -3033,11 +3057,11 @@ impl<'b, 'm> Converter<'b, 'm> {
         // never edge to join, but join is always allocated as the
         // landmark for reconstruction and as the converter's
         // post-switch current_block.
-        let join_b = self.builder.new_block();
+        let join_b = self.new_try_body_block();
         let n_cases = cases.len();
         let mut case_blocks: Vec<BlockId> = Vec::with_capacity(n_cases);
         for _ in 0..n_cases {
-            case_blocks.push(self.builder.new_block());
+            case_blocks.push(self.new_try_body_block());
         }
 
         // Each case body block has a single predecessor (the Switch
@@ -3147,10 +3171,24 @@ impl<'b, 'm> Converter<'b, 'm> {
         catch: Option<(Option<&str>, &[Stmt])>,
         finally_body: Option<&[Stmt]>,
     ) {
-        let try_entry_b = self.builder.new_block();
-        let catch_entry_b = catch.map(|_| self.builder.new_block());
-        let finally_entry_b = finally_body.map(|_| self.builder.new_block());
-        let join_b = self.builder.new_block();
+        // Allocate framing blocks. catch_entry / finally_entry / join
+        // live OUTSIDE this try's body; they only inherit any OUTER
+        // try's handler from the stack. try_entry IS the body's first
+        // block, so it inherits THIS try's handler — allocated AFTER
+        // we push our handler below. (Issue #34.)
+        let catch_entry_b = catch.map(|_| self.new_try_body_block());
+        let finally_entry_b = finally_body.map(|_| self.new_try_body_block());
+        let join_b = self.new_try_body_block();
+        // The exception target for code inside our try-body: catch if
+        // present (throws are caught), else finally (throws still run
+        // cleanup before propagating). Always Some — the parser
+        // rejects bare `try { }`.
+        let our_handler = catch_entry_b.or(finally_entry_b).expect(
+            "Stmt::Try with neither catch nor finally is invalid; \
+             parser should have rejected it",
+        );
+        self.try_handler_stack.push(our_handler);
+        let try_entry_b = self.new_try_body_block();
 
         // Each entry block has exactly one direct CFG predecessor (the
         // framing block); seal upfront.
@@ -3183,7 +3221,13 @@ impl<'b, 'm> Converter<'b, 'm> {
         // finally_entry if present, else join.
         let normal_completion_target = finally_entry_b.unwrap_or(join_b);
 
-        // Lower try-body.
+        // Lower try-body. The handler was pushed before allocating
+        // try_entry_b; every block created during this lowering
+        // inherits the handler via `new_try_body_block`. Pop AFTER
+        // body lowering so catch/finally bodies (which start below)
+        // do not list our own catch/finally as their handler — JS
+        // semantics: a throw inside a catch propagates to the OUTER
+        // try, not back into our own catch.
         self.builder.switch_to_block(try_entry_b);
         for s in body {
             self.lower_stmt(s);
@@ -3195,6 +3239,8 @@ impl<'b, 'm> Converter<'b, 'm> {
                 args: vec![],
             });
         }
+        let popped = self.try_handler_stack.pop();
+        debug_assert_eq!(popped, Some(our_handler));
 
         // Lower catch-body in a fresh lexical scope so the catch param
         // is bound only inside the catch (matches JS semantics).
@@ -3765,9 +3811,9 @@ impl<'b, 'm> Converter<'b, 'm> {
     /// the phi automatically.
     fn convert_ternary(&mut self, cond: &Expr, then_e: &Expr, else_e: &Expr) -> Operand {
         let cond_op = self.convert_expr(cond);
-        let then_b = self.builder.new_block();
-        let else_b = self.builder.new_block();
-        let join_b = self.builder.new_block();
+        let then_b = self.new_try_body_block();
+        let else_b = self.new_try_body_block();
+        let join_b = self.new_try_body_block();
 
         self.builder.set_terminator(Terminator::CondBranch {
             cond: cond_op,
@@ -4134,9 +4180,9 @@ impl<'b, 'm> Converter<'b, 'm> {
         // param holding the result.
         let lhs_op = self.convert_expr(lhs);
 
-        let rhs_b = self.builder.new_block();
-        let skip_b = self.builder.new_block();
-        let join_b = self.builder.new_block();
+        let rhs_b = self.new_try_body_block();
+        let skip_b = self.new_try_body_block();
+        let join_b = self.new_try_body_block();
 
         let (then_b, else_b) = match op {
             BinOp::LogAnd => (rhs_b, skip_b),
