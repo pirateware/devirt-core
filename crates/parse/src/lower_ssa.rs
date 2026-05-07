@@ -354,6 +354,60 @@ fn build_top_level_layout(tm: &tree::Module, pending: &[PendingFunction]) -> Vec
 fn discover_module<'a>(tm: &'a tree::Module) -> Vec<PendingFunction<'a>> {
     let mut pending: Vec<PendingFunction<'a>> = Vec::new();
     let mut captures_by_fid: HashMap<FuncId, Vec<String>> = HashMap::new();
+
+    // Pre-pass: collect all top-level *function* names. Top-level
+    // function declarations hoist and are mutually visible: every
+    // top-level function — including the synthesized `__top_init__`
+    // wrapper from issue #32 — can reference any sibling top-level
+    // function as a direct lexical name. Those references are NOT
+    // closure captures: scope 0 of every Lowered function binds each
+    // top-level function name to `Constant::Func` (see
+    // `setup_entry_with_module_scope`), so an inner literal whose
+    // free-var analysis records a sibling-function name as a capture
+    // can resolve it through the SSA-side `func_names` lookup.
+    //
+    // Issue #44: without this seeding, when `__top_init__` wraps a
+    // top-level IIFE that references a sibling top-level function
+    // through a nested closure (or a class-decl whose constructor
+    // body references one), the discovery / free-var analysis
+    // misclassifies the sibling reference as a forward-ref capture.
+    // For an inner literal carrying a `passthrough_source` this
+    // forces a PassThrough re-classification (suboptimal). For an
+    // inner literal without a stashed source (e.g. a class-decl
+    // desugar producing an implicit constructor) it panics outright
+    // (lower_ssa.rs:1280, "no passthrough_source is stashed; cannot
+    // re-classify"). Seeding sibling function names into every top-
+    // level function's `seen` lets such references stay un-captured
+    // at the discovery layer; the inner literal lowers as Lowered
+    // and resolves the sibling via Constant::Func at AllocClosure
+    // time.
+    //
+    // Top-level `var` names are deliberately *not* seeded here. The
+    // `__top_init__` wrap path emits a `var <names>;` PassThroughStmt
+    // followed by bare assignments inside the wrapper; those vars
+    // don't bind through scope 0 (they live on globalThis). A
+    // Lowered inner literal capturing one would panic at AllocClosure
+    // with `capture not in scope` because lookup() walks scope chains
+    // only. Leaving top-level vars OUT of `seen` keeps the forward-
+    // ref rule active for var captures, routing the inner literal to
+    // PassThrough — which re-emits the body as text and resolves the
+    // var lexically at runtime through globalThis (the same shape
+    // that worked before issue #32).
+    let mut top_level_names: HashSet<String> = HashSet::new();
+    for it in &tm.items {
+        match it {
+            tree::Item::Function(f) => {
+                top_level_names.insert(f.name.clone());
+            }
+            tree::Item::PassThroughFunction(lit) => {
+                if let Some(n) = &lit.name {
+                    top_level_names.insert(n.clone());
+                }
+            }
+            tree::Item::PassThroughStmt(_) | tree::Item::Stmt(_) => {}
+        }
+    }
+
     for it in &tm.items {
         match it {
             tree::Item::Function(f) => {
@@ -364,11 +418,12 @@ fn discover_module<'a>(tm: &'a tree::Module) -> Vec<PendingFunction<'a>> {
                     captures: Vec::new(),
                     parent: None,
                 });
-                // Build outer-body context: reassigned-name set + an
-                // empty bindings-seen-so-far set (params and the
-                // function's own name are bound at body entry).
+                // Build outer-body context: reassigned-name set + a
+                // seen-so-far set seeded with sibling top-level
+                // function names (mutually-visible hoisted bindings),
+                // params, `arguments`, and this function's own name.
                 let reassigned = collect_reassigned_names(&f.body);
-                let mut seen: HashSet<String> = HashSet::new();
+                let mut seen: HashSet<String> = top_level_names.clone();
                 seen.insert(f.name.clone());
                 seen.insert("arguments".to_string());
                 for p in &f.params {
@@ -782,6 +837,148 @@ fn walk_reassigned_in_expr(e: &Expr, out: &mut HashSet<String>) {
             walk_reassigned_in_expr(index, out);
         }
     }
+}
+
+/// Walk every `FuncLiteral` reachable through `lit`'s body (statements
+/// and expressions, recursively) and set `force_passthrough` on each
+/// that carries a `passthrough_source`. Used by the force-passthrough
+/// cascade rule (issue #44): when an outer literal re-classifies to
+/// PassThrough, its descendants become orphans (no parent emits an
+/// AllocClosure for them, so a Lowered descendant referencing a name
+/// the parent binds will panic at AllocClosure time looking up that
+/// name in its own — empty — scope chain). Forcing the cascade is
+/// sound because the outer's preserved source text already contains
+/// every descendant verbatim.
+fn cascade_force_passthrough(lit: &tree::FuncLiteral) {
+    use tree::FuncBody;
+    match &lit.body {
+        FuncBody::Stmts(ss) => cascade_in_stmts(ss),
+        FuncBody::Expression(e) => cascade_in_expr(e),
+        FuncBody::PassThrough(_) => {}
+    }
+}
+
+fn cascade_in_stmts(ss: &[Stmt]) {
+    for s in ss {
+        cascade_in_stmt(s);
+    }
+}
+
+fn cascade_in_stmt(s: &Stmt) {
+    match s {
+        Stmt::FuncDecl(lit) => {
+            if lit.passthrough_source.as_deref().is_some_and(|s| !s.is_empty()) {
+                lit.force_passthrough.set(true);
+            }
+            cascade_force_passthrough(lit);
+        }
+        Stmt::Let { init: Some(e), .. } | Stmt::Const { init: e, .. } => cascade_in_expr(e),
+        Stmt::Let { init: None, .. } => {}
+        Stmt::Assign { target, value } => {
+            cascade_in_expr(target);
+            cascade_in_expr(value);
+        }
+        Stmt::ExprStmt(e) | Stmt::Throw(e) => cascade_in_expr(e),
+        Stmt::Return(Some(e)) => cascade_in_expr(e),
+        Stmt::Return(None) | Stmt::Continue | Stmt::Break { .. }
+        | Stmt::LabeledContinue { .. } | Stmt::Debugger => {}
+        Stmt::If { cond, then_body, else_body } => {
+            cascade_in_expr(cond);
+            cascade_in_stmts(then_body);
+            if let Some(eb) = else_body { cascade_in_stmts(eb); }
+        }
+        Stmt::While { cond, body } => {
+            cascade_in_expr(cond);
+            cascade_in_stmts(body);
+        }
+        Stmt::DoWhile { body, cond } => {
+            cascade_in_stmts(body);
+            cascade_in_expr(cond);
+        }
+        Stmt::For { init, cond, step, body } => {
+            if let Some(i) = init { cascade_in_stmt(i); }
+            if let Some(c) = cond { cascade_in_expr(c); }
+            if let Some(s) = step { cascade_in_expr(s); }
+            cascade_in_stmts(body);
+        }
+        Stmt::ForOf { iterable, body, .. } => {
+            cascade_in_expr(iterable);
+            cascade_in_stmts(body);
+        }
+        Stmt::ForIn { obj, body, .. } => {
+            cascade_in_expr(obj);
+            cascade_in_stmts(body);
+        }
+        Stmt::Block(ss) => cascade_in_stmts(ss),
+        Stmt::Labeled { stmt, .. } => cascade_in_stmt(stmt),
+        Stmt::Switch { discriminant, cases } => {
+            cascade_in_expr(discriminant);
+            for case in cases {
+                if let Some(t) = &case.test { cascade_in_expr(t); }
+                cascade_in_stmts(&case.body);
+            }
+        }
+        Stmt::Try { body, catch, finally } => {
+            cascade_in_stmts(body);
+            if let Some((_, body)) = catch { cascade_in_stmts(body); }
+            if let Some(f) = finally { cascade_in_stmts(f); }
+        }
+    }
+}
+
+fn cascade_in_expr(e: &Expr) {
+    match e {
+        Expr::Func(lit) => {
+            if lit.passthrough_source.as_deref().is_some_and(|s| !s.is_empty()) {
+                lit.force_passthrough.set(true);
+            }
+            cascade_force_passthrough(lit);
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            cascade_in_expr(lhs);
+            cascade_in_expr(rhs);
+        }
+        Expr::Unary { operand, .. } => cascade_in_expr(operand),
+        Expr::Call { callee, args } | Expr::New { callee, args } => {
+            cascade_in_expr(callee);
+            for a in args { cascade_in_expr(a); }
+        }
+        Expr::Member { obj, .. } => cascade_in_expr(obj),
+        Expr::Index { obj, index } => {
+            cascade_in_expr(obj);
+            cascade_in_expr(index);
+        }
+        Expr::Array { elements } => {
+            for el in elements { cascade_in_expr(el); }
+        }
+        Expr::Object { props } => {
+            for p in props {
+                cascade_in_object_prop(p);
+            }
+        }
+        Expr::Spread(inner) => cascade_in_expr(inner),
+        Expr::Ternary { cond, then_branch, else_branch } => {
+            cascade_in_expr(cond);
+            cascade_in_expr(then_branch);
+            cascade_in_expr(else_branch);
+        }
+        Expr::Update { target, .. } => cascade_in_expr(target),
+        Expr::Template { exprs, .. } => {
+            for ex in exprs { cascade_in_expr(ex); }
+        }
+        // Fallback: any expr variant we didn't list is treated as a
+        // leaf (the cascade is a defensive walk; missed inner literals
+        // would only mean we leave a descendant as Lowered, which
+        // reverts to the pre-fix behavior).
+        _ => {}
+    }
+}
+
+fn cascade_in_object_prop(p: &tree::ObjectProp) {
+    if let tree::ObjectKey::Computed(e) = &p.key {
+        cascade_in_expr(e);
+    }
+    cascade_in_expr(&p.value);
 }
 
 /// Hoist nested FuncDecl names into `seen` (top-level only — does not
@@ -1274,8 +1471,25 @@ fn discover_literal<'a>(
         // for nested literals; tests that build tree-IR by hand may
         // omit it, in which case we leave the literal as Lowered (and
         // accept the SSA-level panic the rule was trying to avoid).
-        if lit.passthrough_source.is_some() {
+        if lit.passthrough_source.as_deref().is_some_and(|s| !s.is_empty()) {
             lit.force_passthrough.set(true);
+            // Issue #44: descendants of a force-passthrough literal
+            // are orphaned — their parent's body re-emits as text
+            // and never AllocClosure's them. They were stamped with
+            // FuncIds and discovered with a `seen` set that included
+            // the force-passthrough'd parent's local bindings, so a
+            // descendant Lowered function may carry capture-name
+            // references that resolve only via its parent's
+            // PassThrough text, not via its own SSA scope chain. When
+            // pass 2 builds such a descendant as Lowered and it
+            // contains an inner literal of its own that captures one
+            // of those names, AllocClosure-time lookup panics with
+            // `capture not in scope`. Cascade the force_passthrough
+            // flag downward so every descendant carrying a non-empty
+            // passthrough_source is also re-classified to PT — the
+            // cascade is sound because the outer's text already
+            // contains the descendant verbatim.
+            cascade_force_passthrough(lit);
         } else {
             debug_assert!(
                 false,
@@ -1854,14 +2068,29 @@ impl<'b, 'm> Converter<'b, 'm> {
             self.write_variable(sym, entry, Operand::Capture(i));
         }
 
-        // A named function expression binds its own name to itself. We
-        // model that via a synthetic capture: the outer's `AllocClosure`
-        // emits the binding, but for now the simpler self-reference path
-        // is to bind the name as a capture-style sym pointing at the
-        // matching `Constant::Func` — the inner can then call itself.
-        // Stream A defers this: the front end does not yet produce
-        // anonymous-named function expressions, so the absence is
-        // dormant.
+        // A named function expression binds its own name to itself
+        // inside the function body (ECMA-262: a named FE's own name is
+        // a lexical binding visible only to its body). Bind the name
+        // to `Constant::Func(self)` in scope 1.5 so:
+        //  (a) recursive references like `function fac(n){return n<=1?1:n*fac(n-1)}`
+        //      lookup `fac` and resolve to the function constant, and
+        //  (b) inner closures inside the named FE that capture its own
+        //      name (e.g. `function n(l,t){...t.some(function(l){n(l,t)})}`)
+        //      see the parent's name in scope at AllocClosure time —
+        //      otherwise they panic with `capture not in scope`.
+        //
+        // Skipped if the name is already bound by a capture (a defensive
+        // shadow check; in practice the discovery rule never records a
+        // named-FE's own name as a free var of its own body).
+        // Issue #44.
+        if let Some(self_name) = &lit.name
+            && self.lookup(self_name).is_none()
+            && let Some(self_fid) = lit.func_id.get()
+        {
+            let sym = self.fresh_symbol();
+            self.bind_in_top_scope(self_name.clone(), sym);
+            self.write_variable(sym, entry, Operand::Const(Constant::Func(self_fid)));
+        }
 
         self.push_scope();
         self.lower_params(&lit.params, entry);

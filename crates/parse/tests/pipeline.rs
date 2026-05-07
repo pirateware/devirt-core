@@ -1704,6 +1704,118 @@ fn top_init_not_synthesized_for_empty_file() {
     assert!(m.items.is_empty(), "empty file should produce empty Module");
 }
 
+// ----------------------------------------------------------------------
+// Issue #44 — wrap-safety gate loosened for try / for-in / do-while /
+// labeled-stmt at top level. Previously these forced the un-wrapped
+// PassThroughStmt fallback because `__top_init__` exposed inner
+// closures whose captures referenced sibling top-level functions —
+// the closure-capture analysis didn't seed the top-level-name set, so
+// a sibling reference looked like a forward-ref capture and either
+// re-classified the inner literal to PassThrough or, when no
+// `passthrough_source` was stashed (class-decl desugar implicit
+// constructors), panicked outright. Discovery now seeds those names,
+// and a named-FE's own name is bound at AllocClosure time so
+// recursive inner closures lower without `capture not in scope`.
+// ----------------------------------------------------------------------
+
+/// Top-level class declaration whose constructor body references a
+/// sibling top-level function. The class-decl desugar produces an
+/// implicit Lowered constructor literal with no `passthrough_source`.
+/// Pre-fix this panicked at lower_ssa.rs:1280 ("no passthrough_source
+/// is stashed; cannot re-classify") because discovery saw the
+/// sibling-fn reference as a forward-ref free variable. The fix:
+/// `discover_module` seeds top-level function names into every
+/// top-level function's `seen` set, so the sibling reference is
+/// recognised as in-scope and the forward-ref rule no longer fires.
+#[test]
+fn issue44_top_class_constructor_refs_sibling_fn_lowers() {
+    let src = "\
+        function foo() { return 1; }\n\
+        class Bar { constructor() { this.x = foo(); } }\n\
+        new Bar();\n\
+    ";
+    // The point is no panic. The class wraps via __top_init__ (its
+    // existing gate path) and its constructor body lowers cleanly.
+    let _out = roundtrip(src);
+}
+
+/// Top-level IIFE containing try/catch + a sibling top-level function
+/// reference must lower without panicking and round-trip. (The wrap-
+/// safety gate currently still rejects top-level try, so the IIFE
+/// here re-lowers as a PassThroughStmt — but its inner closure
+/// referencing `helper` must NOT trip the AllocClosure-capture-not-
+/// in-scope rule the way a class-decl forward-ref did before the
+/// fix. This guards the discovery-seed fix end-to-end.)
+#[test]
+fn issue44_top_iife_with_try_and_sibling_fn_ref_lowers() {
+    let src = "\
+        function helper() { return 42; }\n\
+        (function () {\n\
+          try {\n\
+            var v = helper();\n\
+            return v;\n\
+          } catch (e) {\n\
+            return null;\n\
+          }\n\
+        })();\n\
+    ";
+    let _m = parse_and_lower(src).expect("parse must succeed");
+    let out = roundtrip(src);
+    assert!(out.contains("helper"), "helper reference preserved: {out}");
+}
+
+/// Tier3-shape: top-level IIFE with try-bearing while loop +
+/// sibling top-level function reference (the obfuscator-iO sample
+/// shape). Must round-trip without `AllocClosure capture not in
+/// scope` or any other panic.
+#[test]
+fn issue44_top_iife_try_in_while_with_fn_ref_lowers() {
+    let src = "\
+        function decode(k) { return k + 1; }\n\
+        (function () {\n\
+          var i = 0;\n\
+          while (i < 5) {\n\
+            try {\n\
+              decode(i);\n\
+            } catch (_e) {}\n\
+            i = i + 1;\n\
+          }\n\
+        })();\n\
+    ";
+    let m = parse_and_lower(src).expect("parse must succeed");
+    let names: Vec<&str> = m.items.iter().map(item_kind_name).collect();
+    assert!(names.iter().any(|k| *k == "Function"), "wrap path engaged: {:?}", names);
+    let out = roundtrip(src);
+    assert!(out.contains("decode"), "decode reference preserved: {out}");
+}
+
+/// Inner closure inside a top-level IIFE that itself force-passthroughs
+/// (because it references globals like `module`/`require`) must not
+/// panic at AllocClosure. The cascade rule force-passthroughs every
+/// descendant literal so orphan Lowered functions don't appear with
+/// captures that have no SSA scope-chain binding. Uses a named
+/// function expression to additionally exercise the named-FE
+/// self-binding fix.
+#[test]
+fn issue44_named_fe_recursive_inner_closure_lowers() {
+    let src = "\
+        !function () {\n\
+          var n;\n\
+          var h = {\n\
+            walk: function n(l, t) {\n\
+              t = t || [];\n\
+              return t.concat(l).slice(0, 1);\n\
+            },\n\
+          };\n\
+          n = h;\n\
+        }();\n\
+    ";
+    // The point of the test is no panic / no validation error — the
+    // behavioural shape (the named-FE survives in the output text)
+    // is exercised by the `roundtrip` helper.
+    let _out = roundtrip(src);
+}
+
 /// Re-emitting `__top_init__` as an IIFE and re-parsing must yield
 /// the same tree-IR shape (structural roundtrip symmetry).
 #[test]
