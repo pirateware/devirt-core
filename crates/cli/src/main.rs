@@ -114,6 +114,7 @@ fn main() -> ExitCode {
         pm.add_pass(Box::new(::pass::escape_analysis::EscapeAnalysisPass));
         pm.add_pass(Box::new(::pass::refine_arith::RefineArithPass));
         pm.add_pass(Box::new(::pass::const_fold::ConstFoldPass));
+        pm.add_pass(Box::new(::pass::gvn::GvnPass));
         pm.add_pass(Box::new(::pass::branch_fold::BranchFoldPass));
         pm.add_pass(Box::new(::pass::copy_prop::CopyPropPass));
         pm.add_pass(Box::new(::pass::forward_loads::ForwardLoadsPass));
