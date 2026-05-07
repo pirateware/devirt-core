@@ -28,6 +28,7 @@ pub mod dead_fn_elim;
 pub mod escape_analysis;
 pub mod forward_loads;
 pub mod identity_fn_inline;
+pub mod licm;
 pub mod refine_arith;
 pub mod refine_purity;
 
