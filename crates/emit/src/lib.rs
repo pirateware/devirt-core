@@ -1,7 +1,25 @@
 //! Tree-IR → JS source.
 //!
-//! Direct string emission. A real implementation would build an OXC AST and
-//! run oxc_codegen, but for the MVP this is dramatically simpler.
+//! Two-stage emit:
+//!   1. A small per-construct stringifier walks the tree-IR and produces
+//!      a syntactically-valid JS source string. This is intentionally
+//!      conservative (parens-everywhere on operators, quoted object
+//!      keys, etc.) so it's correct without precedence/ASI reasoning.
+//!   2. The result is round-tripped through `oxc_parser` and
+//!      `oxc_codegen`, so the final output is whatever `oxc_codegen`
+//!      produces — canonical formatting, redundant parens collapsed,
+//!      precedence handled by oxc.
+//!
+//! This implements issue #47: oxc_codegen owns final formatting for
+//! Lowered functions, matching what `reparse_and_codegen_body` already
+//! does for PassThrough function bodies. The bespoke stringifier
+//! remains as a thin tree-IR → JS source bridge — it is *not* the
+//! formatter; oxc_codegen is. Removing the stringifier entirely would
+//! require threading an `oxc_allocator::Allocator` through every emit
+//! site and per-node tree-IR → oxc_ast translation (every Atom borrow,
+//! every Vec-in-allocator, every synthesized Span); that's a much
+//! larger refactor with substantial behavior-regression risk and is
+//! deferred — Option A here gives us oxc_codegen output today.
 
 use std::fmt::Write as _;
 
@@ -111,7 +129,42 @@ pub fn emit(module: &Module) -> String {
         }
         p.item(item);
     }
-    out
+    // Hand the assembled JS source to oxc_codegen for final formatting.
+    // The stringifier above produces *syntactically* valid JS but uses
+    // parens-everywhere and other conservative shapes; oxc_codegen
+    // produces canonical output, the same way `reparse_and_codegen_body`
+    // already does for PassThrough bodies.
+    codegen_module(&out)
+}
+
+/// Re-parse the assembled module source via `oxc_parser` and serialize
+/// it back with `oxc_codegen`. On parse error, fall back to the raw
+/// stringifier output: this should not happen for well-formed tree-IR,
+/// but a fallback keeps the deobfuscator robust against transient
+/// emitter bugs (the raw output is itself valid JS in practice — proven
+/// by the corpus + cross-check pre-this-change).
+fn codegen_module(src: &str) -> String {
+    use oxc_allocator::Allocator;
+    use oxc_codegen::Codegen;
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+
+    let allocator = Allocator::default();
+    let source_type = SourceType::default();
+    let parsed = Parser::new(&allocator, src, source_type).parse();
+    if !parsed.errors.is_empty() {
+        // Should be unreachable for well-formed tree-IR. Surface the
+        // stringifier output so the caller can debug the offending
+        // input rather than getting a panic deep in emit.
+        debug_assert!(
+            false,
+            "module re-parse failed; falling back to raw stringifier output. \
+             errors: {:#?}\nsource:\n{}",
+            parsed.errors, src
+        );
+        return src.to_string();
+    }
+    Codegen::new().build(&parsed.program).code
 }
 
 struct Printer<'a> {

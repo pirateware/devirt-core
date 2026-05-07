@@ -3208,12 +3208,16 @@ mod tests {
         let out = full_roundtrip(src);
         // The emitted JS must contain the -0 sentinel so that it evaluates to
         // negative zero (Object.is(-0, result) would hold at runtime).
+        // Accept either `(-0)` (bespoke stringifier shape) or `-0`
+        // (oxc_codegen canonical shape) — both evaluate to negative
+        // zero per ECMA-262. The test's load-bearing invariant is that
+        // we don't silently emit `0` (which is +0).
         assert!(
-            out.contains("(-0)"),
-            "negative zero must survive roundtrip as (-0), got:\n{out}"
+            out.contains("(-0)") || out.contains("-0"),
+            "negative zero must survive roundtrip as `-0` or `(-0)`, got:\n{out}"
         );
         assert!(
-            !out.contains("return 0"),
+            !out.contains("return 0;"),
             "plain `return 0` would silently produce +0:\n{out}"
         );
     }

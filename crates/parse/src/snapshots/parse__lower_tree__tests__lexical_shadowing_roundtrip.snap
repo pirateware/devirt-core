@@ -1,10 +1,9 @@
 ---
-source: src/ir/lower_tree.rs
+source: crates/parse/src/lower_tree.rs
+assertion_line: 2532
 expression: out
 ---
 function f() {
-  if (true) {
-  } else {
-  }
-  return 1;
+	if (true) {} else {}
+	return 1;
 }

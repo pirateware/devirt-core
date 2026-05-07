@@ -1,16 +1,16 @@
 ---
 source: crates/parse/src/lower_tree.rs
-assertion_line: 2415
+assertion_line: 2478
 expression: out
 ---
 function fibonacci(n) {
-  let _t2;
-  let _t4;
-  if ((n <= 1)) {
-    return n;
-  } else {
-    _t2 = fibonacci((n - 1));
-    _t4 = fibonacci((n - 2));
-    return (_t2 + _t4);
-  }
+	let _t2;
+	let _t4;
+	if (n <= 1) {
+		return n;
+	} else {
+		_t2 = fibonacci(n - 1);
+		_t4 = fibonacci(n - 2);
+		return _t2 + _t4;
+	}
 }

@@ -1,10 +1,10 @@
 ---
 source: crates/parse/src/lower_tree.rs
-assertion_line: 2561
+assertion_line: 2624
 expression: out
 ---
 function f() {
-  let _t1;
-  _t1 = console.log("hi");
-  return;
+	let _t1;
+	_t1 = console.log("hi");
+	return;
 }

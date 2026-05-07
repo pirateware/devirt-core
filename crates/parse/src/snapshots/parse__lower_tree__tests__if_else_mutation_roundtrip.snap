@@ -1,13 +1,14 @@
 ---
-source: src/ir/lower_tree.rs
+source: crates/parse/src/lower_tree.rs
+assertion_line: 2512
 expression: out
 ---
 function f(c) {
-  let x;
-  if (c) {
-    x = 2;
-  } else {
-    x = 3;
-  }
-  return x;
+	let x;
+	if (c) {
+		x = 2;
+	} else {
+		x = 3;
+	}
+	return x;
 }

@@ -1,20 +1,20 @@
 ---
 source: crates/parse/src/lower_tree.rs
-assertion_line: 2434
+assertion_line: 2497
 expression: out
 ---
 function sum_to(n) {
-  let i;
-  let s;
-  let s_1;
-  let i_1;
-  i = 0;
-  s = 0;
-  while ((i < n)) {
-    s_1 = (s + i);
-    i_1 = (i + 1);
-    i = i_1;
-    s = s_1;
-  }
-  return s;
+	let i;
+	let s;
+	let s_1;
+	let i_1;
+	i = 0;
+	s = 0;
+	while (i < n) {
+		s_1 = s + i;
+		i_1 = i + 1;
+		i = i_1;
+		s = s_1;
+	}
+	return s;
 }
