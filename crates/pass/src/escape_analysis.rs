@@ -229,6 +229,22 @@ impl EscapeAnalysis {
                             escape_value(*v, &alias_sets, &mut escaped);
                         }
                     }
+                    // ForInInit's `obj` is heap-read position: the
+                    // iterator handle the inst returns is opaque and
+                    // doesn't expose any reference to `obj`, so the
+                    // alloc doesn't escape through it. (The iter
+                    // value is consumed by ForInDone / ForInNext,
+                    // both of which only read iterator state.)
+                    InstKind::ForInInit { obj, .. } => {
+                        let _ = obj;
+                    }
+                    // ForInDone / ForInNext take only the iterator
+                    // handle. The handle's alias-set is empty (it's
+                    // not itself a tracked alloc), so even if these
+                    // fell into the default branch it would be a
+                    // no-op for alloc escape; explicit-skip for
+                    // clarity.
+                    InstKind::ForInDone { .. } | InstKind::ForInNext { .. } => {}
                     other => {
                         // Every operand of every other inst is escape-position.
                         walk_inst_operands(other, |op| {

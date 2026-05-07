@@ -2926,7 +2926,10 @@ impl<'b, 'm> Converter<'b, 'm> {
         // called when the converter is mid-block, like every other
         // loop lowerer).
         let obj_op = self.convert_expr(obj);
-        let iter_val = self.emit(InstKind::ForInInit { obj: obj_op });
+        let iter_val = self.emit(InstKind::ForInInit {
+            obj: obj_op,
+            shape: ir::ssa::ForInIterShape::Opaque,
+        });
 
         // Stash the iterator in a symbol so header / body can read it.
         let iter_name = format!("__forin_iter_{}__", binding);
@@ -2981,7 +2984,10 @@ impl<'b, 'm> Converter<'b, 'm> {
 
         let cb = self.current_block();
         let iter_op = self.read_variable(iter_sym, cb);
-        let key_val = self.emit(InstKind::ForInNext { iter: iter_op });
+        let key_val = self.emit(InstKind::ForInNext {
+            iter: iter_op,
+            shape: ir::ssa::ForInIterShape::Opaque,
+        });
         let binding_sym = self.fresh_symbol();
         let binding_strid = self.builder.intern(binding);
         if let Operand::Value(v) = key_val {

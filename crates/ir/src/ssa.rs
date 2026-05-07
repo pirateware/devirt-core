@@ -91,16 +91,39 @@ bitflags! {
         const WRITES_HEAP = 1 << 1;
         const MAY_THROW   = 1 << 2;
         const MAY_DIVERGE = 1 << 3;
-        const OPAQUE      = 0b1111;
+        /// The instruction may invoke property accessors (getters /
+        /// setters / Proxy traps / prototype-chain callbacks) during
+        /// its execution. Distinct from a plain `READS_HEAP`: a pure
+        /// LoadProp at `Purity::Pure` reads heap cleanly with no
+        /// arbitrary user code; this bit signals "iterating or
+        /// reflecting may run user code". Currently produced only by
+        /// the ForIn instructions; refined off by
+        /// `RefineForInEffectPass` when the iterated object is a
+        /// provably-unaliased plain-data alloc. See issue #35.
+        ///
+        /// Naming choice: `MAY_OBSERVE_GETTERS` over
+        /// `MAY_OBSERVE_PROPERTIES` because "observe getters" is the
+        /// semantic load-bearing fact — accessors that can run code,
+        /// not the broader "touches properties" (which `READS_HEAP`
+        /// already covers).
+        const MAY_OBSERVE_GETTERS = 1 << 4;
+        const OPAQUE      = 0b11111;
     }
 }
 
 impl Effect {
     /// An unused instruction is removable iff its effect contains none of
     /// these. Pure reads (READS_HEAP without write/throw/diverge) are safely
-    /// dead-code-eliminated.
+    /// dead-code-eliminated. `MAY_OBSERVE_GETTERS` is non-removable —
+    /// invoking a getter is observable (it can write globals, throw,
+    /// log, etc.); even when the result is unused, the call must run.
     pub fn removable_when_unused(self) -> bool {
-        !self.intersects(Effect::WRITES_HEAP | Effect::MAY_THROW | Effect::MAY_DIVERGE)
+        !self.intersects(
+            Effect::WRITES_HEAP
+                | Effect::MAY_THROW
+                | Effect::MAY_DIVERGE
+                | Effect::MAY_OBSERVE_GETTERS,
+        )
     }
 }
 
@@ -485,24 +508,31 @@ pub enum InstKind {
 
     // -- For-in iteration protocol -----------------------------------------
     //
-    // Three opaque iteration instructions implementing JS for-in
-    // semantics: walk obj's enumerable string-keyed properties along
-    // the prototype chain, lazily, in implementation-defined-but-
+    // Three iteration instructions implementing JS for-in semantics:
+    // walk obj's enumerable string-keyed properties along the
+    // prototype chain, lazily, in implementation-defined-but-
     // deterministic order. Reconstruction pattern-matches the standard
     // four-block loop (pre-header / header / body / exit) and re-emits
     // `for (k in obj) body`. See docs/design-forin.md.
     //
-    // All three are Opaque purity (iteration touches getters / Proxy
-    // traps / can throw / observes mutations during iteration). A
-    // future `MAY_OBSERVE_GETTERS` lattice flag is the right precision
-    // tier when an optimization pass demands it; until then, Opaque is
-    // honest.
+    // Default effect: `READS_HEAP | MAY_THROW | MAY_OBSERVE_GETTERS`.
+    // The `MAY_OBSERVE_GETTERS` bit captures the precision-relevant
+    // fact that iteration may run user code via property accessors.
+    // A `ForInIterShape::PlainData` per-site refinement (issued by
+    // `RefineForInEffectPass`) clears the bit when the iterated obj
+    // is a provably-unaliased plain-data alloc.
 
     /// Initialize a for-in iterator over `obj`. Returns an opaque
     /// iterator handle threaded through `ForInDone` / `ForInNext`.
     /// The handle's representation is not exposed; passes treat it
     /// as opaque.
-    ForInInit { obj: Operand },
+    ///
+    /// `shape` is the per-site iteration-shape refinement. The
+    /// matching `ForInNext` MUST carry the same shape (the
+    /// refinement pass updates them as a unit). `ForInDone` does
+    /// not carry shape — the done-test alone runs no user code
+    /// regardless of the iterated object.
+    ForInInit { obj: Operand, shape: ForInIterShape },
 
     /// Test whether the iterator has produced all keys. Returns Bool
     /// (`true` when iteration is exhausted). Idiomatically used as the
@@ -515,7 +545,27 @@ pub enum InstKind {
     /// is undefined (in practice the JS engine panics at re-emit time).
     /// Reconstruction enforces this by pattern-matching the four-block
     /// shape — out-of-pattern construction would fail to round-trip.
-    ForInNext { iter: Operand },
+    ///
+    /// See `ForInInit::shape` for the shape semantics.
+    ForInNext { iter: Operand, shape: ForInIterShape },
+}
+
+/// Per-site refinement of a ForIn iteration's may-observe-getters
+/// behavior. Default `Opaque`; `RefineForInEffectPass` narrows to
+/// `PlainData` when the iterated object is a provably-unaliased
+/// plain-data alloc with only direct data-property stores.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ForInIterShape {
+    /// Default: iteration may invoke property accessors (getters /
+    /// Proxy traps / prototype-chain callbacks). Effect carries
+    /// `MAY_OBSERVE_GETTERS`.
+    Opaque,
+    /// Iteration is over a fresh, non-escaped plain-data object —
+    /// no Proxy, no defined getters, no exotic prototype. Effect
+    /// drops `MAY_OBSERVE_GETTERS`; only `READS_HEAP | MAY_THROW`
+    /// remains (the iterator state itself can still throw on
+    /// pathological inputs, but no user code runs).
+    PlainData,
 }
 
 impl InstKind {
@@ -591,9 +641,36 @@ impl InstKind {
             // Opaque per design — see docs/design-try-phase-a.md §3.
             CatchValue => Effect::OPAQUE,
 
-            // For-in iteration: opaque per design — getters / Proxy
-            // traps / can throw / observe mutations. See docs/design-forin.md.
-            ForInInit { .. } | ForInDone { .. } | ForInNext { .. } => Effect::OPAQUE,
+            // For-in iteration: reads heap, may throw, and — most
+            // importantly — may invoke property accessors during
+            // iteration (getters / Proxy traps / prototype-chain
+            // callbacks). The `MAY_OBSERVE_GETTERS` bit captures
+            // that fact precisely; passes that previously had to
+            // pessimize on `OPAQUE` can now distinguish iteration
+            // from a generic side-effecting call.
+            //
+            // `RefineForInEffectPass` narrows the per-site
+            // `ForInIterShape` to `PlainData` (clearing
+            // `MAY_OBSERVE_GETTERS`) when the iterated object is a
+            // provably-unaliased plain-data alloc. See issue #35
+            // and docs/design-forin.md.
+            //
+            // Note we deliberately do NOT set `WRITES_HEAP`. The
+            // iteration itself doesn't write — only a getter
+            // callback could, and that's what
+            // `MAY_OBSERVE_GETTERS` signals.
+            ForInInit { shape, .. } | ForInNext { shape, .. } => match shape {
+                ForInIterShape::Opaque => {
+                    Effect::READS_HEAP | Effect::MAY_THROW | Effect::MAY_OBSERVE_GETTERS
+                }
+                ForInIterShape::PlainData => Effect::READS_HEAP | Effect::MAY_THROW,
+            },
+            // ForInDone is the iterator-state done-test: no user
+            // code runs regardless of the iterated object's shape,
+            // so the effect doesn't depend on `ForInIterShape`.
+            // It still reads internal iterator state and can throw
+            // on pathological iterators.
+            ForInDone { .. } => Effect::READS_HEAP | Effect::MAY_THROW,
 
             // Spread collections: opaque (iterator protocol can throw and mutate heap).
             ArrayWithSpread { .. } | ObjectWithSpread { .. } => Effect::OPAQUE,
@@ -1773,8 +1850,9 @@ pub fn walk_inst_operands(kind: &InstKind, mut f: impl FnMut(&Operand)) {
             f(index);
         }
         CatchValue => {} // no operands
-        ForInInit { obj } => f(obj),
-        ForInDone { iter } | ForInNext { iter } => f(iter),
+        ForInInit { obj, .. } => f(obj),
+        ForInDone { iter } => f(iter),
+        ForInNext { iter, .. } => f(iter),
     }
 }
 
@@ -2080,8 +2158,9 @@ pub fn walk_inst_operands_mut(kind: &mut InstKind, f: &mut impl FnMut(&mut Opera
             f(index);
         }
         CatchValue => {}
-        ForInInit { obj } => f(obj),
-        ForInDone { iter } | ForInNext { iter } => f(iter),
+        ForInInit { obj, .. } => f(obj),
+        ForInDone { iter } => f(iter),
+        ForInNext { iter, .. } => f(iter),
     }
 }
 
@@ -2863,9 +2942,21 @@ fn write_inst_kind(out: &mut String, kind: &InstKind, m: &Module) {
         }
         OpaqueEval { source } => unop(out, "opaque_eval", source, m),
         CatchValue => out.push_str("catch_value"),
-        ForInInit { obj } => unop(out, "for_in_init", obj, m),
+        ForInInit { obj, shape } => {
+            let name = match shape {
+                ForInIterShape::Opaque => "for_in_init",
+                ForInIterShape::PlainData => "for_in_init_plain",
+            };
+            unop(out, name, obj, m);
+        }
         ForInDone { iter } => unop(out, "for_in_done", iter, m),
-        ForInNext { iter } => unop(out, "for_in_next", iter, m),
+        ForInNext { iter, shape } => {
+            let name = match shape {
+                ForInIterShape::Opaque => "for_in_next",
+                ForInIterShape::PlainData => "for_in_next_plain",
+            };
+            unop(out, name, iter, m);
+        }
     }
 }
 
@@ -3077,6 +3168,9 @@ fn fmt_effect(e: Effect) -> Option<String> {
     if e.contains(Effect::MAY_DIVERGE) {
         parts.push("may_diverge");
     }
+    if e.contains(Effect::MAY_OBSERVE_GETTERS) {
+        parts.push("may_observe_getters");
+    }
     Some(parts.join(", "))
 }
 
@@ -3196,6 +3290,7 @@ mod tests {
         assert!(!Effect::MAY_THROW.removable_when_unused());
         assert!(!Effect::WRITES_HEAP.removable_when_unused());
         assert!(!Effect::MAY_DIVERGE.removable_when_unused());
+        assert!(!Effect::MAY_OBSERVE_GETTERS.removable_when_unused());
         assert!(!Effect::OPAQUE.removable_when_unused());
     }
 

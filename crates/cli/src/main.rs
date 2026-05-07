@@ -112,6 +112,9 @@ fn main() -> ExitCode {
         pm.add_module_pass(Box::new(::pass::dead_fn_elim::DeadFnElimPass));
         pm.add_pass(Box::new(::pass::refine_purity::RefinePurityPass));
         pm.add_pass(Box::new(::pass::escape_analysis::EscapeAnalysisPass));
+        pm.add_pass(Box::new(
+            ::pass::refine_forin_effect::RefineForInEffectPass,
+        ));
         pm.add_pass(Box::new(::pass::refine_arith::RefineArithPass));
         pm.add_pass(Box::new(::pass::const_fold::ConstFoldPass));
         pm.add_pass(Box::new(::pass::gvn::GvnPass));

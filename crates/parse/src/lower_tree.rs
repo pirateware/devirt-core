@@ -1518,7 +1518,7 @@ impl LowerCtx<'_> {
         let body_blk = &self.func.lowered().blocks[info.body_b.0 as usize];
         let next_iid = *body_blk.instructions.first()?;
         let next_iter = match &self.func.lowered().instructions[next_iid.0 as usize].kind {
-            InstKind::ForInNext { iter } => *iter,
+            InstKind::ForInNext { iter, .. } => *iter,
             _ => return None,
         };
         // Iter operand match: ForInDone and ForInNext must use the
@@ -1540,7 +1540,7 @@ impl LowerCtx<'_> {
         let pre_header_blk = &self.func.lowered().blocks[pre_header_b.0 as usize];
         let init_iid = *pre_header_blk.instructions.last()?;
         let obj_op = match &self.func.lowered().instructions[init_iid.0 as usize].kind {
-            InstKind::ForInInit { obj } => *obj,
+            InstKind::ForInInit { obj, .. } => *obj,
             _ => return None,
         };
         // Iter operand must match the ForInInit's result.
