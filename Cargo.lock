@@ -101,6 +101,8 @@ dependencies = [
  "ir",
  "parse",
  "pass",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

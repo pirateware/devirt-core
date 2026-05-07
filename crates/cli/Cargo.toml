@@ -9,7 +9,21 @@ parse         = { path = "../parse" }
 emit          = { path = "../emit" }
 pass          = { path = "../pass" }
 
+[dev-dependencies]
+# Used only by the `cross-check` opt-in test target. Pulled in
+# unconditionally as a dev-dep so a `cargo test --features cross-check`
+# invocation can decode test-inputs.json files; the dep is invisible to
+# non-test builds.
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+
 [features]
 # Behavior-preservation tests that shell out to `node`. Off by default
 # so plain `cargo test` runs without a Node runtime installed.
 node-tests = ["parse/node-tests"]
+# Functional cross-check: runs each corpus sample with declared
+# test-inputs.json through `node`, then runs the deobfuscated output
+# through `node` with the same inputs, and asserts identical observable
+# behaviour (stdout, stderr, exit code). Off by default so a plain
+# `cargo test --workspace` doesn't require a Node runtime.
+cross-check = []

@@ -1,0 +1,14 @@
+{
+  "_comment": "Cross-check spec for 08_recursive.js. The sample is self-driving (it calls console.log(fact(5)) at module level), so a single case with empty harness is enough. See crates/cli/tests/cross_check.rs for schema details.",
+  "skip": false,
+  "timeout_secs": 10,
+  "cases": [
+    {
+      "name": "default"
+    },
+    {
+      "name": "extra_calls",
+      "harness": "console.log(fact(0)); console.log(fact(1)); console.log(fact(8));"
+    }
+  ]
+}
