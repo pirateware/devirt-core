@@ -129,12 +129,11 @@ fn continue_inside_switch_inside_loop() {
 }
 
 #[test]
-fn labeled_break_out_of_switch_still_passthrough() {
-    // Labeled statements remain a disposition blocker. So this
-    // function PassThroughs at AST disposition; we verify the source
-    // round-trips through emit verbatim. The labeled-break code path
-    // in lower_ssa would need to be exercised by removing LabeledStmt
-    // from the blocker set first; that's a separate ticket.
+fn labeled_break_out_of_switch_lowers() {
+    // Issue #33: labeled break/continue lift via the BreakFrame
+    // pending-label mechanism in lower_ssa. The function lowers to
+    // Item::Function with the labeled break/continue resolving against
+    // the matching loop frame.
     let src = "function f(x) {
         outer: for (var i = 0; i < 10; i = i + 1) {
             switch (x) {
@@ -147,9 +146,9 @@ fn labeled_break_out_of_switch_still_passthrough() {
     let m = parse_and_lower(src).expect("parse");
     let item0 = m.items.first().expect("item");
     match item0 {
-        Item::PassThroughFunction(_) => {} // expected
-        Item::Function(_) => panic!(
-            "labeled break/continue should still PT — LabeledStmt remains a blocker"
+        Item::Function(_) => {} // expected: now lifted
+        Item::PassThroughFunction(_) => panic!(
+            "labeled break/continue should lower (issue #33)"
         ),
         _ => panic!("unexpected item kind"),
     }

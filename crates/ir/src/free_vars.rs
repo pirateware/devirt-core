@@ -279,12 +279,25 @@ impl Ctx<'_> {
                     self.leave_scope();
                 }
             }
+            Stmt::DoWhile { body, cond } => {
+                self.enter_block_scope();
+                self.walk_stmts(body);
+                self.leave_scope();
+                self.walk_expr(cond);
+            }
+            Stmt::Labeled { stmt, .. } => {
+                // Labels themselves are not bindings; descend into the
+                // labeled statement directly.
+                self.walk_stmt(stmt);
+            }
+            Stmt::LabeledContinue { .. } => {}
+            Stmt::Debugger => {}
         }
     }
 
     fn walk_expr(&mut self, e: &Expr) {
         match e {
-            Expr::Number(_) | Expr::String(_) | Expr::Bool(_) | Expr::Null | Expr::Undefined => {}
+            Expr::Number(_) | Expr::String(_) | Expr::Bool(_) | Expr::Null | Expr::Undefined | Expr::BigInt(_) => {}
             Expr::This => {}
             Expr::RegExp(_) => {}
             Expr::Ident(name) => self.use_name(name),

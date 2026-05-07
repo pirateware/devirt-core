@@ -212,6 +212,14 @@ fn walk_stmts(stmts: &[Stmt], parent: &str, rows: &mut Vec<FunctionCoverage>) {
                     walk_stmts(finally_body, parent, rows);
                 }
             }
+            Stmt::DoWhile { body, cond } => {
+                walk_stmts(body, parent, rows);
+                walk_expr(cond, parent, rows);
+            }
+            Stmt::Labeled { stmt, .. } => {
+                walk_stmts(std::slice::from_ref(stmt.as_ref()), parent, rows);
+            }
+            Stmt::LabeledContinue { .. } | Stmt::Debugger => {}
         }
     }
 }

@@ -466,6 +466,30 @@ impl Printer<'_> {
                     self.buf.push('}');
                 }
             }
+            Stmt::DoWhile { body, cond } => {
+                self.buf.push_str("do {\n");
+                self.indent += 1;
+                for s in body {
+                    self.pad();
+                    self.stmt(s);
+                    self.buf.push('\n');
+                }
+                self.indent -= 1;
+                self.pad();
+                self.buf.push_str("} while (");
+                self.expr(cond);
+                self.buf.push_str(");");
+            }
+            Stmt::Labeled { label, stmt } => {
+                write!(self.buf, "{label}: ").unwrap();
+                self.stmt(stmt);
+            }
+            Stmt::LabeledContinue { label } => {
+                write!(self.buf, "continue {label};").unwrap();
+            }
+            Stmt::Debugger => {
+                self.buf.push_str("debugger;");
+            }
         }
     }
 
@@ -575,6 +599,10 @@ impl Printer<'_> {
             Expr::Bool(b) => self.buf.push_str(if *b { "true" } else { "false" }),
             Expr::Null => self.buf.push_str("null"),
             Expr::Undefined => self.buf.push_str("undefined"),
+            Expr::BigInt(s) => {
+                self.buf.push_str(s);
+                self.buf.push('n');
+            }
             Expr::Ident(name) => self.buf.push_str(name),
             Expr::This => self.buf.push_str("this"),
             Expr::RegExp(s) => self.buf.push_str(s),

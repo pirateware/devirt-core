@@ -260,6 +260,10 @@ fn stmt_kind(s: &Stmt) -> &'static str {
         Stmt::Block(_) => "Block",
         Stmt::FuncDecl(_) => "FuncDecl",
         Stmt::Try { .. } => "Try",
+        Stmt::DoWhile { .. } => "DoWhile",
+        Stmt::Labeled { .. } => "Labeled",
+        Stmt::LabeledContinue { .. } => "LabeledContinue",
+        Stmt::Debugger => "Debugger",
     }
 }
 
@@ -284,6 +288,9 @@ fn expr_diff(a: &Expr, b: &Expr, path: &str) -> Option<String> {
         (Expr::Bool(x), Expr::Bool(y)) if x == y => None,
         (Expr::Null, Expr::Null) => None,
         (Expr::Undefined, Expr::Undefined) => None,
+        (Expr::BigInt(x), Expr::BigInt(y)) => {
+            if x == y { None } else { Some(format!("{path}: bigint {x} vs {y}")) }
+        }
         (Expr::Ident(x), Expr::Ident(y)) => {
             if x == y {
                 None
@@ -542,6 +549,7 @@ fn expr_kind(e: &Expr) -> &'static str {
         Expr::Bool(_) => "Bool",
         Expr::Null => "Null",
         Expr::Undefined => "Undefined",
+        Expr::BigInt(_) => "BigInt",
         Expr::Ident(_) => "Ident",
         Expr::This => "This",
         Expr::RegExp(_) => "RegExp",

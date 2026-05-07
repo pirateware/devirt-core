@@ -41,6 +41,11 @@ pub enum Constant {
     Int32(i32),
     Bool(bool),
     String(StrId),
+    /// BigInt literal — stored as the raw digit string (interned). The
+    /// frontend produces this for `42n` etc; arithmetic on BigInt is
+    /// not constant-folded (operations on Constant::BigInt are opaque
+    /// to the typed-specializer / fold pipeline).
+    BigInt(StrId),
     Null,
     Undefined,
     /// A reference to another function in the module. Produced by the SSA
@@ -867,6 +872,7 @@ pub fn const_bit_eq(a: &Constant, b: &Constant) -> bool {
         (Int32(x), Int32(y)) => x == y,
         (Bool(x), Bool(y)) => x == y,
         (String(x), String(y)) => x == y,
+        (BigInt(x), BigInt(y)) => x == y,
         (Null, Null) => true,
         (Undefined, Undefined) => true,
         (Func(x), Func(y)) => x.0 == y.0,
@@ -1571,6 +1577,7 @@ fn const_eq(a: &Constant, b: &Constant) -> bool {
         (Int32(x), Int32(y)) => x == y,
         (Bool(x), Bool(y)) => x == y,
         (String(x), String(y)) => x == y,
+        (BigInt(x), BigInt(y)) => x == y,
         (Null, Null) => true,
         (Undefined, Undefined) => true,
         (Func(x), Func(y)) => x.0 == y.0,
@@ -2233,8 +2240,10 @@ fn const_type(c: &Constant) -> ValueType {
         Constant::String(_) => ValueType::String,
         Constant::Null => ValueType::Null,
         Constant::Undefined => ValueType::Undefined,
-        // GlobalThis/This/Func: opaque, no useful type.
-        Constant::GlobalThis | Constant::This | Constant::Func(_) => ValueType::Top,
+        // GlobalThis/This/Func/BigInt: opaque, no useful type.
+        Constant::GlobalThis | Constant::This | Constant::Func(_) | Constant::BigInt(_) => {
+            ValueType::Top
+        }
     }
 }
 
@@ -2537,6 +2546,8 @@ pub fn try_const_fold(kind: &InstKind) -> Option<Constant> {
                             | (_, Constant::This)
                             | (Constant::Func(_), _)
                             | (_, Constant::Func(_))
+                            | (Constant::BigInt(_), _)
+                            | (_, Constant::BigInt(_))
                     ) {
                         return None;
                     }
@@ -2845,6 +2856,10 @@ fn write_constant(out: &mut String, c: &Constant, m: &Module) {
         Constant::Int32(n) => write!(out, "{}i32", n).unwrap(),
         Constant::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Constant::String(s) => write_string_literal(out, m.strings.resolve(s)),
+        Constant::BigInt(s) => {
+            out.push_str(m.strings.resolve(s));
+            out.push('n');
+        }
         Constant::Null => out.push_str("null"),
         Constant::Undefined => out.push_str("undefined"),
         Constant::Func(id) => write!(out, "@{}", func_label(m, *id)).unwrap(),

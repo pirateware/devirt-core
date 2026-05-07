@@ -205,6 +205,32 @@ pub enum Stmt {
         /// Optional finally block.
         finally: Option<Vec<Stmt>>,
     },
+    /// `do { body } while (cond);` — test-after-body loop. Lowered in
+    /// SSA as a body block followed by a `CondBranch(cond, body, exit)`,
+    /// matching the test-after-body semantics. `continue` jumps to the
+    /// test block; `break` jumps to the exit, mirroring the existing
+    /// `While` / `For` plumbing.
+    DoWhile {
+        body: Vec<Stmt>,
+        cond: Expr,
+    },
+    /// `label: stmt` — a labeled statement. The label is in scope for
+    /// labeled `break label;` / `continue label;` inside `stmt`. SSA
+    /// resolves labeled break/continue by walking the break stack
+    /// looking for a frame matching `label`.
+    Labeled {
+        label: String,
+        stmt: Box<Stmt>,
+    },
+    /// `continue label;` — labeled continue. Resolved at SSA time
+    /// against the labeled loop frame's continue target.
+    LabeledContinue {
+        label: String,
+    },
+    /// `debugger;` — no-op for our purposes. Preserved syntactically
+    /// through the tree-IR (so round-trip is exact); SSA lowering
+    /// elides it (no instruction emitted, no terminator change).
+    Debugger,
 }
 
 /// Shared shape for function expressions, arrow functions, and nested
@@ -280,6 +306,11 @@ pub enum Expr {
     Bool(bool),
     Null,
     Undefined,
+    /// BigInt literal: `42n`. Stored as the raw digit string (without
+    /// the trailing `n`), since BigInts can be arbitrary precision and
+    /// cannot fit in `f64`. Pure operations on BigInt are not constant-
+    /// folded yet — the SSA layer treats `Constant::BigInt` as opaque.
+    BigInt(String),
     Ident(String),
     /// Regex literal, stored as the raw source slice including the
     /// surrounding slashes and flags (e.g. `"/abc/gi"`). Preserved
@@ -753,6 +784,21 @@ fn dump_stmt(out: &mut String, s: &Stmt, depth: usize) {
         Stmt::FuncDecl(lit) => {
             dump_func_literal(out, lit, depth);
         }
+        Stmt::DoWhile { body, cond } => {
+            writeln!(out, "{pad}do {{").unwrap();
+            for s in body {
+                dump_stmt(out, s, depth + 1);
+            }
+            writeln!(out, "{pad}}} while {}", dump_expr(cond)).unwrap();
+        }
+        Stmt::Labeled { label, stmt } => {
+            writeln!(out, "{pad}{label}:").unwrap();
+            dump_stmt(out, stmt, depth + 1);
+        }
+        Stmt::LabeledContinue { label } => {
+            writeln!(out, "{pad}continue {label}").unwrap();
+        }
+        Stmt::Debugger => writeln!(out, "{pad}debugger").unwrap(),
         Stmt::Try {
             body,
             catch,
@@ -827,6 +873,7 @@ fn dump_expr(e: &Expr) -> String {
         Expr::Bool(b) => format!("{b}"),
         Expr::Null => "null".to_string(),
         Expr::Undefined => "undefined".to_string(),
+        Expr::BigInt(s) => format!("{s}n"),
         Expr::Ident(n) => n.clone(),
         Expr::This => "this".to_string(),
         Expr::RegExp(s) => s.clone(),

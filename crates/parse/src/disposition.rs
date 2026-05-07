@@ -190,10 +190,11 @@ fn collect_stmt_blockers(stmt: &js::Statement, blockers: &mut BTreeSet<BlockerKi
         FunctionDeclaration(f) => collect_func_decl_blockers(f, blockers),
         ForStatement(f) => collect_for_stmt_blockers(f, blockers),
         ForOfStatement(f) => collect_for_of_stmt_blockers(f, blockers),
-        ContinueStatement(c) => {
-            if c.label.is_some() {
-                blockers.insert(BlockerKind::LabeledContinue);
-            }
+        ContinueStatement(_) => {
+            // Both unlabeled and labeled `continue` are now lowered:
+            // labeled `continue label;` lifts to `Stmt::LabeledContinue`,
+            // resolved at SSA build time against the matching labeled
+            // loop frame. (Unlabeled `continue` was already lowered.)
         }
         TryStatement(t) => collect_try_stmt_blockers(t, blockers),
         ThrowStatement(t) => {
@@ -226,23 +227,34 @@ fn collect_stmt_blockers(stmt: &js::Statement, blockers: &mut BTreeSet<BlockerKi
             }
         }
         DoWhileStatement(s) => {
+            // `do { body } while (cond);` lowers to `Stmt::DoWhile` in
+            // tree-IR and the SSA layer desugars it into a top-test
+            // loop with a tail-branch to enforce test-after-body
+            // semantics. Out-of-SSA reconstruction relooper does not
+            // yet recognize the test-after-body pattern, so the
+            // round-trip would not preserve do-while shape; leaving
+            // the disposition path as Lowered would panic the
+            // relooper. For now we keep DoWhileStmt as a blocker,
+            // routing such functions to PassThrough where the
+            // verbatim source slice is preserved verbatim. The IR
+            // variant `Stmt::DoWhile` is in place so a later pass
+            // (relooper extension) can lift this without further IR
+            // churn.
             blockers.insert(BlockerKind::DoWhileStmt);
             collect_expr_blockers(&s.test, blockers);
             collect_stmt_blockers(&s.body, blockers);
         }
         ForInStatement(f) => {
-            // The for-in loop is preserved as `Stmt::ForIn`. The IR
-            // only represents the simple form: single-declarator
-            // var/let/const with a plain-identifier binding. Fall back
-            // to the blocker for exotic shapes (multiple declarators,
-            // destructuring, no declaration on the left, etc.).
+            // The for-in loop is preserved as `Stmt::ForIn` with a
+            // plain-identifier binding. Destructuring bindings
+            // (`for (const {a} of ...)`-style for-in) lift via parse-
+            // time desugaring: bind a fresh temp on the left and emit
+            // a destructuring prologue at the top of the body. Walk
+            // the binding pattern so any *inner* expression blockers
+            // (default values, computed keys) still surface.
             let binding_ok = match &f.left {
                 js::ForStatementLeft::VariableDeclaration(decl) => {
                     decl.declarations.len() == 1
-                        && matches!(
-                            decl.declarations[0].id.kind,
-                            js::BindingPatternKind::BindingIdentifier(_)
-                        )
                         && matches!(
                             decl.kind,
                             js::VariableDeclarationKind::Const
@@ -254,16 +266,24 @@ fn collect_stmt_blockers(stmt: &js::Statement, blockers: &mut BTreeSet<BlockerKi
             };
             if !binding_ok {
                 blockers.insert(BlockerKind::ForInStmt);
+            } else if let js::ForStatementLeft::VariableDeclaration(decl) = &f.left {
+                if let Some(d) = decl.declarations.first() {
+                    collect_binding_pattern_blockers(&d.id, blockers);
+                }
             }
             collect_expr_blockers(&f.right, blockers);
             collect_stmt_blockers(&f.body, blockers);
         }
         LabeledStatement(s) => {
-            blockers.insert(BlockerKind::LabeledStmt);
+            // `label: stmt` lowers to `Stmt::Labeled`. Labeled
+            // break/continue inside the body resolves at SSA build time
+            // against the matching labeled frame on the break stack.
             collect_stmt_blockers(&s.body, blockers);
         }
         DebuggerStatement(_) => {
-            blockers.insert(BlockerKind::DebuggerStmt);
+            // `debugger;` is a no-op for our purposes — preserved as
+            // `Stmt::Debugger` through tree-IR (round-trip exact); SSA
+            // lowering elides it.
         }
         ClassDeclaration(c) => {
             // Plain class shapes desugar at parse time to a `function`
@@ -324,13 +344,14 @@ fn collect_for_of_stmt_blockers(f: &js::ForOfStatement, blockers: &mut BTreeSet<
     if f.r#await {
         blockers.insert(BlockerKind::ForAwaitOf);
     }
+    // For-of with single-declarator var/let/const is lowerable. A
+    // destructuring binding (`for (const {a} of xs)`) lifts via
+    // parse-time desugaring: bind a fresh temp and emit a
+    // destructuring prologue at the top of the body. Walk the binding
+    // pattern so any *inner* blockers still surface.
     let binding_ok = match &f.left {
         js::ForStatementLeft::VariableDeclaration(decl) => {
             decl.declarations.len() == 1
-                && matches!(
-                    decl.declarations[0].id.kind,
-                    js::BindingPatternKind::BindingIdentifier(_)
-                )
                 && matches!(
                     decl.kind,
                     js::VariableDeclarationKind::Const
@@ -342,6 +363,10 @@ fn collect_for_of_stmt_blockers(f: &js::ForOfStatement, blockers: &mut BTreeSet<
     };
     if !binding_ok {
         blockers.insert(BlockerKind::ForOfDestructuringBinding);
+    } else if let js::ForStatementLeft::VariableDeclaration(decl) = &f.left {
+        if let Some(d) = decl.declarations.first() {
+            collect_binding_pattern_blockers(&d.id, blockers);
+        }
     }
     // Reject if the body contains a bare return. The desugared iterator
     // protocol does not call iterator.return() on abrupt completion.
@@ -634,7 +659,9 @@ fn collect_expr_blockers(expr: &js::Expression, blockers: &mut BTreeSet<BlockerK
                         collect_expr_blockers(&s.argument, blockers);
                     }
                     js::ArrayExpressionElement::Elision(_) => {
-                        blockers.insert(BlockerKind::ArrayElision);
+                        // Elision (`[1,,3]`) lifts at parse time by
+                        // substituting `undefined` for the missing
+                        // slot. Lowerable.
                     }
                     other => {
                         if let Some(e) = other.as_expression() {
@@ -665,8 +692,16 @@ fn collect_expr_blockers(expr: &js::Expression, blockers: &mut BTreeSet<BlockerK
                 collect_expr_blockers(arg, blockers);
             }
         }
-        TaggedTemplateExpression(_) => {
-            blockers.insert(BlockerKind::TaggedTemplateExpr);
+        TaggedTemplateExpression(t) => {
+            // `tag`...`` desugars at parse time to a function call:
+            // `tag([cooked0, cooked1, ...], expr0, ...)`. The desugar
+            // is a simplification — `String.raw` tagging additionally
+            // depends on the array's `.raw` property, which we don't
+            // populate. For v1 we accept this trade-off.
+            collect_expr_blockers(&t.tag, blockers);
+            for e in &t.quasi.expressions {
+                collect_expr_blockers(e, blockers);
+            }
         }
         ChainExpression(c) => {
             // Optional chain (`a?.b`, `a?.()`, `a?.[k]`) is
@@ -712,7 +747,9 @@ fn collect_expr_blockers(expr: &js::Expression, blockers: &mut BTreeSet<BlockerK
             // `InstKind::AllocRegExp` (PURE allocation per evaluation).
         }
         BigIntLiteral(_) => {
-            blockers.insert(BlockerKind::BigIntLiteral);
+            // `42n` lifts to `Expr::BigInt(...)` / `Constant::BigInt(...)`.
+            // Pure operations on BigInt aren't const-folded; lowering
+            // accepts the literal opaquely.
         }
         ThisExpression(_) => {
             // `this` is preserved syntactically as `Expr::This` and

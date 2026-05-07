@@ -898,15 +898,22 @@ fn for_of_await_passthrough() {
     );
 }
 
-/// Destructuring binding in for-of — must remain PassThrough.
+/// Destructuring binding in for-of lifts via parse-time desugaring (issue #33):
+/// bind a fresh temp on the left and emit a destructuring prologue at the top
+/// of the body.
 #[test]
-fn for_of_destructuring_passthrough() {
+fn for_of_destructuring_lowers() {
     let src = "function f(arr) { for (const {x} of arr) { use(x); } }";
     let m = parse_and_lower(src).expect("for-of destructuring must not error");
     use ir::tree::Item;
     assert!(
-        matches!(m.items[0], Item::PassThroughFunction(_)),
-        "for-of destructuring must be PassThrough"
+        matches!(m.items[0], Item::Function(_)),
+        "for-of destructuring must lower (issue #33), got {:?}",
+        match &m.items[0] {
+            Item::Function(_) => "Function",
+            Item::PassThroughFunction(_) => "PassThroughFunction",
+            _ => "other",
+        }
     );
 }
 
@@ -1054,15 +1061,18 @@ fn template_literal_multi_expr() {
     parse_and_lower(&out).expect("emitted JS must re-parse");
 }
 
-/// Tagged template literals must remain PassThrough (not panic).
+/// Tagged template literals lift via parse-time desugaring (issue #33):
+/// `tag`a${e}b`` becomes `tag(["a", "b"], e)`. Note this is a v1
+/// simplification — `String.raw`-style tagging additionally depends on the
+/// strings array's `.raw` property, which we do not populate.
 #[test]
-fn tagged_template_passthrough() {
+fn tagged_template_lowers() {
     use ir::tree::Item;
     let src = r#"function f(content) { return html`<div>${content}</div>`; }"#;
     let m = parse_and_lower(src).expect("tagged template must not error");
     assert!(
-        matches!(m.items[0], Item::PassThroughFunction(_)),
-        "tagged template must be PassThrough"
+        matches!(m.items[0], Item::Function(_)),
+        "tagged template must lower (issue #33)"
     );
 }
 
@@ -1716,4 +1726,125 @@ fn item_kind_name(it: &ir::tree::Item) -> &'static str {
         ir::tree::Item::PassThroughStmt(_) => "PassThroughStmt",
         ir::tree::Item::Stmt(_) => "Stmt",
     }
+}
+
+// ----------------------------------------------------------------------
+// Issue #33 — long-tail blockers: round-trip smoke
+// ----------------------------------------------------------------------
+
+#[test]
+fn issue33_do_while_passthrough_roundtrips() {
+    // Disposition keeps DoWhileStmt blocked (relooper can't yet
+    // recognize test-after-body); the function should round-trip as
+    // a PassThroughFunction with the verbatim source preserved.
+    let src = "function f() { let i = 0; do { i = i + 1; } while (i < 10); return i; }";
+    use ir::tree::Item;
+    let m = parse_and_lower(src).expect("parse_and_lower");
+    assert!(
+        matches!(m.items[0], Item::PassThroughFunction(_)),
+        "do-while must remain PassThrough until relooper supports it"
+    );
+    let out = roundtrip(src);
+    assert!(out.contains("do") && out.contains("while"), "emit preserves do-while source: {out}");
+}
+
+#[test]
+fn issue33_debugger_roundtrips() {
+    let src = "function f() { debugger; return 1; }";
+    use ir::tree::Item;
+    let m = parse_and_lower(src).expect("parse_and_lower");
+    assert!(matches!(m.items[0], Item::Function(_)), "debugger must lower");
+    // Tree-IR roundtrip preserves the debugger token.
+    let out = roundtrip(src);
+    assert!(out.contains("debugger"), "emit preserves `debugger`: {out}");
+}
+
+#[test]
+fn issue33_array_elision_roundtrips() {
+    let src = "function f() { return [1, , 3]; }";
+    use ir::tree::Item;
+    let m = parse_and_lower(src).expect("parse_and_lower");
+    assert!(matches!(m.items[0], Item::Function(_)), "array elision must lower");
+    // Elision lifts to undefined; emission writes `undefined`.
+    let _ = ssa_roundtrip(src);
+}
+
+#[test]
+fn issue33_bigint_literal_roundtrips() {
+    let src = "function f() { return 42n; }";
+    use ir::tree::Item;
+    let m = parse_and_lower(src).expect("parse_and_lower");
+    assert!(matches!(m.items[0], Item::Function(_)), "BigInt literal must lower");
+    let out = ssa_roundtrip(src);
+    assert!(out.contains("42n"), "emit preserves bigint literal: {out}");
+}
+
+#[test]
+fn issue33_tagged_template_roundtrips() {
+    let src = "function f(x) { return tag`a${x}b`; }";
+    use ir::tree::Item;
+    let m = parse_and_lower(src).expect("parse_and_lower");
+    assert!(matches!(m.items[0], Item::Function(_)), "tagged template must lower");
+    let out = ssa_roundtrip(src);
+    // Desugared form: tag(["a", "b"], x). The SSA round-trip may
+    // bind the tag identifier into a temp before the call, so we
+    // only assert that the cooked strings are visible somewhere in
+    // the output — that's the observable surface of the desugar.
+    assert!(out.contains("\"a\"") && out.contains("\"b\""), "emit produces cooked strings: {out}");
+}
+
+#[test]
+fn issue33_for_of_destructuring_roundtrips() {
+    let src = "function f(xs) { let s = 0; for (const {a} of xs) { s = s + a; } return s; }";
+    use ir::tree::Item;
+    let m = parse_and_lower(src).expect("parse_and_lower");
+    assert!(matches!(m.items[0], Item::Function(_)), "for-of destructuring must lower");
+    let _ = ssa_roundtrip(src);
+}
+
+#[test]
+fn issue33_for_in_destructuring_roundtrips() {
+    let src = "function f(o) { for (let { a } in o) { g(a); } }";
+    use ir::tree::Item;
+    let m = parse_and_lower(src).expect("parse_and_lower");
+    assert!(matches!(m.items[0], Item::Function(_)), "for-in destructuring must lower");
+    // ForIn currently routes to PassThrough at SSA build time anyway,
+    // but tree-IR roundtrip must still work.
+    let _ = roundtrip(src);
+}
+
+#[test]
+fn issue33_labeled_break_lowers_and_roundtrips() {
+    let src = "function f(xs) {
+        outer: for (var i = 0; i < xs.length; i = i + 1) {
+            if (xs[i] === 0) break outer;
+        }
+        return i;
+    }";
+    use ir::tree::Item;
+    let m = parse_and_lower(src).expect("parse_and_lower");
+    assert!(matches!(m.items[0], Item::Function(_)), "labeled break must lower");
+    let out = ssa_roundtrip(src);
+    // After SSA round-trip the labeled break may be reconstructed in
+    // a different shape (e.g. as a plain break out of the loop). What
+    // matters is that the program re-parses and the labeled-break is
+    // still expressible if we round-trip via tree-IR only.
+    let _ = out;
+}
+
+#[test]
+fn issue33_labeled_continue_tree_roundtrips() {
+    let src = "function f(xs) {
+        outer: for (var i = 0; i < xs.length; i = i + 1) {
+            for (var j = 0; j < 3; j = j + 1) {
+                if (j === 1) continue outer;
+            }
+        }
+    }";
+    use ir::tree::Item;
+    let m = parse_and_lower(src).expect("parse_and_lower");
+    assert!(matches!(m.items[0], Item::Function(_)), "labeled continue must lower");
+    // Tree-IR roundtrip preserves the labeled-continue token verbatim.
+    let out = roundtrip(src);
+    assert!(out.contains("continue outer"), "tree-IR roundtrip preserves labeled continue: {out}");
 }

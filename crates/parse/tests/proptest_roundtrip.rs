@@ -381,6 +381,10 @@ fn stmt_kind(s: &ir::tree::Stmt) -> &'static str {
         Block(_) => "Block",
         FuncDecl(_) => "FuncDecl",
         Try { .. } => "Try",
+        DoWhile { .. } => "DoWhile",
+        Labeled { .. } => "Labeled",
+        LabeledContinue { .. } => "LabeledContinue",
+        Debugger => "Debugger",
     }
 }
 

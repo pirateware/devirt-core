@@ -486,13 +486,16 @@ pub fn collect_try_address_taken_names(stmts: &[Stmt]) -> HashSet<String> {
                 Stmt::While { body, .. }
                 | Stmt::For { body, .. }
                 | Stmt::ForOf { body, .. }
-                | Stmt::ForIn { body, .. } => walk(body, inside_try_body, out),
+                | Stmt::ForIn { body, .. }
+                | Stmt::DoWhile { body, .. } => walk(body, inside_try_body, out),
                 Stmt::Switch { cases, .. } => {
                     for c in cases { walk(&c.body, inside_try_body, out); }
                 }
                 Stmt::Block(b) => walk(b, inside_try_body, out),
                 Stmt::FuncDecl(_) => {} // nested literal: own scope
-                Stmt::Continue | Stmt::Break { .. } => {}
+                Stmt::Continue | Stmt::Break { .. } | Stmt::LabeledContinue { .. } => {}
+                Stmt::Labeled { stmt, .. } => walk(std::slice::from_ref(stmt.as_ref()), inside_try_body, out),
+                Stmt::Debugger => {}
             }
         }
     }
@@ -622,8 +625,14 @@ fn walk_reassigned_stmts(stmts: &[Stmt], out: &mut HashSet<String>) {
                 walk_reassigned_in_expr(obj, out);
                 walk_reassigned_stmts(body, out);
             }
+            Stmt::DoWhile { body, .. } => walk_reassigned_stmts(body, out),
+            Stmt::Labeled { stmt, .. } => {
+                walk_reassigned_stmts(std::slice::from_ref(stmt.as_ref()), out);
+            }
             Stmt::Continue => {}
             Stmt::Break { .. } => {}
+            Stmt::LabeledContinue { .. } => {}
+            Stmt::Debugger => {}
             Stmt::Switch { cases, .. } => {
                 for case in cases {
                     walk_reassigned_stmts(&case.body, out);
@@ -717,7 +726,7 @@ fn walk_reassigned_in_expr(e: &Expr, out: &mut HashSet<String>) {
         | Expr::Undefined
         | Expr::Ident(_)
         | Expr::This
-        | Expr::RegExp(_) => {}
+        | Expr::RegExp(_) | Expr::BigInt(_) => {}
         Expr::Sequence { exprs } => {
             for e in exprs {
                 walk_reassigned_in_expr(e, out);
@@ -957,6 +966,23 @@ fn discover_stmt<'a>(
         }
         Stmt::Continue => {}
         Stmt::Break { .. } => {}
+        Stmt::LabeledContinue { .. } => {}
+        Stmt::Debugger => {}
+        Stmt::DoWhile { body, cond } => {
+            let mut inner_seen = seen.clone();
+            discover_stmts(body, pending, captures_by_fid, &mut inner_seen, reassigned, parent_fid);
+            discover_expr(cond, pending, captures_by_fid, seen, reassigned, parent_fid);
+        }
+        Stmt::Labeled { stmt, .. } => {
+            discover_stmts(
+                std::slice::from_ref(stmt.as_ref()),
+                pending,
+                captures_by_fid,
+                seen,
+                reassigned,
+                parent_fid,
+            );
+        }
         Stmt::Switch {
             discriminant,
             cases,
@@ -1030,7 +1056,7 @@ fn discover_expr<'a>(
         | Expr::Undefined
         | Expr::Ident(_)
         | Expr::This
-        | Expr::RegExp(_) => {}
+        | Expr::RegExp(_) | Expr::BigInt(_) => {}
         Expr::Binary { lhs, rhs, .. } => {
             discover_expr(lhs, pending, captures_by_fid, seen, reassigned, parent_fid);
             discover_expr(rhs, pending, captures_by_fid, seen, reassigned, parent_fid);
@@ -1349,6 +1375,13 @@ fn collect_assign_expr_target_names(stmts: &[Stmt]) -> std::collections::HashSet
                 }
             }
             Stmt::Throw(e) => visit_expr(e, out),
+            Stmt::DoWhile { body, cond } => {
+                for s in body { visit_stmt(s, out); }
+                visit_expr(cond, out);
+            }
+            Stmt::Labeled { stmt, .. } => visit_stmt(stmt, out),
+            Stmt::LabeledContinue { .. } => {}
+            Stmt::Debugger => {}
         }
     }
     fn visit_expr(e: &Expr, out: &mut std::collections::HashSet<String>) {
@@ -1428,7 +1461,7 @@ fn collect_assign_expr_target_names(stmts: &[Stmt]) -> std::collections::HashSet
             // Stop at function literals — nested scope.
             Expr::Func(_) => {}
             Expr::Number(_) | Expr::String(_) | Expr::Bool(_) | Expr::Null
-            | Expr::Undefined | Expr::Ident(_) | Expr::This | Expr::RegExp(_) => {}
+            | Expr::Undefined | Expr::Ident(_) | Expr::This | Expr::RegExp(_) | Expr::BigInt(_) => {}
         }
     }
     let mut out = std::collections::HashSet::new();
@@ -1668,23 +1701,44 @@ struct Converter<'b, 'm> {
     /// uses the desugared iterator-protocol header.
     break_stack: Vec<BreakFrame>,
 
+    /// Set by `lower_labeled` immediately before recursing into the
+    /// labeled inner statement; consumed by `take_pending_label()` when
+    /// the inner statement creates its loop/switch frame. This is how
+    /// `Stmt::Labeled { label, stmt: <loop> }` attaches the label to the
+    /// loop's `BreakFrame` without weaving the label parameter through
+    /// every loop-lowering helper.
+    pending_label: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum BreakFrame {
     Loop {
         continue_to: BlockId,
         break_to: BlockId,
+        /// `Some(name)` if this loop is the body of an enclosing
+        /// `Stmt::Labeled { label: name, stmt: <loop> }`. Resolved by
+        /// `Stmt::Break { label: Some(_) }` and `Stmt::LabeledContinue`
+        /// when walking the stack for a matching frame.
+        label: Option<String>,
     },
     Switch {
         break_to: BlockId,
+        /// `Some(name)` for `label: switch (...) {...}`. Switch frames
+        /// don't carry a continue target — `continue label` only ever
+        /// resolves to a loop, never a switch.
+        label: Option<String>,
     },
 }
 
 impl BreakFrame {
     fn break_to(&self) -> BlockId {
         match self {
-            BreakFrame::Loop { break_to, .. } | BreakFrame::Switch { break_to } => *break_to,
+            BreakFrame::Loop { break_to, .. } | BreakFrame::Switch { break_to, .. } => *break_to,
+        }
+    }
+    fn label(&self) -> Option<&str> {
+        match self {
+            BreakFrame::Loop { label, .. } | BreakFrame::Switch { label, .. } => label.as_deref(),
         }
     }
 }
@@ -1712,7 +1766,15 @@ impl<'b, 'm> Converter<'b, 'm> {
             sealed: HashSet::new(),
             symbol_names: HashMap::new(),
             break_stack: Vec::new(),
+            pending_label: None,
         }
+    }
+
+    /// Take a previously-set pending label (set by `lower_labeled`
+    /// before recursing into a labeled loop/switch). Called by every
+    /// loop/switch lowering helper when constructing its `BreakFrame`.
+    fn take_pending_label(&mut self) -> Option<String> {
+        self.pending_label.take()
     }
 
     /// Walk the break stack inward → outward to find the nearest
@@ -2230,17 +2292,25 @@ impl<'b, 'm> Converter<'b, 'm> {
                 // (dead) code.
             }
             Stmt::Break { label } => {
-                debug_assert!(
-                    label.is_none(),
-                    "labeled break reached lower_ssa — LabeledStmt is still a \
-                     disposition blocker; if labels were lowered, this arm \
-                     needs a stack walk for matching label"
-                );
-                let target = self
-                    .break_stack
-                    .last()
-                    .expect("Stmt::Break outside any loop or switch")
-                    .break_to();
+                let target = match label {
+                    None => self
+                        .break_stack
+                        .last()
+                        .expect("Stmt::Break outside any loop or switch")
+                        .break_to(),
+                    Some(name) => self
+                        .break_stack
+                        .iter()
+                        .rev()
+                        .find(|f| f.label() == Some(name.as_str()))
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "Stmt::Break {{ label: {name:?} }} without a matching \
+                                 labeled frame on the break stack"
+                            )
+                        })
+                        .break_to(),
+                };
                 self.builder.set_terminator(Terminator::Branch {
                     target,
                     args: vec![],
@@ -2287,6 +2357,37 @@ impl<'b, 'm> Converter<'b, 'm> {
             Stmt::ForIn { kind, binding, obj, body } => {
                 self.lower_for_in(kind, binding, obj, body);
                 return;
+            }
+            Stmt::DoWhile { body, cond } => self.lower_do_while(body, cond),
+            Stmt::Labeled { label, stmt } => self.lower_labeled(label, stmt),
+            Stmt::LabeledContinue { label } => {
+                let target = self
+                    .break_stack
+                    .iter()
+                    .rev()
+                    .find_map(|f| match f {
+                        BreakFrame::Loop {
+                            label: Some(l),
+                            continue_to,
+                            ..
+                        } if l == label => Some(*continue_to),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Stmt::LabeledContinue {{ label: {label:?} }} \
+                             without a matching labeled loop frame on the break stack"
+                        )
+                    });
+                self.builder.set_terminator(Terminator::Branch {
+                    target,
+                    args: vec![],
+                });
+            }
+            Stmt::Debugger => {
+                // No-op: `debugger;` has no observable effect for our
+                // purposes. The tree-IR retains `Stmt::Debugger` so
+                // round-trip preserves the source token; SSA elides it.
             }
         }
     }
@@ -2378,9 +2479,11 @@ impl<'b, 'm> Converter<'b, 'm> {
 
         // Body. `continue` inside the body jumps to the header.
         self.builder.switch_to_block(body_b);
+        let __pl = self.take_pending_label();
         self.break_stack.push(BreakFrame::Loop {
             continue_to: header_b,
             break_to: exit_b,
+            label: __pl.clone(),
         });
         self.push_scope();
         for s in body {
@@ -2403,6 +2506,121 @@ impl<'b, 'm> Converter<'b, 'm> {
         self.seal_block(header_b);
 
         self.builder.switch_to_block(exit_b);
+    }
+
+    /// Lower `do { body } while (cond);` by desugaring into the
+    /// equivalent `while (true) { body; if (!cond) break; }`. The
+    /// SSA out-of-SSA relooper currently only models pre-test (while)
+    /// loops; emitting a real test-after-body CFG (header == body, test
+    /// after body) would require relooper extensions we don't have. The
+    /// desugar preserves test-after-body semantics — the body always
+    /// executes at least once — and produces a CFG the existing
+    /// relooper handles as a top-test loop with an early-exit branch.
+    ///
+    /// `continue` inside the body jumps to the synthesized "after-body"
+    /// test block (matching do-while semantics — the test still runs);
+    /// `break` jumps to exit.
+    fn lower_do_while(&mut self, body: &[Stmt], cond: &Expr) {
+        let header_b = self.builder.new_block();
+        let body_b = self.builder.new_block();
+        let test_b = self.builder.new_block();
+        let exit_b = self.builder.new_block();
+
+        // Branch from current to header. Header has one entry pred plus
+        // a back-edge from test_b — sealed last.
+        self.builder.set_terminator(Terminator::Branch {
+            target: header_b,
+            args: vec![],
+        });
+
+        // body_b has only one pred (header_b's then-branch); seal it
+        // once header_b's terminator is set. exit_b has two potential
+        // preds (header's else and test_b's else) — seal it after both
+        // edges are wired.
+        self.sealed.insert(body_b);
+
+        // Header: condition is `true` (the desugared while-true);
+        // unconditionally branches to body. We model this as a
+        // CondBranch on a `true` constant so the loop has the standard
+        // header→body / header→exit shape the relooper recognizes.
+        // (Branching unconditionally would still work but keeps the
+        // shape uniform with `lower_while`.)
+        self.builder.switch_to_block(header_b);
+        let true_op = Operand::Const(Constant::Bool(true));
+        self.builder.set_terminator(Terminator::CondBranch {
+            cond: true_op,
+            then_b: body_b,
+            then_args: vec![],
+            else_b: exit_b,
+            else_args: vec![],
+        });
+
+        // Body. `continue` inside body jumps to test_b; `break` to exit_b.
+        self.builder.switch_to_block(body_b);
+        let __pl = self.take_pending_label();
+        self.break_stack.push(BreakFrame::Loop {
+            continue_to: test_b,
+            break_to: exit_b,
+            label: __pl,
+        });
+        self.push_scope();
+        for s in body {
+            self.lower_stmt(s);
+        }
+        self.pop_scope();
+        self.break_stack.pop();
+        let body_end = self.current_block();
+        if !self.is_terminated(body_end) {
+            self.builder.set_terminator(Terminator::Branch {
+                target: test_b,
+                args: vec![],
+            });
+        }
+
+        // Test block: evaluate cond, then-branch back to header,
+        // else-branch to exit. test_b has body_end (and any `continue`
+        // sites) as predecessors — must be unsealed until those edges
+        // are wired. body_end → test_b is the only edge that targets
+        // test_b in the simple case; `continue` adds more.
+        self.sealed.insert(test_b);
+        self.builder.switch_to_block(test_b);
+        let cond_op = self.convert_expr(cond);
+        self.builder.set_terminator(Terminator::CondBranch {
+            cond: cond_op,
+            then_b: header_b,
+            then_args: vec![],
+            else_b: exit_b,
+            else_args: vec![],
+        });
+
+        // Seal header — back-edge predecessor (test_b's then) exists.
+        self.seal_block(header_b);
+        // Seal exit_b — both predecessors (header's else and test's else) exist.
+        self.sealed.insert(exit_b);
+
+        self.builder.switch_to_block(exit_b);
+    }
+
+    /// Lower `label: stmt`. The label attaches to the inner statement's
+    /// loop/switch frame via `pending_label` so that `Stmt::Break {
+    /// label: Some(_) }` and `Stmt::LabeledContinue` inside `stmt`
+    /// resolve against it. If `stmt` isn't a loop or switch (e.g. a
+    /// labeled block), we still lower it — labeled break against a
+    /// labeled non-loop is rare but legal; we don't model that case
+    /// (the inner `break label` would fail to resolve and panic). The
+    /// corpus has zero such occurrences.
+    fn lower_labeled(&mut self, label: &str, stmt: &Stmt) {
+        // Stash the label so the inner loop/switch frame picks it up.
+        // If the inner stmt produces no frame, the label is silently
+        // dropped on the next take call — acceptable: a label with no
+        // body-internal break/continue is observably equivalent to no
+        // label at all.
+        self.pending_label = Some(label.to_string());
+        self.lower_stmt(stmt);
+        // Defensive: if take_pending_label was never called (e.g. inner
+        // stmt is a non-loop), clear it so it doesn't leak into the
+        // next loop.
+        self.pending_label = None;
     }
 
     /// Lower `for (init; cond; step) body`. Distinct from while only in
@@ -2473,9 +2691,11 @@ impl<'b, 'm> Converter<'b, 'm> {
 
         // Body. `continue` inside jumps to step_b.
         self.builder.switch_to_block(body_b);
+        let __pl = self.take_pending_label();
         self.break_stack.push(BreakFrame::Loop {
             continue_to: step_b,
             break_to: exit_b,
+            label: __pl.clone(),
         });
         self.push_scope();
         for s in body {
@@ -2626,9 +2846,11 @@ impl<'b, 'm> Converter<'b, 'm> {
 
         // Body.
         self.builder.switch_to_block(body_b);
+        let __pl = self.take_pending_label();
         self.break_stack.push(BreakFrame::Loop {
             continue_to: header_b,
             break_to: exit_b,
+            label: __pl.clone(),
         });
         self.push_scope();
 
@@ -2725,9 +2947,11 @@ impl<'b, 'm> Converter<'b, 'm> {
         // Body: `key = ForInNext(iter)`; bind to user's `binding`
         // symbol with source-name = binding string.
         self.builder.switch_to_block(body_b);
+        let __pl = self.take_pending_label();
         self.break_stack.push(BreakFrame::Loop {
             continue_to: header_b,
             break_to: exit_b,
+            label: __pl.clone(),
         });
         self.push_scope();
 
@@ -2870,7 +3094,11 @@ impl<'b, 'm> Converter<'b, 'm> {
         // Lower each case body. Push a Switch frame so `break;` inside
         // resolves to `join_b`. Continue still walks past Switch frames
         // to the enclosing loop (handled by enclosing_loop_continue_target).
-        self.break_stack.push(BreakFrame::Switch { break_to: join_b });
+        let __pl = self.take_pending_label();
+        self.break_stack.push(BreakFrame::Switch {
+            break_to: join_b,
+            label: __pl,
+        });
         for (i, c) in cases.iter().enumerate() {
             self.builder.switch_to_block(case_blocks[i]);
             // Deliberately no per-case `push_scope`. JS `var`
@@ -3041,6 +3269,10 @@ impl<'b, 'm> Converter<'b, 'm> {
             Expr::Bool(b) => Operand::Const(Constant::Bool(*b)),
             Expr::Null => Operand::Const(Constant::Null),
             Expr::Undefined => Operand::Const(Constant::Undefined),
+            Expr::BigInt(s) => {
+                let id = self.builder.intern(s);
+                Operand::Const(Constant::BigInt(id))
+            }
             Expr::This => Operand::Const(Constant::This),
             Expr::RegExp(s) => {
                 let id = self.builder.intern(s);

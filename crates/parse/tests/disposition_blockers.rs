@@ -374,10 +374,14 @@ fn for_in_var_kind_is_lowered() {
 }
 
 #[test]
-fn for_in_destructuring_binding_still_blocked() {
-    // Disposition still rejects exotic for-in left sides.
-    let b = blockers_of("function f(o) { for (let { a } in o) { g(a); } }");
-    assert!(b.contains(&BlockerKind::ForInStmt), "{b:?}");
+fn for_in_destructuring_binding_is_lowered() {
+    // Issue #33: for-in with a destructuring binding lifts at parse
+    // time by binding a fresh temp on the left and emitting a
+    // destructuring prologue at the top of the body.
+    assert_eq!(
+        decide_first_fn("function f(o) { for (let { a } in o) { g(a); } }"),
+        Disposition::Lowered
+    );
 }
 
 #[test]
@@ -401,6 +405,100 @@ fn multi_declarator_in_for_init_var_is_lowered() {
         decide_first_fn(
             "function f() { for (var a = 1, b = 2; a < 10; a++) {} }"
         ),
+        Disposition::Lowered
+    );
+}
+
+// ----------------------------------------------------------------------
+// Issue #33 — long-tail disposition blockers
+// ----------------------------------------------------------------------
+
+#[test]
+fn do_while_still_blocked() {
+    // do-while lowers to `Stmt::DoWhile` in tree-IR (the IR variant
+    // and lower_ssa support exist), but the SSA→tree relooper can't
+    // yet reconstruct test-after-body loops without an upstream
+    // round-trip regression. Disposition keeps DoWhileStmt blocked
+    // until the relooper grows test-after-body recognition; the
+    // groundwork is in place for that follow-up.
+    let b = blockers_of("function f() { let i = 0; do { i = i + 1; } while (i < 10); }");
+    assert!(b.contains(&BlockerKind::DoWhileStmt), "{b:?}");
+}
+
+#[test]
+fn debugger_stmt_is_lowered() {
+    assert_eq!(
+        decide_first_fn("function f() { debugger; return 1; }"),
+        Disposition::Lowered
+    );
+}
+
+#[test]
+fn labeled_loop_with_labeled_break_is_lowered() {
+    assert_eq!(
+        decide_first_fn(
+            "function f(xs) {
+                outer: for (var i = 0; i < xs.length; i = i + 1) {
+                    if (xs[i] === 0) break outer;
+                }
+            }"
+        ),
+        Disposition::Lowered
+    );
+}
+
+#[test]
+fn labeled_continue_is_lowered() {
+    assert_eq!(
+        decide_first_fn(
+            "function f(xs) {
+                outer: for (var i = 0; i < xs.length; i = i + 1) {
+                    for (var j = 0; j < 3; j = j + 1) {
+                        if (j === 1) continue outer;
+                    }
+                }
+            }"
+        ),
+        Disposition::Lowered
+    );
+}
+
+#[test]
+fn array_elision_is_lowered() {
+    assert_eq!(
+        decide_first_fn("function f() { return [1, , 3]; }"),
+        Disposition::Lowered
+    );
+}
+
+#[test]
+fn bigint_literal_is_lowered() {
+    assert_eq!(
+        decide_first_fn("function f() { return 42n; }"),
+        Disposition::Lowered
+    );
+}
+
+#[test]
+fn tagged_template_is_lowered() {
+    assert_eq!(
+        decide_first_fn("function f(x) { return tag`a${x}b`; }"),
+        Disposition::Lowered
+    );
+}
+
+#[test]
+fn for_of_destructuring_is_lowered() {
+    assert_eq!(
+        decide_first_fn("function f(xs) { for (const {a} of xs) { g(a); } }"),
+        Disposition::Lowered
+    );
+}
+
+#[test]
+fn for_of_array_destructuring_is_lowered() {
+    assert_eq!(
+        decide_first_fn("function f(xs) { for (const [a, b] of xs) { g(a, b); } }"),
         Disposition::Lowered
     );
 }

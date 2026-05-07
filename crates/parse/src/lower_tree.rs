@@ -593,6 +593,7 @@ impl<'a> LowerCtx<'a> {
             Constant::String(s) => Expr::String(self.sm.strings.resolve(s).to_string()),
             Constant::Null => Expr::Null,
             Constant::Undefined => Expr::Undefined,
+            Constant::BigInt(s) => Expr::BigInt(self.sm.strings.resolve(s).to_string()),
             // Direct references to top-level functions become identifier
             // reads of the function name. Function declarations are
             // top-level, so the binding is in scope at every call site.
@@ -2212,6 +2213,7 @@ fn render_expr_to_string(e: &Expr) -> String {
         Expr::Bool(b) => format!("{b}"),
         Expr::Null => "null".to_string(),
         Expr::Undefined => "undefined".to_string(),
+        Expr::BigInt(s) => format!("{s}n"),
         Expr::Ident(n) => n.clone(),
         Expr::This => "this".to_string(),
         Expr::RegExp(s) => s.clone(),

@@ -1124,11 +1124,26 @@ impl<'src> Lowerer<'src> {
             js::Statement::ForOfStatement(f) => self.lower_for_of_stmt(f),
             js::Statement::ForInStatement(f) => self.lower_for_in_stmt(f),
             js::Statement::ContinueStatement(c) => {
-                if c.label.is_some() {
-                    return Err(Error::Unsupported("labeled continue"));
+                if let Some(l) = &c.label {
+                    Ok(Stmt::LabeledContinue {
+                        label: l.name.to_string(),
+                    })
+                } else {
+                    Ok(Stmt::Continue)
                 }
-                Ok(Stmt::Continue)
             }
+            js::Statement::DoWhileStatement(s) => Ok(Stmt::DoWhile {
+                body: self.stmts_from(&s.body)?,
+                cond: self.lower_expr(&s.test)?,
+            }),
+            js::Statement::LabeledStatement(s) => {
+                let body = self.lower_stmt(&s.body)?;
+                Ok(Stmt::Labeled {
+                    label: s.label.name.to_string(),
+                    stmt: Box::new(body),
+                })
+            }
+            js::Statement::DebuggerStatement(_) => Ok(Stmt::Debugger),
             js::Statement::TryStatement(t) => self.lower_try_stmt(t),
             js::Statement::ThrowStatement(t) => Ok(Stmt::Throw(self.lower_expr(&t.argument)?)),
             js::Statement::BreakStatement(b) => Ok(Stmt::Break {
@@ -1204,28 +1219,14 @@ impl<'src> Lowerer<'src> {
     }
 
     fn lower_for_in_stmt(&self, f: &js::ForInStatement) -> Result<Stmt, Error> {
-        let (kind, binding) = match &f.left {
-            js::ForStatementLeft::VariableDeclaration(decl) => {
-                if decl.declarations.len() != 1 {
-                    return Err(Error::Unsupported("for-in with multiple declarators"));
-                }
-                let d = &decl.declarations[0];
-                let name = match &d.id.kind {
-                    js::BindingPatternKind::BindingIdentifier(id) => id.name.to_string(),
-                    _ => return Err(Error::Unsupported("for-in with destructuring binding")),
-                };
-                let kind = match decl.kind {
-                    js::VariableDeclarationKind::Const => "const".to_string(),
-                    js::VariableDeclarationKind::Let => "let".to_string(),
-                    js::VariableDeclarationKind::Var => "var".to_string(),
-                    _ => return Err(Error::Unsupported("for-in with exotic binding kind")),
-                };
-                (kind, name)
-            }
-            _ => return Err(Error::Unsupported("for-in with non-declaration left side")),
-        };
+        let (kind, binding, destructure_prologue) = self.lower_for_iter_binding(&f.left, "for-in")?;
         let obj = self.lower_expr(&f.right)?;
-        let body = self.stmts_from(&f.body)?;
+        let mut body = self.stmts_from(&f.body)?;
+        if !destructure_prologue.is_empty() {
+            let mut new_body = destructure_prologue;
+            new_body.append(&mut body);
+            body = new_body;
+        }
         Ok(Stmt::ForIn {
             kind,
             binding,
@@ -1238,34 +1239,79 @@ impl<'src> Lowerer<'src> {
         if f.r#await {
             return Err(Error::Unsupported("for-await-of statement"));
         }
-        let (kind, binding) = match &f.left {
-            js::ForStatementLeft::VariableDeclaration(decl) => {
-                if decl.declarations.len() != 1 {
-                    return Err(Error::Unsupported("for-of with multiple declarators"));
-                }
-                let d = &decl.declarations[0];
-                let name = match &d.id.kind {
-                    js::BindingPatternKind::BindingIdentifier(id) => id.name.to_string(),
-                    _ => return Err(Error::Unsupported("for-of with destructuring binding")),
-                };
-                let kind = match decl.kind {
-                    js::VariableDeclarationKind::Const => "const".to_string(),
-                    js::VariableDeclarationKind::Let => "let".to_string(),
-                    js::VariableDeclarationKind::Var => "var".to_string(),
-                    _ => return Err(Error::Unsupported("for-of with exotic binding kind")),
-                };
-                (kind, name)
-            }
-            _ => return Err(Error::Unsupported("for-of with non-declaration left side")),
-        };
+        let (kind, binding, destructure_prologue) = self.lower_for_iter_binding(&f.left, "for-of")?;
         let iterable = self.lower_expr(&f.right)?;
-        let body = self.stmts_from(&f.body)?;
+        let mut body = self.stmts_from(&f.body)?;
+        if !destructure_prologue.is_empty() {
+            let mut new_body = destructure_prologue;
+            new_body.append(&mut body);
+            body = new_body;
+        }
         Ok(Stmt::ForOf {
             kind,
             binding,
             iterable: Box::new(iterable),
             body,
         })
+    }
+
+    /// Shared lowering for the LHS of `for-in` / `for-of`. Returns
+    /// `(kind, binding, prologue)`. A destructuring binding (`for (const
+    /// {a} of xs)`) lifts by binding a fresh synthetic name on the left
+    /// and emitting a destructuring prologue that the caller prepends to
+    /// the loop body. Mirrors the catch-param desugaring path.
+    fn lower_for_iter_binding(
+        &self,
+        left: &js::ForStatementLeft,
+        ctx: &'static str,
+    ) -> Result<(String, String, Vec<Stmt>), Error> {
+        let decl = match left {
+            js::ForStatementLeft::VariableDeclaration(decl) => decl,
+            _ => return Err(Error::Unsupported(match ctx {
+                "for-in" => "for-in with non-declaration left side",
+                _ => "for-of with non-declaration left side",
+            })),
+        };
+        if decl.declarations.len() != 1 {
+            return Err(Error::Unsupported(match ctx {
+                "for-in" => "for-in with multiple declarators",
+                _ => "for-of with multiple declarators",
+            }));
+        }
+        let d = &decl.declarations[0];
+        let kind = match decl.kind {
+            js::VariableDeclarationKind::Const => "const".to_string(),
+            js::VariableDeclarationKind::Let => "let".to_string(),
+            js::VariableDeclarationKind::Var => "var".to_string(),
+            _ => return Err(Error::Unsupported(match ctx {
+                "for-in" => "for-in with exotic binding kind",
+                _ => "for-of with exotic binding kind",
+            })),
+        };
+        match &d.id.kind {
+            js::BindingPatternKind::BindingIdentifier(id) => {
+                Ok((kind, id.name.to_string(), Vec::new()))
+            }
+            _ => {
+                // Destructuring: bind a fresh synthetic name and emit a
+                // prologue that destructures it into the user's pattern.
+                // We always synthesize a `let` for the inner bindings —
+                // the loop's `kind` controls the synthetic-name scope,
+                // not the user-bindings scope. (For-of/for-in scoping
+                // semantics for `const` are preserved because the
+                // destructured names are write-once in this iteration's
+                // body; the inner `let` is just our IR's binding-form
+                // marker, not a re-binding.)
+                let slot = self.fresh_temp();
+                let mut prologue: Vec<Stmt> = Vec::new();
+                self.emit_destructure_into(
+                    &d.id,
+                    Expr::Ident(slot.clone()),
+                    &mut prologue,
+                )?;
+                Ok((kind, slot, prologue))
+            }
+        }
     }
 
     fn lower_try_stmt(&self, t: &js::TryStatement) -> Result<Stmt, Error> {
@@ -1631,6 +1677,15 @@ impl<'src> Lowerer<'src> {
             js::Expression::StringLiteral(s) => Ok(Expr::String(s.value.to_string())),
             js::Expression::BooleanLiteral(b) => Ok(Expr::Bool(b.value)),
             js::Expression::NullLiteral(_) => Ok(Expr::Null),
+            js::Expression::BigIntLiteral(b) => {
+                // `42n` — store the digit string. OXC's `raw` field
+                // includes the trailing `n`; trim it so the IR holds
+                // just the digits (the emitter and SSA printer add the
+                // suffix back).
+                let raw = b.raw.as_str();
+                let digits = raw.strip_suffix('n').unwrap_or(raw).to_string();
+                Ok(Expr::BigInt(digits))
+            }
             js::Expression::Identifier(id) => {
                 // Canonicalize the global numeric-value identifiers
                 // (`undefined`, `NaN`, `Infinity`) to literal-shape IR
@@ -1986,7 +2041,15 @@ impl<'src> Lowerer<'src> {
                             elements.push(Expr::Spread(Box::new(self.lower_expr(&s.argument)?)));
                         }
                         js::ArrayExpressionElement::Elision(_) => {
-                            return Err(Error::Unsupported("elision in array literal"));
+                            // `[1,,3]` — sparse-array hole. JS observably
+                            // distinguishes elision from `undefined`
+                            // (`in` / Array iteration callbacks), but
+                            // for our purposes treating elision as
+                            // explicit `undefined` is acceptable: the
+                            // few sites that depend on the difference
+                            // would already not be analysable. Document
+                            // and proceed.
+                            elements.push(Expr::Undefined);
                         }
                         other => {
                             let e = other
@@ -1997,6 +2060,34 @@ impl<'src> Lowerer<'src> {
                     }
                 }
                 Ok(Expr::Array { elements })
+            }
+
+            js::Expression::TaggedTemplateExpression(t) => {
+                // Desugar `tag`q0${e0}q1${e1}q2`` into
+                // `tag([q0, q1, q2], e0, e1)`. This is a v1
+                // simplification: real `String.raw` tagging additionally
+                // depends on the strings array's `.raw` property, which
+                // we do not populate. See issue #33 for the trade-off.
+                let tag = self.lower_expr(&t.tag)?;
+                let mut elements: Vec<Expr> = Vec::with_capacity(t.quasi.quasis.len());
+                for q in &t.quasi.quasis {
+                    let s = q
+                        .value
+                        .cooked
+                        .as_deref()
+                        .unwrap_or_else(|| q.value.raw.as_str())
+                        .to_string();
+                    elements.push(Expr::String(s));
+                }
+                let mut args: Vec<Expr> = Vec::with_capacity(1 + t.quasi.expressions.len());
+                args.push(Expr::Array { elements });
+                for e in &t.quasi.expressions {
+                    args.push(self.lower_expr(e)?);
+                }
+                Ok(Expr::Call {
+                    callee: Box::new(tag),
+                    args,
+                })
             }
 
             js::Expression::TemplateLiteral(tpl) => {

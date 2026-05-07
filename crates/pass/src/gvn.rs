@@ -85,6 +85,7 @@ enum OpKey {
     Func(u32),
     GlobalThis,
     This,
+    BigInt(StrId),
 }
 
 fn op_key(op: &Operand) -> OpKey {
@@ -100,6 +101,7 @@ fn op_key(op: &Operand) -> OpKey {
         Operand::Const(Constant::Func(f)) => OpKey::Func(f.0),
         Operand::Const(Constant::GlobalThis) => OpKey::GlobalThis,
         Operand::Const(Constant::This) => OpKey::This,
+        Operand::Const(Constant::BigInt(s)) => OpKey::BigInt(*s),
     }
 }
 
