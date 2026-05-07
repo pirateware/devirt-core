@@ -289,6 +289,23 @@ fn lower_function(sm: &ssa::Module, _id: FuncId, func: &Function, cfg: &EmitConf
 
     ctx.walk(func.lowered().entry, None, &mut body);
 
+    // Cosmetic codegen pass: `let X;` followed (at the same scope) by
+    // `X = expr;` with no intervening reference to X collapses into
+    // `let X = expr;` at the assign's position. The let-declaration
+    // moves DOWN, so no reordering of evaluation. Only top-level
+    // function-body scope; nested-block lets are not touched (their
+    // scope semantics differ).
+    sink_top_level_let_init(&mut body);
+
+    // Drop trivial `X = X;` self-assignments at any nesting depth (relooper
+    // artifact from SSA→tree phi resolution that simplified to a no-op).
+    drop_trivial_self_assigns(&mut body);
+
+    // Drop `let X;` declarations whose name is never referenced anywhere
+    // in the body (DCE didn't catch them because they live at the tree-IR
+    // level, not SSA). Function-top scope only.
+    drop_unused_top_level_lets(&mut body);
+
     let rest_param = func
         .lowered()
         .rest_param
@@ -303,6 +320,285 @@ fn lower_function(sm: &ssa::Module, _id: FuncId, func: &Function, cfg: &EmitConf
         // SSA — the SSA round-trip is lossy and the original slice no
         // longer corresponds to `body`.
         source: None,
+    }
+}
+
+// ============================================================================
+// sink_top_level_let_init — collapse `let X; ... X = expr;` → `let X = expr;`
+// ============================================================================
+//
+// The hoisted-`let X;` declarations at function top exist for SSA-correctness
+// (so a `var x;` declared in a block is visible after the block). Most of
+// them are immediately followed by a single assignment `X = expr;` later in
+// the same scope, with no intervening reference to X. In that case we move
+// the declaration DOWN to the assign site (no evaluation reordering since
+// only the *declaration* moves, not the value). Same scope → identical
+// JS scoping semantics. Reduces tier3 output from 368 lines to ~263.
+
+fn sink_top_level_let_init(body: &mut Vec<Stmt>) {
+    let mut i = 0;
+    while i < body.len() {
+        let name = match &body[i] {
+            Stmt::Let { name, init: None } => name.clone(),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        // Search forward at this scope for the first reference to `name`.
+        let mut merge_idx: Option<usize> = None;
+        for j in (i + 1)..body.len() {
+            match &body[j] {
+                Stmt::Assign {
+                    target: Expr::Ident(n),
+                    value,
+                } if n == &name && !expr_refs_name(value, &name) => {
+                    merge_idx = Some(j);
+                    break;
+                }
+                other => {
+                    if stmt_refs_name(other, &name) {
+                        break;
+                    }
+                }
+            }
+        }
+        match merge_idx {
+            Some(j) => {
+                let assigned = match body.remove(j) {
+                    Stmt::Assign { value, .. } => value,
+                    _ => unreachable!(),
+                };
+                body[i] = Stmt::Let {
+                    name,
+                    init: Some(assigned),
+                };
+            }
+            None => {}
+        }
+        i += 1;
+    }
+}
+
+fn drop_trivial_self_assigns(body: &mut Vec<Stmt>) {
+    body.retain(|s| {
+        !matches!(
+            s,
+            Stmt::Assign { target: Expr::Ident(t), value: Expr::Ident(v) } if t == v
+        )
+    });
+    // Recurse into nested scopes.
+    for s in body.iter_mut() {
+        recurse_drop_self_assigns(s);
+    }
+}
+
+fn recurse_drop_self_assigns(s: &mut Stmt) {
+    match s {
+        Stmt::If { then_body, else_body, .. } => {
+            drop_trivial_self_assigns(then_body);
+            if let Some(eb) = else_body {
+                drop_trivial_self_assigns(eb);
+            }
+        }
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::For { body, .. }
+        | Stmt::ForIn { body, .. }
+        | Stmt::ForOf { body, .. }
+        | Stmt::Block(body) => drop_trivial_self_assigns(body),
+        Stmt::Switch { cases, .. } => {
+            for c in cases.iter_mut() {
+                drop_trivial_self_assigns(&mut c.body);
+            }
+        }
+        Stmt::Try { body, catch, finally } => {
+            drop_trivial_self_assigns(body);
+            if let Some((_, cb)) = catch {
+                drop_trivial_self_assigns(cb);
+            }
+            if let Some(fb) = finally {
+                drop_trivial_self_assigns(fb);
+            }
+        }
+        Stmt::Labeled { stmt, .. } => recurse_drop_self_assigns(stmt),
+        _ => {}
+    }
+}
+
+fn drop_unused_top_level_lets(body: &mut Vec<Stmt>) {
+    // Collect names declared at top-level via `let X;` (no init).
+    let candidates: Vec<String> = body
+        .iter()
+        .filter_map(|s| match s {
+            Stmt::Let { name, init: None } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    // For each, check if the name is referenced anywhere in body.
+    let mut to_drop: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for name in candidates {
+        let referenced = body.iter().any(|s| match s {
+            Stmt::Let { name: n, init: None } if n == &name => false,
+            other => stmt_refs_name(other, &name),
+        });
+        if !referenced {
+            to_drop.insert(name);
+        }
+    }
+    body.retain(|s| match s {
+        Stmt::Let { name, init: None } if to_drop.contains(name) => false,
+        _ => true,
+    });
+}
+
+fn expr_refs_name(e: &Expr, name: &str) -> bool {
+    use ir::tree::OptChainKind;
+    match e {
+        Expr::Ident(n) => n == name,
+        Expr::Number(_)
+        | Expr::String(_)
+        | Expr::Bool(_)
+        | Expr::Null
+        | Expr::Undefined
+        | Expr::RegExp(_)
+        | Expr::BigInt(_)
+        | Expr::This => false,
+        Expr::Array { elements } => elements.iter().any(|e| expr_refs_name(e, name)),
+        Expr::Object { props } => props.iter().any(|p| {
+            // Spread props store the spread expr in `value`; computed keys
+            // store an expr in `key`. ObjectKey otherwise is a static
+            // string/identifier — no expr to walk.
+            expr_refs_name(&p.value, name)
+        }),
+        Expr::Member { obj, .. } => expr_refs_name(obj, name),
+        Expr::Index { obj, index } => {
+            expr_refs_name(obj, name) || expr_refs_name(index, name)
+        }
+        Expr::Call { callee, args } => {
+            expr_refs_name(callee, name) || args.iter().any(|a| expr_refs_name(a, name))
+        }
+        Expr::New { callee, args } => {
+            expr_refs_name(callee, name) || args.iter().any(|a| expr_refs_name(a, name))
+        }
+        Expr::Unary { operand, .. } => expr_refs_name(operand, name),
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_refs_name(lhs, name) || expr_refs_name(rhs, name)
+        }
+        Expr::Ternary { cond, then_branch, else_branch } => {
+            expr_refs_name(cond, name)
+                || expr_refs_name(then_branch, name)
+                || expr_refs_name(else_branch, name)
+        }
+        Expr::Update { target, .. } => expr_refs_name(target, name),
+        Expr::Template { exprs, .. } => exprs.iter().any(|e| expr_refs_name(e, name)),
+        Expr::Assign { target, value } => {
+            expr_refs_name(target, name) || expr_refs_name(value, name)
+        }
+        Expr::CompoundAssign { target, value, .. } => {
+            expr_refs_name(target, name) || expr_refs_name(value, name)
+        }
+        Expr::Sequence { exprs } => exprs.iter().any(|e| expr_refs_name(e, name)),
+        Expr::Spread(e) => expr_refs_name(e, name),
+        // Function literals: conservative — assume they may capture
+        // `name` lexically. Don't sink across them.
+        Expr::Func(_) => true,
+        Expr::NullishCoalesce { lhs, rhs } => {
+            expr_refs_name(lhs, name) || expr_refs_name(rhs, name)
+        }
+        Expr::LogicalAssign { target, value, .. } => {
+            expr_refs_name(target, name) || expr_refs_name(value, name)
+        }
+        Expr::OptionalChain { base, segments } => {
+            if expr_refs_name(base, name) {
+                return true;
+            }
+            for seg in segments {
+                match &seg.kind {
+                    OptChainKind::Index(e) => {
+                        if expr_refs_name(e, name) {
+                            return true;
+                        }
+                    }
+                    OptChainKind::Call(args) => {
+                        for a in args {
+                            if expr_refs_name(a, name) {
+                                return true;
+                            }
+                        }
+                    }
+                    OptChainKind::Member(_) => {}
+                }
+            }
+            false
+        }
+        Expr::DeleteProp { obj, .. } => expr_refs_name(obj, name),
+        Expr::DeleteIndex { obj, index } => {
+            expr_refs_name(obj, name) || expr_refs_name(index, name)
+        }
+    }
+}
+
+fn stmt_refs_name(s: &Stmt, name: &str) -> bool {
+    match s {
+        Stmt::Let { init, .. } => init.as_ref().is_some_and(|e| expr_refs_name(e, name)),
+        Stmt::Const { init, .. } => expr_refs_name(init, name),
+        Stmt::Assign { target, value } => {
+            expr_refs_name(target, name) || expr_refs_name(value, name)
+        }
+        Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) => expr_refs_name(e, name),
+        Stmt::Return(None) | Stmt::Continue | Stmt::Debugger => false,
+        Stmt::If { cond, then_body, else_body } => {
+            if expr_refs_name(cond, name) {
+                return true;
+            }
+            then_body.iter().any(|s| stmt_refs_name(s, name))
+                || else_body
+                    .as_ref()
+                    .is_some_and(|b| b.iter().any(|s| stmt_refs_name(s, name)))
+        }
+        Stmt::While { cond, body } => {
+            expr_refs_name(cond, name) || body.iter().any(|s| stmt_refs_name(s, name))
+        }
+        Stmt::DoWhile { body, cond } => {
+            expr_refs_name(cond, name) || body.iter().any(|s| stmt_refs_name(s, name))
+        }
+        Stmt::For { init, cond, step, body } => {
+            init.as_ref().is_some_and(|s| stmt_refs_name(s, name))
+                || cond.as_ref().is_some_and(|e| expr_refs_name(e, name))
+                || step.as_ref().is_some_and(|e| expr_refs_name(e, name))
+                || body.iter().any(|s| stmt_refs_name(s, name))
+        }
+        Stmt::Switch { discriminant, cases } => {
+            if expr_refs_name(discriminant, name) {
+                return true;
+            }
+            cases.iter().any(|c| {
+                c.test.as_ref().is_some_and(|t| expr_refs_name(t, name))
+                    || c.body.iter().any(|s| stmt_refs_name(s, name))
+            })
+        }
+        Stmt::Block(b) => b.iter().any(|s| stmt_refs_name(s, name)),
+        Stmt::Break { .. } => false,
+        Stmt::Try { body, catch, finally } => {
+            body.iter().any(|s| stmt_refs_name(s, name))
+                || catch
+                    .as_ref()
+                    .is_some_and(|(_, cb)| cb.iter().any(|s| stmt_refs_name(s, name)))
+                || finally
+                    .as_ref()
+                    .is_some_and(|f| f.iter().any(|s| stmt_refs_name(s, name)))
+        }
+        Stmt::Labeled { stmt, .. } => stmt_refs_name(stmt, name),
+        Stmt::ForIn { obj, body, .. } => {
+            expr_refs_name(obj, name) || body.iter().any(|s| stmt_refs_name(s, name))
+        }
+        Stmt::ForOf { iterable, body, .. } => {
+            expr_refs_name(iterable, name) || body.iter().any(|s| stmt_refs_name(s, name))
+        }
+        Stmt::FuncDecl(_) => true,
+        Stmt::LabeledContinue { .. } => false,
     }
 }
 

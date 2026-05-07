@@ -435,11 +435,13 @@ fn passthrough_pin_disambiguates_collision() {
     let out = emit(&tm);
 
     // The pinned value must keep `tmp`; the other must be suffixed.
-    // We don't constrain WHICH let comes first (the renamer is
-    // allocation-order-driven), but exactly one of `let tmp;` and
-    // `let tmp_1;` must appear, in some order.
+    // The let-sink pass may collapse `let tmp;` + `tmp = expr;` into
+    // `let tmp = expr;`, so we check for either form. Both `tmp` and
+    // `tmp_1` must appear as let-bound identifiers.
+    let has_tmp = out.contains("let tmp;") || out.contains("let tmp = ");
+    let has_tmp_1 = out.contains("let tmp_1;") || out.contains("let tmp_1 = ");
     assert!(
-        out.contains("let tmp;") && out.contains("let tmp_1;"),
+        has_tmp && has_tmp_1,
         "expected `tmp` and `tmp_1` lets in output, got:\n{out}"
     );
 }
