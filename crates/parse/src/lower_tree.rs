@@ -42,7 +42,7 @@ use ir::ssa::{
     self, BlockId, Constant, Effect, FuncId, Function, InstId, InstKind, Operand, Terminator,
     Value, ValueDefKind, walk_inst_operands, walk_term_operands,
 };
-use ir::tree::{self, BinOp, Expr, IrFunction, Item, Stmt, UnOp};
+use ir::tree::{self, BinOp, Expr, FuncBody, IrFunction, Item, Stmt, UnOp};
 
 // ============================================================================
 // Public entry points
@@ -306,6 +306,14 @@ fn lower_function(sm: &ssa::Module, _id: FuncId, func: &Function, cfg: &EmitConf
     // level, not SSA). Function-top scope only.
     drop_unused_top_level_lets(&mut body);
 
+    // Tighten scope: if a function-top `let X;` has all its references
+    // inside exactly one nested top-level Stmt, drop the function-top
+    // let and recursively merge with the first write inside that nested
+    // scope. JS-semantically safe because `name` was never visible
+    // outside that scope to begin with — the function-top `let` was
+    // overly conservative hoisting.
+    tighten_top_level_let_scopes(&mut body);
+
     let rest_param = func
         .lowered()
         .rest_param
@@ -426,6 +434,147 @@ fn recurse_drop_self_assigns(s: &mut Stmt) {
     }
 }
 
+/// Recursively try to merge `let X;` (anywhere in this body slice's
+/// top-level) with X's first write IF all refs to X are in nested
+/// scopes within one specific Stmt in this body. Drops the bare let
+/// and re-emits the first inner write as `let X = expr;`.
+fn tighten_top_level_let_scopes(body: &mut Vec<Stmt>) {
+    let mut i = 0;
+    while i < body.len() {
+        let name = match &body[i] {
+            Stmt::Let { name, init: None } => name.clone(),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        // Locate which top-level Stmts (other than the let itself) reference `name`.
+        // We want all references to be in exactly one Stmt at this scope.
+        let mut owner_idx: Option<usize> = None;
+        let mut multi = false;
+        for (j, s) in body.iter().enumerate() {
+            if j == i {
+                continue;
+            }
+            if stmt_refs_name(s, &name) {
+                if owner_idx.is_some() {
+                    multi = true;
+                    break;
+                }
+                owner_idx = Some(j);
+            }
+        }
+        if multi {
+            i += 1;
+            continue;
+        }
+        let Some(j) = owner_idx else {
+            i += 1;
+            continue;
+        };
+        // The owner Stmt must be one with a body (block-bearing).
+        // Try to recurse into its body and merge there.
+        let success = try_merge_let_into_stmt(&mut body[j], &name);
+        if success {
+            body.remove(i);
+            // Don't advance i: removed at i, next item slid into place.
+            // But nothing else at i is a let-decl that was relying on
+            // i+1 onward — we re-walk from current i.
+            continue;
+        }
+        i += 1;
+    }
+}
+
+/// Try to merge `let X = first_write_value;` inside the Stmt's body.
+/// Returns true if the merge happened, false otherwise.
+fn try_merge_let_into_stmt(s: &mut Stmt, name: &str) -> bool {
+    // Find the body to merge into. If a Stmt has multiple bodies (If
+    // with then+else, Try with body+catch+finally, Switch with cases),
+    // attempt only when exactly one of them references `name`.
+    match s {
+        Stmt::If { cond, then_body, else_body } => {
+            if expr_refs_name(cond, name) {
+                return false; // ref in cond — would need to predeclare
+            }
+            let then_refs = then_body.iter().any(|s| stmt_refs_name(s, name));
+            let else_refs = else_body
+                .as_ref()
+                .is_some_and(|b| b.iter().any(|s| stmt_refs_name(s, name)));
+            match (then_refs, else_refs) {
+                (true, false) => merge_let_at_first_write(then_body, name),
+                (false, true) => {
+                    if let Some(eb) = else_body {
+                        merge_let_at_first_write(eb, name)
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            }
+        }
+        Stmt::While { cond, body } => {
+            if expr_refs_name(cond, name) {
+                return false;
+            }
+            merge_let_at_first_write(body, name)
+        }
+        Stmt::DoWhile { cond, body } => {
+            if expr_refs_name(cond, name) {
+                return false;
+            }
+            merge_let_at_first_write(body, name)
+        }
+        Stmt::For { init, cond, step, body } => {
+            if init.as_ref().is_some_and(|s| stmt_refs_name(s, name))
+                || cond.as_ref().is_some_and(|e| expr_refs_name(e, name))
+                || step.as_ref().is_some_and(|e| expr_refs_name(e, name))
+            {
+                return false;
+            }
+            merge_let_at_first_write(body, name)
+        }
+        Stmt::Block(b) => merge_let_at_first_write(b, name),
+        Stmt::Labeled { stmt, .. } => try_merge_let_into_stmt(stmt, name),
+        // Conservative: don't touch Try/Switch/ForIn/ForOf — scoping
+        // and control-flow there are subtle.
+        _ => false,
+    }
+}
+
+/// Walk `body`, find the first Stmt that's `name = value;`, replace it
+/// with `let name = value;` and return true. Bail (false) if any read
+/// of `name` precedes the first write, or if no write exists.
+fn merge_let_at_first_write(body: &mut Vec<Stmt>, name: &str) -> bool {
+    for j in 0..body.len() {
+        match &body[j] {
+            Stmt::Assign {
+                target: Expr::Ident(t),
+                value,
+            } if t == name => {
+                if expr_refs_name(value, name) {
+                    return false;
+                }
+                let new = match std::mem::replace(&mut body[j], Stmt::Continue) {
+                    Stmt::Assign { value, .. } => Stmt::Let {
+                        name: name.to_string(),
+                        init: Some(value),
+                    },
+                    _ => unreachable!(),
+                };
+                body[j] = new;
+                return true;
+            }
+            other => {
+                if stmt_refs_name(other, name) {
+                    return false;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn drop_unused_top_level_lets(body: &mut Vec<Stmt>) {
     // Collect names declared at top-level via `let X;` (no init).
     let candidates: Vec<String> = body
@@ -451,6 +600,66 @@ fn drop_unused_top_level_lets(body: &mut Vec<Stmt>) {
         Stmt::Let { name, init: None } if to_drop.contains(name) => false,
         _ => true,
     });
+}
+
+/// True iff a function literal's body references `name` from outer
+/// scope. Shadowing-aware: function name + params + rest param +
+/// top-level `let/const/var` declarations in the body are local
+/// shadows that block the outer-scope reference.
+fn func_lit_refs_name(f: &ir::tree::FuncLiteral, name: &str) -> bool {
+    // Shadowed by the function's own name (named function expressions).
+    if f.name.as_deref() == Some(name) {
+        return false;
+    }
+    // Shadowed by a positional or rest param.
+    if f.params.iter().any(|p| p == name) {
+        return false;
+    }
+    if f.rest_param.as_deref() == Some(name) {
+        return false;
+    }
+    match &f.body {
+        FuncBody::Stmts(stmts) => {
+            // Shadowed by a top-level local in the body.
+            if stmts.iter().any(|s| stmt_declares_local(s, name)) {
+                return false;
+            }
+            stmts.iter().any(|s| stmt_refs_name(s, name))
+        }
+        FuncBody::Expression(e) => expr_refs_name(e, name),
+        FuncBody::PassThrough(src) => func_lit_passthrough_refs_name(src, name),
+    }
+}
+
+fn stmt_declares_local(s: &Stmt, name: &str) -> bool {
+    match s {
+        Stmt::Let { name: n, .. } | Stmt::Const { name: n, .. } => n == name,
+        // Inner FuncDecl introduces its own name as a local binding.
+        Stmt::FuncDecl(fl) => fl.name.as_deref() == Some(name),
+        _ => false,
+    }
+}
+
+fn func_lit_passthrough_refs_name(src: &str, name: &str) -> bool {
+    let bytes = src.as_bytes();
+    let nbytes = name.as_bytes();
+    if nbytes.is_empty() {
+        return false;
+    }
+    let is_ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+    let mut i = 0;
+    while i + nbytes.len() <= bytes.len() {
+        if &bytes[i..i + nbytes.len()] == nbytes {
+            let prev_ok = i == 0 || !is_ident_byte(bytes[i - 1]);
+            let next_idx = i + nbytes.len();
+            let next_ok = next_idx >= bytes.len() || !is_ident_byte(bytes[next_idx]);
+            if prev_ok && next_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 fn expr_refs_name(e: &Expr, name: &str) -> bool {
@@ -501,9 +710,10 @@ fn expr_refs_name(e: &Expr, name: &str) -> bool {
         }
         Expr::Sequence { exprs } => exprs.iter().any(|e| expr_refs_name(e, name)),
         Expr::Spread(e) => expr_refs_name(e, name),
-        // Function literals: conservative — assume they may capture
-        // `name` lexically. Don't sink across them.
-        Expr::Func(_) => true,
+        // Function literals: walk the body checking for name uses,
+        // accounting for shadowing by the function's params + own name.
+        // PassThrough bodies are walked as raw source-text token search.
+        Expr::Func(f) => func_lit_refs_name(f, name),
         Expr::NullishCoalesce { lhs, rhs } => {
             expr_refs_name(lhs, name) || expr_refs_name(rhs, name)
         }
