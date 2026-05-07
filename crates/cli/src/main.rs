@@ -124,6 +124,9 @@ fn main() -> ExitCode {
         pm.add_pass(Box::new(::pass::sroa::SroaPass));
         pm.add_pass(Box::new(::pass::forward_loads::ForwardLoadsPass));
         pm.add_pass(Box::new(::pass::licm::LicmPass));
+        // SymEx (issue #53): smt-gated, after LICM and before DCE.
+        #[cfg(feature = "smt")]
+        pm.add_pass(Box::new(::pass::symex_pass::SymExPass));
         pm.add_pass(Box::new(::pass::dce::DcePass));
         if let Err(e) = pm.run_module(&mut ssa_module) {
             eprintln!("\ninternal error: pass pipeline failed: {e}");

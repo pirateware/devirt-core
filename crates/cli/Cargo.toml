@@ -27,3 +27,7 @@ node-tests = ["parse/node-tests"]
 # behaviour (stdout, stderr, exit code). Off by default so a plain
 # `cargo test --workspace` doesn't require a Node runtime.
 cross-check = []
+# Symbolic-execution + Z3 SMT backend (issue #53). Enabling this
+# wires `SymExPass` into the default pipeline. Off by default — links
+# libz3 only when explicitly opted in. Forwarded to `pass`.
+smt = ["pass/smt"]

@@ -42,6 +42,12 @@ pub mod sroa;
 #[cfg(feature = "smt")]
 pub mod symex;
 
+/// Symex-driven loop-collapse FunctionPass (issue #53). Gated behind
+/// `smt` for the same reason as the framework. Wired into the default
+/// pipeline only when the feature is enabled (see `cli`).
+#[cfg(feature = "smt")]
+pub mod symex_pass;
+
 /// A single function-local pass. Returns `true` iff the targeted
 /// function was mutated. Receives `&mut Module` for shared state
 /// (string interner, function-summary lookups) but conventionally

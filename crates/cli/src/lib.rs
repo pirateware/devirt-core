@@ -70,6 +70,12 @@ pub fn process(source: &str) -> Result<String, error::Error> {
     pm.add_pass(Box::new(::pass::sroa::SroaPass));
     pm.add_pass(Box::new(::pass::forward_loads::ForwardLoadsPass));
     pm.add_pass(Box::new(::pass::licm::LicmPass));
+    // SymEx (issue #53) runs after LICM (so loop-invariant inst hoisting
+    // already happened) and before DCE (so the now-orphaned loop body
+    // gets cleaned up). Behind `--features pass/smt`; default builds
+    // never link libz3.
+    #[cfg(feature = "smt")]
+    pm.add_pass(Box::new(::pass::symex_pass::SymExPass));
     pm.add_pass(Box::new(::pass::dce::DcePass));
     pm.run_module(&mut ssa_module)?;
     let back = ::parse::lower_tree::lower_module(&ssa_module);
