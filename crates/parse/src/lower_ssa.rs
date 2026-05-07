@@ -1256,9 +1256,18 @@ fn discover_literal<'a>(
     // position) or appears in `outer_reassigned`, re-classify this
     // literal to PassThrough. The check is per project memory
     // `closures-disposition-rule`.
-    let should_passthrough = captures
-        .iter()
-        .any(|name| !outer_seen.contains(name) || outer_reassigned.contains(name));
+    //
+    // Additionally: a capture that is reassigned BY THE INNER BODY
+    // itself (`function () { n = n + 1 }` capturing `n`) requires
+    // shared-cell semantics — every call must mutate the outer's
+    // binding. Our SSA capture model is by-value (Operand::Capture is
+    // read-only), so this case is unsound to lower. Force PassThrough.
+    // Counter-pattern (`makeCounter`) is the canonical example.
+    let should_passthrough = captures.iter().any(|name| {
+        !outer_seen.contains(name)
+            || outer_reassigned.contains(name)
+            || inner_reassigned.contains(name)
+    });
     if should_passthrough {
         // Source slice is required for re-classification — without it
         // we'd lose the body. The lower.rs front end always stashes one

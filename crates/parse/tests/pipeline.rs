@@ -1915,6 +1915,35 @@ fn issue36_skip_one_level_capture_lowers() {
     let _ = ssa_roundtrip(src);
 }
 
+/// Counter pattern: inner closure mutates a captured `let n`. Our SSA
+/// capture model is by-value (Operand::Capture is read-only), so the
+/// inner-reassigned-capture rule must fire and route the inner literal
+/// to PassThrough so the source-level mutation of the shared binding
+/// survives the round-trip. Without the rule the emitter previously
+/// produced a fresh `let n; n = (0 + 1)` inside the inner — wrong by
+/// observable semantics.
+#[test]
+fn issue36_inner_reassigned_capture_forces_passthrough() {
+    let src = "
+        function makeCounter() {
+            let n = 0;
+            return function() {
+                n = n + 1;
+                return n;
+            };
+        }
+    ";
+    let out = ssa_roundtrip(src);
+    // The inner body must survive verbatim with `n = n + 1`. If the
+    // closure had been Lowered, the inner would print a parenthesised
+    // SSA form like `n = (n + 1)` — the verbatim form is the
+    // PassThrough signature.
+    assert!(
+        out.contains("n = n + 1"),
+        "inner-reassigned capture must reach PassThrough verbatim: {out}"
+    );
+}
+
 /// Forward-ref through a nested closure: `inner2` captures `y` which is
 /// declared AFTER inner1 in outer's body. The forward-ref rule must
 /// still fire at the outer's discovery of inner1 (since inner1's
