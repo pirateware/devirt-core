@@ -50,12 +50,13 @@ fn arithmetic_and_return_is_lowered() {
 
 #[test]
 fn two_distinct_blockers_all_reported() {
-    // Issue #30 lifted NullishCoalescing — pair RestParam (still
-    // blocked) with DebuggerStmt to keep two distinct blockers.
-    let src = "function f(...rest) { debugger; return rest; }";
+    // Issue #33 lifted DebuggerStmt — pair RestParam (still blocked)
+    // with MetaProperty (`new.target`, still blocked) to keep two
+    // distinct blockers.
+    let src = "function f(...rest) { var a = new.target; return rest; }";
     let b = blockers_of(src);
     assert!(b.contains(&BlockerKind::RestParam), "missing RestParam in {b:?}");
-    assert!(b.contains(&BlockerKind::DebuggerStmt), "missing DebuggerStmt in {b:?}");
+    assert!(b.contains(&BlockerKind::MetaProperty), "missing MetaProperty in {b:?}");
     assert_eq!(b.len(), 2, "expected exactly 2 blockers, got {b:?}");
 }
 
@@ -63,11 +64,11 @@ fn two_distinct_blockers_all_reported() {
 
 #[test]
 fn repeated_blocker_kind_reported_once() {
-    // Issue #30 lifted NullishCoalescing — switch to a still-blocked
-    // construct (DebuggerStmt) repeated to verify the set semantics.
-    let src = "function f() { debugger; debugger; }";
+    // Issue #33 lifted DebuggerStmt — switch to MetaProperty
+    // (`new.target`, still blocked) repeated to verify set semantics.
+    let src = "function f() { new.target; new.target; }";
     let b = blockers_of(src);
-    assert!(b.contains(&BlockerKind::DebuggerStmt), "{b:?}");
+    assert!(b.contains(&BlockerKind::MetaProperty), "{b:?}");
     assert_eq!(b.len(), 1, "expected exactly 1 unique blocker, got {b:?}");
 }
 
