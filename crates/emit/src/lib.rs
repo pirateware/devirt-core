@@ -150,6 +150,22 @@ pub fn emit(module: &Module) -> String {
 /// but a fallback keeps the deobfuscator robust against transient
 /// emitter bugs (the raw output is itself valid JS in practice — proven
 /// by the corpus + cross-check pre-this-change).
+/// True iff `s` matches the JS identifier syntax: starts with letter,
+/// underscore, or `$`, followed by letters / digits / underscore /
+/// `$`. Reserved words (return, if, else, for, while, function, etc.)
+/// are still valid JS identifier-shaped property names since ES5
+/// — `obj.return` is legal — so we don't filter them out here.
+fn is_js_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_' || first == '$') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
 fn codegen_module(src: &str) -> String {
     use oxc_allocator::Allocator;
     use oxc_codegen::Codegen;
@@ -721,10 +737,21 @@ impl Printer<'_> {
                 write!(self.buf, ".{prop}").unwrap();
             }
             Expr::Index { obj, index } => {
-                self.expr(obj);
-                self.buf.push('[');
-                self.expr(index);
-                self.buf.push(']');
+                // Cosmetic: if the index is a string-literal that
+                // matches the JS identifier syntax, render as
+                // `.prop` instead of `["prop"]`. Pure cosmetic;
+                // semantics identical for ident-shaped keys.
+                if let Expr::String(s) = index.as_ref()
+                    && is_js_identifier(s)
+                {
+                    self.expr(obj);
+                    write!(self.buf, ".{s}").unwrap();
+                } else {
+                    self.expr(obj);
+                    self.buf.push('[');
+                    self.expr(index);
+                    self.buf.push(']');
+                }
             }
             Expr::Array { elements } => {
                 self.buf.push('[');

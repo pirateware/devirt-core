@@ -324,6 +324,24 @@ fn expr_diff(a: &Expr, b: &Expr, path: &str) -> Option<String> {
             expr_diff(oa, ob, &format!("{path}.obj"))
                 .or_else(|| expr_diff(ia, ib, &format!("{path}.index")))
         }
+        // Cosmetic equivalence: `obj["ident"]` (Index with string-
+        // literal key) is semantically equivalent to `obj.ident`
+        // (Member). The bracket→dot codegen normalization in
+        // crates/emit/src/lib.rs renders the former as the latter
+        // when the string is a valid JS identifier; round-tripping
+        // therefore can shift between these forms. Same prop name
+        // → no semantic difference.
+        (
+            Expr::Index { obj: oa, index: ia },
+            Expr::Member { obj: ob, prop: pb },
+        )
+        | (
+            Expr::Member { obj: ob, prop: pb },
+            Expr::Index { obj: oa, index: ia },
+        ) => match ia.as_ref() {
+            Expr::String(s) if s == pb => expr_diff(oa, ob, &format!("{path}.obj")),
+            _ => Some(format!("{path}: Index vs Member key mismatch")),
+        },
         (Expr::New { callee: ca, args: aa }, Expr::New { callee: cb, args: ab }) => {
             expr_diff(ca, cb, &format!("{path}.callee")).or_else(|| args_diff(aa, ab, path))
         }
