@@ -1,9 +1,0 @@
-[workspace]
-resolver = "2"
-members = [
-    "crates/ir",
-    "crates/parse",
-    "crates/emit",
-    "crates/pass",
-    "crates/cli",
-]

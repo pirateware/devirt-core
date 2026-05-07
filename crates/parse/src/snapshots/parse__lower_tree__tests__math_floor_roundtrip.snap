@@ -1,8 +1,0 @@
----
-source: crates/parse/src/lower_tree.rs
-expression: out
----
-function f(x) {
-	let _t1 = Math.floor(x);
-	return _t1;
-}

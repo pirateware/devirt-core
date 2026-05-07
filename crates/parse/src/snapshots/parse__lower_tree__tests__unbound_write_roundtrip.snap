@@ -1,9 +1,0 @@
----
-source: crates/parse/src/lower_tree.rs
-assertion_line: 2647
-expression: out
----
-function f() {
-	x = 1;
-	return;
-}

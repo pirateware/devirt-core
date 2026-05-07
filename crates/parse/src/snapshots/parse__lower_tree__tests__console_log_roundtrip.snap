@@ -1,8 +1,0 @@
----
-source: crates/parse/src/lower_tree.rs
-expression: out
----
-function f() {
-	let _t1 = console.log("hi");
-	return;
-}

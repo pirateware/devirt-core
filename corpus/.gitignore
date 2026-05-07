@@ -1,9 +1,0 @@
-realworld/**/*.js
-realworld/**/*.source.txt
-
-# Tier4 holds *snapshots* of randomized obfuscator output. JsConfuser 2.0.1
-# does not expose a seed, so the bytes can't be reproduced — we track them.
-# obfuscator.io is seeded, but tier4 tracks all three samples uniformly so
-# a fresh checkout reproduces the exact harness state without re-running
-# fetch_obfuscated.sh (which still works idempotently if you do).
-!realworld/tier4/*.js
