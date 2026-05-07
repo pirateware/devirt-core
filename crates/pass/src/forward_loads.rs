@@ -53,6 +53,9 @@ use ir::ssa::{
 };
 
 use crate::FunctionPass;
+use crate::constructor_fn_inline::{
+    FunctionSummary, SummaryKey, callee_func_id, module_summaries,
+};
 
 pub struct ForwardLoadsPass;
 
@@ -121,6 +124,35 @@ fn shapes_equal(a: &Shape, b: &Shape) -> bool {
         }
     }
     true
+}
+
+/// Issue #40: cross-procedural summary lookup. Returns the resolved
+/// Operand iff `obj_v` is the result of a Call to a constructor-shape
+/// function in `summaries`, all of that Call's args are `Const(_)`,
+/// and the summary's latest store for `key` is resolvable.
+fn try_resolve_summary(
+    body: &LoweredBody,
+    summaries: &HashMap<u32, FunctionSummary>,
+    obj_v: Value,
+    key: SummaryKey,
+) -> Option<Operand> {
+    let iid = match body.values[obj_v.0 as usize].kind {
+        ValueDefKind::Inst(iid) => iid,
+        _ => return None,
+    };
+    let (callee, args) = match &body.instructions[iid.0 as usize].kind {
+        InstKind::Call { callee, args } => (callee, args),
+        _ => return None,
+    };
+    let fid = callee_func_id(callee)?;
+    let summary = summaries.get(&fid.0)?;
+    if args.iter().any(|a| !matches!(a, Operand::Const(_))) {
+        return None;
+    }
+    if args.len() < summary.arity() {
+        return None;
+    }
+    summary.resolve(args, key)
 }
 
 /// Apply a single instruction's effect to the running shape.
@@ -257,6 +289,13 @@ impl FunctionPass for ForwardLoadsPass {
         if module.functions[fid.0 as usize].is_pass_through() {
             return Ok(false);
         }
+        // Issue #40: build cross-procedural summaries once per pass
+        // run. Used as a fallback when intra-function shape lookup
+        // fails — a `LoadProp/LoadIndex(call_result, k)` where the
+        // call's callee is a constructor-shape function with all-const
+        // args resolves directly via the summary.
+        let summaries = module_summaries(module);
+
         let body = module.functions[fid.0 as usize].lowered_mut();
         let n = body.blocks.len();
 
@@ -335,13 +374,34 @@ impl FunctionPass for ForwardLoadsPass {
                         obj: Operand::Value(a),
                         key,
                         purity: Purity::Pure,
-                    } => shape.get(&(a.0, key_from_str(*key))).copied(),
+                    } => shape
+                        .get(&(a.0, key_from_str(*key)))
+                        .copied()
+                        .or_else(|| {
+                            try_resolve_summary(body, &summaries, *a, SummaryKey::Str(*key))
+                        }),
                     InstKind::LoadIndex {
                         obj: Operand::Value(a),
                         index,
                         purity: Purity::Pure,
                     } => key_from_index_operand(index)
-                        .and_then(|k| shape.get(&(a.0, k)).copied()),
+                        .and_then(|k| shape.get(&(a.0, k)).copied())
+                        .or_else(|| {
+                            let sk = match index {
+                                Operand::Const(Constant::Int32(i)) => SummaryKey::Idx(*i),
+                                Operand::Const(Constant::Number(n))
+                                    if n.is_finite()
+                                        && n.trunc() == *n
+                                        && *n >= i32::MIN as f64
+                                        && *n <= i32::MAX as f64 =>
+                                {
+                                    SummaryKey::Idx(*n as i32)
+                                }
+                                Operand::Const(Constant::String(s)) => SummaryKey::Str(*s),
+                                _ => return None,
+                            };
+                            try_resolve_summary(body, &summaries, *a, sk)
+                        }),
                     _ => None,
                 };
                 if let Some(stored) = forward {
@@ -390,6 +450,76 @@ mod tests {
         BlockId, Constant, FuncId, FunctionBuilder, InstKind, Module, Operand, Purity,
         Terminator,
     };
+
+    /// Issue #40 cross-procedural forwarding: a constructor function
+    /// that is NOT physically inlined (e.g., the caller hasn't run
+    /// ConstructorFnInlinePass), but the load against its result still
+    /// resolves through the summary.
+    #[test]
+    fn cross_procedural_summary_resolves_load_without_physical_inlining() {
+        let mut module = Module::new();
+        let s_a;
+        let s_b;
+        // FuncId(0) mkArr() → ['a','b']
+        {
+            let mut b = FunctionBuilder::new(&mut module, "mkArr", 0);
+            s_a = b.intern("a");
+            s_b = b.intern("b");
+            let bb0 = b.new_block();
+            b.switch_to_block(bb0);
+            let alloc = b.add_inst(InstKind::AllocArray { length: Some(2) }).unwrap();
+            for (i, sid) in [s_a, s_b].iter().enumerate() {
+                b.add_inst(InstKind::StoreIndex {
+                    obj: Operand::Value(alloc),
+                    index: Operand::Const(Constant::Int32(i as i32)),
+                    val: Operand::Const(Constant::String(*sid)),
+                    purity: Purity::Pure,
+                });
+            }
+            b.set_terminator(Terminator::Return {
+                val: Some(Operand::Value(alloc)),
+            });
+            b.finish();
+        }
+        // FuncId(1) caller — has the Call but we DON'T run
+        // ConstructorFnInlinePass; ForwardLoadsPass alone must resolve
+        // the load via the cross-procedural summary.
+        {
+            let mut b = FunctionBuilder::new(&mut module, "caller", 0);
+            let bb0 = b.new_block();
+            b.switch_to_block(bb0);
+            let call_v = b
+                .add_inst(InstKind::Call {
+                    callee: Operand::Const(Constant::Func(FuncId(0))),
+                    args: vec![],
+                })
+                .unwrap();
+            let load_v = b
+                .add_inst(InstKind::LoadIndex {
+                    obj: Operand::Value(call_v),
+                    index: Operand::Const(Constant::Int32(1)),
+                    purity: Purity::Pure,
+                })
+                .unwrap();
+            b.set_terminator(Terminator::Return {
+                val: Some(Operand::Value(load_v)),
+            });
+            b.finish();
+        }
+
+        let mut pm = PassManager::new();
+        pm.add_pass(Box::new(ForwardLoadsPass));
+        pm.run(&mut module, FuncId(1)).unwrap();
+
+        let body = module.functions[1].lowered();
+        let entry = body.entry;
+        match &body.blocks[entry.0 as usize].terminator {
+            Terminator::Return {
+                val: Some(Operand::Const(Constant::String(id))),
+            } => assert_eq!(module.strings.resolve(id), "b"),
+            other => panic!("expected ret String('b'), got {other:?}"),
+        }
+    }
 
     /// `let o = {}; o.x = 5; return o.x;` — same-block, Pure load
     /// forwards to Const(5).

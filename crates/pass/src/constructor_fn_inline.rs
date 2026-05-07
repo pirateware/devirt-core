@@ -96,8 +96,9 @@ use std::collections::{HashMap, HashSet};
 
 use ir::error::Error;
 use ir::ssa::{
-    BlockId, Constant, Effect, FunctionBody, InstId, InstKind, Module, Operand, SwitchCase,
-    Terminator, Value, ValueDef, ValueDefKind, find_value_for_inst, walk_inst_operands_mut,
+    BlockId, Constant, Effect, FuncId, FunctionBody, InstId, InstKind, Module, Operand, StrId,
+    SwitchCase, Terminator, Value, ValueDef, ValueDefKind, find_value_for_inst,
+    walk_inst_operands_mut,
 };
 
 use crate::ModulePass;
@@ -1366,6 +1367,181 @@ fn translate_term(
         }
         TermDesc::Throw { val } => Terminator::Throw { val: map_op(val) },
         TermDesc::Unreachable => Terminator::Unreachable,
+    }
+}
+
+// ============================================================================
+// Function summaries (issue #40) — cross-procedural forwarding
+// ============================================================================
+//
+// Public infrastructure that lets `ForwardLoadsPass` resolve
+// `LoadProp/LoadIndex(call_result, k)` against a constructor-shape
+// callee's stored shape WITHOUT physically inlining the constructor at
+// the call site. Useful when the constructor is large or called from
+// many sites — physical inlining would N×M-bloat the IR before
+// downstream passes collapse it.
+//
+// v1 scope:
+//   - Single-block constructor-shape bodies (alloc + stores + return alloc).
+//   - Stores whose val is `Const(_)` or directly references an `Arg(i)`.
+//   - Loads at the call site whose key is a known `(Idx | Str)` constant.
+//   - All Call args at the resolution site must be `Const(_)` (so any
+//     `ArgRef(i)` summary entry resolves to a Const).
+//
+// Out of scope:
+//   - Multi-block bodies (would need block-level dataflow).
+//   - Stores whose val is the result of an in-body expression — encoded
+//     as `Unresolvable` so resolve returns None for that key.
+//   - Recursive summary chains (decoder calls decoder calls constructor).
+
+#[derive(Hash, PartialEq, Eq, Clone, Copy, Debug)]
+pub enum SummaryKey {
+    Idx(i32),
+    Str(StrId),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SummaryVal {
+    Const(Constant),
+    ArgRef(u32),
+    Unresolvable,
+}
+
+#[derive(Clone, Debug)]
+pub struct FunctionSummary {
+    stores: Vec<(SummaryKey, SummaryVal)>,
+    arity: usize,
+}
+
+impl FunctionSummary {
+    /// Resolve a load at `key` given the Call's `args`. Walks stores
+    /// in reverse (latest wins). Returns None for keys never stored
+    /// or whose latest store's val is unresolvable.
+    pub fn resolve(&self, args: &[Operand], key: SummaryKey) -> Option<Operand> {
+        let stored = self
+            .stores
+            .iter()
+            .rev()
+            .find_map(|(k, v)| if *k == key { Some(*v) } else { None })?;
+        match stored {
+            SummaryVal::Const(c) => Some(Operand::Const(c)),
+            SummaryVal::ArgRef(i) => args.get(i as usize).copied(),
+            SummaryVal::Unresolvable => None,
+        }
+    }
+
+    pub fn arity(&self) -> usize {
+        self.arity
+    }
+}
+
+/// Helper for callers: extract `FuncId` from a `Call.callee` Operand
+/// when it's a static `Func(_)` constant.
+pub fn callee_func_id(callee: &Operand) -> Option<FuncId> {
+    match callee {
+        Operand::Const(Constant::Func(fid)) => Some(*fid),
+        _ => None,
+    }
+}
+
+/// Build summaries for every constructor-shape function in `module`.
+/// Self-contained matcher: single block, optional zero-or-more
+/// non-store insts (silently treated as opaque so any store referencing
+/// their result becomes Unresolvable), and `Return(Some(Value(alloc)))`.
+pub fn module_summaries(module: &Module) -> HashMap<u32, FunctionSummary> {
+    let mut out = HashMap::new();
+    for (i, func) in module.functions.iter().enumerate() {
+        if let Some(summary) = match_simple_constructor(func) {
+            out.insert(i as u32, summary);
+        }
+    }
+    out
+}
+
+/// Single-block alloc-and-stores matcher. Distinct from
+/// `match_inlinable`: this one is purely about extracting the
+/// (key → val) shape for cross-procedural forwarding; it doesn't
+/// need to track admissible-effect semantics or multi-block dataflow.
+fn match_simple_constructor(func: &ir::ssa::Function) -> Option<FunctionSummary> {
+    let body = match &func.body {
+        FunctionBody::Lowered(b) => b,
+        FunctionBody::PassThrough(_) => return None,
+    };
+    if body.blocks.len() != 1 {
+        return None;
+    }
+    let entry = &body.blocks[body.entry.0 as usize];
+    if !entry.params.is_empty() || entry.instructions.is_empty() {
+        return None;
+    }
+
+    let arity = body.params.len();
+    let mut alloc_value: Option<Value> = None;
+    let mut stores: Vec<(SummaryKey, SummaryVal)> = Vec::new();
+
+    for &iid in &entry.instructions {
+        let kind = &body.instructions[iid.0 as usize].kind;
+        match kind {
+            InstKind::AllocObject | InstKind::AllocArray { .. } => {
+                if alloc_value.is_some() {
+                    return None;
+                }
+                alloc_value = Some(find_value_for_inst(body, iid));
+            }
+            InstKind::StoreProp { obj, key, val, .. } => {
+                let av = alloc_value?;
+                if !matches!(obj, Operand::Value(v) if *v == av) {
+                    return None;
+                }
+                stores.push((SummaryKey::Str(*key), encode_summary_val(body, val)));
+            }
+            InstKind::StoreIndex { obj, index, val, .. } => {
+                let av = alloc_value?;
+                if !matches!(obj, Operand::Value(v) if *v == av) {
+                    return None;
+                }
+                let k = match index {
+                    Operand::Const(Constant::Int32(k)) => SummaryKey::Idx(*k),
+                    Operand::Const(Constant::Number(n))
+                        if n.is_finite()
+                            && n.trunc() == *n
+                            && *n >= i32::MIN as f64
+                            && *n <= i32::MAX as f64 =>
+                    {
+                        SummaryKey::Idx(*n as i32)
+                    }
+                    Operand::Const(Constant::String(s)) => SummaryKey::Str(*s),
+                    _ => continue,
+                };
+                stores.push((k, encode_summary_val(body, val)));
+            }
+            // Other instructions are tolerated (they'd block the
+            // physical inliner's matcher, but for summary purposes
+            // any store whose val references their result will encode
+            // as Unresolvable, which is correct).
+            _ => {}
+        }
+    }
+
+    let alloc_value = alloc_value?;
+    if !matches!(
+        &entry.terminator,
+        Terminator::Return { val: Some(Operand::Value(v)) } if *v == alloc_value
+    ) {
+        return None;
+    }
+
+    Some(FunctionSummary { stores, arity })
+}
+
+fn encode_summary_val(body: &ir::ssa::LoweredBody, val: &Operand) -> SummaryVal {
+    match val {
+        Operand::Const(c) => SummaryVal::Const(*c),
+        Operand::Value(v) => match body.values[v.0 as usize].kind {
+            ValueDefKind::Arg(i) => SummaryVal::ArgRef(i),
+            _ => SummaryVal::Unresolvable,
+        },
+        _ => SummaryVal::Unresolvable,
     }
 }
 
