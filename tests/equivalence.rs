@@ -171,6 +171,14 @@ fn dead_object_prop_removal_preserves_value() {
         __r = O[k] + O.a;
         "#,
     );
+    // Assignment-initialized table (the param=`{…}` form).
+    assert_equivalent(
+        r#"
+        var O;
+        O = { keep: 5, lt: function(a,b){ return a < b; }, deadData: 9 };
+        __r = O.keep;
+        "#,
+    );
 }
 
 #[test]

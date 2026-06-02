@@ -17,6 +17,20 @@ fn unaccessed_pure_members_removed() {
 }
 
 #[test]
+fn assignment_initialized_table_pruned() {
+    // The table is stored into a pre-declared param via a single `O = {…}`.
+    let out = deob("(function(O){ O = { used: 1, deadFn: function(){return 2;} }; return O.used; })();");
+    assert!(out.contains("used: 1"), "live member lost: {out}");
+    assert!(!out.contains("deadFn"), "dead member survived: {out}");
+}
+
+#[test]
+fn twice_assigned_object_not_pruned() {
+    let out = deob("(function(O){ O = { a: 1, b: 2 }; O = other; return O.a; })();");
+    assert!(out.contains("b: 2"), "object with two writes was pruned: {out}");
+}
+
+#[test]
 fn computed_access_disables_removal() {
     let out = deob("(function(k){ var O = { a: 1, b: 2 }; return O[k]; })('a');");
     assert!(out.contains("a: 1") && out.contains("b: 2"), "computed-access object was pruned: {out}");

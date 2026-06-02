@@ -8,8 +8,10 @@
 //! never read (and whose value is pure to construct) is dropped.
 //!
 //! Soundness is by construction — we default to *keeping*:
-//!   * A candidate is a non-root, never-reassigned binding initialized with an
-//!     object literal.
+//!   * A candidate is a non-root binding whose value is established by exactly
+//!     one write, and that write is an object literal — either a declarator
+//!     initializer (`var O = {…}`) or a single assignment (`O = {…}`, the form
+//!     used when the table is stored into a pre-declared param/var).
 //!   * Escape analysis treats every reference to the binding as disqualifying
 //!     UNLESS it is the object of a *static* member read (`O.name`). Any other
 //!     shape — `O[x]`, bare `O`, `O.x = v` (the object read in target
@@ -47,17 +49,32 @@ impl Pass for DeadObjectProp {
     fn run<'a>(&mut self, program: &mut Program<'a>, allocator: &'a Allocator) -> bool {
         let scoping = build_scoping(program);
 
-        // 1. Candidate object-literal bindings: non-root, never reassigned.
-        let mut cand = CandidateCollector { scoping: &scoping, candidates: HashSet::new() };
+        // 1. Candidate object-literal bindings: non-root, value established by
+        //    exactly one write and that write is an object literal.
+        let mut cand = CandidateCollector {
+            scoping: &scoping,
+            total_writes: HashMap::new(),
+            object_writes: HashMap::new(),
+        };
         cand.visit_program(program);
-        if cand.candidates.is_empty() {
+        let candidates: HashSet<SymbolId> = cand
+            .object_writes
+            .keys()
+            .copied()
+            .filter(|s| {
+                cand.total_writes.get(s).copied() == Some(1)
+                    && cand.object_writes.get(s).copied() == Some(1)
+                    && scoping.symbol_scope_id(*s) != scoping.root_scope_id()
+            })
+            .collect();
+        if candidates.is_empty() {
             return false;
         }
 
         // 2. Classify every reference: record static-read accesses, escape all else.
         let mut cls = Classifier {
             scoping: &scoping,
-            candidates: &cand.candidates,
+            candidates: &candidates,
             accessed: HashMap::new(),
             escaped: HashSet::new(),
         };
@@ -65,7 +82,7 @@ impl Pass for DeadObjectProp {
 
         // 3. A binding is rewritable if it did not escape.
         let live: HashSet<SymbolId> =
-            cand.candidates.iter().copied().filter(|s| !cls.escaped.contains(s)).collect();
+            candidates.iter().copied().filter(|s| !cls.escaped.contains(s)).collect();
         if live.is_empty() {
             return false;
         }
@@ -102,20 +119,45 @@ fn static_key(key: &PropertyKey<'_>) -> Option<String> {
 
 struct CandidateCollector<'s> {
     scoping: &'s Scoping,
-    candidates: HashSet<SymbolId>,
+    /// Count of value-establishing writes per symbol (declarator initializers and
+    /// identifier-target assignments).
+    total_writes: HashMap<SymbolId, usize>,
+    /// Of those, how many wrote an object literal.
+    object_writes: HashMap<SymbolId, usize>,
+}
+
+impl<'s> CandidateCollector<'s> {
+    fn record(&mut self, sym: SymbolId, is_object: bool) {
+        *self.total_writes.entry(sym).or_default() += 1;
+        if is_object {
+            *self.object_writes.entry(sym).or_default() += 1;
+        }
+    }
+
+    fn ref_sym(&self, id: &oxc_ast::ast::IdentifierReference<'_>) -> Option<SymbolId> {
+        let rid = id.reference_id.get()?;
+        self.scoping.get_reference(rid).symbol_id()
+    }
 }
 
 impl<'a, 's> Visit<'a> for CandidateCollector<'s> {
     fn visit_variable_declarator(&mut self, decl: &VariableDeclarator<'a>) {
-        if let (Some(sym), Some(Expression::ObjectExpression(_))) = (binding_sym(decl), &decl.init) {
-            // Non-root (a global may be read externally) and never reassigned.
-            if self.scoping.symbol_scope_id(sym) != self.scoping.root_scope_id()
-                && !self.scoping.symbol_is_mutated(sym)
-            {
-                self.candidates.insert(sym);
-            }
+        if let (Some(sym), Some(init)) = (binding_sym(decl), &decl.init) {
+            self.record(sym, matches!(init, Expression::ObjectExpression(_)));
         }
         oxc_ast_visit::walk::walk_variable_declarator(self, decl);
+    }
+
+    fn visit_assignment_expression(&mut self, node: &oxc_ast::ast::AssignmentExpression<'a>) {
+        if let oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(id) = &node.left {
+            if let Some(sym) = self.ref_sym(id) {
+                // A compound assignment (`+=`) never establishes an object value.
+                let is_object = matches!(node.operator, oxc_syntax::operator::AssignmentOperator::Assign)
+                    && matches!(node.right, Expression::ObjectExpression(_));
+                self.record(sym, is_object);
+            }
+        }
+        oxc_ast_visit::walk::walk_assignment_expression(self, node);
     }
 }
 
@@ -149,9 +191,25 @@ impl<'a, 's, 'c> Visit<'a> for Classifier<'s, 'c> {
         oxc_ast_visit::walk::walk_static_member_expression(self, m);
     }
 
+    fn visit_assignment_expression(&mut self, node: &oxc_ast::ast::AssignmentExpression<'a>) {
+        // The single object-literal write that DEFINES a candidate is not an
+        // escape. Walk only the right side (the object), skipping the target
+        // identifier so it never reaches visit_identifier_reference as an escape.
+        // (A candidate has exactly one identifier-target write — this one.)
+        if let oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(id) = &node.left {
+            if let Some(sym) = self.ref_sym(id) {
+                if self.candidates.contains(&sym) {
+                    self.visit_expression(&node.right);
+                    return;
+                }
+            }
+        }
+        oxc_ast_visit::walk::walk_assignment_expression(self, node);
+    }
+
     fn visit_identifier_reference(&mut self, id: &oxc_ast::ast::IdentifierReference<'a>) {
         // Any reference to a candidate that was not consumed as a static read
-        // above is an escape (bare use, computed access, assignment target, …).
+        // above is an escape (bare use, computed access, member write, …).
         if let Some(sym) = self.ref_sym(id) {
             if self.candidates.contains(&sym) {
                 self.escaped.insert(sym);
@@ -167,6 +225,21 @@ struct Remover<'a, 'r> {
     _marker: std::marker::PhantomData<&'a ()>,
 }
 
+impl<'a, 'r> Remover<'a, 'r> {
+    fn prune(&mut self, sym: SymbolId, obj: &mut oxc_ast::ast::ObjectExpression<'a>) {
+        if !self.live.contains(&sym) {
+            return;
+        }
+        let empty = HashSet::new();
+        let accessed = self.accessed.get(&sym).unwrap_or(&empty);
+        let before = obj.properties.len();
+        obj.properties.retain(|prop| keep_property(prop, accessed));
+        if obj.properties.len() != before {
+            self.changed = true;
+        }
+    }
+}
+
 impl<'a, 'r> Traverse<'a, ()> for Remover<'a, 'r> {
     fn enter_variable_declarator(
         &mut self,
@@ -174,18 +247,20 @@ impl<'a, 'r> Traverse<'a, ()> for Remover<'a, 'r> {
         _ctx: &mut TraverseCtx<'a, ()>,
     ) {
         let Some(sym) = binding_sym(decl) else { return };
-        if !self.live.contains(&sym) {
-            return;
+        if let Some(Expression::ObjectExpression(obj)) = &mut decl.init {
+            self.prune(sym, obj);
         }
-        let Some(Expression::ObjectExpression(obj)) = &mut decl.init else {
+    }
+
+    fn enter_expression(&mut self, expr: &mut Expression<'a>, ctx: &mut TraverseCtx<'a, ()>) {
+        let Expression::AssignmentExpression(a) = expr else { return };
+        let oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(id) = &a.left else {
             return;
         };
-        let empty = HashSet::new();
-        let accessed = self.accessed.get(&sym).unwrap_or(&empty);
-        let before = obj.properties.len();
-        obj.properties.retain(|prop| keep_property(prop, accessed));
-        if obj.properties.len() != before {
-            self.changed = true;
+        let Some(rid) = id.reference_id.get() else { return };
+        let Some(sym) = ctx.scoping().get_reference(rid).symbol_id() else { return };
+        if let Expression::ObjectExpression(obj) = &mut a.right {
+            self.prune(sym, obj);
         }
     }
 }
