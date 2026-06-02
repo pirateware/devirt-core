@@ -5,6 +5,7 @@ mod const_fold;
 mod dce;
 mod dead_store;
 mod decoder_lift;
+mod flatten_else;
 mod member_normalize;
 mod proxy_inline;
 mod rename;
@@ -15,6 +16,7 @@ pub use const_fold::ConstantFold;
 pub use dce::Dce;
 pub use dead_store::DeadStore;
 pub use decoder_lift::DecoderLift;
+pub use flatten_else::FlattenElse;
 pub use member_normalize::MemberNormalize;
 pub use proxy_inline::ProxyInline;
 pub use rename::RenameByRole;
@@ -43,6 +45,10 @@ pub fn default_pipeline() -> Vec<Box<dyn Pass>> {
         // Remove pure stores to variables that are now read-never (spent
         // decoder-index arithmetic chains).
         Box::new(DeadStore::default()),
+        // De-nest: drop the `else` of an `if` whose consequent always exits.
+        // Runs after DCE so dead branches are already gone, and in the loop so
+        // `else if` ladders unwind one level per round.
+        Box::new(FlattenElse::default()),
         // Rename last: decoder-lift's name-based analysis sees original names
         // first, and we only rename what survives DCE.
         Box::new(RenameByRole::default()),

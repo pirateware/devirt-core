@@ -133,6 +133,29 @@ fn call_apply_proxy_forms_preserve_value() {
 }
 
 #[test]
+fn flatten_else_preserves_value() {
+    assert_equivalent(
+        r#"
+        function classify(n){
+            if (n < 0) { return "neg"; }
+            else { if (n === 0) { return "zero"; } else { return "pos"; } }
+        }
+        __r = classify(-5) + classify(0) + classify(7);
+        "#,
+    );
+    // break/continue terminators inside a loop.
+    assert_equivalent(
+        r#"
+        var acc = 0;
+        for (var i = 0; i < 5; i++) {
+            if (i === 3) { continue; } else { acc += i; }
+        }
+        __r = acc;
+        "#,
+    );
+}
+
+#[test]
 fn dead_literal_removal_preserves_value() {
     assert_equivalent("80214130; true; null; __r = 7;");
 }
