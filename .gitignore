@@ -26,3 +26,7 @@ rustc-ice-*.txt
 
 # Local deobfuscation outputs (in/out pairs for side-by-side diffing)
 /out/
+
+# Local scratch input/output
+/in.js
+/out.js
