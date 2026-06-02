@@ -8,6 +8,7 @@ mod decoder_lift;
 mod member_normalize;
 mod proxy_inline;
 mod rename;
+mod sequence_split;
 
 pub use assigned_once::AssignedOnceInline;
 pub use const_fold::ConstantFold;
@@ -17,6 +18,7 @@ pub use decoder_lift::DecoderLift;
 pub use member_normalize::MemberNormalize;
 pub use proxy_inline::ProxyInline;
 pub use rename::RenameByRole;
+pub use sequence_split::SequenceSplit;
 
 use crate::pass::Pass;
 
@@ -26,6 +28,9 @@ use crate::pass::Pass;
 pub fn default_pipeline() -> Vec<Box<dyn Pass>> {
     vec![
         Box::new(MemberNormalize::default()),
+        // Split statement-level comma chains into one statement per effect, so
+        // later passes (fold, inline, DCE) see individual assignments.
+        Box::new(SequenceSplit::default()),
         Box::new(ConstantFold::default()),
         Box::new(AssignedOnceInline::default()),
         // Collapse operator-proxy wrappers (a OP b) before lifting, so decoder
