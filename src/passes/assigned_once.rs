@@ -5,14 +5,29 @@
 //! that binding with a clone of the literal. The now-unused declaration is left
 //! for the DCE pass to remove.
 //!
-//! This is the first pass that uses the symbol table. It runs two traversals:
-//! a collector (binding → literal value) and a replacer (read site → value).
-//! Two passes are needed because a read may textually precede its declaration.
+//! Soundness — a read may only be replaced when the initializer is guaranteed to
+//! have run before it; otherwise the read could observe the binding's pre-init
+//! `undefined`. Proving that in general is dominance analysis, but a cheap,
+//! conservative sufficient condition holds here. All three must hold:
+//!
+//! - the declarator sits **directly** in its function (or the program) — not
+//!   inside any block, `if`, loop, `switch`, `try`, or `with`. Each of those
+//!   introduces its own scope, so the test is simply "the declarator's lexical
+//!   scope *is* its enclosing function/root scope". Such a declarator runs
+//!   unconditionally, exactly once, before any later statement of the function.
+//! - the read is in that **same** function (no closure could be invoked before
+//!   the initializer ran).
+//! - the read appears **after** the declarator in source order.
+//!
+//! Reads that fail these — captured by a nested function, or textually before the
+//! declaration — are simply left untouched (the declaration then survives DCE).
 
 use std::collections::{HashMap, HashSet};
 
 use oxc_allocator::{Allocator, CloneIn};
 use oxc_ast::ast::{BindingPattern, Expression, Program, VariableDeclarator};
+use oxc_semantic::Scoping;
+use oxc_syntax::scope::{ScopeFlags, ScopeId};
 use oxc_syntax::symbol::SymbolId;
 use oxc_traverse::{traverse_mut, Traverse, TraverseCtx};
 
@@ -46,8 +61,31 @@ impl Pass for AssignedOnceInline {
     }
 }
 
+/// The nearest enclosing function scope of `scope`, or the root if there is none.
+fn enclosing_function(scoping: &Scoping, mut scope: ScopeId) -> ScopeId {
+    loop {
+        if scoping.scope_flags(scope).contains(ScopeFlags::Function) {
+            return scope;
+        }
+        match scoping.scope_parent_id(scope) {
+            Some(parent) => scope = parent,
+            None => return scope, // root
+        }
+    }
+}
+
+/// A recorded constant: the literal value plus the dominance facts needed to
+/// decide, at each read, whether the initializer is guaranteed to have run.
+struct Const<'a> {
+    value: Expression<'a>,
+    /// The function (or root) scope the declarator runs in.
+    func_scope: ScopeId,
+    /// Source offset just past the declarator; a read must start at or after it.
+    decl_end: u32,
+}
+
 struct Collector<'a> {
-    values: HashMap<SymbolId, Expression<'a>>,
+    values: HashMap<SymbolId, Const<'a>>,
     poisoned: HashSet<SymbolId>,
 }
 
@@ -70,18 +108,27 @@ impl<'a> Traverse<'a, ()> for Collector<'a> {
         if ctx.scoping().symbol_is_mutated(sym) {
             return;
         }
+        // Unconditional-execution gate: the declarator must sit directly in its
+        // function/root scope. Any wrapping block/if/loop/switch/try introduces
+        // an intermediate scope, so a nested declarator fails this check and is
+        // never recorded (its init might be skipped at runtime).
+        let scope = ctx.current_scope_id();
+        if enclosing_function(ctx.scoping(), scope) != scope {
+            self.poisoned.insert(sym);
+            return;
+        }
         // Two declarations writing the same symbol → value is ambiguous; poison.
         if self.values.contains_key(&sym) {
             self.poisoned.insert(sym);
             return;
         }
-        let cloned = init.clone_in(ctx.ast.allocator);
-        self.values.insert(sym, cloned);
+        let value = init.clone_in(ctx.ast.allocator);
+        self.values.insert(sym, Const { value, func_scope: scope, decl_end: node.span.end });
     }
 }
 
 struct Replacer<'a, 'm> {
-    values: &'m HashMap<SymbolId, Expression<'a>>,
+    values: &'m HashMap<SymbolId, Const<'a>>,
     changed: bool,
 }
 
@@ -100,9 +147,18 @@ impl<'a, 'm> Traverse<'a, ()> for Replacer<'a, 'm> {
         let Some(sym) = reference.symbol_id() else {
             return;
         };
-        if let Some(value) = self.values.get(&sym) {
-            *expr = value.clone_in(ctx.ast.allocator);
-            self.changed = true;
+        let Some(konst) = self.values.get(&sym) else {
+            return;
+        };
+        // The read must be in the same function as the declarator (no closure
+        // could run before the init) and lexically after it.
+        if enclosing_function(ctx.scoping(), ctx.current_scope_id()) != konst.func_scope {
+            return;
         }
+        if idref.span.start < konst.decl_end {
+            return;
+        }
+        *expr = konst.value.clone_in(ctx.ast.allocator);
+        self.changed = true;
     }
 }

@@ -123,6 +123,23 @@ fn apply_proxy_preserves_value_and_receiver() {
 }
 
 #[test]
+fn assigned_once_respects_initialization_order() {
+    // A read that is textually before the `var x = 5` initializer must observe
+    // the pre-init `undefined`, not 5.
+    assert_equivalent(r#"var out = "" + x; var x = 5; __r = out + ":" + x;"#);
+    // A conditionally-declared constant must not be inlined where the branch may
+    // not have run (`h(false)` leaves the hoisted `x` undefined).
+    assert_equivalent(
+        r#"
+        function h(c){ var acc = []; if (c) { var x = 5; } acc.push(x); return acc.join(); }
+        __r = h(false) + "|" + h(true);
+        "#,
+    );
+    // The safe shape still inlines: same function, declared before use.
+    assert_equivalent("function s(){ var x = 5; return x + 1; } __r = s();");
+}
+
+#[test]
 fn proxy_inline_keeps_effect_order() {
     // The proxy body uses params in reversed order; inlining two effectful args
     // would swap their effects. Result must observe `f` before `g`.
