@@ -101,6 +101,28 @@ fn object_method_proxy_preserves_value() {
 }
 
 #[test]
+fn apply_proxy_preserves_value_and_receiver() {
+    // Apply proxy with a plain function: inlinable, value preserved.
+    assert_equivalent(
+        r#"
+        var O = { ap: function(f, x){ return f(x); } };
+        function inc(n){ return n + 1; }
+        __r = O.ap(inc, 9);
+        "#,
+    );
+    // Apply proxy with a METHOD argument: the proxy detaches `this`, so the
+    // result must stay whatever the detached call yields. The pass must not
+    // re-bind the receiver (it declines to inline); either way values match.
+    assert_equivalent(
+        r#"
+        var obj = { v: 42, get: function(){ return this === obj ? "BOUND" : "free"; } };
+        var O = { ap: function(f){ return f(); } };
+        __r = O.ap(obj.get);
+        "#,
+    );
+}
+
+#[test]
 fn dead_literal_removal_preserves_value() {
     assert_equivalent("80214130; true; null; __r = 7;");
 }

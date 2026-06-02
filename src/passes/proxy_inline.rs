@@ -64,7 +64,12 @@ impl Pass for ProxyInline {
 struct Proxy<'a> {
     params: Vec<String>,
     multi_use: HashSet<String>, // params referenced more than once in the body
-    body: Expression<'a>,       // owned clone of the return expression
+    /// Params that appear in *callee* position of a call within the body (apply
+    /// proxies, `function(f, x){ return f(x); }`). Their argument must not be a
+    /// member expression: `O.apply(obj.m, x)` would bind receiver `obj`, whereas
+    /// the proxy detaches the function (`f = obj.m; f(x)` has `this`=undefined).
+    callee_params: HashSet<String>,
+    body: Expression<'a>, // owned clone of the return expression
 }
 
 // ---------------------------------------------------------------------------
@@ -153,10 +158,17 @@ impl<'a> ProxyCollector<'a> {
             .filter(|p| counts.get(*p).copied().unwrap_or(0) > 1)
             .cloned()
             .collect();
+        let mut callee_params = HashSet::new();
+        collect_callee_params(ret, &set, &mut callee_params);
         self.candidates.push((
             key,
             guard,
-            Proxy { params: param_names, multi_use, body: ret.clone_in(self.allocator) },
+            Proxy {
+                params: param_names,
+                multi_use,
+                callee_params,
+                body: ret.clone_in(self.allocator),
+            },
         ));
     }
 
@@ -339,7 +351,56 @@ fn body_supported(expr: &Expression<'_>, params: &HashSet<&str>) -> bool {
         Expression::ComputedMemberExpression(m) => {
             body_supported(&m.object, params) && body_supported(&m.expression, params)
         }
+        // Apply proxy: `f(x)`. Callee and every argument must be supported; no
+        // spread (we can't expand it). Receiver-binding is handled at inline time
+        // via `callee_params`.
+        Expression::CallExpression(c) => {
+            body_supported(&c.callee, params)
+                && c.arguments.iter().all(|a| match a.as_expression() {
+                    Some(e) => body_supported(e, params),
+                    None => false,
+                })
+        }
         _ => false,
+    }
+}
+
+/// Collect parameters used in callee position of a call anywhere in `body`.
+fn collect_callee_params(expr: &Expression<'_>, params: &HashSet<&str>, out: &mut HashSet<String>) {
+    match expr {
+        Expression::CallExpression(c) => {
+            if let Expression::Identifier(id) = &c.callee {
+                if params.contains(id.name.as_str()) {
+                    out.insert(id.name.to_string());
+                }
+            }
+            collect_callee_params(&c.callee, params, out);
+            for a in &c.arguments {
+                if let Some(e) = a.as_expression() {
+                    collect_callee_params(e, params, out);
+                }
+            }
+        }
+        Expression::UnaryExpression(u) => collect_callee_params(&u.argument, params, out),
+        Expression::BinaryExpression(b) => {
+            collect_callee_params(&b.left, params, out);
+            collect_callee_params(&b.right, params, out);
+        }
+        Expression::LogicalExpression(l) => {
+            collect_callee_params(&l.left, params, out);
+            collect_callee_params(&l.right, params, out);
+        }
+        Expression::ConditionalExpression(c) => {
+            collect_callee_params(&c.test, params, out);
+            collect_callee_params(&c.consequent, params, out);
+            collect_callee_params(&c.alternate, params, out);
+        }
+        Expression::StaticMemberExpression(m) => collect_callee_params(&m.object, params, out),
+        Expression::ComputedMemberExpression(m) => {
+            collect_callee_params(&m.object, params, out);
+            collect_callee_params(&m.expression, params, out);
+        }
+        _ => {}
     }
 }
 
@@ -364,6 +425,14 @@ fn count_idents(expr: &Expression<'_>, acc: &mut HashMap<String, usize>) {
         Expression::ComputedMemberExpression(m) => {
             count_idents(&m.object, acc);
             count_idents(&m.expression, acc);
+        }
+        Expression::CallExpression(c) => {
+            count_idents(&c.callee, acc);
+            for a in &c.arguments {
+                if let Some(e) = a.as_expression() {
+                    count_idents(e, acc);
+                }
+            }
         }
         _ => {}
     }
@@ -420,6 +489,12 @@ impl<'a> Traverse<'a, ()> for Inliner<'a> {
                 if contains_scoped_node(ae) {
                     return;
                 }
+                // Receiver guard: an apply proxy detaches its callee from any
+                // receiver. Substituting a member expression into callee position
+                // would re-bind `this`, changing semantics — decline.
+                if proxy.callee_params.contains(param) && is_member_expr(ae) {
+                    return;
+                }
                 args.insert(param.as_str(), ae);
             }
 
@@ -456,6 +531,13 @@ fn contains_scoped_node(expr: &Expression<'_>) -> bool {
     let mut f = Finder { found: false };
     f.visit_expression(expr);
     f.found
+}
+
+fn is_member_expr(expr: &Expression<'_>) -> bool {
+    matches!(
+        expr,
+        Expression::StaticMemberExpression(_) | Expression::ComputedMemberExpression(_)
+    )
 }
 
 fn is_side_effect_free(expr: &Expression<'_>) -> bool {
@@ -497,6 +579,14 @@ fn subst<'a>(expr: &mut Expression<'a>, args: &HashMap<&str, &Expression<'a>>, a
         Expression::ComputedMemberExpression(m) => {
             subst(&mut m.object, args, alloc);
             subst(&mut m.expression, args, alloc);
+        }
+        Expression::CallExpression(c) => {
+            subst(&mut c.callee, args, alloc);
+            for a in c.arguments.iter_mut() {
+                if let Some(e) = a.as_expression_mut() {
+                    subst(e, args, alloc);
+                }
+            }
         }
         _ => {}
     }

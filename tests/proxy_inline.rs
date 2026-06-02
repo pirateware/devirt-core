@@ -41,6 +41,24 @@ fn assignment_initialized_table_inlines() {
 }
 
 #[test]
+fn apply_proxy_inlines() {
+    let out = deob(
+        "(function(){ var O = { ap: function(f, x){ return f(x); } }; sink(O.ap(g, y)); })();",
+    );
+    assert!(out.contains("g(y)"), "apply proxy not inlined: {out}");
+    assert!(!out.contains("O.ap("), "apply proxy call survived: {out}");
+}
+
+#[test]
+fn apply_proxy_with_method_arg_is_not_inlined() {
+    // Substituting `obj.m` into callee position would re-bind `this` to obj.
+    let out = deob(
+        "(function(obj){ var O = { ap: function(f, x){ return f(x); } }; sink(O.ap(obj.m, y)); })(t);",
+    );
+    assert!(out.contains(".ap("), "receiver-binding apply was unsoundly inlined: {out}");
+}
+
+#[test]
 fn function_argument_does_not_panic_and_is_skipped() {
     // Splicing a cloned function arg would reset its scope_id and crash the
     // walker; such calls must be left intact, not inlined.
