@@ -66,6 +66,14 @@ fn opaque_predicates() {
 }
 
 #[test]
+fn dead_literal_statements_removed() {
+    let out = deob(r#"function g(){ 80214130; true; null; keep(); }"#);
+    assert!(out.contains("keep()"), "real statement dropped: {out}");
+    assert!(!out.contains("80214130"), "dead numeric literal survived: {out}");
+    assert!(!out.contains("true;") && !out.contains("null;"), "dead literal survived: {out}");
+}
+
+#[test]
 fn unreachable_after_return() {
     let out = deob("function g(){ return 1; sideEffect(); }");
     assert!(!out.contains("sideEffect"), "unreachable code survived: {out}");

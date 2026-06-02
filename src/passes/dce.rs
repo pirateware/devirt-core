@@ -79,8 +79,24 @@ fn keep_statement(s: &Statement<'_>, scoping: &Scoping) -> bool {
             .id
             .as_ref()
             .map_or(true, |id| !is_removable_symbol(id.symbol_id(), scoping)),
+        // A bare literal statement (`80214130;`, `true;`, `null;`) computes a
+        // value that is immediately discarded with no side effect — pure
+        // obfuscation noise (often a spent opaque-predicate constant). Drop it.
+        // Strings are excluded: a leading string can be a directive-like marker
+        // and removing it is both low-value and potentially surprising.
+        Statement::ExpressionStatement(es) => !is_dead_literal(&es.expression),
         _ => true,
     }
+}
+
+/// A literal expression whose evaluation has no side effect, so using it as a
+/// statement does nothing. Excludes string literals (directive concern).
+fn is_dead_literal(expr: &oxc_ast::ast::Expression<'_>) -> bool {
+    use oxc_ast::ast::Expression as E;
+    matches!(
+        expr,
+        E::NumericLiteral(_) | E::BooleanLiteral(_) | E::NullLiteral(_) | E::BigIntLiteral(_)
+    )
 }
 
 /// A binding may be removed only if it is unused AND not declared in the root
