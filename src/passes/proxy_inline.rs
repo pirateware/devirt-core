@@ -30,7 +30,8 @@ use std::collections::{HashMap, HashSet};
 
 use oxc_allocator::{Allocator, CloneIn};
 use oxc_ast::ast::{
-    BindingPattern, Expression, FormalParameters, FunctionBody, Program, Statement,
+    ArrayExpressionElement, BindingPattern, CallExpression, Expression, FormalParameters,
+    FunctionBody, Program, Statement,
 };
 use oxc_ast_visit::Visit;
 use oxc_traverse::{traverse_mut, Traverse, TraverseCtx};
@@ -453,31 +454,23 @@ impl<'a> Traverse<'a, ()> for Inliner<'a> {
             let Expression::CallExpression(call) = &*expr else {
                 return;
             };
-            // Callee key: `name` for a standalone proxy, `obj.prop` for an
-            // object-method proxy. A computed `obj[k]()` is not matched (the key
-            // would have to be a static string we can resolve).
-            let key = match &call.callee {
-                Expression::Identifier(callee) => callee.name.to_string(),
-                Expression::StaticMemberExpression(m) => {
-                    let Expression::Identifier(obj) = &m.object else {
-                        return;
-                    };
-                    format!("{}.{}", obj.name, m.property.name)
-                }
-                _ => return,
+            // Resolve the proxy key and the *effective* argument expressions for
+            // the three call shapes: `P(args)`, `P.call(this, args)`, and
+            // `P.apply(this, [args])`. The proxy body never uses `this`, so the
+            // receiver passed to .call/.apply is irrelevant — but it is still
+            // evaluated, so a non-pure receiver must not be dropped.
+            let Some((key, arg_exprs)) = resolve_proxy_call(call, &self.proxies) else {
+                return;
             };
             let Some(proxy) = self.proxies.get(key.as_str()) else {
                 return;
             };
-            if call.arguments.len() != proxy.params.len() {
+            if arg_exprs.len() != proxy.params.len() {
                 return;
             }
 
             let mut args: HashMap<&str, &Expression<'a>> = HashMap::new();
-            for (param, arg) in proxy.params.iter().zip(call.arguments.iter()) {
-                let Some(ae) = arg.as_expression() else {
-                    return; // spread argument
-                };
+            for (param, ae) in proxy.params.iter().zip(arg_exprs.iter().copied()) {
                 if proxy.multi_use.contains(param) && !is_side_effect_free(ae) {
                     return; // would duplicate a side effect
                 }
@@ -508,6 +501,89 @@ impl<'a> Traverse<'a, ()> for Inliner<'a> {
             self.changed = true;
         }
     }
+}
+
+/// The proxy-map key for a callee that is an identifier (`p`) or a static member
+/// of an identifier (`obj.prop`). Other shapes have no key.
+fn callee_key(expr: &Expression<'_>) -> Option<String> {
+    match expr {
+        Expression::Identifier(id) => Some(id.name.to_string()),
+        Expression::StaticMemberExpression(m) => match &m.object {
+            Expression::Identifier(obj) => Some(format!("{}.{}", obj.name, m.property.name)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Resolve a call against the proxy table, returning the proxy key and the
+/// effective argument expressions. Handles three shapes:
+///   * `P(a, b)`               — direct call
+///   * `P.call(this, a, b)`    — `this` evaluated then ignored by the body
+///   * `P.apply(this, [a, b])` — args from a literal array
+/// For `.call`/`.apply` the receiver must be side-effect-free (it is dropped).
+fn resolve_proxy_call<'a, 'e>(
+    call: &'e CallExpression<'a>,
+    proxies: &HashMap<String, Proxy<'a>>,
+) -> Option<(String, Vec<&'e Expression<'a>>)> {
+    // Direct call form (also covers an object method literally named `call`).
+    if let Some(key) = callee_key(&call.callee) {
+        if proxies.contains_key(&key) {
+            let mut out = Vec::with_capacity(call.arguments.len());
+            for a in &call.arguments {
+                out.push(a.as_expression()?);
+            }
+            return Some((key, out));
+        }
+    }
+
+    // `.call` / `.apply` invocation of a proxy.
+    let Expression::StaticMemberExpression(m) = &call.callee else {
+        return None;
+    };
+    let method = m.property.name.as_str();
+    if method != "call" && method != "apply" {
+        return None;
+    }
+    let base = callee_key(&m.object)?;
+    if !proxies.contains_key(&base) {
+        return None;
+    }
+    // The receiver (first arg) is evaluated then discarded; only drop it if it
+    // has no side effect. A missing receiver means a zero-argument call.
+    let Some(first) = call.arguments.first() else {
+        return Some((base, Vec::new()));
+    };
+    let this_arg = first.as_expression()?;
+    if !is_side_effect_free(this_arg) {
+        return None;
+    }
+
+    if method == "call" {
+        let mut out = Vec::new();
+        for a in call.arguments.iter().skip(1) {
+            out.push(a.as_expression()?);
+        }
+        return Some((base, out));
+    }
+
+    // apply: the second argument must be a literal array with no holes/spreads.
+    let Some(second) = call.arguments.get(1) else {
+        return Some((base, Vec::new())); // `P.apply(this)` → no args
+    };
+    let Expression::ArrayExpression(arr) = second.as_expression()? else {
+        return None;
+    };
+    let mut out = Vec::with_capacity(arr.elements.len());
+    for el in &arr.elements {
+        match el {
+            ArrayExpressionElement::SpreadElement(_) | ArrayExpressionElement::Elision(_) => {
+                return None;
+            }
+            other => out.push(other.as_expression()?),
+        }
+    }
+    Some((base, out))
 }
 
 /// Whether `expr` contains a node that owns a scope (function, arrow, class).

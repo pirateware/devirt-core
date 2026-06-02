@@ -50,6 +50,27 @@ fn apply_proxy_inlines() {
 }
 
 #[test]
+fn call_and_apply_invocation_forms_inline() {
+    let out = deob(
+        "(function(){ var O = { lt: function(a,b){ return a < b; }, sub: function(a,b){ return a - b; } };
+           sink(O.lt.call(null, x, y), O.sub.apply(null, [m, n])); })();",
+    );
+    assert!(out.contains("x < y"), ".call form not inlined: {out}");
+    assert!(out.contains("m - n"), ".apply form not inlined: {out}");
+    assert!(!out.contains(".call(") && !out.contains(".apply("), "invocation survived: {out}");
+}
+
+#[test]
+fn call_with_impure_receiver_is_not_inlined() {
+    // The receiver `boom()` is evaluated then discarded; dropping it would lose
+    // its side effect, so the inline must be declined.
+    let out = deob(
+        "(function(){ var O = { lt: function(a,b){ return a < b; } }; sink(O.lt.call(boom(), x, y)); })();",
+    );
+    assert!(out.contains(".call(boom()"), "impure receiver was unsoundly dropped: {out}");
+}
+
+#[test]
 fn apply_proxy_with_method_arg_is_not_inlined() {
     // Substituting `obj.m` into callee position would re-bind `this` to obj.
     let out = deob(

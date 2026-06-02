@@ -123,6 +123,16 @@ fn apply_proxy_preserves_value_and_receiver() {
 }
 
 #[test]
+fn call_apply_proxy_forms_preserve_value() {
+    assert_equivalent(
+        r#"
+        var O = { add: function(a,b){ return a + b; }, mul: function(a,b){ return a * b; } };
+        __r = O.add.call(null, 6, 7) + ":" + O.mul.apply(null, [3, 4]);
+        "#,
+    );
+}
+
+#[test]
 fn dead_literal_removal_preserves_value() {
     assert_equivalent("80214130; true; null; __r = 7;");
 }
