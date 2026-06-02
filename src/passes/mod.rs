@@ -36,7 +36,7 @@ pub fn default_pipeline() -> Vec<Box<dyn Pass>> {
         // later passes (fold, inline, DCE) see individual assignments.
         Box::new(SequenceSplit::default()),
         Box::new(ConstantFold::default()),
-        Box::new(AssignedOnceInline::default()),
+        Box::new(AssignedOnceInline),
         // Collapse operator-proxy wrappers (a OP b) before lifting, so decoder
         // calls hidden inside proxy expansions become visible.
         Box::new(ProxyInline::default()),
