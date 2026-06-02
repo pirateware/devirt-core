@@ -37,6 +37,21 @@ fn assigned_once_inline_and_fold() {
 }
 
 #[test]
+fn void_literal_folds_to_undefined() {
+    let out = deob("f(void 0, a === void 0);");
+    assert!(out.contains("f(undefined, a === undefined)"), "got: {out}");
+    assert!(!out.contains("void 0"), "void 0 survived: {out}");
+}
+
+#[test]
+fn void_not_folded_when_undefined_is_shadowed() {
+    // A local binding named `undefined` shadows the global; rewriting `void 0`
+    // to `undefined` here would be unsound.
+    let out = deob("function f(undefined){ return void 0; }");
+    assert!(out.contains("void 0"), "unsoundly folded shadowed undefined: {out}");
+}
+
+#[test]
 fn opaque_predicates() {
     let out = deob("if (!![]) { keep(); } if (![]) { drop(); }");
     assert!(out.contains("keep()"));

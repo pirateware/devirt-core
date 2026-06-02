@@ -32,6 +32,10 @@ use crate::util::build_scoping;
 #[derive(Default)]
 pub struct ConstantFold {
     changed: bool,
+    /// Whether it is safe to emit the bare `undefined` identifier (i.e. nothing
+    /// in the program binds a local named `undefined` that could shadow the
+    /// read-only global). Recomputed each run.
+    allow_undefined: bool,
 }
 
 impl Pass for ConstantFold {
@@ -42,6 +46,9 @@ impl Pass for ConstantFold {
     fn run<'a>(&mut self, program: &mut Program<'a>, allocator: &'a Allocator) -> bool {
         self.changed = false;
         let scoping = build_scoping(program);
+        // `undefined` is a read-only global, but sloppy-mode code *may* bind a
+        // local of that name. Only rewrite to it when no such binding exists.
+        self.allow_undefined = !scoping.symbol_names().any(|n| n == "undefined");
         traverse_mut(self, allocator, program, scoping, ());
         self.changed
     }
@@ -51,8 +58,9 @@ use oxc_ast::ast::Program;
 
 impl<'a> Traverse<'a, ()> for ConstantFold {
     fn enter_expression(&mut self, expr: &mut Expression<'a>, ctx: &mut TraverseCtx<'a, ()>) {
-        // Don't re-fold something already in canonical literal form.
-        if is_literal(expr) {
+        // Don't re-fold something already in canonical form. `undefined` folds
+        // to itself, so without this guard the fixpoint would never converge.
+        if is_literal(expr) || is_undefined_ident(expr) {
             return;
         }
         let folded = {
@@ -60,7 +68,7 @@ impl<'a> Traverse<'a, ()> for ConstantFold {
             expr.evaluate_value(&ectx)
         };
         if let Some(value) = folded {
-            if let Some(new_expr) = const_to_expr(value, ctx.ast, expr) {
+            if let Some(new_expr) = const_to_expr(value, ctx.ast, expr, self.allow_undefined) {
                 *expr = new_expr;
                 self.changed = true;
             }
@@ -101,6 +109,10 @@ fn is_literal(expr: &Expression<'_>) -> bool {
     )
 }
 
+fn is_undefined_ident(expr: &Expression<'_>) -> bool {
+    matches!(expr, Expression::Identifier(id) if id.name == "undefined")
+}
+
 /// Convert a folded constant back to a literal node. Returns `None` for cases
 /// we deliberately skip (strings, bigint, undefined, non-finite/negative
 /// numbers — the latter to avoid fold/rebuild oscillation with unary minus).
@@ -108,6 +120,7 @@ fn const_to_expr<'a>(
     value: ConstantValue<'a>,
     ast: AstBuilder<'a>,
     original: &Expression<'a>,
+    allow_undefined: bool,
 ) -> Option<Expression<'a>> {
     let span = original.span();
     match value {
@@ -116,6 +129,12 @@ fn const_to_expr<'a>(
         }
         ConstantValue::Boolean(b) => Some(ast.expression_boolean_literal(span, b)),
         ConstantValue::Null => Some(ast.expression_null_literal(span)),
+        // `void 0`, `void "x"`, etc. fold to the readable `undefined`. Only the
+        // original expression's purity matters (evaluate_value already required
+        // it), and we skip emission entirely if `undefined` could be shadowed.
+        ConstantValue::Undefined if allow_undefined => {
+            Some(ast.expression_identifier(span, "undefined"))
+        }
         _ => None,
     }
 }
