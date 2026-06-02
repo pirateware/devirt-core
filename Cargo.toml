@@ -1,0 +1,24 @@
+[package]
+name = "js-deobfuscator"
+version = "0.0.1"
+edition = "2021"
+
+[[bin]]
+name = "deob"
+path = "src/main.rs"
+
+[dependencies]
+oxc_allocator = "0.134.0"
+oxc_parser    = "0.134.0"
+oxc_ast       = "0.134.0"
+oxc_semantic  = "0.134.0"
+oxc_traverse  = "0.134.0"
+oxc_codegen   = "0.134.0"
+oxc_span      = "0.134.0"
+oxc_syntax    = "0.134.0"
+oxc_ecmascript = "0.134.0"
+rquickjs = "0.12.0"
+oxc_ast_visit = "0.134.0"
+
+[profile.release]
+opt-level = 3
