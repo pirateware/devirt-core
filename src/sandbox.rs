@@ -25,6 +25,17 @@ pub struct Sandbox {
     _rt: Runtime,
 }
 
+/// A primitive decoder result, tagged by JS type so the lifter can splice the
+/// *correct* literal kind. Coercing a numeric result to a string literal (the
+/// old `eval_to_string`-only path) silently changed semantics: `dec(x) + 1`
+/// would go from numeric `262` to string `"2611"`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EvalValue {
+    Str(String),
+    Num(f64),
+    Bool(bool),
+}
+
 impl Sandbox {
     pub fn new() -> Option<Sandbox> {
         let rt = Runtime::new().ok()?;
@@ -67,6 +78,28 @@ impl Sandbox {
                         format!("{n}")
                     }
                 })
+            } else {
+                None
+            }
+        });
+        *self.deadline.lock().unwrap() = None;
+        result
+    }
+
+    /// Evaluate `code` (ending in an expression) and return its primitive value
+    /// tagged by type. Returns `None` on any error, timeout, or non-primitive
+    /// (object/array/function/undefined/null) result — those are not safe to
+    /// splice as a single literal.
+    pub fn eval_to_value(&self, code: &str) -> Option<EvalValue> {
+        *self.deadline.lock().unwrap() = Some(Instant::now() + EVAL_BUDGET);
+        let result = self.ctx.with(|ctx| {
+            let v: rquickjs::Value = ctx.eval(code).ok()?;
+            if v.is_string() {
+                v.get::<String>().ok().map(EvalValue::Str)
+            } else if v.is_number() {
+                v.as_number().map(EvalValue::Num)
+            } else if v.is_bool() {
+                v.as_bool().map(EvalValue::Bool)
             } else {
                 None
             }

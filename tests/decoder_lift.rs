@@ -20,6 +20,23 @@ fn lifts_string_array_decoder_with_rotation() {
 }
 
 #[test]
+fn numeric_decoder_result_stays_numeric() {
+    // A decoder that returns a *number* must be spliced as a numeric literal,
+    // not a string — otherwise `dec(i) + 1` flips from arithmetic to concat.
+    let src = r#"
+        (function () {
+            var tbl = [10, 20, 30];
+            function d(i) { return tbl[i]; }
+            sink(d(1) + 1);
+        })();
+    "#;
+    let out = deobfuscate(src, "t.js").code;
+    // 20 + 1 must fold to 21 (numeric), never "201" (string concat) or "20".
+    assert!(out.contains("sink(21)"), "numeric decode mis-typed as string: {out}");
+    assert!(!out.contains("\"20\""), "spliced a string literal for a number: {out}");
+}
+
+#[test]
 fn does_not_lift_impure_decoder() {
     // "Decoder" touches the host (window) → must not be evaluated/lifted.
     let src = r#"

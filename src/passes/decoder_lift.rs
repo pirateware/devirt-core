@@ -29,7 +29,7 @@ use oxc_syntax::scope::ScopeFlags;
 use oxc_traverse::{traverse_mut, Traverse, TraverseCtx};
 
 use crate::pass::Pass;
-use crate::sandbox::Sandbox;
+use crate::sandbox::{EvalValue, Sandbox};
 use crate::util::build_scoping;
 
 /// Globals a pure decoder may reference (present in QuickJS, side-effect free).
@@ -687,7 +687,7 @@ struct Lifter<'a, 'r> {
     allowed: &'r HashSet<String>,
     grounded: &'r HashSet<String>,
     sandbox: Sandbox,
-    memo: HashMap<String, Option<String>>,
+    memo: HashMap<String, Option<EvalValue>>,
     changed: bool,
     _marker: std::marker::PhantomData<&'a ()>,
 }
@@ -753,7 +753,7 @@ impl<'a, 'r> Traverse<'a, ()> for Lifter<'a, 'r> {
             return;
         }
 
-        let lift: Option<String> = {
+        let lift: Option<EvalValue> = {
             // Two kinds of decode site are sound to lift:
             //  * a CALL whose callee is a *classified-pure* decoder/alias
             //    identifier — purity analysis proved it side-effect-free, so
@@ -800,10 +800,8 @@ impl<'a, 'r> Traverse<'a, ()> for Lifter<'a, 'r> {
                 // (e.g. one reaching Math.random / Date), so a lift is only ever
                 // a stable, reproducible value.
                 let call = format!("({});", src);
-                let result = match self.sandbox.eval_to_string(&call) {
-                    Some(a) if self.sandbox.eval_to_string(&call).as_deref() == Some(a.as_str()) => {
-                        Some(a)
-                    }
+                let result = match self.sandbox.eval_to_value(&call) {
+                    Some(a) if self.sandbox.eval_to_value(&call).as_ref() == Some(&a) => Some(a),
                     _ => None,
                 };
                 self.memo.insert(src, result.clone());
@@ -811,11 +809,37 @@ impl<'a, 'r> Traverse<'a, ()> for Lifter<'a, 'r> {
             }
         };
 
-        if let Some(s) = lift {
+        if let Some(val) = lift {
             let span = expr.span();
-            let value = ctx.ast.str(&s);
-            *expr = ctx.ast.expression_string_literal(span, value, None);
+            *expr = match val {
+                EvalValue::Str(s) => {
+                    let value = ctx.ast.str(&s);
+                    ctx.ast.expression_string_literal(span, value, None)
+                }
+                // A numeric/boolean decoder result must splice as that literal
+                // kind, not as a string — `dec(x) + 1` must stay arithmetic.
+                EvalValue::Num(n) if n.is_finite() => num_literal(n, span, ctx),
+                EvalValue::Bool(b) => ctx.ast.expression_boolean_literal(span, b),
+                // NaN / Infinity have no literal form; leave the call in place.
+                EvalValue::Num(_) => return,
+            };
             self.changed = true;
         }
+    }
+}
+
+/// Build a numeric literal expression for `n`. A numeric literal is always
+/// non-negative in the grammar, so negatives become `-(lit)` to round-trip.
+fn num_literal<'a>(
+    n: f64,
+    span: oxc_span::Span,
+    ctx: &mut TraverseCtx<'a, ()>,
+) -> Expression<'a> {
+    use oxc_syntax::number::NumberBase;
+    if n.is_sign_negative() {
+        let lit = ctx.ast.expression_numeric_literal(span, -n, None, NumberBase::Decimal);
+        ctx.ast.expression_unary(span, oxc_syntax::operator::UnaryOperator::UnaryNegation, lit)
+    } else {
+        ctx.ast.expression_numeric_literal(span, n, None, NumberBase::Decimal)
     }
 }
