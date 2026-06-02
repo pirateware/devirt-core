@@ -78,7 +78,7 @@ fn keep_statement(s: &Statement<'_>, scoping: &Scoping) -> bool {
         Statement::FunctionDeclaration(f) => f
             .id
             .as_ref()
-            .map_or(true, |id| !is_removable_symbol(id.symbol_id(), scoping)),
+            .is_none_or(|id| !is_removable_symbol(id.symbol_id(), scoping)),
         // A bare literal statement (`80214130;`, `true;`, `null;`) computes a
         // value that is immediately discarded with no side effect — pure
         // obfuscation noise (often a spent opaque-predicate constant). Drop it.
@@ -128,7 +128,7 @@ fn keep_declarator(d: &VariableDeclarator<'_>, scoping: &Scoping) -> bool {
     let BindingPattern::BindingIdentifier(bid) = &d.id else {
         return true; // patterns: keep (destructuring may have effects)
     };
-    let pure = d.init.as_ref().map_or(true, |e| is_pure_simple(e));
+    let pure = d.init.as_ref().is_none_or(|e| is_pure_simple(e));
     !(is_removable_symbol(bid.symbol_id(), scoping) && pure)
 }
 

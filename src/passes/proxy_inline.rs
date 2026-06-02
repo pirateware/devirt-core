@@ -521,6 +521,7 @@ fn callee_key(expr: &Expression<'_>) -> Option<String> {
 ///   * `P(a, b)`               — direct call
 ///   * `P.call(this, a, b)`    — `this` evaluated then ignored by the body
 ///   * `P.apply(this, [a, b])` — args from a literal array
+///
 /// For `.call`/`.apply` the receiver must be side-effect-free (it is dropped).
 fn resolve_proxy_call<'a, 'e>(
     call: &'e CallExpression<'a>,
