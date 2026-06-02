@@ -156,6 +156,24 @@ fn flatten_else_preserves_value() {
 }
 
 #[test]
+fn dead_object_prop_removal_preserves_value() {
+    assert_equivalent(
+        r#"
+        var O = { used: 7, deadFn: function(){ return 99; }, deadData: 42 };
+        __r = O.used;
+        "#,
+    );
+    // Object escapes via computed access → must keep all members & behavior.
+    assert_equivalent(
+        r#"
+        var O = { a: 1, b: 2 };
+        var k = "b";
+        __r = O[k] + O.a;
+        "#,
+    );
+}
+
+#[test]
 fn dead_literal_removal_preserves_value() {
     assert_equivalent("80214130; true; null; __r = 7;");
 }

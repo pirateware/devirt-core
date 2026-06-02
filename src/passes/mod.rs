@@ -3,6 +3,7 @@
 mod assigned_once;
 mod const_fold;
 mod dce;
+mod dead_object_prop;
 mod dead_store;
 mod decoder_lift;
 mod flatten_else;
@@ -14,6 +15,7 @@ mod sequence_split;
 pub use assigned_once::AssignedOnceInline;
 pub use const_fold::ConstantFold;
 pub use dce::Dce;
+pub use dead_object_prop::DeadObjectProp;
 pub use dead_store::DeadStore;
 pub use decoder_lift::DecoderLift;
 pub use flatten_else::FlattenElse;
@@ -45,6 +47,9 @@ pub fn default_pipeline() -> Vec<Box<dyn Pass>> {
         // Remove pure stores to variables that are now read-never (spent
         // decoder-index arithmetic chains).
         Box::new(DeadStore::default()),
+        // Drop never-accessed pure members of a non-escaping object literal
+        // (uncalled methods left in a mixed proxy/data table after inlining).
+        Box::new(DeadObjectProp::default()),
         // De-nest: drop the `else` of an `if` whose consequent always exits.
         // Runs after DCE so dead branches are already gone, and in the loop so
         // `else if` ladders unwind one level per round.
