@@ -30,6 +30,28 @@ fn object_method_operator_proxy_inlines() {
 }
 
 #[test]
+fn assignment_initialized_table_inlines() {
+    // The table is established by a single `O = {…}` assignment (param/var
+    // pre-declared), the form real VM decoders use — still soundly inlinable.
+    let out = deob(
+        "(function(O){ O = { lt: function(a,b){ return a < b; } }; sink(O.lt(x, y)); })();",
+    );
+    assert!(out.contains("x < y"), "assignment-init table not inlined: {out}");
+    assert!(!out.contains("O.lt("), "proxy call survived: {out}");
+}
+
+#[test]
+fn function_argument_does_not_panic_and_is_skipped() {
+    // Splicing a cloned function arg would reset its scope_id and crash the
+    // walker; such calls must be left intact, not inlined.
+    let out = deob(
+        "var O = { eq: function(a,b){ return a === b; } };
+         sink(O.eq(function(){ return 1; }, g));",
+    );
+    assert!(out.contains("O.eq("), "function-arg call should be left intact: {out}");
+}
+
+#[test]
 fn mutated_table_is_not_inlined() {
     // A table whose member is reassigned can't be assumed fixed.
     let out = deob(

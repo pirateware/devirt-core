@@ -75,14 +75,18 @@ fn collect_proxies<'a>(program: &Program<'a>, allocator: &'a Allocator) -> HashM
     let mut c = ProxyCollector {
         allocator,
         counts: HashMap::new(),
-        mutated: HashSet::new(),
+        value_writes: HashMap::new(),
+        member_mutated: HashSet::new(),
         candidates: Vec::new(),
     };
     c.visit_program(program);
 
-    // Each candidate carries the *guard* name that must be unique and unmutated
-    // for the inline to be sound: the function's own name for a standalone
-    // proxy, or the table object's name for an object-method proxy.
+    // Each candidate carries the *guard* name whose value must be fixed for the
+    // inline to be sound: the function's own name for a standalone proxy, or the
+    // table object's name for an object-method proxy. A guard is fixed iff it is
+    // declared exactly once (unique name), its value is established by exactly
+    // one write (the proxy/table we analyzed — a function decl, a declarator
+    // initializer, or a single assignment), and it is never member-mutated.
     let mut map: HashMap<String, Proxy<'a>> = HashMap::new();
     let mut guard_of: HashMap<String, String> = HashMap::new();
     let mut dup: HashSet<String> = HashSet::new();
@@ -95,17 +99,26 @@ fn collect_proxies<'a>(program: &Program<'a>, allocator: &'a Allocator) -> HashM
     }
     map.retain(|key, _| {
         let guard = &guard_of[key];
-        c.counts.get(guard).copied() == Some(1) && !dup.contains(key) && !c.mutated.contains(guard)
+        c.counts.get(guard).copied() == Some(1)
+            && c.value_writes.get(guard).copied() == Some(1)
+            && !c.member_mutated.contains(guard)
+            && !dup.contains(key)
     });
     map
 }
 
 struct ProxyCollector<'a> {
     allocator: &'a Allocator,
+    /// How many times each name is *declared* (binding identifiers). >1 means the
+    /// name is not unique and a call site could bind to a different one.
     counts: HashMap<String, usize>,
-    /// Names that are reassigned or have a member/element written or deleted —
-    /// unsafe to treat as a fixed proxy.
-    mutated: HashSet<String>,
+    /// How many times each name's value is *established*: a function declaration,
+    /// a declarator with an initializer, or an identifier-target assignment. The
+    /// proxy is only fixed if this is exactly 1.
+    value_writes: HashMap<String, usize>,
+    /// Names whose member/element is written or deleted (`o.x = …`, `o[i] = …`,
+    /// `delete o.x`) — the table is not immutable, so never inline through it.
+    member_mutated: HashSet<String>,
     /// (key, guard-name, proxy). Key is the call form: `"name"` for a standalone
     /// proxy, `"obj.prop"` for an object-method proxy.
     candidates: Vec<(String, String, Proxy<'a>)>,
@@ -198,6 +211,7 @@ impl<'a> Visit<'a> for ProxyCollector<'a> {
     fn visit_function(&mut self, func: &oxc_ast::ast::Function<'a>, flags: oxc_syntax::scope::ScopeFlags) {
         if let (Some(id), Some(body)) = (&func.id, &func.body) {
             let name = id.name.to_string();
+            *self.value_writes.entry(name.clone()).or_default() += 1;
             self.try_record(name.clone(), name, &func.params, body, false);
         }
         oxc_ast_visit::walk::walk_function(self, func, flags);
@@ -206,6 +220,9 @@ impl<'a> Visit<'a> for ProxyCollector<'a> {
     fn visit_variable_declarator(&mut self, node: &oxc_ast::ast::VariableDeclarator<'a>) {
         if let BindingPattern::BindingIdentifier(id) = &node.id {
             let name = id.name.to_string();
+            if node.init.is_some() {
+                *self.value_writes.entry(name.clone()).or_default() += 1;
+            }
             match &node.init {
                 Some(Expression::FunctionExpression(f)) if f.id.is_none() => {
                     if let Some(body) = &f.body {
@@ -224,28 +241,50 @@ impl<'a> Visit<'a> for ProxyCollector<'a> {
         oxc_ast_visit::walk::walk_variable_declarator(self, node);
     }
 
-    /// Track writes that would invalidate a proxy: `name = ...`, `name.x = ...`,
-    /// `name[i] = ...`, and `name op= ...`. The mutated name is then never
-    /// treated as a fixed proxy/table.
+    /// Classify the target of every assignment: an identifier target is a value
+    /// write (counted); a member/element target is a member mutation (the object
+    /// is not immutable). A proxy/table assigned exactly once via `X = {…}` is
+    /// also recorded here — that single value write is its definition.
     fn visit_assignment_expression(&mut self, node: &oxc_ast::ast::AssignmentExpression<'a>) {
         use oxc_ast::ast::AssignmentTarget as T;
         match &node.left {
             T::AssignmentTargetIdentifier(id) => {
-                self.mutated.insert(id.name.to_string());
+                let name = id.name.to_string();
+                *self.value_writes.entry(name.clone()).or_default() += 1;
+                if let Expression::ObjectExpression(obj) = &node.right {
+                    self.try_record_object(&name, obj);
+                }
             }
             T::StaticMemberExpression(m) => {
                 if let Expression::Identifier(obj) = &m.object {
-                    self.mutated.insert(obj.name.to_string());
+                    self.member_mutated.insert(obj.name.to_string());
                 }
             }
             T::ComputedMemberExpression(m) => {
                 if let Expression::Identifier(obj) = &m.object {
-                    self.mutated.insert(obj.name.to_string());
+                    self.member_mutated.insert(obj.name.to_string());
                 }
             }
             _ => {}
         }
         oxc_ast_visit::walk::walk_assignment_expression(self, node);
+    }
+
+    /// `delete o.x` / `o.x++` style mutations also disqualify the object.
+    fn visit_unary_expression(&mut self, node: &oxc_ast::ast::UnaryExpression<'a>) {
+        if matches!(node.operator, oxc_syntax::operator::UnaryOperator::Delete) {
+            if let Expression::StaticMemberExpression(m) = &node.argument {
+                if let Expression::Identifier(obj) = &m.object {
+                    self.member_mutated.insert(obj.name.to_string());
+                }
+            }
+            if let Expression::ComputedMemberExpression(m) = &node.argument {
+                if let Expression::Identifier(obj) = &m.object {
+                    self.member_mutated.insert(obj.name.to_string());
+                }
+            }
+        }
+        oxc_ast_visit::walk::walk_unary_expression(self, node);
     }
 }
 
@@ -373,6 +412,14 @@ impl<'a> Traverse<'a, ()> for Inliner<'a> {
                 if proxy.multi_use.contains(param) && !is_side_effect_free(ae) {
                     return; // would duplicate a side effect
                 }
+                // A cloned argument containing a function/class/arrow carries
+                // scope cells that are reset to None by the clone; the traverse
+                // walker unwraps a function's scope_id and would panic when it
+                // descends into the spliced node. Such args are rare for operator
+                // proxies, so just decline the inline (semantics unaffected).
+                if contains_scoped_node(ae) {
+                    return;
+                }
                 args.insert(param.as_str(), ae);
             }
 
@@ -386,6 +433,29 @@ impl<'a> Traverse<'a, ()> for Inliner<'a> {
             self.changed = true;
         }
     }
+}
+
+/// Whether `expr` contains a node that owns a scope (function, arrow, class).
+/// Cloning such a node resets its scope_id cell to None, which the traverse
+/// walker later unwraps — so we must not splice one mid-traversal.
+fn contains_scoped_node(expr: &Expression<'_>) -> bool {
+    struct Finder {
+        found: bool,
+    }
+    impl<'a> Visit<'a> for Finder {
+        fn visit_function(&mut self, _f: &oxc_ast::ast::Function<'a>, _flags: oxc_syntax::scope::ScopeFlags) {
+            self.found = true; // do not recurse: one is enough
+        }
+        fn visit_arrow_function_expression(&mut self, _f: &oxc_ast::ast::ArrowFunctionExpression<'a>) {
+            self.found = true;
+        }
+        fn visit_class(&mut self, _c: &oxc_ast::ast::Class<'a>) {
+            self.found = true;
+        }
+    }
+    let mut f = Finder { found: false };
+    f.visit_expression(expr);
+    f.found
 }
 
 fn is_side_effect_free(expr: &Expression<'_>) -> bool {
