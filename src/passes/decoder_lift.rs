@@ -238,7 +238,40 @@ impl<'a> Visit<'a> for FreeVars {
         }
         oxc_ast_visit::walk::walk_unary_expression(self, node);
     }
+
+    fn visit_call_expression(&mut self, node: &oxc_ast::ast::CallExpression<'a>) {
+        // A well-known mutating method (`a.push(…)`, `m.set(…)`, `a.splice(…)`)
+        // mutates its receiver. If that receiver's base is a free name, the call
+        // mutates outer/shared state — a side effect a lifted value would drop.
+        // We can't decide purity for an arbitrary method, so this catches the
+        // realistic accidental mutators while leaving pure reads (`s.charCodeAt`,
+        // `a.slice`, `a[i]`) liftable. Calls through a *local* receiver are fine.
+        let prop = match &node.callee {
+            Expression::StaticMemberExpression(m) => Some((m.property.name.as_str(), &m.object)),
+            Expression::ComputedMemberExpression(m) => match &m.expression {
+                Expression::StringLiteral(s) => Some((s.value.as_str(), &m.object)),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some((name, object)) = prop {
+            if MUTATOR_METHODS.contains(&name) {
+                self.record_write(member_base(object));
+            }
+        }
+        oxc_ast_visit::walk::walk_call_expression(self, node);
+    }
 }
+
+/// Method names that mutate their receiver (Array, Map/Set, typed arrays). A call
+/// to one on a *free* object is treated as a write to that object. Not exhaustive
+/// — an unknown method on a free object is assumed pure, the same optimism every
+/// decoder lifter makes; the double-eval guard catches non-deterministic returns.
+const MUTATOR_METHODS: &[&str] = &[
+    "push", "pop", "shift", "unshift", "splice", "sort", "reverse", "fill", "copyWithin", "set",
+    "add", "delete", "clear", "setItem", "removeItem", "setUint8", "setInt8", "setUint16",
+    "setInt16", "setUint32", "setInt32", "setFloat32", "setFloat64",
+];
 
 impl FreeVars {
     /// Record a write whose target base resolves to `name`. An unresolvable shape
