@@ -190,3 +190,41 @@ fn dead_literal_removal_preserves_value() {
 fn member_normalization_preserves_value() {
     assert_equivalent(r#"var o = {}; o["foo"] = 3; __r = o["foo"] + o.foo;"#);
 }
+
+#[test]
+fn fold_must_not_drop_embedded_side_effects() {
+    // The real-sample shape: an obfuscator hides a side-effecting assignment
+    // inside an arithmetic expression that evaluates to a constant. oxc's
+    // `evaluate_value` reports the constant but folding to it would delete the
+    // assignment. `out` must survive — and be observable afterwards.
+    assert_equivalent("var out = 0, v = 0; v << ((v | (out = 7)) & 15); __r = out;");
+    // Sequence whose last operand is a constant but whose first has an effect.
+    assert_equivalent("var hit = 0; (hit = 1, 42); __r = hit;");
+    // Conditional/if tests with a side effect must keep running the test.
+    assert_equivalent("var t = 0; var __x = (t = 5, 1) ? 'a' : 'b'; __r = __x + t;");
+    assert_equivalent("var t = 0; if ((t = 9, 1)) { __r = 'y'; } __r = __r + t;");
+}
+
+#[test]
+fn literal_member_fold_preserves_value() {
+    // Array index / length on a literal.
+    assert_equivalent("__r = [10, 20, 30][1];");
+    assert_equivalent("__r = [10, 20, 30].length;");
+    // Object property on a literal — static and computed key forms.
+    assert_equivalent("__r = ({ a: 7, b: 8 }).b;");
+    assert_equivalent(r#"__r = ({ a: 7, b: 8 })["a"];"#);
+    // String index / length — value must stay a string, not become a number.
+    assert_equivalent(r#"__r = "abc"[1];"#);
+    assert_equivalent(r#"__r = "abc".length;"#);
+    // The selected element keeps its own type (numeric stays numeric).
+    assert_equivalent(r#"__r = ["1", "0", "0"][0] + [1, 2][1];"#);
+    // Nested: index into an array literal whose element is another literal.
+    assert_equivalent("__r = [[1, 2], [3, 4]][1][0];");
+    // Out-of-range and holes are left as `undefined` — still must match.
+    assert_equivalent("__r = String([5, 6][9]);");
+    assert_equivalent("__r = String([1, , 3][1]);");
+    // A non-selected sibling with a side effect must NOT be folded away: index 0
+    // sets `seen`, so the fold must decline and keep that effect. Equivalence
+    // holds precisely because we refuse to drop the impure sibling.
+    assert_equivalent("var seen = 0; __r = [ (seen = 1, 'x'), 'y' ][1]; __r = __r + seen;");
+}
