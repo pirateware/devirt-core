@@ -59,6 +59,12 @@ fn void_not_folded_when_undefined_is_shadowed() {
 }
 
 #[test]
+fn constant_ternary_folds_to_taken_branch() {
+    let out = deob("f(true ? 10 : 0, false ? a : b());");
+    assert!(out.contains("f(10, b())"), "constant ternary not folded: {out}");
+}
+
+#[test]
 fn opaque_predicates() {
     let out = deob("if (!![]) { keep(); } if (![]) { drop(); }");
     assert!(out.contains("keep()"));

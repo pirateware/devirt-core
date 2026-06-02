@@ -63,6 +63,23 @@ impl<'a> Traverse<'a, ()> for ConstantFold {
         if is_literal(expr) || is_undefined_ident(expr) {
             return;
         }
+
+        // A ternary with a constant test collapses to its taken branch. Mirrors
+        // the `if (<constant>)` statement fold; the conservative eval context
+        // only resolves a pure test, so dropping the untaken branch is sound.
+        if let Expression::ConditionalExpression(c) = expr {
+            let cond = {
+                let ectx = EvalCtx { ast: ctx.ast, scoping: ctx.scoping() };
+                c.test.evaluate_value_to_boolean(&ectx)
+            };
+            if let Some(cond) = cond {
+                let taken =
+                    if cond { c.consequent.take_in(ctx.ast) } else { c.alternate.take_in(ctx.ast) };
+                *expr = taken;
+                self.changed = true;
+                return;
+            }
+        }
         let folded = {
             let ectx = EvalCtx { ast: ctx.ast, scoping: ctx.scoping() };
             expr.evaluate_value(&ectx)
