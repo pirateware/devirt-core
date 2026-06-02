@@ -33,10 +33,25 @@ use crate::sandbox::{EvalValue, Sandbox};
 use crate::util::build_scoping;
 
 /// Globals a pure decoder may reference (present in QuickJS, side-effect free).
+/// Referencing/constructing any of these has no host-visible effect, so a
+/// function whose only free names are these (or other pure bindings) is pure.
+/// The double-eval determinism guard separately rejects any that turn out
+/// non-deterministic (e.g. `Date`), so the list can stay generous.
 const GLOBALS: &[&str] = &[
     "String", "Math", "Array", "Number", "Boolean", "Object", "JSON", "RegExp", "parseInt",
     "parseFloat", "isNaN", "isFinite", "decodeURIComponent", "encodeURIComponent", "unescape",
     "escape", "undefined", "NaN", "Infinity", "Date",
+    // Collections & symbols — common in modern decoders (e.g. a Map charset
+    // lookup). Pure to construct; mutation stays inside the sandbox.
+    "Map", "Set", "WeakMap", "WeakSet", "Symbol", "BigInt",
+    // Binary/typed-array machinery used by byte-oriented decoders.
+    "ArrayBuffer", "SharedArrayBuffer", "DataView", "Int8Array", "Uint8Array",
+    "Uint8ClampedArray", "Int16Array", "Uint16Array", "Int32Array", "Uint32Array", "Float32Array",
+    "Float64Array", "BigInt64Array", "BigUint64Array",
+    // Error constructors (decoders sometimes build/throw-and-catch internally).
+    "Error", "TypeError", "RangeError", "SyntaxError", "ReferenceError", "EvalError", "URIError",
+    // Pure reflection helpers.
+    "Reflect",
 ];
 
 #[derive(Default)]
