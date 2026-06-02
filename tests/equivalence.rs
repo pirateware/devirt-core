@@ -192,6 +192,25 @@ fn member_normalization_preserves_value() {
 }
 
 #[test]
+fn deletion_passes_must_not_drop_side_effects() {
+    // DCE must not drop an unused binding whose initializer has a side effect.
+    assert_equivalent("var hit = 0; var unused = (hit = 1); __r = hit;");
+    // Dead-store removal must keep a store whose RHS is impure (a call).
+    assert_equivalent(
+        r#"
+        var log = 0;
+        function bump(){ log++; return 1; }
+        var dead;
+        dead = bump(), dead = bump();
+        __r = log;
+        "#,
+    );
+    // An unreachable tail with effects is fine to drop (it never runs), but the
+    // reachable prefix's effects must survive.
+    assert_equivalent("__r = (function(){ var s = 0; s = 5; return s; never(); })();");
+}
+
+#[test]
 fn fold_must_not_drop_embedded_side_effects() {
     // The real-sample shape: an obfuscator hides a side-effecting assignment
     // inside an arithmetic expression that evaluates to a constant. oxc's

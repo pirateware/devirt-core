@@ -203,7 +203,11 @@ fn iife_body<'b, 'a>(stmt: &'b Statement<'a>) -> Option<&'b ArenaVec<'a, Stateme
 struct FreeVars {
     used: HashSet<String>,
     bound: HashSet<String>,
-    impure: bool, // uses `this` → can't safely evaluate detached
+    /// Base names of every write target (`x = …`, `x++`, `o.p = …`, `delete o.p`).
+    /// A write whose base is *not* one of `bound` mutates outer/global state — a
+    /// side effect that lifting the value would silently drop.
+    written: HashSet<String>,
+    impure: bool, // uses `this`, or performs an un-analyzable write → not liftable
 }
 
 impl<'a> Visit<'a> for FreeVars {
@@ -216,19 +220,92 @@ impl<'a> Visit<'a> for FreeVars {
     fn visit_this_expression(&mut self, _it: &oxc_ast::ast::ThisExpression) {
         self.impure = true;
     }
+
+    fn visit_assignment_expression(&mut self, node: &oxc_ast::ast::AssignmentExpression<'a>) {
+        self.record_write(assign_target_base(&node.left));
+        oxc_ast_visit::walk::walk_assignment_expression(self, node);
+    }
+
+    fn visit_update_expression(&mut self, node: &oxc_ast::ast::UpdateExpression<'a>) {
+        self.record_write(simple_target_base(&node.argument));
+        oxc_ast_visit::walk::walk_update_expression(self, node);
+    }
+
+    fn visit_unary_expression(&mut self, node: &oxc_ast::ast::UnaryExpression<'a>) {
+        // `delete o.p` mutates `o`; treat its base like any other write.
+        if matches!(node.operator, oxc_syntax::operator::UnaryOperator::Delete) {
+            self.record_write(member_base(&node.argument));
+        }
+        oxc_ast_visit::walk::walk_unary_expression(self, node);
+    }
 }
 
 impl FreeVars {
+    /// Record a write whose target base resolves to `name`. An unresolvable shape
+    /// (destructuring, a write through a call result) is conservatively impure.
+    fn record_write(&mut self, name: Option<String>) {
+        match name {
+            Some(n) => {
+                self.written.insert(n);
+            }
+            None => self.impure = true,
+        }
+    }
+
     fn free(&self) -> HashSet<String> {
         self.used.difference(&self.bound).cloned().collect()
     }
+
+    /// True if the body writes to any name it does not itself bind — i.e. mutates
+    /// an outer variable or a global. Such a function has a side effect beyond its
+    /// return value and must never be lifted away.
+    fn writes_free(&self) -> bool {
+        self.written.iter().any(|n| !self.bound.contains(n))
+    }
+
     fn all_allowed(&self, pureset: &HashSet<String>, extra: Option<&str>) -> bool {
         !self.impure
+            && !self.writes_free()
             && self.free().iter().all(|n| {
                 Some(n.as_str()) == extra
                     || pureset.contains(n)
                     || GLOBALS.contains(&n.as_str())
             })
+    }
+}
+
+/// The base identifier name of an assignment target (`x` for `x`, `x.a`, `x[i]`),
+/// or `None` for destructuring patterns and member chains not rooted in a name.
+fn assign_target_base(target: &oxc_ast::ast::AssignmentTarget<'_>) -> Option<String> {
+    use oxc_ast::ast::AssignmentTarget as T;
+    match target {
+        T::AssignmentTargetIdentifier(id) => Some(id.name.to_string()),
+        T::StaticMemberExpression(m) => member_base(&m.object),
+        T::ComputedMemberExpression(m) => member_base(&m.object),
+        T::PrivateFieldExpression(m) => member_base(&m.object),
+        _ => None,
+    }
+}
+
+fn simple_target_base(target: &oxc_ast::ast::SimpleAssignmentTarget<'_>) -> Option<String> {
+    use oxc_ast::ast::SimpleAssignmentTarget as S;
+    match target {
+        S::AssignmentTargetIdentifier(id) => Some(id.name.to_string()),
+        S::StaticMemberExpression(m) => member_base(&m.object),
+        S::ComputedMemberExpression(m) => member_base(&m.object),
+        S::PrivateFieldExpression(m) => member_base(&m.object),
+        _ => None,
+    }
+}
+
+/// Walk a member chain down to its root identifier name. A base that is itself a
+/// call/other expression (`f().x = …`) returns `None` → treated conservatively.
+fn member_base(e: &Expression<'_>) -> Option<String> {
+    match e {
+        Expression::Identifier(id) => Some(id.name.to_string()),
+        Expression::StaticMemberExpression(m) => member_base(&m.object),
+        Expression::ComputedMemberExpression(m) => member_base(&m.object),
+        _ => None,
     }
 }
 
