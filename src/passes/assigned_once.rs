@@ -75,7 +75,6 @@ impl<'a> Traverse<'a, ()> for Collector<'a> {
             self.poisoned.insert(sym);
             return;
         }
-        eprintln!("[collect] sym={:?} init_is_lit={}", sym, is_inlineable_literal(init));
         let cloned = init.clone_in(ctx.ast.allocator);
         self.values.insert(sym, cloned);
     }
