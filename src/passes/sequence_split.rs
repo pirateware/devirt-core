@@ -20,6 +20,7 @@
 use oxc_allocator::{Allocator, TakeIn, Vec as ArenaVec};
 use oxc_ast::ast::{Expression, Program, Statement};
 use oxc_span::GetSpan;
+use oxc_syntax::scope::ScopeFlags;
 use oxc_traverse::{traverse_mut, Traverse, TraverseCtx};
 
 use crate::pass::Pass;
@@ -106,6 +107,32 @@ fn split_off_last<'a>(
 }
 
 impl<'a> Traverse<'a, ()> for SequenceSplit {
+    /// A lone sequence statement that is *not* in a statement list — the body of
+    /// `if (c) a, b;`, `for (;;) a, b;`, `while (c) a, b;` — can't be expanded
+    /// in place (there is no list to grow). Wrap it in a block of split
+    /// statements instead: `if (c) { a; b; }`. `enter_statements` runs before
+    /// this on any real list, so statements already flattened there never reach
+    /// here as sequences (no spurious block wrapping).
+    fn enter_statement(&mut self, stmt: &mut Statement<'a>, ctx: &mut TraverseCtx<'a, ()>) {
+        let Statement::ExpressionStatement(es) = stmt else {
+            return;
+        };
+        if !matches!(es.expression, Expression::SequenceExpression(_)) {
+            return;
+        }
+        let span = es.span;
+        let expr = es.expression.take_in(ctx.ast);
+        let mut body = ctx.ast.vec();
+        push_as_statements(expr, &mut body, ctx);
+        // A BlockStatement carries a scope; the traverse walker unwraps its
+        // scope_id, so it must be registered. The split parts are only
+        // expression statements (no declarations), so an empty child scope of
+        // the current one is correct.
+        let scope_id = ctx.create_child_scope_of_current(ScopeFlags::empty());
+        *stmt = ctx.ast.statement_block_with_scope_id(span, body, scope_id);
+        self.changed = true;
+    }
+
     fn enter_statements(
         &mut self,
         stmts: &mut ArenaVec<'a, Statement<'a>>,

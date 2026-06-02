@@ -41,3 +41,11 @@ fn assignment_rhs_sequence_is_not_split() {
     assert!(out.contains("(sideEffect(), value)") || out.contains("sideEffect(), value"),
         "RHS sequence wrongly split: {out}");
 }
+
+#[test]
+fn non_block_body_sequence_becomes_block() {
+    // `if (c) a, b;` has no statement list to grow into — it must become a block.
+    let out = deob("if (cond) first(), second();");
+    assert!(out.contains("first();") && out.contains("second();"), "not split: {out}");
+    assert!(out.contains('{') && out.contains('}'), "should wrap in a block: {out}");
+}
