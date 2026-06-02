@@ -65,6 +65,10 @@ impl Pass for ProxyInline {
 struct Proxy<'a> {
     params: Vec<String>,
     multi_use: HashSet<String>, // params referenced more than once in the body
+    /// Params that never appear in the body. Their argument is evaluated at the
+    /// call but would vanish on substitution — so an impure one must not be
+    /// dropped (`p((x = 1), 5)` with `p(a, b) { return b; }`).
+    unused: HashSet<String>,
     /// Params that appear in *callee* position of a call within the body (apply
     /// proxies, `function(f, x){ return f(x); }`). Their argument must not be a
     /// member expression: `O.apply(obj.m, x)` would bind receiver `obj`, whereas
@@ -159,6 +163,11 @@ impl<'a> ProxyCollector<'a> {
             .filter(|p| counts.get(*p).copied().unwrap_or(0) > 1)
             .cloned()
             .collect();
+        let unused = param_names
+            .iter()
+            .filter(|p| counts.get(*p).copied().unwrap_or(0) == 0)
+            .cloned()
+            .collect();
         let mut callee_params = HashSet::new();
         collect_callee_params(ret, &set, &mut callee_params);
         self.candidates.push((
@@ -167,6 +176,7 @@ impl<'a> ProxyCollector<'a> {
             Proxy {
                 params: param_names,
                 multi_use,
+                unused,
                 callee_params,
                 body: ret.clone_in(self.allocator),
             },
@@ -469,10 +479,22 @@ impl<'a> Traverse<'a, ()> for Inliner<'a> {
                 return;
             }
 
+            // Inlining substitutes args into the body, which may reference params
+            // in a different order than the call (`sub(a,b){return b-a}`). Pure
+            // and member-read args reorder harmlessly, but two args that each
+            // carry a *strong* effect (a call/assignment/new/update) could have
+            // their effects swapped. Decline when more than one such arg exists.
+            if arg_exprs.iter().filter(|ae| has_strong_side_effect(ae)).count() > 1 {
+                return;
+            }
+
             let mut args: HashMap<&str, &Expression<'a>> = HashMap::new();
             for (param, ae) in proxy.params.iter().zip(arg_exprs.iter().copied()) {
                 if proxy.multi_use.contains(param) && !is_side_effect_free(ae) {
                     return; // would duplicate a side effect
+                }
+                if proxy.unused.contains(param) && !is_side_effect_free(ae) {
+                    return; // would drop the argument's side effect
                 }
                 // A cloned argument containing a function/class/arrow carries
                 // scope cells that are reset to None by the clone; the traverse
@@ -615,6 +637,46 @@ fn is_member_expr(expr: &Expression<'_>) -> bool {
         expr,
         Expression::StaticMemberExpression(_) | Expression::ComputedMemberExpression(_)
     )
+}
+
+/// Whether `expr` contains a node whose evaluation has an observable, ordered
+/// effect — a call, `new`, assignment, update (`++`/`--`), await, yield, or
+/// tagged template. Bare member reads are deliberately excluded: the pass treats
+/// property reads as reorderable (consistent with its other inlining). Used to
+/// forbid swapping the effects of two effectful arguments.
+fn has_strong_side_effect(expr: &Expression<'_>) -> bool {
+    struct Finder {
+        found: bool,
+    }
+    impl<'a> Visit<'a> for Finder {
+        fn visit_call_expression(&mut self, _c: &oxc_ast::ast::CallExpression<'a>) {
+            self.found = true;
+        }
+        fn visit_new_expression(&mut self, _n: &oxc_ast::ast::NewExpression<'a>) {
+            self.found = true;
+        }
+        fn visit_assignment_expression(&mut self, _a: &oxc_ast::ast::AssignmentExpression<'a>) {
+            self.found = true;
+        }
+        fn visit_update_expression(&mut self, _u: &oxc_ast::ast::UpdateExpression<'a>) {
+            self.found = true;
+        }
+        fn visit_await_expression(&mut self, _a: &oxc_ast::ast::AwaitExpression<'a>) {
+            self.found = true;
+        }
+        fn visit_yield_expression(&mut self, _y: &oxc_ast::ast::YieldExpression<'a>) {
+            self.found = true;
+        }
+        fn visit_tagged_template_expression(
+            &mut self,
+            _t: &oxc_ast::ast::TaggedTemplateExpression<'a>,
+        ) {
+            self.found = true;
+        }
+    }
+    let mut f = Finder { found: false };
+    f.visit_expression(expr);
+    f.found
 }
 
 fn is_side_effect_free(expr: &Expression<'_>) -> bool {

@@ -123,6 +123,49 @@ fn apply_proxy_preserves_value_and_receiver() {
 }
 
 #[test]
+fn proxy_inline_keeps_effect_order() {
+    // The proxy body uses params in reversed order; inlining two effectful args
+    // would swap their effects. Result must observe `f` before `g`.
+    assert_equivalent(
+        r#"
+        var ord = "";
+        function f(){ ord += "f"; return 1; }
+        function g(){ ord += "g"; return 2; }
+        function sub(a, b){ return b - a; }
+        var v = sub(f(), g());
+        __r = v + ":" + ord;
+        "#,
+    );
+}
+
+#[test]
+fn decoder_lift_keeps_method_mutation() {
+    // A "decoder"-shaped function that mutates a free array via `push` must not be
+    // lifted away — the mutation is observable.
+    assert_equivalent(
+        r#"
+        var sink = [];
+        function tag(i){ sink.push(i); return i + 1; }
+        var a = tag(10), b = tag(20);
+        __r = a + ":" + b + ":" + sink.length;
+        "#,
+    );
+}
+
+#[test]
+fn proxy_inline_keeps_unused_arg_side_effect() {
+    // Param `a` is never used in the body, but `(seen = 1)` must still run.
+    assert_equivalent(
+        r#"
+        var seen = 0;
+        function p(a, b) { return b; }
+        var v = p((seen = 1), 5);
+        __r = v + ":" + seen;
+        "#,
+    );
+}
+
+#[test]
 fn call_apply_proxy_forms_preserve_value() {
     assert_equivalent(
         r#"
