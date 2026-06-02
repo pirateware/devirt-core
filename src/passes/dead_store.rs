@@ -14,7 +14,9 @@
 use std::collections::HashSet;
 
 use oxc_allocator::{Allocator, TakeIn};
-use oxc_ast::ast::{ArrayExpressionElement, AssignmentTarget, Expression, Program, Statement};
+use oxc_ast::ast::{
+    ArrayExpressionElement, AssignmentTarget, Expression, ObjectPropertyKind, Program, Statement,
+};
 use oxc_semantic::Scoping;
 use oxc_syntax::operator::{AssignmentOperator, UnaryOperator};
 use oxc_syntax::symbol::SymbolId;
@@ -144,6 +146,14 @@ fn is_pure_expr(e: &Expression<'_>) -> bool {
             ArrayExpressionElement::Elision(_) => true,
             ArrayExpressionElement::SpreadElement(_) => false,
             other => other.as_expression().is_some_and(is_pure_expr),
+        }),
+        // Defining a function or building an object literal of pure parts has no
+        // side effect, so a dead store of one can be dropped (a spent
+        // operator-proxy table left after every call site was inlined).
+        Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_) => true,
+        Expression::ObjectExpression(o) => o.properties.iter().all(|p| match p {
+            ObjectPropertyKind::ObjectProperty(op) => !op.computed && is_pure_expr(&op.value),
+            ObjectPropertyKind::SpreadProperty(_) => false,
         }),
         _ => false,
     }
