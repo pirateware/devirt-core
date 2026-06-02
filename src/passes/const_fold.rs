@@ -129,6 +129,13 @@ fn const_to_expr<'a>(
         }
         ConstantValue::Boolean(b) => Some(ast.expression_boolean_literal(span, b)),
         ConstantValue::Null => Some(ast.expression_null_literal(span)),
+        // String concatenation chains (`"a" + "b"`, `"x" + 5`) collapse to one
+        // literal. Common after decoder-lift splices string fragments that the
+        // obfuscator had `+`-joined. evaluate_value already enforced purity.
+        ConstantValue::String(s) => {
+            let atom = ast.str(&s);
+            Some(ast.expression_string_literal(span, atom, None))
+        }
         // `void 0`, `void "x"`, etc. fold to the readable `undefined`. Only the
         // original expression's purity matters (evaluate_value already required
         // it), and we skip emission entirely if `undefined` could be shadowed.

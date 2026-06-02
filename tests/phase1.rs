@@ -37,6 +37,13 @@ fn assigned_once_inline_and_fold() {
 }
 
 #[test]
+fn string_concatenation_folds() {
+    let out = deob(r#"sink("foo" + "bar" + "baz", "n" + 5);"#);
+    assert!(out.contains(r#""foobarbaz""#), "string concat not folded: {out}");
+    assert!(out.contains(r#""n5""#), "mixed string+number concat not folded: {out}");
+}
+
+#[test]
 fn void_literal_folds_to_undefined() {
     let out = deob("f(void 0, a === void 0);");
     assert!(out.contains("f(undefined, a === undefined)"), "got: {out}");
