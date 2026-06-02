@@ -6,14 +6,23 @@
 //! call with the body, replacing parameters by the argument expressions. The
 //! function then becomes unused and DCE removes it.
 //!
+//! We also handle the *object-method* form of the same trick, where the proxies
+//! are properties of one table object — `var O = { wDLfP: function(a,b){return
+//! b != a }, ... }` — and called as `O.wDLfP(x, y)`. Each property body is held
+//! to the identical purity grammar, and the method receiver `this` is never used
+//! (the grammar forbids it), so `O.m(x,y)` is equivalent to substituting the
+//! body. These tables drive the operator-virtualised VM decoders (Cloudflare,
+//! PerimeterX) and account for the bulk of remaining `O.x(a,b)` call noise.
+//!
 //! Soundness:
 //!  * Proxy body is a *pure* expression over the parameters only (no free
 //!    locals, no `this`/`arguments`, no calls/assignments) — so substitution is
 //!    semantics-preserving.
 //!  * If a parameter is used more than once, its argument must be side-effect
 //!    free (literal/identifier), so we never duplicate or reorder effects.
-//!  * Proxy name must be globally unique, so a call can't bind to a different
-//!    same-named function in another scope.
+//!  * The proxy name — the function name, or the table object's name — must be
+//!    globally unique AND never reassigned/mutated, so a call always binds to
+//!    the proxy we analyzed and never to a rebound value.
 //!  * Operator precedence is preserved automatically: we splice AST nodes and
 //!    the printer re-parenthesizes by precedence.
 
@@ -63,29 +72,57 @@ struct Proxy<'a> {
 // ---------------------------------------------------------------------------
 
 fn collect_proxies<'a>(program: &Program<'a>, allocator: &'a Allocator) -> HashMap<String, Proxy<'a>> {
-    let mut c = ProxyCollector { allocator, counts: HashMap::new(), candidates: Vec::new() };
+    let mut c = ProxyCollector {
+        allocator,
+        counts: HashMap::new(),
+        mutated: HashSet::new(),
+        candidates: Vec::new(),
+    };
     c.visit_program(program);
 
+    // Each candidate carries the *guard* name that must be unique and unmutated
+    // for the inline to be sound: the function's own name for a standalone
+    // proxy, or the table object's name for an object-method proxy.
     let mut map: HashMap<String, Proxy<'a>> = HashMap::new();
+    let mut guard_of: HashMap<String, String> = HashMap::new();
     let mut dup: HashSet<String> = HashSet::new();
-    for (name, proxy) in c.candidates {
-        if map.contains_key(&name) {
-            dup.insert(name.clone());
+    for (key, guard, proxy) in c.candidates {
+        if map.contains_key(&key) {
+            dup.insert(key.clone());
         }
-        map.insert(name, proxy);
+        guard_of.insert(key.clone(), guard);
+        map.insert(key, proxy);
     }
-    map.retain(|name, _| c.counts.get(name).copied() == Some(1) && !dup.contains(name));
+    map.retain(|key, _| {
+        let guard = &guard_of[key];
+        c.counts.get(guard).copied() == Some(1) && !dup.contains(key) && !c.mutated.contains(guard)
+    });
     map
 }
 
 struct ProxyCollector<'a> {
     allocator: &'a Allocator,
     counts: HashMap<String, usize>,
-    candidates: Vec<(String, Proxy<'a>)>,
+    /// Names that are reassigned or have a member/element written or deleted —
+    /// unsafe to treat as a fixed proxy.
+    mutated: HashSet<String>,
+    /// (key, guard-name, proxy). Key is the call form: `"name"` for a standalone
+    /// proxy, `"obj.prop"` for an object-method proxy.
+    candidates: Vec<(String, String, Proxy<'a>)>,
 }
 
 impl<'a> ProxyCollector<'a> {
-    fn try_record(&mut self, name: &str, params: &FormalParameters<'a>, body: &FunctionBody<'a>, arrow_expr: bool) {
+    /// Build a `Proxy` from a parameter list and a single-return body, if it fits
+    /// the pure-operator grammar. `key`/`guard` identify the call form and the
+    /// name that must stay unique+unmutated.
+    fn try_record(
+        &mut self,
+        key: String,
+        guard: String,
+        params: &FormalParameters<'a>,
+        body: &FunctionBody<'a>,
+        arrow_expr: bool,
+    ) {
         let Some(param_names) = simple_param_names(params) else {
             return;
         };
@@ -104,9 +141,52 @@ impl<'a> ProxyCollector<'a> {
             .cloned()
             .collect();
         self.candidates.push((
-            name.to_string(),
+            key,
+            guard,
             Proxy { params: param_names, multi_use, body: ret.clone_in(self.allocator) },
         ));
+    }
+
+    /// Record each operator-proxy method of an object-literal table bound to
+    /// `obj`: `obj = { prop: function(a,b){ return <pure expr> }, ... }`.
+    fn try_record_object(&mut self, obj: &str, object: &oxc_ast::ast::ObjectExpression<'a>) {
+        use oxc_ast::ast::ObjectPropertyKind;
+        for prop in &object.properties {
+            let ObjectPropertyKind::ObjectProperty(p) = prop else {
+                continue;
+            };
+            // Only plain data/method properties with a static name; never a
+            // getter/setter (kind != Init) or a computed key.
+            if p.computed || p.kind != oxc_ast::ast::PropertyKind::Init {
+                continue;
+            }
+            let Some(prop_name) = static_key_name(&p.key) else {
+                continue;
+            };
+            let key = format!("{obj}.{prop_name}");
+            match &p.value {
+                Expression::FunctionExpression(f) if f.id.is_none() => {
+                    if let Some(body) = &f.body {
+                        self.try_record(key, obj.to_string(), &f.params, body, false);
+                    }
+                }
+                Expression::ArrowFunctionExpression(f) => {
+                    self.try_record(key, obj.to_string(), &f.params, &f.body, f.expression);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// The textual name of a non-computed property key, if it is a plain identifier
+/// or string literal.
+fn static_key_name(key: &oxc_ast::ast::PropertyKey<'_>) -> Option<String> {
+    use oxc_ast::ast::PropertyKey as K;
+    match key {
+        K::StaticIdentifier(id) => Some(id.name.to_string()),
+        K::StringLiteral(s) => Some(s.value.to_string()),
+        _ => None,
     }
 }
 
@@ -117,26 +197,55 @@ impl<'a> Visit<'a> for ProxyCollector<'a> {
 
     fn visit_function(&mut self, func: &oxc_ast::ast::Function<'a>, flags: oxc_syntax::scope::ScopeFlags) {
         if let (Some(id), Some(body)) = (&func.id, &func.body) {
-            self.try_record(id.name.as_str(), &func.params, body, false);
+            let name = id.name.to_string();
+            self.try_record(name.clone(), name, &func.params, body, false);
         }
         oxc_ast_visit::walk::walk_function(self, func, flags);
     }
 
     fn visit_variable_declarator(&mut self, node: &oxc_ast::ast::VariableDeclarator<'a>) {
         if let BindingPattern::BindingIdentifier(id) = &node.id {
+            let name = id.name.to_string();
             match &node.init {
                 Some(Expression::FunctionExpression(f)) if f.id.is_none() => {
                     if let Some(body) = &f.body {
-                        self.try_record(id.name.as_str(), &f.params, body, false);
+                        self.try_record(name.clone(), name, &f.params, body, false);
                     }
                 }
                 Some(Expression::ArrowFunctionExpression(f)) => {
-                    self.try_record(id.name.as_str(), &f.params, &f.body, f.expression);
+                    self.try_record(name.clone(), name, &f.params, &f.body, f.expression);
+                }
+                Some(Expression::ObjectExpression(obj)) => {
+                    self.try_record_object(&name, obj);
                 }
                 _ => {}
             }
         }
         oxc_ast_visit::walk::walk_variable_declarator(self, node);
+    }
+
+    /// Track writes that would invalidate a proxy: `name = ...`, `name.x = ...`,
+    /// `name[i] = ...`, and `name op= ...`. The mutated name is then never
+    /// treated as a fixed proxy/table.
+    fn visit_assignment_expression(&mut self, node: &oxc_ast::ast::AssignmentExpression<'a>) {
+        use oxc_ast::ast::AssignmentTarget as T;
+        match &node.left {
+            T::AssignmentTargetIdentifier(id) => {
+                self.mutated.insert(id.name.to_string());
+            }
+            T::StaticMemberExpression(m) => {
+                if let Expression::Identifier(obj) = &m.object {
+                    self.mutated.insert(obj.name.to_string());
+                }
+            }
+            T::ComputedMemberExpression(m) => {
+                if let Expression::Identifier(obj) = &m.object {
+                    self.mutated.insert(obj.name.to_string());
+                }
+            }
+            _ => {}
+        }
+        oxc_ast_visit::walk::walk_assignment_expression(self, node);
     }
 }
 
@@ -236,10 +345,20 @@ impl<'a> Traverse<'a, ()> for Inliner<'a> {
             let Expression::CallExpression(call) = &*expr else {
                 return;
             };
-            let Expression::Identifier(callee) = &call.callee else {
-                return;
+            // Callee key: `name` for a standalone proxy, `obj.prop` for an
+            // object-method proxy. A computed `obj[k]()` is not matched (the key
+            // would have to be a static string we can resolve).
+            let key = match &call.callee {
+                Expression::Identifier(callee) => callee.name.to_string(),
+                Expression::StaticMemberExpression(m) => {
+                    let Expression::Identifier(obj) = &m.object else {
+                        return;
+                    };
+                    format!("{}.{}", obj.name, m.property.name)
+                }
+                _ => return,
             };
-            let Some(proxy) = self.proxies.get(callee.name.as_str()) else {
+            let Some(proxy) = self.proxies.get(key.as_str()) else {
                 return;
             };
             if call.arguments.len() != proxy.params.len() {

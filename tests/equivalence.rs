@@ -86,6 +86,21 @@ fn string_decoder_preserves_value() {
 }
 
 #[test]
+fn object_method_proxy_preserves_value() {
+    assert_equivalent(
+        r#"
+        var O = {
+            lt: function(a, b) { return a < b; },
+            an: function(a, b) { return a & b; },
+            mul: function(a, b) { return a * b; }
+        };
+        var x = 6, y = 10;
+        __r = "" + O.lt(x, y) + ":" + O.an(x, 3) + ":" + O.mul(x, y);
+        "#,
+    );
+}
+
+#[test]
 fn dead_literal_removal_preserves_value() {
     assert_equivalent("80214130; true; null; __r = 7;");
 }
