@@ -6,7 +6,9 @@
 //! any symbol information.
 
 use oxc_allocator::{Allocator, TakeIn};
-use oxc_ast::ast::{Expression, Program};
+use oxc_ast::ast::{
+    ComputedMemberExpression, Expression, Program, SimpleAssignmentTarget, StaticMemberExpression,
+};
 use oxc_traverse::{traverse_mut, Traverse, TraverseCtx};
 
 use crate::ident::is_identifier_name;
@@ -33,30 +35,54 @@ impl Pass for MemberNormalize {
     }
 }
 
+/// Rewrite `<obj>["ident"]` → `<obj>.ident`, returning the new node, or `None`
+/// if `computed` is not a string-literal key that is a valid identifier name.
+/// Shared by the read-position (`Expression`) and write-position
+/// (`SimpleAssignmentTarget`) hooks so `a["x"] = a["x"]` normalizes on both
+/// sides identically.
+fn try_static<'a>(
+    computed: &mut ComputedMemberExpression<'a>,
+    ctx: &mut TraverseCtx<'a, ()>,
+) -> Option<oxc_allocator::Box<'a, StaticMemberExpression<'a>>> {
+    let (key_atom, key_span) = match &computed.expression {
+        Expression::StringLiteral(key) if is_identifier_name(key.value.as_str()) => {
+            (key.value, key.span) // Atom and Span are Copy
+        }
+        _ => return None,
+    };
+    let span = computed.span;
+    let optional = computed.optional;
+    let object = computed.object.take_in(ctx.ast);
+    let property = ctx.ast.identifier_name(key_span, key_atom);
+    Some(ctx.ast.alloc_static_member_expression(span, object, property, optional))
+}
+
 impl<'a> Traverse<'a, ()> for MemberNormalize {
     fn enter_expression(&mut self, expr: &mut Expression<'a>, ctx: &mut TraverseCtx<'a, ()>) {
         // Match `<obj>[<string-literal>]` where the literal is an identifier.
         let Expression::ComputedMemberExpression(computed) = expr else {
             return;
         };
-        let (key_atom, key_span) = match &computed.expression {
-            Expression::StringLiteral(key) if is_identifier_name(key.value.as_str()) => {
-                (key.value, key.span) // Atom and Span are Copy
-            }
-            _ => return,
+        if let Some(member) = try_static(computed, ctx) {
+            *expr = Expression::StaticMemberExpression(member);
+            self.changed = true;
+        }
+    }
+
+    /// The LHS of an assignment (`a["x"] = ...`) is a `SimpleAssignmentTarget`,
+    /// not an `Expression`, so `enter_expression` never sees it. Normalize it
+    /// here too — otherwise `a["x"] = a.x` prints with mismatched access forms.
+    fn enter_simple_assignment_target(
+        &mut self,
+        target: &mut SimpleAssignmentTarget<'a>,
+        ctx: &mut TraverseCtx<'a, ()>,
+    ) {
+        let SimpleAssignmentTarget::ComputedMemberExpression(computed) = target else {
+            return;
         };
-
-        let span = computed.span;
-        let optional = computed.optional;
-        // `take_in` swaps in a placeholder and hands us the owned object; this is
-        // the last use of `computed`, so the borrow of `*expr` ends here and we
-        // may overwrite it on the next line.
-        let object = computed.object.take_in(ctx.ast);
-
-        let property = ctx.ast.identifier_name(key_span, key_atom);
-        *expr = Expression::StaticMemberExpression(
-            ctx.ast.alloc_static_member_expression(span, object, property, optional),
-        );
-        self.changed = true;
+        if let Some(member) = try_static(computed, ctx) {
+            *target = SimpleAssignmentTarget::StaticMemberExpression(member);
+            self.changed = true;
+        }
     }
 }

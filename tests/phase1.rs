@@ -20,6 +20,16 @@ fn member_normalization() {
 }
 
 #[test]
+fn member_normalization_on_assignment_target() {
+    // The LHS of an assignment is a SimpleAssignmentTarget, not an Expression;
+    // it must normalize just like read-position member access.
+    // (param name may be renamed; assert on the access form, not the name.)
+    let out = deob(r#"function g(o){ o["foo"] = o["foo"] || 1; return o; }"#);
+    assert!(out.contains(".foo = "), "LHS not normalized: {out}");
+    assert!(!out.contains(r#"["foo"]"#), "bracket access remained: {out}");
+}
+
+#[test]
 fn assigned_once_inline_and_fold() {
     let out = deob("function g(){ var n = (0x10, 256); return 5 + n; }");
     assert!(out.contains("261"), "got: {out}");
