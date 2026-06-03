@@ -87,7 +87,9 @@ impl Dominators {
     }
 
     /// Does `a` dominate `b` (reflexive: a block dominates itself)? Walks the
-    /// idom chain from `b` up to entry.
+    /// idom chain from `b` up to entry. Part of the dominator API (exercised by
+    /// the unit tests); SSA renaming gets dominance implicitly via the dom tree.
+    #[allow(dead_code)]
     pub fn dominates(&self, a: BlockId, b: BlockId) -> bool {
         if !self.reachable(a) || !self.reachable(b) {
             return false;
