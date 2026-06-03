@@ -1,7 +1,48 @@
 # Plan: the Dispatch & Decoder Resolution tier (Tier C/D)
 
-Status: proposal. Target start: after the SSA/CFG dataflow layer (`src/ir/`,
-delivered 2026-06). Owner: TBD.
+Status: **ROI core (Phases 0–2 / M1–M2) DELIVERED** 2026-06 on branch
+`feat/scoped-decoder-lift`. Phases 3–4 assessed and **deferred** (data-driven, see
+§11). Phase 5 remains groundwork-only by design.
+
+## 11. Delivered & measured (2026-06)
+
+**Phases 0–2 — scoped decoder lifting — shipped, sound, green.** `decoder-lift`
+now classifies pure decoder functions at *every* scope depth (not just
+`collect_top_level`), seeds classification with proven pure-data table names, and
+emits all pure functions (any depth) into the preamble via a single emitter.
+Soundness rides a new symbol-precise escape query
+`ir::mutable_aggregate_tables` (reusing `src/ir/analysis.rs`) that flags any
+aggregate reassigned / member-written / `.push`d / aliased anywhere; the exclusion
+is threaded into `scan_invariants` so the groundedness fixpoint also drops
+transitive dependents (identity aliases), keeping the preamble dependency-closed.
+
+Result on the acceptance demo (§7): **sample_11 `fn55(...)` dispatch sites
+3178 → 12** (the 12 survivors decode to null/object and are correctly left); the
+DataDome DOM code (`.createElement`/`.appendChild`/`.documentElement`) is revealed.
+No regression on any sample (idempotent + re-parse) or the equivalence net;
+sample_4 base-N materialisation unaffected. New adversarial equivalence cases
+(member-mutated / pushed / aliased-mutated / reassigned scoped tables) + positive
+behavioural tests cover the gate.
+
+**Phase 4 — apply/call forwarding — assessed NO-GO on this corpus.** Recon of the
+deobfuscated sample_1 (3124 forwarding sites) and sample_10 (1218) shows the
+forwarding *target* is essentially never a plain identifier: it is threaded
+through closure-memoised dispatchers (`fn102().Bt.apply(null, […])`) whose backing
+object is populated elsewhere — i.e. interprocedural alias analysis, the §3
+non-goal. The trivially-sound subset (`f.apply(null, [a,b]) → f(a,b)` with `f` a
+plain identifier) is ~0 sites across both files. A sound, general collapse is not
+available; the object-method `.call`/`.apply` *proxy* form is already handled by
+`proxy-inline`. Deferred rather than ship a high-risk interprocedural transform.
+
+**Phase 3 — interprocedural SCCP — deferred.** A from-scratch call-graph + SCCP
+pass targeting one already-86%-reduced sample (sample_4) is high effort / low
+corpus ROI and carries real interprocedural-unsoundness risk against the green
+soundness nets. Left open, as the plan intends for Tier C/D remainders.
+
+---
+
+Status (original): proposal. Target start: after the SSA/CFG dataflow layer
+(`src/ir/`, delivered 2026-06). Owner: TBD.
 
 This is the successor to the now-removed SSA plan. That work delivered Tier B
 (sound intraprocedural flow). This plan attacks the obfuscation that actually
