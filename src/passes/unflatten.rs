@@ -99,7 +99,9 @@ impl<'a> Traverse<'a, ()> for Unflatten {
             let Some(cases) = parse_cases(switch, &s_name) else {
                 continue;
             };
-            let Some(seq) = simulate(init, &cases, &test, kind, ctx.ast.allocator) else {
+            // The local form replaces only the dispatcher; statements after it stay
+            // in the list, so the exit mode is irrelevant here.
+            let Some((seq, _exit)) = simulate(init, &cases, &test, kind, ctx.ast.allocator) else {
                 continue;
             };
             hit = Some((i, seq));
@@ -498,13 +500,22 @@ fn is_top_level_control(stmt: &Statement<'_>) -> bool {
 /// *before* each switch, `do…while` *after* (so the body runs at least once).
 /// `test.continues(state)` models the real loop condition exactly, so the emitted
 /// sequence runs the same statements in the same order as the dispatcher.
+/// How the simulated machine left the loop.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum ExitMode {
+    /// The loop test went false — control falls through past the loop.
+    Test,
+    /// A `return`/`throw` case fired — control leaves the enclosing function.
+    Terminal,
+}
+
 pub(crate) fn simulate<'a>(
     init: i64,
     cases: &HashMap<i64, ParsedCase<'_, 'a>>,
     test: &LoopTest,
     kind: LoopKind,
     alloc: &'a Allocator,
-) -> Option<Vec<Statement<'a>>> {
+) -> Option<(Vec<Statement<'a>>, ExitMode)> {
     let mut state = init;
     let mut visited: HashSet<i64> = HashSet::new();
     let mut seq: Vec<Statement<'a>> = Vec::new();
@@ -512,7 +523,7 @@ pub(crate) fn simulate<'a>(
     for _ in 0..100_000 {
         // `while`/`for`: the test gates entry into the body.
         if kind == LoopKind::While && !test.continues(state) {
-            return Some(seq);
+            return Some((seq, ExitMode::Test));
         }
         if !visited.insert(state) {
             return None; // revisited state → real loop, not a linear chain
@@ -525,11 +536,11 @@ pub(crate) fn simulate<'a>(
         }
         match case.end {
             CaseEnd::Step(t) => state = t.apply(state),
-            CaseEnd::Terminal => return Some(seq),
+            CaseEnd::Terminal => return Some((seq, ExitMode::Terminal)),
         }
         // `do…while`: the body has run; the test now decides whether to continue.
         if kind == LoopKind::DoWhile && !test.continues(state) {
-            return Some(seq);
+            return Some((seq, ExitMode::Test));
         }
     }
     None

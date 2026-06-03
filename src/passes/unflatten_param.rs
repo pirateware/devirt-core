@@ -43,7 +43,7 @@ use oxc_ast_visit::Visit;
 use oxc_span::SPAN;
 use oxc_traverse::{traverse_mut, Traverse, TraverseCtx};
 
-use super::unflatten::{detect_loop, parse_cases, simulate};
+use super::unflatten::{detect_loop, parse_cases, simulate, ExitMode};
 use crate::pass::Pass;
 use crate::util::build_scoping;
 
@@ -362,7 +362,14 @@ impl<'a, 'c> Builder<'a, 'c> {
         let state = param0_name(cand.func)?;
         let (switch, kind, test) = detect_loop(loop_stmt, &state)?;
         let cases = parse_cases(switch, &state)?;
-        let seq = simulate(c, &cases, &test, kind, alloc)?;
+        let (mut seq, exit) = simulate(c, &cases, &test, kind, alloc)?;
+        // Statements after the loop run only when the machine exits via the loop
+        // test; a terminal (`return`/`throw`) case makes them unreachable.
+        if exit == ExitMode::Test {
+            for st in body.statements.iter().skip(1) {
+                seq.push(st.clone_in(alloc));
+            }
+        }
 
         let mut func: Function<'a> = cand.func.clone_in(alloc);
         func.r#type = FunctionType::FunctionDeclaration;
@@ -442,19 +449,44 @@ fn shape_ok(cand: &Candidate<'_, '_>) -> bool {
     let Some(body) = f.body.as_ref() else {
         return false;
     };
-    if body.statements.len() != 1 {
-        return false; // body must be exactly the dispatch loop
-    }
     if uses_arguments(body) {
         return false;
     }
+    // The dispatch loop must be the *first* statement (no prefix that runs before
+    // the machine). Statements after it (trailing, run on a test-exit) must not
+    // reference the dispatch parameter — it is dropped in the specialization.
     let Some(loop_stmt) = body.statements.first() else {
         return false;
     };
+    for trailing in body.statements.iter().skip(1) {
+        if mentions_name(trailing, &state) {
+            return false;
+        }
+    }
     let Some((switch, _, _)) = detect_loop(loop_stmt, &state) else {
         return false;
     };
     parse_cases(switch, &state).is_some()
+}
+
+/// Does `stmt` reference `name` (read or write) anywhere, not descending into
+/// nested functions (which would have their own binding)?
+fn mentions_name(stmt: &Statement<'_>, name: &str) -> bool {
+    struct M<'r> {
+        name: &'r str,
+        found: bool,
+    }
+    impl<'a> Visit<'a> for M<'_> {
+        fn visit_identifier_reference(&mut self, it: &oxc_ast::ast::IdentifierReference<'a>) {
+            if it.name == self.name {
+                self.found = true;
+            }
+        }
+        fn visit_function(&mut self, _f: &Function<'a>, _flags: oxc_syntax::scope::ScopeFlags) {}
+    }
+    let mut m = M { name, found: false };
+    m.visit_statement(stmt);
+    m.found
 }
 
 fn param0_name(f: &Function<'_>) -> Option<String> {

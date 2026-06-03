@@ -1376,6 +1376,20 @@ fn unflatten_param_state_preserves_value() {
              case 5: o.v += 7; s = 6; break; case 6: o.v += 2; s = 9; break; } } while (s != 9); }; \
            var o = { v: 0 }; g(5, o); return o.v; })();",
     );
+    // Trailing statements after the loop run on a test-exit, are dead on a
+    // terminal (return) exit.
+    assert_equivalent(
+        "__r = (function(){ \
+           function f(s, o) { while (s != 9) { switch (s) { \
+             case 1: o.v += 1; s = 2; break; case 2: o.v += 4; s = 9; break; } } o.v += 100; } \
+           var o = { v: 0 }; f(1, o); return o.v; })();",
+    );
+    assert_equivalent(
+        "__r = (function(){ \
+           function f(s, o) { while (s != 9) { switch (s) { \
+             case 1: o.v += 1; s = 2; break; case 2: o.v += 4; return o.v; } } o.v += 100; return o.v; } \
+           var o = { v: 0 }; return f(1, o); })();",
+    );
     // Side-effecting argument must be evaluated exactly once, in order.
     assert_equivalent(
         "__r = (function(){ var log = ''; \
