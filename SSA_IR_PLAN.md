@@ -1,6 +1,48 @@
 # Plan: a CFG / SSA dataflow layer for the deobfuscator
 
-Status: proposal. Target start: after the 2026-06 soundness-hardening pass
+Status: **DELIVERED** (2026-06). Implemented in `src/ir/` as the `SsaOpt` pass,
+registered in `default_pipeline()` after `decoder-lift`, before `dce`.
+
+**Results (M4/M5 acceptance met):**
+- sample_10 const-array noise collapsed: `varN[const]` reads 21,882 → 15,779
+  (−28%); output 1,826,547 → 1,697,401 bytes (−7%). The headline `Date(year,
+  month=0, day=1, …)` default-argument arrays (§8) now read as literals.
+- Folds delivered: scalar const propagation (flow-sensitive, beats
+  assigned-once across reassignment/branches), const-array element + `.length`,
+  const-object property — all gated by SSA reaching-def + escape facts.
+- Soundness by construction: the reassignment trap and branch-merge cases that
+  broke the structural passes are now phis (non-const) and left alone. A full
+  adversarial equivalence battery (short-circuit, reassignment, branch-merge,
+  escape, capture, loop-carried, init-order, for-head rebinding) is green, plus
+  all 11 samples re-parse + idempotent.
+- Two soundness bugs were caught by the adversarial battery *during* the build
+  and fixed: member-write bases not excluded from versioning; and
+  `for (var s of/in …)` head rebinding being invisible to both the new escape
+  analysis and the pre-existing `assigned-once` (`symbol_is_mutated` misses it).
+
+Implementation notes vs. the plan below:
+- **Custom minimal CFG** chosen over `oxc_cfg` (§4.1 decision rule): we control
+  raising and need per-event granularity. `src/ir/dom.rs` is iterative CHK.
+- **De-SSA is a no-op** (§11 Q2, "start naive"): SSA renaming is used purely as
+  the *analysis* that resolves each use to its reaching def; transforms are
+  applied in place on the original AST by arena-address node identity, so the
+  Phase-1 lower→raise identity is trivially preserved (control flow is never
+  rebuilt). This is the safest sound interpretation of "raise back to AST".
+- **Candidate scope**: function-scope symbols (params + top-level vars), like
+  assigned-once. Block-scoped `let`/`const` folding is future work (sound to add).
+- Tiers C/D remain explicitly open, as planned.
+
+Known *pre-existing* unsoundness surfaced (not in scope, not introduced here):
+`decoder-lift` will lift a closure decoder using a stale captured table even
+when the table is reassigned afterwards
+(`var s=[1,2]; function get(){return s[0];} s=[3,4]; get()` → folds to 1, runtime
+3). Left for a separate decoder-lift hardening pass.
+
+---
+
+## Original proposal
+
+Target start: after the 2026-06 soundness-hardening pass
 (commits `4ca4318..945e701`). Owner: TBD.
 
 ---

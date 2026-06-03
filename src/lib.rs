@@ -3,6 +3,7 @@
 
 mod driver;
 mod ident;
+pub(crate) mod ir;
 mod pass;
 mod passes;
 pub mod sandbox;

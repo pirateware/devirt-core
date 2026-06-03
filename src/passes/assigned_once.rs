@@ -125,6 +125,42 @@ impl<'a> Traverse<'a, ()> for Collector<'a> {
         let value = init.clone_in(ctx.ast.allocator);
         self.values.insert(sym, Const { value, func_scope: scope, decl_end: node.span.end });
     }
+
+    // A `for (var x of/in …)` head rebinds `x` on every iteration, but that write
+    // is a binding, not an `is_write` reference, so `symbol_is_mutated` misses it.
+    // Poison every symbol bound in such a head so it is never treated as a const.
+    fn enter_for_of_statement(
+        &mut self,
+        node: &mut oxc_ast::ast::ForOfStatement<'a>,
+        _ctx: &mut TraverseCtx<'a, ()>,
+    ) {
+        poison_for_head(&node.left, &mut self.poisoned);
+    }
+
+    fn enter_for_in_statement(
+        &mut self,
+        node: &mut oxc_ast::ast::ForInStatement<'a>,
+        _ctx: &mut TraverseCtx<'a, ()>,
+    ) {
+        poison_for_head(&node.left, &mut self.poisoned);
+    }
+}
+
+/// Poison every symbol bound by a `for`-head variable declaration.
+fn poison_for_head(left: &oxc_ast::ast::ForStatementLeft<'_>, poisoned: &mut HashSet<SymbolId>) {
+    use oxc_ast::ast::ForStatementLeft;
+    let ForStatementLeft::VariableDeclaration(d) = left else {
+        return; // bare/destructuring assignment targets are `is_write` references
+    };
+    struct Collect<'p>(&'p mut HashSet<SymbolId>);
+    impl<'a, 'p> oxc_ast_visit::Visit<'a> for Collect<'p> {
+        fn visit_binding_identifier(&mut self, id: &oxc_ast::ast::BindingIdentifier<'a>) {
+            if let Some(sym) = id.symbol_id.get() {
+                self.0.insert(sym);
+            }
+        }
+    }
+    oxc_ast_visit::Visit::visit_variable_declaration(&mut Collect(poisoned), d);
 }
 
 struct Replacer<'a, 'm> {

@@ -11,17 +11,25 @@ fn deob(src: &str) -> String {
 
 #[test]
 fn unaccessed_pure_members_removed() {
+    // The SSA dataflow pass now folds the single live `O.used` read to its
+    // constant and DCE collapses the whole table — a strictly stronger result
+    // than pruning dead members in place. The value is preserved (see
+    // `tests/equivalence.rs::dead_object_prop_removal_preserves_value`).
     let out = deob("(function(){ var O = { used: 1, deadFn: function(){return 2;}, deadData: 3 }; return O.used; })();");
-    assert!(out.contains("used: 1"), "live member lost: {out}");
-    assert!(!out.contains("deadFn") && !out.contains("deadData"), "dead members survived: {out}");
+    assert!(out.contains("return 1"), "live read not folded to its constant: {out}");
+    assert!(
+        !out.contains("deadFn") && !out.contains("deadData") && !out.contains("used"),
+        "dead table survived: {out}"
+    );
 }
 
 #[test]
 fn assignment_initialized_table_pruned() {
-    // The table is stored into a pre-declared param via a single `O = {…}`.
+    // The table is stored into a pre-declared param via a single `O = {…}`. SSA
+    // resolves `O.used` through that single reaching object literal and folds it.
     let out = deob("(function(O){ O = { used: 1, deadFn: function(){return 2;} }; return O.used; })();");
-    assert!(out.contains("used: 1"), "live member lost: {out}");
-    assert!(!out.contains("deadFn"), "dead member survived: {out}");
+    assert!(out.contains("return 1"), "live read not folded to its constant: {out}");
+    assert!(!out.contains("deadFn") && !out.contains("used"), "dead table survived: {out}");
 }
 
 #[test]

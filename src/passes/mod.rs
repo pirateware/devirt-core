@@ -43,6 +43,11 @@ pub fn default_pipeline() -> Vec<Box<dyn Pass>> {
         // Lift after Phase-1 simplification (so decoder args are literals/pure),
         // before DCE (so spent decoders/arrays become dead and get removed).
         Box::new(DecoderLift::default()),
+        // SSA dataflow layer: sound intraprocedural const/copy propagation and
+        // const-aggregate index folding. Runs after lifting (so it sees lifted
+        // literals) and before DCE (so spent assignments become dead and get
+        // removed). See `src/ir/`.
+        Box::new(crate::ir::SsaOpt::default()),
         Box::new(Dce::default()),
         // Remove pure stores to variables that are now read-never (spent
         // decoder-index arithmetic chains).

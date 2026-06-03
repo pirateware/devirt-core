@@ -86,13 +86,21 @@ fn unreachable_after_return() {
 }
 
 #[test]
-fn mutated_var_not_inlined() {
-    // x is reassigned, so it must NOT be treated as a constant: the return
-    // value stays a variable, not a folded literal. (Name-agnostic: rename may
-    // have changed `x`.)
+fn reassigned_var_folds_to_last_dominating_value() {
+    // The SSA dataflow pass resolves `return x` to its single reaching
+    // definition (`x = 2` dominates the return), so the read folds to 2 and the
+    // dead assignments are removed. assigned-once alone bailed on the
+    // reassignment; SSA makes this sound by construction.
     let out = deob("function g(){ var x = 1; x = 2; return x; }");
-    assert!(out.contains("= 2"), "must preserve reassignment: {out}");
-    assert!(!out.contains("return 1") && !out.contains("return 2"), "must not constant-fold a mutated var: {out}");
+    assert!(out.contains("return 2"), "should fold to the dominating value: {out}");
+}
+
+#[test]
+fn ambiguous_reassignment_not_folded() {
+    // The reaching definition at the return is a phi (1 on the fall-through
+    // path, 2 on the branch), so it must NOT fold to either literal.
+    let out = deob("function g(c){ var x = 1; if (c) { x = 2; } return x; }");
+    assert!(!out.contains("return 1") && !out.contains("return 2"), "merge wrongly folded: {out}");
 }
 
 #[test]
