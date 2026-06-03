@@ -85,6 +85,19 @@ impl<'s, 'b> Classifier<'s, 'b> {
         self.scoping.get_reference(rid).symbol_id()
     }
 
+    /// A `for (var <pat> of/in …)` head rebinds its pattern's symbols on every
+    /// iteration — a write the CFG does not model (`lower_for_each` ignores the
+    /// head) and that is not an `is_write` reference. Exclude every candidate it
+    /// binds. (Bare/destructuring `for (s of …)` targets are `is_write` references
+    /// already excluded by `visit_identifier_reference`; `let`/`const` heads are
+    /// block-scoped, hence never candidates.)
+    fn exclude_for_head<'a>(&mut self, left: &ForStatementLeft<'a>) {
+        if let ForStatementLeft::VariableDeclaration(d) = left {
+            let mut ex = BindingExcluder { excluded: &mut self.excluded, base: self.base };
+            ex.visit_variable_declaration(d);
+        }
+    }
+
     fn cand_object<'x>(&self, obj: &'x Expression<'x>) -> Option<SymbolId> {
         let Expression::Identifier(id) = obj else { return None };
         let sym = self.ref_sym(id)?;
@@ -167,6 +180,20 @@ impl<'a, 's, 'b> Visit<'a> for Classifier<'s, 'b> {
         walk::walk_assignment_expression(self, node);
     }
 
+    fn visit_for_of_statement(&mut self, node: &ForOfStatement<'a>) {
+        if self.depth == 0 {
+            self.exclude_for_head(&node.left);
+        }
+        walk::walk_for_of_statement(self, node);
+    }
+
+    fn visit_for_in_statement(&mut self, node: &ForInStatement<'a>) {
+        if self.depth == 0 {
+            self.exclude_for_head(&node.left);
+        }
+        walk::walk_for_in_statement(self, node);
+    }
+
     fn visit_update_expression(&mut self, node: &UpdateExpression<'a>) {
         // `s[k]++` / `--s.x`: a member mutation → exclude the base.
         if self.depth == 0 {
@@ -242,6 +269,23 @@ impl<'a, 's, 'b> Visit<'a> for Classifier<'s, 'b> {
                     // A bare read in value position (or a member-write base, etc.).
                     self.has_bare_read.insert(sym);
                 }
+            }
+        }
+    }
+}
+
+/// Excludes every candidate symbol bound by a binding pattern (handles nested
+/// destructuring, defaults, and rest elements without enumerating each shape).
+struct BindingExcluder<'x> {
+    excluded: &'x mut HashSet<SymbolId>,
+    base: &'x HashSet<SymbolId>,
+}
+
+impl<'a, 'x> Visit<'a> for BindingExcluder<'x> {
+    fn visit_binding_identifier(&mut self, id: &BindingIdentifier<'a>) {
+        if let Some(sym) = id.symbol_id.get() {
+            if self.base.contains(&sym) {
+                self.excluded.insert(sym);
             }
         }
     }

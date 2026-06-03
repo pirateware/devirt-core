@@ -436,3 +436,14 @@ fn ssa_keeps_effects_when_folding_reads() {
         "#,
     );
 }
+
+#[test]
+fn ssa_for_each_var_head_rebinding_not_folded() {
+    // A `var` for-in/of head hoists into the function scope and rebinds the
+    // candidate every iteration — a write the CFG does not see. It must not be
+    // folded to the pre-loop value.
+    assert_equivalent("var s = [10, 20]; for (var s of [[7, 8]]) {} __r = s[0];");
+    assert_equivalent("var x = 1; for (var x of [9]) {} __r = x;");
+    assert_equivalent(r#"var x = 1; for (var x in { a: 0, b: 0 }) {} __r = x;"#);
+    assert_equivalent("var x = 1; for (var [x] of [[9]]) {} __r = x;");
+}
