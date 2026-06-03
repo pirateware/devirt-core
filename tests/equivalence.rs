@@ -1343,3 +1343,43 @@ fn unflatten_generalized_shapes_preserve_value() {
          case 1: n += 1; s = 2; break; case 2: __r += n; s = (n < 3) ? 1 : 0; break; } } while (s);",
     );
 }
+
+#[test]
+fn unflatten_param_state_preserves_value() {
+    // Param-state dispatcher: state is param 0, called with a constant entry.
+    assert_equivalent(
+        "__r = (function(){ \
+           function f(s, o) { while (s != 9) { switch (s) { \
+             case 1: o.v += 10; s = 2; break; case 2: o.v += 5; s = 9; break; } } } \
+           var o = { v: 0 }; f(1, o); return o.v; })();",
+    );
+    // Multiple distinct entry constants reuse one function.
+    assert_equivalent(
+        "__r = (function(){ \
+           function f(s, o) { while (s) { switch (s) { \
+             case 1: o.v += 1; s = 3; break; case 2: o.v += 100; s = 0; break; \
+             case 3: o.v += 10; s = 0; break; } } } \
+           var o = { v: 0 }; f(1, o); f(2, o); return o.v; })();",
+    );
+    // Recursion: the body calls itself with a constant entry.
+    assert_equivalent(
+        "__r = (function(){ \
+           function f(s, n) { while (s != 0) { switch (s) { \
+             case 1: if (n <= 0) return 0; s = 2; break; \
+             case 2: return n + f(1, n - 1); } } return -1; } \
+           return f(1, 3); })();",
+    );
+    // Named function expression (dual name: outer V + inner self-name), do-while.
+    assert_equivalent(
+        "__r = (function(){ \
+           var g = function self(s, o) { do { switch (s) { \
+             case 5: o.v += 7; s = 6; break; case 6: o.v += 2; s = 9; break; } } while (s != 9); }; \
+           var o = { v: 0 }; g(5, o); return o.v; })();",
+    );
+    // Side-effecting argument must be evaluated exactly once, in order.
+    assert_equivalent(
+        "__r = (function(){ var log = ''; \
+           function f(s, x) { while (s) { switch (s) { case 1: log += x; s = 0; break; } } } \
+           f(1, (log += 'a', 'b')); return log; })();",
+    );
+}

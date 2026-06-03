@@ -16,6 +16,7 @@ mod pure_eval;
 mod rename;
 mod sequence_split;
 mod unflatten;
+mod unflatten_param;
 
 pub use assigned_once::AssignedOnceInline;
 pub use const_fold::ConstantFold;
@@ -33,6 +34,7 @@ pub use pure_eval::PureEval;
 pub use rename::RenameByRole;
 pub use sequence_split::SequenceSplit;
 pub use unflatten::Unflatten;
+pub use unflatten_param::UnflattenParam;
 
 use crate::pass::Pass;
 
@@ -57,6 +59,11 @@ pub fn default_pipeline() -> Vec<Box<dyn Pass>> {
         // (after sequence-split splits comma chains in cases into clean top-level
         // transition statements) so the revealed code feeds the folds below.
         Box::new(Unflatten::default()),
+        // Interprocedural variant: specialize *param-state* dispatchers (the state
+        // is a function parameter, selected by a constant entry at the call site)
+        // per entry constant, then route calls to the specialization. Runs right
+        // after the local unflattener; the linearized bodies feed the folds below.
+        Box::new(UnflattenParam::default()),
         Box::new(ConstantFold::default()),
         Box::new(AssignedOnceInline),
         // Fingerprint algebraic operator-proxy functions (`fn(a,b)` that is really

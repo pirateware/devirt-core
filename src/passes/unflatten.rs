@@ -46,10 +46,11 @@ use std::collections::{HashMap, HashSet};
 
 use oxc_allocator::{Allocator, CloneIn, Vec as ArenaVec};
 use oxc_ast::ast::{
-    AssignmentTarget, BindingPattern, Expression, Program, SimpleAssignmentTarget, Statement,
-    SwitchStatement,
+    AssignmentTarget, BindingPattern, BlockStatement, Expression, Program, SimpleAssignmentTarget,
+    Statement, SwitchStatement,
 };
 use oxc_syntax::operator::{AssignmentOperator, BinaryOperator};
+use oxc_ast::ast::VariableDeclarationKind;
 use oxc_ast_visit::Visit;
 use oxc_traverse::{traverse_mut, Traverse, TraverseCtx};
 
@@ -177,7 +178,7 @@ fn int_literal(expr: &Expression<'_>) -> Option<i64> {
 /// Whether the loop tests its condition *before* the body (`while`/`for`) or
 /// *after* (`do…while`, body runs at least once).
 #[derive(Clone, Copy, PartialEq)]
-enum LoopKind {
+pub(crate) enum LoopKind {
     While,
     DoWhile,
 }
@@ -186,7 +187,7 @@ enum LoopKind {
 /// runs the switch while this holds and exits when it goes false. Modelling the
 /// test exactly (rather than hard-coding the `while (s)` falsy exit) is what lets
 /// us handle `while (s != K)`, `while (s < K)`, etc.
-enum LoopTest {
+pub(crate) enum LoopTest {
     /// `while (s)` — continue while `s` is truthy (non-zero).
     Truthy,
     /// `while (true)` / `for (;;)` — never exits via the test (only via a
@@ -219,16 +220,34 @@ impl LoopTest {
 /// return the switch, the loop kind, and the parsed test. The switch discriminant
 /// must be the bare state identifier; the test must be a predicate over `s` (and
 /// integer constants) so the exit is statically determined. No `default` clause.
-fn detect_loop<'b, 'a>(
+pub(crate) fn detect_loop<'b, 'a>(
     stmt: &'b Statement<'a>,
     s: &str,
 ) -> Option<(&'b SwitchStatement<'a>, LoopKind, LoopTest)> {
-    let (test_expr, body, kind) = match stmt {
-        Statement::WhileStatement(w) => (&w.test, &w.body, LoopKind::While),
-        Statement::DoWhileStatement(d) => (&d.test, &d.body, LoopKind::DoWhile),
+    let (test, body, kind) = match stmt {
+        Statement::WhileStatement(w) => (parse_loop_test(&w.test, s)?, &w.body, LoopKind::While),
+        Statement::DoWhileStatement(d) => {
+            (parse_loop_test(&d.test, s)?, &d.body, LoopKind::DoWhile)
+        }
+        // `for (init; test; update) { switch }` behaves like `while` (test before
+        // body). The init/update must not assign the state — for a param-state
+        // dispatcher they are no-ops (`for (s; s != K; s)`); we do not model a
+        // for-update transition. A missing test means `for (;;)` → `Always`.
+        Statement::ForStatement(f) => {
+            if f.init.as_ref().is_some_and(|i| for_init_writes(i, s)) {
+                return None;
+            }
+            if f.update.as_ref().is_some_and(|u| writes_in_expr(u, s)) {
+                return None;
+            }
+            let test = match &f.test {
+                Some(t) => parse_loop_test(t, s)?,
+                None => LoopTest::Always,
+            };
+            (test, &f.body, LoopKind::While)
+        }
         _ => return None,
     };
-    let test = parse_loop_test(test_expr, s)?;
     let switch = match body {
         Statement::SwitchStatement(sw) => sw,
         Statement::BlockStatement(b) if b.body.len() == 1 => {
@@ -332,56 +351,53 @@ enum CaseEnd {
     Terminal,
 }
 
-struct ParsedCase<'b, 'a> {
+pub(crate) struct ParsedCase<'b, 'a> {
     emit: Vec<&'b Statement<'a>>,
     end: CaseEnd,
 }
 
 /// Parse every case into (emitted body, end behavior), keyed by its integer state.
 /// Returns `None` (bail) on any shape we don't model soundly.
-fn parse_cases<'b, 'a>(
+pub(crate) fn parse_cases<'b, 'a>(
     switch: &'b SwitchStatement<'a>,
     s: &str,
 ) -> Option<HashMap<i64, ParsedCase<'b, 'a>>> {
     let mut out = HashMap::new();
     for case in &switch.cases {
         let state = int_literal(case.test.as_ref()?)?;
-        let body = &case.consequent;
-        if body.is_empty() {
-            return None; // empty case → fall-through; unmodeled
-        }
-        let last = &body[body.len() - 1];
-        let (end, drop_last) = match last {
+        // Obfuscators wrap each case body in a block (`case X: { … } break;`). Inline
+        // transparent blocks (no block-scoped declarations) so the transition and
+        // terminator become visible at the case's top level.
+        let mut flat: Vec<&Statement> = Vec::new();
+        flatten_case(&case.consequent, &mut flat);
+        // The first top-level terminator decides the case end; anything after it is
+        // dead (e.g. a `break` after a `return`).
+        let term_idx = flat.iter().position(|st| is_top_level_control(st))?;
+        let (end, upto, terminal_incl) = match flat[term_idx] {
             Statement::BreakStatement(b) if b.label.is_none() => {
-                // Need exactly one top-level transition (`s = K` / `s += K`).
-                let next = sole_transition(&body[..body.len() - 1], s)?;
-                (CaseEnd::Step(next), true)
+                let next = sole_transition(&flat[..term_idx], s)?;
+                (CaseEnd::Step(next), term_idx, false)
             }
             Statement::ContinueStatement(c) if c.label.is_none() => {
-                let next = sole_transition(&body[..body.len() - 1], s)?;
-                (CaseEnd::Step(next), true)
+                let next = sole_transition(&flat[..term_idx], s)?;
+                (CaseEnd::Step(next), term_idx, false)
             }
             Statement::ReturnStatement(_) | Statement::ThrowStatement(_) => {
-                (CaseEnd::Terminal, false)
+                // Emit the terminator too (it exits the machine / function).
+                (CaseEnd::Terminal, term_idx + 1, true)
             }
-            _ => return None, // fall-through or unmodeled terminator
+            _ => return None, // labeled break/continue → unmodeled
         };
 
-        // Statements to emit: everything except the trailing break/continue and
-        // any top-level `s = <int>` transition. Validate the remainder is
-        // dispatch-clean (no `s`, no stray top-level break/continue/return/throw).
-        // For a `return`/`throw` terminator, the terminator is the last emitted
-        // statement and is exempt from the top-level-control check.
-        let upto = if drop_last {
-            body.len() - 1
-        } else {
-            body.len()
-        };
+        // Statements to emit: everything up to the terminator, minus the state
+        // transition(s). Validate the remainder is dispatch-clean (no `s`, no stray
+        // top-level control). For a `return`/`throw` end the terminator is the last
+        // emitted statement and is exempt from the control check.
         let mut emit = Vec::new();
-        for (k, st) in body[..upto].iter().enumerate() {
-            let is_terminal_stmt = !drop_last && k == upto - 1;
+        for (k, &st) in flat[..upto].iter().enumerate() {
+            let is_terminal_stmt = terminal_incl && k == upto - 1;
             if is_state_transition(st, s).is_some() {
-                continue; // drop the transition assignment (dead before a return)
+                continue; // drop the transition assignment
             }
             if mentions(st, s) {
                 return None; // body observes/alters dispatch state
@@ -398,11 +414,37 @@ fn parse_cases<'b, 'a>(
     Some(out)
 }
 
-/// Among top-level statements, find the state transitions. Require exactly one
-/// (the next state); none or a non-top-level transition → `None` (bail).
-fn sole_transition(stmts: &[Statement<'_>], s: &str) -> Option<Trans> {
-    let mut found: Option<Trans> = None;
+/// Flatten a case consequent, inlining *transparent* blocks (those with no
+/// block-scoped declarations — `let`/`const`/`class`/`function`). A `var` block is
+/// transparent (var is function-scoped). An opaque block is pushed as one
+/// statement (so a transition hidden inside it trips the `mentions` guard).
+fn flatten_case<'b, 'a>(stmts: &'b [Statement<'a>], out: &mut Vec<&'b Statement<'a>>) {
     for st in stmts {
+        if let Statement::BlockStatement(b) = st {
+            if block_is_transparent(b) {
+                flatten_case(&b.body, out);
+                continue;
+            }
+        }
+        out.push(st);
+    }
+}
+
+/// A block is transparent (safe to inline into its parent) when it declares no
+/// block-scoped bindings: only `var`, expressions, and control flow.
+fn block_is_transparent(b: &BlockStatement<'_>) -> bool {
+    !b.body.iter().any(|st| match st {
+        Statement::ClassDeclaration(_) | Statement::FunctionDeclaration(_) => true,
+        Statement::VariableDeclaration(vd) => vd.kind != VariableDeclarationKind::Var,
+        _ => false,
+    })
+}
+
+/// Among (flattened) top-level statements, find the state transitions. Require
+/// exactly one (the next state); none or a non-top-level transition → `None`.
+fn sole_transition(stmts: &[&Statement<'_>], s: &str) -> Option<Trans> {
+    let mut found: Option<Trans> = None;
+    for &st in stmts {
         if let Some(t) = is_state_transition(st, s) {
             if found.is_some() {
                 return None; // more than one unconditional transition
@@ -456,7 +498,7 @@ fn is_top_level_control(stmt: &Statement<'_>) -> bool {
 /// *before* each switch, `do…while` *after* (so the body runs at least once).
 /// `test.continues(state)` models the real loop condition exactly, so the emitted
 /// sequence runs the same statements in the same order as the dispatcher.
-fn simulate<'a>(
+pub(crate) fn simulate<'a>(
     init: i64,
     cases: &HashMap<i64, ParsedCase<'_, 'a>>,
     test: &LoopTest,
@@ -542,31 +584,59 @@ fn mentions(stmt: &Statement<'_>, name: &str) -> bool {
     s.reads_or_writes
 }
 
+/// A visitor that flags any assignment/update whose target identifier is `name`.
+struct WriteScan<'r> {
+    name: &'r str,
+    found: bool,
+}
+impl<'a, 'r> Visit<'a> for WriteScan<'r> {
+    fn visit_assignment_target(&mut self, t: &AssignmentTarget<'a>) {
+        if let AssignmentTarget::AssignmentTargetIdentifier(id) = t {
+            if id.name == self.name {
+                self.found = true;
+            }
+        }
+        oxc_ast_visit::walk::walk_assignment_target(self, t);
+    }
+    fn visit_simple_assignment_target(&mut self, t: &SimpleAssignmentTarget<'a>) {
+        if let SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = t {
+            if id.name == self.name {
+                self.found = true;
+            }
+        }
+        oxc_ast_visit::walk::walk_simple_assignment_target(self, t);
+    }
+}
+
 /// Does `stmt` write `name` (assignment/update/binding) anywhere within it?
 fn writes_name(stmt: &Statement<'_>, name: &str) -> bool {
-    struct W<'r> {
-        name: &'r str,
-        found: bool,
-    }
-    impl<'a, 'r> Visit<'a> for W<'r> {
-        fn visit_assignment_target(&mut self, t: &AssignmentTarget<'a>) {
-            if let AssignmentTarget::AssignmentTargetIdentifier(id) = t {
-                if id.name == self.name {
-                    self.found = true;
-                }
-            }
-            oxc_ast_visit::walk::walk_assignment_target(self, t);
-        }
-        fn visit_simple_assignment_target(&mut self, t: &SimpleAssignmentTarget<'a>) {
-            if let SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = t {
-                if id.name == self.name {
-                    self.found = true;
-                }
-            }
-            oxc_ast_visit::walk::walk_simple_assignment_target(self, t);
-        }
-    }
-    let mut w = W { name, found: false };
+    let mut w = WriteScan { name, found: false };
     w.visit_statement(stmt);
     w.found
+}
+
+/// Does the `for`-update expression assign `name`?
+fn writes_in_expr(expr: &Expression<'_>, name: &str) -> bool {
+    let mut w = WriteScan { name, found: false };
+    w.visit_expression(expr);
+    w.found
+}
+
+/// Does the `for`-init clause (a declaration of `name`, or an assignment to it)
+/// establish/overwrite the state? A bare-ident no-op (`for (s; …)`) does not.
+fn for_init_writes(init: &oxc_ast::ast::ForStatementInit<'_>, name: &str) -> bool {
+    use oxc_ast::ast::ForStatementInit as F;
+    match init {
+        F::VariableDeclaration(vd) => vd.declarations.iter().any(|d| {
+            matches!(&d.id, BindingPattern::BindingIdentifier(id) if id.name == name)
+        }),
+        other => {
+            // An expression init (`for (s = 1; …)` / `for (s; …)`).
+            let mut w = WriteScan { name, found: false };
+            if let Some(e) = other.as_expression() {
+                w.visit_expression(e);
+            }
+            w.found
+        }
+    }
 }

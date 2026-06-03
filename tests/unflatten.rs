@@ -121,3 +121,17 @@ fn real_do_while_loop_is_kept() {
     );
     assert!(out.contains("switch"), "cyclic do-while wrongly unflattened: {out}");
 }
+
+#[test]
+fn param_state_dispatcher_specializes() {
+    // State is a function parameter, selected by a constant entry at the call site.
+    // The machine must specialize per entry and the switch must vanish.
+    let out = deob(
+        "(function(){ \
+           var f = function self(s, o) { while (s != 9) { switch (s) { \
+             case 1: { o.v += 10; s = 2; break; } case 2: { o.v += 5; s = 9; break; } } } }; \
+           var o = { v: 0 }; f(1, o); sink(o.v); })();",
+    );
+    assert!(!out.contains("switch"), "param-state switch survived: {out}");
+    assert!(out.contains("__pf_"), "no specialization emitted: {out}");
+}
