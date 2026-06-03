@@ -17,7 +17,10 @@
 mod analysis;
 mod cfg;
 mod dom;
+mod inline;
 mod ssa;
+
+pub use inline::InlineSingleUse;
 
 /// Symbol-precise "which local aggregate tables are NOT provably immutable" query,
 /// reused by `decoder-lift` as the soundness gate for baking a table into the
@@ -98,7 +101,7 @@ struct UnitProcessor<'a, 's> {
 
 impl<'a, 's> UnitProcessor<'a, 's> {
     fn process(&mut self, scope: ScopeId, stmts: &[Statement<'a>]) {
-        let cands = analysis::collect_candidates(stmts, scope, self.scoping);
+        let cands = analysis::collect_candidates(stmts, scope, self.scoping, true);
         if cands.is_empty() {
             return;
         }
@@ -158,6 +161,9 @@ fn collect_dead_stores<'a>(
                     // A read makes the pending store live.
                     pending.remove(sym);
                 }
+                // A barrier (a call etc.) cannot read a candidate (they don't
+                // escape), so it leaves the pending store dead.
+                Event::Barrier => {}
             }
         }
         // Stores still pending at block end may be read on a later block → keep.
