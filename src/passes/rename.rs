@@ -244,10 +244,12 @@ fn helper_marker_name(body: Option<&FunctionBody<'_>>) -> Option<String> {
     let body = body?;
     for d in &body.directives {
         let raw = d.directive.as_str();
-        let rest = raw
+        if let Some(rest) = raw
             .strip_prefix("@swc/helpers - ")
-            .or_else(|| raw.strip_prefix("@babel/helpers - "))?;
-        return canonical_helper_name(rest.trim());
+            .or_else(|| raw.strip_prefix("@babel/helpers - "))
+        {
+            return canonical_helper_name(rest.trim());
+        }
     }
     None
 }

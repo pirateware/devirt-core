@@ -71,7 +71,10 @@ fn while_neq_terminal_collapses() {
         "var s = 1; while (s != 9) { switch (s) { \
          case 1: a(); s = 2; break; case 2: b(); s = 9; break; } }",
     );
-    assert!(!out.contains("switch") && !out.contains("while"), "not unflattened: {out}");
+    assert!(
+        !out.contains("switch") && !out.contains("while"),
+        "not unflattened: {out}"
+    );
     let (ia, ib) = (out.find("a()").unwrap(), out.find("b()").unwrap());
     assert!(ia < ib, "order wrong: {out}");
 }
@@ -95,7 +98,10 @@ fn compound_transition_collapses() {
         "var s = 1; while (s != 13) { switch (s) { \
          case 1: a(); s += 4; break; case 5: b(); s += 8; break; } }",
     );
-    assert!(!out.contains("switch"), "compound-transition not unflattened: {out}");
+    assert!(
+        !out.contains("switch"),
+        "compound-transition not unflattened: {out}"
+    );
     let (ia, ib) = (out.find("a()").unwrap(), out.find("b()").unwrap());
     assert!(ia < ib, "order wrong: {out}");
 }
@@ -107,7 +113,10 @@ fn symbolic_const_labels_collapse() {
         "var A = 1, B = 2, Z = 0; var s = A; while (s) { switch (s) { \
          case A: a(); s = B; break; case B: b(); s = Z; break; } }",
     );
-    assert!(!out.contains("switch"), "symbolic-label machine not unflattened: {out}");
+    assert!(
+        !out.contains("switch"),
+        "symbolic-label machine not unflattened: {out}"
+    );
     let (ia, ib) = (out.find("a()").unwrap(), out.find("b()").unwrap());
     assert!(ia < ib, "order wrong: {out}");
 }
@@ -119,7 +128,10 @@ fn real_do_while_loop_is_kept() {
         "var s = 1; do { switch (s) { \
          case 1: a(); s = 2; break; case 2: b(); s = 1; break; } } while (s);",
     );
-    assert!(out.contains("switch"), "cyclic do-while wrongly unflattened: {out}");
+    assert!(
+        out.contains("switch"),
+        "cyclic do-while wrongly unflattened: {out}"
+    );
 }
 
 #[test]
@@ -132,6 +144,9 @@ fn param_state_dispatcher_specializes() {
              case 1: { o.v += 10; s = 2; break; } case 2: { o.v += 5; s = 9; break; } } } }; \
            var o = { v: 0 }; f(1, o); sink(o.v); })();",
     );
-    assert!(!out.contains("switch"), "param-state switch survived: {out}");
+    assert!(
+        !out.contains("switch"),
+        "param-state switch survived: {out}"
+    );
     assert!(out.contains("__pf_"), "no specialization emitted: {out}");
 }

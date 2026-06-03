@@ -18,9 +18,9 @@
 //! a self-recursive machine stays correct. The original `f` is left for DCE.
 //!
 //! Soundness gates (all required, else the function is left untouched):
-//!   * the function body is exactly the dispatch loop over parameter 0, and that
-//!     parameter is dispatch-only (guaranteed: `parse_cases` rejects any case body
-//!     that references it, and the loop is the whole body);
+//!   * the dispatch loop is the *first* statement; parameter 0 is dispatch-only
+//!     (`parse_cases` rejects any case body that references it) and any trailing
+//!     statements after the loop never reference it;
 //!   * params are plain identifiers (no rest/pattern/default) and the body does
 //!     not use `arguments` (dropping param 0 must not shift `arguments` indices);
 //!   * every binding name of the function (the outer `var f` and any inner
@@ -28,6 +28,7 @@
 //!     those names is the callee of a call whose first argument is an integer
 //!     literal — so the function never escapes and every entry is a known constant;
 //!   * every distinct entry simulates to a finite linear sequence.
+//!
 //! Because param 0 is dispatch-only and each call passes a constant entry, the
 //! specialized body runs exactly the statements the original would, in order, with
 //! the remaining parameters bound identically (bare calls ⇒ `this` is unchanged).
@@ -145,7 +146,10 @@ fn int_literal(expr: &Expression<'_>) -> Option<i64> {
             Some(n.value as i64)
         }
         Expression::UnaryExpression(u)
-            if matches!(u.operator, oxc_syntax::operator::UnaryOperator::UnaryNegation) =>
+            if matches!(
+                u.operator,
+                oxc_syntax::operator::UnaryOperator::UnaryNegation
+            ) =>
         {
             int_literal(&u.argument).map(|v| -v)
         }
@@ -284,7 +288,11 @@ impl<'a, 'c> Builder<'a, 'c> {
 
     /// Recurse into function bodies embedded in an expression (IIFEs, `var f =
     /// function(){…}`, `~(function(){…})()`, comma/assignment chains).
-    fn recurse_expr_fn(&self, expr: &mut Expression<'a>, plan: &mut HashMap<(String, i64), String>) {
+    fn recurse_expr_fn(
+        &self,
+        expr: &mut Expression<'a>,
+        plan: &mut HashMap<(String, i64), String>,
+    ) {
         match expr {
             Expression::FunctionExpression(f) => {
                 if let Some(body) = &mut f.body {
@@ -323,7 +331,12 @@ impl<'a, 'c> Builder<'a, 'c> {
             if self.census.bindings.get(name).copied() != Some(1) {
                 return None;
             }
-            let calls = self.census.calls.get(name).map(Vec::as_slice).unwrap_or(&[]);
+            let calls = self
+                .census
+                .calls
+                .get(name)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
             let refs = self.census.refs.get(name).copied().unwrap_or(0);
             // Every reference must be a call callee (callee refs == total refs)…
             if refs != calls.len() {
@@ -542,7 +555,11 @@ impl<'a, 'c> Traverse<'a, ()> for Rewriter<'a, 'c> {
             return;
         };
         let name = callee.name.to_string();
-        let Some(entry) = node.arguments.first().and_then(|a| a.as_expression()).and_then(int_literal)
+        let Some(entry) = node
+            .arguments
+            .first()
+            .and_then(|a| a.as_expression())
+            .and_then(int_literal)
         else {
             return;
         };

@@ -15,6 +15,7 @@
 //! literal in the preceding statement):
 //!   * `while (<test>) { switch (s) { … } }`
 //!   * `do { switch (s) { … } } while (<test>)` — body runs before the test.
+//!
 //! `<test>` may be `s` (falsy exit), `true` (exit only via a terminal case), or a
 //! comparison `s <op> K` (`!=`, `==`, `<`, `<=`, `>`, `>=`) against an integer
 //! literal on either side. The exit is modelled exactly by `LoopTest::continues`,
@@ -45,13 +46,13 @@
 use std::collections::{HashMap, HashSet};
 
 use oxc_allocator::{Allocator, CloneIn, Vec as ArenaVec};
+use oxc_ast::ast::VariableDeclarationKind;
 use oxc_ast::ast::{
     AssignmentTarget, BindingPattern, BlockStatement, Expression, Program, SimpleAssignmentTarget,
     Statement, SwitchStatement,
 };
-use oxc_syntax::operator::{AssignmentOperator, BinaryOperator};
-use oxc_ast::ast::VariableDeclarationKind;
 use oxc_ast_visit::Visit;
+use oxc_syntax::operator::{AssignmentOperator, BinaryOperator};
 use oxc_traverse::{traverse_mut, Traverse, TraverseCtx};
 
 use crate::pass::Pass;
@@ -638,9 +639,10 @@ fn writes_in_expr(expr: &Expression<'_>, name: &str) -> bool {
 fn for_init_writes(init: &oxc_ast::ast::ForStatementInit<'_>, name: &str) -> bool {
     use oxc_ast::ast::ForStatementInit as F;
     match init {
-        F::VariableDeclaration(vd) => vd.declarations.iter().any(|d| {
-            matches!(&d.id, BindingPattern::BindingIdentifier(id) if id.name == name)
-        }),
+        F::VariableDeclaration(vd) => vd
+            .declarations
+            .iter()
+            .any(|d| matches!(&d.id, BindingPattern::BindingIdentifier(id) if id.name == name)),
         other => {
             // An expression init (`for (s = 1; …)` / `for (s; …)`).
             let mut w = WriteScan { name, found: false };

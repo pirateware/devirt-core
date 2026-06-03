@@ -145,6 +145,9 @@ fn swc_helper_markers_get_canonical_names() {
         "t.js",
         "rename",
     );
-    assert!(out.contains("instanceOf"), "instanceof helper not named: {out}");
+    assert!(
+        out.contains("instanceOf"),
+        "instanceof helper not named: {out}"
+    );
     assert!(out.contains("typeOf"), "typeof helper not named: {out}");
 }
