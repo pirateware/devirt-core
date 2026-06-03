@@ -290,6 +290,14 @@ impl<'a> ArrayCollector<'a> {
         // bound — a large multi-statement slot would only bloat output), and no
         // `arguments` use (dropping param 0 would shift its indices). Everything else
         // is stored as `None` — never cloned, never specialized.
+        //
+        // NOTE (issue 02, 2026-06): widening this to multi-statement / `switch`
+        // bodies was tried and *reverted* — it regressed sample_10 from 1.67 MB to
+        // 3.9–10 MB. The reCAPTCHA handlers do real, non-foldable work (DOM/XHR), so
+        // binding the selector only removes the dispatch guard and leaves the large
+        // live body, duplicated once per distinct selector. Only the trivial
+        // single-`return` slots fold to nothing; for everything else specialization
+        // bloats. See issues/02-demultiplex-slot-gate.md.
         let selector = selector?;
         let single_return = body.statements.len() == 1
             && matches!(

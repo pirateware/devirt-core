@@ -54,10 +54,23 @@ pub(crate) const GLOBALS: &[&str] = &[
     "encodeURIComponent",
     "unescape",
     "escape",
+    // base64 (WHATWG, polyfilled in the sandbox — see SANDBOX_PRELUDE). A common
+    // decoder codec, e.g. DataDome's `function(i){ return atob(table[i]) }`.
+    "atob",
+    "btoa",
     "undefined",
     "NaN",
     "Infinity",
     "Date",
+    // Global-object handles. A decoder's environment-detection prelude reads
+    // these (`globalThis || global || window || self`) to find `String`,
+    // `Array`, etc. Referencing them is side-effect free; in the sandbox only
+    // `globalThis` is actually bound, so a decoder that hard-depends on a missing
+    // one simply fails to eval and is left untouched (execution is the validator).
+    "globalThis",
+    "window",
+    "global",
+    "self",
     // Collections & symbols — common in modern decoders (e.g. a Map charset
     // lookup). Pure to construct; mutation stays inside the sandbox.
     "Map",

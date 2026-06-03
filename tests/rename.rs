@@ -129,3 +129,22 @@ fn preserves_global_names() {
     let out = run_pass("var Qz = 1; window.x = Qz;", "t.js", "rename");
     assert!(out.contains("Qz"), "global binding renamed: {out}");
 }
+
+#[test]
+fn swc_helper_markers_get_canonical_names() {
+    // A function carrying swc/babel's self-identifying directive prologue is named
+    // from that marker, not the misleading body-shape heuristic (a `?:` body would
+    // otherwise become `pick`, hiding `instanceOf` / `typeOf`). Run in isolation so
+    // the helpers aren't inlined before rename sees them.
+    let out = run_pass(
+        r#"(function(){
+            function aB(o, C) { "@swc/helpers - instanceof"; return o instanceof C; }
+            function cD(v) { "@babel/helpers - typeof"; return typeof v; }
+            sink(aB(x, Y), cD(z));
+        })();"#,
+        "t.js",
+        "rename",
+    );
+    assert!(out.contains("instanceOf"), "instanceof helper not named: {out}");
+    assert!(out.contains("typeOf"), "typeof helper not named: {out}");
+}

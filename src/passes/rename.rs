@@ -24,8 +24,8 @@
 use std::collections::{HashMap, HashSet};
 
 use oxc_ast::ast::{
-    BindingIdentifier, BindingPattern, Expression, Function, IdentifierReference, Program,
-    Statement, StaticMemberExpression, VariableDeclarator,
+    BindingIdentifier, BindingPattern, Expression, Function, FunctionBody, IdentifierReference,
+    Program, Statement, StaticMemberExpression, VariableDeclarator,
 };
 use oxc_syntax::operator::BinaryOperator;
 use oxc_syntax::symbol::{SymbolFlags, SymbolId};
@@ -176,6 +176,12 @@ impl<'a> Traverse<'a, ()> for Collector {
         let Some(init) = &node.init else {
             return;
         };
+        // A `var h = function(){ "@swc/helpers - X"; … }` carries the compiler's own
+        // label for the helper — far more informative than the behavior heuristic.
+        if let Some(name) = helper_marker_name(function_body_of(init)) {
+            self.record_hint(bid.symbol_id(), &name);
+            return;
+        }
         if let Some(name) = name_from_expr(init) {
             self.record_hint(bid.symbol_id(), name);
         }
@@ -185,6 +191,13 @@ impl<'a> Traverse<'a, ()> for Collector {
         let Some(id) = &node.id else {
             return;
         };
+        // Prefer the swc/babel helper marker (`"@swc/helpers - instanceof"`) over the
+        // body-shape heuristic — the latter mis-names these (a `?:` body → `pick`,
+        // a `||` body → `or`), hiding e.g. `_instanceof` behind `pick(x, Foo)`.
+        if let Some(name) = helper_marker_name(node.body.as_deref()) {
+            self.record_hint(id.symbol_id(), &name);
+            return;
+        }
         if let Some(name) = name_from_function_body(node.body.as_deref()) {
             self.record_hint(id.symbol_id(), name);
         }
@@ -208,6 +221,64 @@ impl<'a> Traverse<'a, ()> for Collector {
                 .push(node.property.name.to_string());
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Compiler-helper fingerprinting (swc / babel)
+// ---------------------------------------------------------------------------
+
+/// The `FunctionBody` of a function/arrow expression initializer, if any.
+fn function_body_of<'a, 'b>(expr: &'b Expression<'a>) -> Option<&'b FunctionBody<'a>> {
+    match expr {
+        Expression::FunctionExpression(f) => f.body.as_deref(),
+        Expression::ArrowFunctionExpression(f) => Some(&f.body),
+        _ => None,
+    }
+}
+
+/// swc/babel emit a self-identifying directive prologue at the top of each runtime
+/// helper, e.g. `"@swc/helpers - instanceof"` / `"@babel/helpers - typeof"`. That
+/// is the compiler's own label — a ground-truth name we trust over any heuristic.
+/// Returns a clean, non-reserved canonical identifier for the helper, or `None`.
+fn helper_marker_name(body: Option<&FunctionBody<'_>>) -> Option<String> {
+    let body = body?;
+    for d in &body.directives {
+        let raw = d.directive.as_str();
+        let rest = raw
+            .strip_prefix("@swc/helpers - ")
+            .or_else(|| raw.strip_prefix("@babel/helpers - "))?;
+        return canonical_helper_name(rest.trim());
+    }
+    None
+}
+
+/// Map a helper marker tail (`instanceof`, `typeof`, `async to generator`, …) to a
+/// readable camelCase identifier. Returns `None` for an empty/digit-leading tail.
+fn canonical_helper_name(tail: &str) -> Option<String> {
+    match tail {
+        "instanceof" => return Some("instanceOf".to_string()),
+        "typeof" => return Some("typeOf".to_string()),
+        _ => {}
+    }
+    let parts: Vec<&str> = tail
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.is_empty() || parts[0].chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let mut out = String::new();
+    for (i, p) in parts.iter().enumerate() {
+        let mut chars = p.chars();
+        let first = chars.next().unwrap();
+        if i == 0 {
+            out.push(first.to_ascii_lowercase());
+        } else {
+            out.push(first.to_ascii_uppercase());
+        }
+        out.extend(chars.flat_map(|c| c.to_lowercase()));
+    }
+    Some(out)
 }
 
 // ---------------------------------------------------------------------------
