@@ -39,6 +39,26 @@ pub fn format_only(source: &str, filename: &str) -> String {
         .code
 }
 
+/// Test-support: parse `source`, run a single named pass once, and return the
+/// printed result. Pass-level unit tests use this to observe one pass free of
+/// pipeline interactions (e.g. an earlier pass inlining a fixture away before the
+/// pass under test ever sees it). Not part of the public deobfuscation API.
+#[doc(hidden)]
+pub fn run_pass(source: &str, filename: &str, pass_name: &str) -> String {
+    let allocator = Allocator::default();
+    let source_type = SourceType::from_path(Path::new(filename)).unwrap_or_default();
+    let parsed = Parser::new(&allocator, source, source_type)
+        .with_options(ParseOptions { preserve_parens: false, ..ParseOptions::default() })
+        .parse();
+    let mut program = parsed.program;
+    let mut p: Box<dyn pass::Pass> = match pass_name {
+        "rename" => Box::new(passes::RenameByRole::default()),
+        other => panic!("run_pass: unknown pass {other:?}"),
+    };
+    p.run(&mut program, &allocator);
+    Codegen::new().with_options(CodegenOptions::default()).build(&program).code
+}
+
 /// Deobfuscate `source`. `filename` is used only to infer the source type
 /// (module vs script, jsx, ts). The pipeline is the sample-agnostic default.
 pub fn deobfuscate(source: &str, filename: &str) -> Report {

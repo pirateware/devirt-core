@@ -1,4 +1,4 @@
-use js_deobfuscator::deobfuscate;
+use js_deobfuscator::{deobfuscate, run_pass};
 
 #[test]
 fn renames_opaque_bindings_and_all_references() {
@@ -19,8 +19,11 @@ fn renames_opaque_bindings_and_all_references() {
 #[test]
 fn names_by_assignment() {
     // A known global, a regex, a `new Date()`, an array literal, and an object
-    // literal each get a descriptive name from what they hold.
-    let out = deobfuscate(
+    // literal each get a descriptive name from what they hold. Run the rename
+    // pass in isolation: in the full pipeline these single-use temps would be
+    // inlined away before rename sees them (correct — see the inline pass), so
+    // this unit test targets the rename pass directly.
+    let out = run_pass(
         r#"(function(){
             var aa = document;
             var bb = /x/g;
@@ -30,8 +33,8 @@ fn names_by_assignment() {
             sink(aa, bb, cc, dd, ee);
         })();"#,
         "t.js",
-    )
-    .code;
+        "rename",
+    );
     for name in ["doc", "regex", "date", "arr", "obj"] {
         assert!(out.contains(name), "missing assignment-based name `{name}`: {out}");
     }
@@ -76,8 +79,9 @@ fn names_array_accumulator_by_usage() {
 #[test]
 fn emitted_names_are_unique_and_collision_free() {
     // Two regex bindings both want `regex`; the second must be suffixed, and the
-    // pre-existing `regex` reference in scope must not be clobbered.
-    let out = deobfuscate(
+    // pre-existing `regex` reference in scope must not be clobbered. Rename in
+    // isolation (single-use temps would otherwise be inlined before rename runs).
+    let out = run_pass(
         r#"(function(){
             var regex = 0;
             var aa = /x/;
@@ -85,8 +89,8 @@ fn emitted_names_are_unique_and_collision_free() {
             sink(regex, aa, bb);
         })();"#,
         "t.js",
-    )
-    .code;
+        "rename",
+    );
     assert!(out.contains("regex1") || out.contains("regex2"), "duplicate base not suffixed: {out}");
 }
 
