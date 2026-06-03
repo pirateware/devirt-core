@@ -693,6 +693,105 @@ fn memo_non_memo_write_must_not_lift() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Cross-function write-once constant inlining (Phase 2, GlobalConstInline). A
+// constant defined once (literal) in an init function that runs unconditionally
+// before any reader is inlined into its reads. Each "inlines" case is paired with
+// a sibling where the write does NOT happen-before a read (read-before-init,
+// conditional init/write, multiple writes, compound write) and inlining would
+// expose a pre-init `undefined` or a wrong value. Differential net catches it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn global_const_inline_preserves_value() {
+    // The canonical shape: write-once literal in an init fn called before readers.
+    assert_equivalent(
+        r#"
+        var k;
+        function init(){ k = 19; }
+        init();
+        function use(){ return k; }
+        __r = use();
+        "#,
+    );
+    // Multiple constants, read as switch labels in a later-defined dispatcher.
+    assert_equivalent(
+        r#"
+        var L1, L2;
+        function setup(){ L1 = 7; L2 = 3; }
+        setup();
+        var run = function(s){
+            var acc = 0;
+            while (s) { switch (s) { case L1: acc += 10; s = L2; break; case L2: acc += 20; s = 0; break; } }
+            return acc;
+        };
+        __r = run(L1);
+        "#,
+    );
+}
+
+#[test]
+fn global_const_read_before_init_must_not_inline() {
+    // `out` reads `k` before `init()` runs, observing the pre-init undefined.
+    assert_equivalent(r#"var out = "" + k; var k; function init(){ k = 5; } init(); __r = out;"#);
+}
+
+#[test]
+fn global_const_conditional_init_must_not_inline() {
+    // The write to `k` is inside a conditional within the init fn: it may not run.
+    assert_equivalent(
+        r#"
+        var k;
+        var cond = String(0) === "1";
+        function init(){ if (cond) { k = 5; } }
+        init();
+        __r = String(k);
+        "#,
+    );
+}
+
+#[test]
+fn global_const_conditional_init_call_must_not_inline() {
+    // The init call itself is conditional (not an unconditional top-level call).
+    assert_equivalent(
+        r#"
+        var k;
+        var cond = String(0) === "1";
+        function init(){ k = 5; }
+        if (cond) { init(); }
+        __r = String(k);
+        "#,
+    );
+}
+
+#[test]
+fn global_const_two_writes_must_not_inline() {
+    // Two writes: the value is position-dependent; the read sees the last (2).
+    assert_equivalent(
+        r#"
+        var k;
+        function init(){ k = 1; k = 2; }
+        init();
+        function use(){ return k; }
+        __r = use();
+        "#,
+    );
+}
+
+#[test]
+fn global_const_compound_write_must_not_inline() {
+    // A compound write makes `k` real mutable state.
+    assert_equivalent(
+        r#"
+        var k = 10;
+        function bump(){ k += 5; }
+        bump();
+        function use(){ return k; }
+        __r = use();
+        "#,
+    );
+}
+
 #[test]
 fn ssa_copy_propagation_preserves_value() {
     // A proxy variable collapses to its source.

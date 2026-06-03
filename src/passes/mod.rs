@@ -7,6 +7,7 @@ mod dead_object_prop;
 mod dead_store;
 mod decoder_lift;
 mod flatten_else;
+mod global_const_inline;
 mod math_fingerprint;
 mod member_normalize;
 mod proxy_inline;
@@ -22,6 +23,7 @@ pub use dead_object_prop::DeadObjectProp;
 pub use dead_store::DeadStore;
 pub use decoder_lift::DecoderLift;
 pub use flatten_else::FlattenElse;
+pub use global_const_inline::GlobalConstInline;
 pub use math_fingerprint::MathFingerprint;
 pub use member_normalize::MemberNormalize;
 pub use proxy_inline::ProxyInline;
@@ -41,6 +43,13 @@ pub fn default_pipeline() -> Vec<Box<dyn Pass>> {
         // Split statement-level comma chains into one statement per effect, so
         // later passes (fold, inline, DCE) see individual assignments.
         Box::new(SequenceSplit::default()),
+        // Inline program-wide write-once literal constants defined in an init
+        // function and read elsewhere (`case varN:` → `case 19:`). Runs before
+        // `unflatten` so symbolic case labels become numeric and the dispatcher
+        // becomes a plain numeric switch the unflattener can act on. The literal
+        // values it consumes are produced upstream by decoder-lift's base-N
+        // arithmetic materialization, so it fires on a later fixpoint round.
+        Box::new(GlobalConstInline),
         // Unflatten the integer-state `while(s){switch(s){…}}` control-flow
         // dispatcher back into the straight-line sequence it encodes. Runs early
         // (after sequence-split splits comma chains in cases into clean top-level
