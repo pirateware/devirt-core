@@ -2,7 +2,31 @@
 
 - **Samples:** 1, 4, 8, 11
 - **Impact:** High · **Effort:** High · **Risk:** Medium
-- **Pass:** `src/passes/unflatten.rs` (~422 lines); IR substrate `src/ir/{cfg,dom,ssa}.rs`
+- **Pass:** `src/passes/unflatten.rs`, `src/passes/unflatten_param.rs`; IR substrate `src/ir/{cfg,dom,ssa}.rs`
+
+> **STATUS (2026-06): SUBSTANTIALLY IMPLEMENTED (branch `feat/unflatten-redesign`).**
+> The unflattener fired on only the toy `while(s)` shape. Now landed, all sound +
+> test-gated (semantic equivalence battery executes original-vs-deobfuscated in
+> QuickJS):
+> 1. **Loop shapes** — `while` / `do-while` / `for`; exits modelled exactly
+>    (`while(s)` falsy, `while(s != K)`, relational, `while(true)`); transitions
+>    `s = K` and `s += K` / `s -= K`.
+> 2. **Block-wrapped case bodies** — `case X: { … } break;` flattened (transparent
+>    blocks only); first top-level terminator wins, dead code after it dropped.
+> 3. **Param-state specialization** (`unflatten_param.rs`) — the dominant shape in
+>    samples 1 & 4: state is a function parameter, entry chosen by a constant at the
+>    call site. Specializes per entry (`__pf_<f>_<C>`), routes calls there, handles
+>    recursion + dual-name (`var f = function self`). **Fires on sample_4**
+>    (`var162`/`fn10`, entries 2 & 56; switch 6→5).
+>
+> **Still not firing (follow-up, each sound + incremental):**
+> - **Trailing statements** after the loop in the function body (`body.len > 1`) —
+>   needs simulate to report test-exit vs terminal-exit so trailing is appended
+>   only when reachable. Blocks several sample_4 functions.
+> - **Symbolic entries/labels** — at the early pipeline stage the call entries and
+>   case labels are still write-once-const identifiers (`var944`), not literals.
+>   Needs a write-once-int const map (resolve in `int_literal`). Blocks sample_1.
+> - **Bytecode VMs** (sample_8 `arr[pc++]` over `split("|")`) remain out of scope.
 
 ## Symptom
 
