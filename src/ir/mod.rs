@@ -47,11 +47,25 @@ impl Pass for SsaOpt {
     fn run<'a>(&mut self, program: &mut Program<'a>, allocator: &'a Allocator) -> bool {
         let scoping = build_scoping(program);
 
+        // Names bound by exactly one symbol. Copy propagation emits an identifier
+        // by name, so it must only do so for a globally-unique name — otherwise the
+        // emitted name could resolve to a shadowing binding at the use site.
+        let mut name_counts: HashMap<&str, u32> = HashMap::new();
+        for name in scoping.symbol_names() {
+            *name_counts.entry(name).or_default() += 1;
+        }
+        let unique_names: std::collections::HashSet<String> = name_counts
+            .into_iter()
+            .filter(|(_, c)| *c == 1)
+            .map(|(n, _)| n.to_string())
+            .collect();
+
         // Phase 1 (read-only): per function unit, lower → dominators → SSA →
         // compute the set of node-identified rewrites.
         let mut collector = UnitProcessor {
             allocator,
             scoping: &scoping,
+            unique_names: &unique_names,
             rewrites: HashMap::new(),
         };
         collector.visit_program(program);
@@ -73,6 +87,7 @@ impl Pass for SsaOpt {
 struct UnitProcessor<'a, 's> {
     allocator: &'a Allocator,
     scoping: &'s Scoping,
+    unique_names: &'s std::collections::HashSet<String>,
     rewrites: HashMap<NodeId, Expression<'a>>,
 }
 
@@ -87,11 +102,60 @@ impl<'a, 's> UnitProcessor<'a, 's> {
         };
         let dom = Dominators::compute(&cfg.succs, cfg.entry);
         let ast = AstBuilder::new(self.allocator);
-        for u in ssa::resolve(&cfg, &dom) {
-            if let Some(rep) = build_replacement(u.kind, u.val, ast) {
-                self.rewrites.insert(u.node, rep);
+        for r in ssa::resolve(&cfg, &dom) {
+            match r {
+                ssa::Resolved::Const { node, kind, val } => {
+                    if let Some(rep) = build_replacement(kind, val, ast) {
+                        self.rewrites.insert(node, rep);
+                    }
+                }
+                ssa::Resolved::Copy { node, src } => {
+                    // Replace the use with the source identifier — only when its
+                    // name is globally unique (no shadowing hazard).
+                    let name = self.scoping.symbol_name(src);
+                    if self.unique_names.contains(name) {
+                        let id = ast.expression_identifier(oxc_span::SPAN, ast.str(name));
+                        self.rewrites.insert(node, id);
+                    }
+                }
             }
         }
+        collect_dead_stores(&cfg, ast, &mut self.rewrites);
+    }
+}
+
+/// Flow-sensitive dead-store removal: within a block, a `s = rhs` whose stored
+/// version is overwritten by a later `s = …` before any read of `s` is dead. Its
+/// node is rewritten to a clone of `rhs` — preserving the rhs value and effects,
+/// dropping only the now-useless store. Intra-block only, so no phi/liveness
+/// reasoning is needed: the later def provably overwrites with no read between.
+fn collect_dead_stores<'a>(
+    cfg: &cfg::Cfg<'a>,
+    ast: AstBuilder<'a>,
+    rewrites: &mut HashMap<NodeId, Expression<'a>>,
+) {
+    use cfg::Event;
+    for block in &cfg.blocks {
+        // Per symbol: the last `s = rhs` store not yet read or overwritten.
+        let mut pending: HashMap<oxc_syntax::symbol::SymbolId, &cfg::AssignInfo<'a>> = HashMap::new();
+        for ev in &block.events {
+            match ev {
+                Event::Def { sym, assign, .. } => {
+                    // The previous pending store of `sym` is overwritten unread.
+                    if let Some(prev) = pending.remove(sym) {
+                        rewrites.insert(prev.node, prev.rhs.clone_in(ast.allocator));
+                    }
+                    if let Some(info) = assign {
+                        pending.insert(*sym, info);
+                    }
+                }
+                Event::Use { sym, .. } => {
+                    // A read makes the pending store live.
+                    pending.remove(sym);
+                }
+            }
+        }
+        // Stores still pending at block end may be read on a later block → keep.
     }
 }
 
