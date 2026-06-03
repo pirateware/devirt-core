@@ -447,3 +447,27 @@ fn ssa_for_each_var_head_rebinding_not_folded() {
     assert_equivalent(r#"var x = 1; for (var x in { a: 0, b: 0 }) {} __r = x;"#);
     assert_equivalent("var x = 1; for (var [x] of [[9]]) {} __r = x;");
 }
+
+#[test]
+fn decoder_lift_respects_table_reassignment() {
+    // A decoder reads a table that is REASSIGNED before the decoder is called.
+    // The lift must not bake the stale initial table — get() must see [3,4].
+    assert_equivalent(
+        r#"
+        var s = [1, 2];
+        function get(){ return s[0]; }
+        s = [3, 4];
+        __r = get();
+        "#,
+    );
+    // Same hazard with a string decoder table reassigned between uses.
+    assert_equivalent(
+        r#"
+        var tbl = ["a", "b"];
+        function d(i){ return tbl[i]; }
+        var first = d(0);
+        tbl = ["x", "y"];
+        __r = first + ":" + d(0);
+        "#,
+    );
+}
