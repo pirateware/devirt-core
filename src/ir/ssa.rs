@@ -23,16 +23,41 @@ use oxc_syntax::symbol::SymbolId;
 use super::cfg::{Cfg, DefVal, Event, NodeId, UseKind};
 use super::dom::{BlockId, Dominators};
 
-/// A use whose reaching definition is a single concrete (non-phi) definition.
-pub struct ResolvedUse<'c, 'a> {
-    pub node: NodeId,
-    pub kind: &'c UseKind,
-    pub val: &'c DefVal<'a>,
+/// A use whose reaching definition is a single concrete (non-phi) definition,
+/// resolved to the rewrite it enables.
+pub enum Resolved<'c, 'a> {
+    /// A use reached by a constant definition — fold to the constant.
+    Const { node: NodeId, kind: &'c UseKind, val: &'c DefVal<'a> },
+    /// A scalar use reached by a copy `s = src` where `src` is provably unchanged
+    /// since the copy — replace the use with `src`.
+    Copy { node: NodeId, src: SymbolId },
+}
+
+impl<'c, 'a> Resolved<'c, 'a> {
+    #[allow(dead_code)] // used by the unit tests
+    pub fn node(&self) -> NodeId {
+        match self {
+            Resolved::Const { node, .. } | Resolved::Copy { node, .. } => *node,
+        }
+    }
+}
+
+/// What a live SSA version carries, for resolving uses. `Copy` is reflexively
+/// `Copy` (it holds only refs / small values), so it can be lifted off the stack
+/// cheaply during the rename walk.
+#[derive(Clone, Copy)]
+enum Reaching<'c, 'a> {
+    /// Entry/param value or a phi result — never folds.
+    NonConst,
+    /// A concrete definition's classified value.
+    Concrete(&'c DefVal<'a>),
+    /// `s = src`, captured with the version id `src` held at the copy point.
+    Copy { src: SymbolId, src_version: u32 },
 }
 
 /// Resolve every candidate use to its reaching definition; return only those
-/// reached by a single concrete definition (the fold candidates).
-pub fn resolve<'c, 'a>(cfg: &'c Cfg<'a>, dom: &Dominators) -> Vec<ResolvedUse<'c, 'a>> {
+/// reached by a single concrete definition or a stable copy (the fold sites).
+pub fn resolve<'c, 'a>(cfg: &'c Cfg<'a>, dom: &Dominators) -> Vec<Resolved<'c, 'a>> {
     let n = cfg.blocks.len();
 
     // Definition sites per symbol (blocks containing at least one Def).
@@ -87,14 +112,21 @@ pub fn resolve<'c, 'a>(cfg: &'c Cfg<'a>, dom: &Dominators) -> Vec<ResolvedUse<'c
     }
 
     // Rename: a dominator-tree DFS maintaining, per symbol, a stack of reaching
-    // values. `None` = non-constant (entry value or a phi); `Some(&val)` = a
-    // concrete definition's value.
-    let mut stacks: HashMap<SymbolId, Vec<Option<&DefVal>>> = HashMap::new();
+    // values tagged with a globally-unique version id. The version id lets a copy
+    // `s = src` check, at each use of `s`, whether `src` still holds the exact
+    // version it held at the copy (same id ⇒ unchanged ⇒ safe to propagate).
+    let mut next_ver: u32 = 0;
+    let mut fresh = || {
+        let v = next_ver;
+        next_ver += 1;
+        v
+    };
+    let mut stacks: HashMap<SymbolId, Vec<(u32, Reaching)>> = HashMap::new();
     for &sym in &symbols {
-        stacks.insert(sym, vec![None]); // entry / param / undefined value
+        stacks.insert(sym, vec![(fresh(), Reaching::NonConst)]); // entry / param value
     }
 
-    let mut resolved: Vec<ResolvedUse> = Vec::new();
+    let mut resolved: Vec<Resolved> = Vec::new();
 
     // Iterative DFS over the dom tree. Each frame remembers, per symbol, how many
     // pushes to undo when the subtree is done.
@@ -117,21 +149,45 @@ pub fn resolve<'c, 'a>(cfg: &'c Cfg<'a>, dom: &Dominators) -> Vec<ResolvedUse<'c
 
                 // Phi results: a fresh non-constant version at the block head.
                 for &sym in &has_phi[b] {
-                    stacks.get_mut(&sym).unwrap().push(None);
+                    let v = fresh();
+                    stacks.get_mut(&sym).unwrap().push((v, Reaching::NonConst));
                     *pushes.entry(sym).or_default() += 1;
                 }
 
                 for ev in &cfg.blocks[b].events {
                     match ev {
                         Event::Use { sym, kind, node } => {
-                            if let Some(s) = stacks.get(sym) {
-                                if let Some(Some(val)) = s.last() {
-                                    resolved.push(ResolvedUse { node: *node, kind, val });
+                            let reaching = stacks.get(sym).and_then(|s| s.last()).map(|(_, r)| *r);
+                            match reaching {
+                                Some(Reaching::Concrete(val)) => {
+                                    resolved.push(Resolved::Const { node: *node, kind, val });
                                 }
+                                Some(Reaching::Copy { src, src_version }) => {
+                                    // Propagate only a bare (scalar) read, and only
+                                    // if `src` still holds the copied version.
+                                    let cur =
+                                        stacks.get(&src).and_then(|s| s.last()).map(|(v, _)| *v);
+                                    if matches!(kind, UseKind::Scalar) && cur == Some(src_version) {
+                                        resolved.push(Resolved::Copy { node: *node, src });
+                                    }
+                                }
+                                _ => {}
                             }
                         }
-                        Event::Def { sym, val } => {
-                            stacks.get_mut(sym).unwrap().push(Some(val));
+                        Event::Def { sym, val, .. } => {
+                            let reaching = match val {
+                                DefVal::Copy(src) => {
+                                    let sv = stacks
+                                        .get(src)
+                                        .and_then(|s| s.last())
+                                        .map(|(v, _)| *v)
+                                        .unwrap_or(0);
+                                    Reaching::Copy { src: *src, src_version: sv }
+                                }
+                                other => Reaching::Concrete(other),
+                            };
+                            let v = fresh();
+                            stacks.get_mut(sym).unwrap().push((v, reaching));
                             *pushes.entry(*sym).or_default() += 1;
                         }
                     }
@@ -174,7 +230,7 @@ mod tests {
             entry: 0,
         };
         let dom = Dominators::compute(&cfg.succs, 0);
-        resolve(&cfg, &dom).into_iter().map(|r| r.node).collect()
+        resolve(&cfg, &dom).into_iter().map(|r| r.node()).collect()
     }
 
     #[test]
@@ -184,7 +240,7 @@ mod tests {
         let s = sym(0);
         let folded = run(
             vec![vec![
-                Event::Def { sym: s, val: DefVal::Array(vec![]) },
+                Event::Def { sym: s, val: DefVal::Array(vec![]), assign: None },
                 Event::Use { sym: s, kind: UseKind::Member(Key::Index(0)), node: addr(1) },
             ]],
             vec![vec![]],
@@ -198,7 +254,7 @@ mod tests {
         let folded = run(
             vec![vec![
                 Event::Use { sym: s, kind: UseKind::Scalar, node: addr(1) },
-                Event::Def { sym: s, val: DefVal::Array(vec![]) },
+                Event::Def { sym: s, val: DefVal::Array(vec![]), assign: None },
             ]],
             vec![vec![]],
         );
@@ -212,8 +268,8 @@ mod tests {
         let folded = run(
             vec![
                 vec![],                                                          // b0
-                vec![Event::Def { sym: s, val: DefVal::Array(vec![]) }],         // b1
-                vec![Event::Def { sym: s, val: DefVal::Array(vec![]) }],         // b2
+                vec![Event::Def { sym: s, val: DefVal::Array(vec![]), assign: None }],         // b1
+                vec![Event::Def { sym: s, val: DefVal::Array(vec![]), assign: None }],         // b2
                 vec![Event::Use { sym: s, kind: UseKind::Scalar, node: addr(9) }], // b3
             ],
             vec![vec![1, 2], vec![3], vec![3], vec![]],
@@ -228,8 +284,8 @@ mod tests {
         let s = sym(0);
         let folded = run(
             vec![
-                vec![Event::Def { sym: s, val: DefVal::Array(vec![]) }], // b0
-                vec![Event::Def { sym: s, val: DefVal::Array(vec![]) }], // b1
+                vec![Event::Def { sym: s, val: DefVal::Array(vec![]), assign: None }], // b0
+                vec![Event::Def { sym: s, val: DefVal::Array(vec![]), assign: None }], // b1
                 vec![Event::Use { sym: s, kind: UseKind::Scalar, node: addr(7) }], // b2
             ],
             vec![vec![1, 2], vec![2], vec![]],
@@ -245,7 +301,7 @@ mod tests {
         let folded = run(
             vec![
                 vec![],                                                            // b0 eval a
-                vec![Event::Def { sym: s, val: DefVal::Array(vec![]) }],           // b1 s=A
+                vec![Event::Def { sym: s, val: DefVal::Array(vec![]), assign: None }],           // b1 s=A
                 vec![Event::Use { sym: s, kind: UseKind::Member(Key::Index(0)), node: addr(5) }], // b2 use
                 vec![],                                                            // b3 merge
             ],

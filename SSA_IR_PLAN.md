@@ -9,7 +9,11 @@ registered in `default_pipeline()` after `decoder-lift`, before `dce`.
   month=0, day=1, …)` default-argument arrays (§8) now read as literals.
 - Folds delivered: scalar const propagation (flow-sensitive, beats
   assigned-once across reassignment/branches), const-array element + `.length`,
-  const-object property — all gated by SSA reaching-def + escape facts.
+  const-object property, **copy propagation** (`s = t` collapses to `t` when SSA
+  proves `t` unchanged since the copy, gated on globally-unique name to avoid
+  shadowing), and **flow-sensitive dead-store removal** (an intra-block store
+  overwritten before any read is rewritten to its rhs, preserving rhs
+  value/effects) — all gated by SSA reaching-def + escape facts.
 - Soundness by construction: the reassignment trap and branch-merge cases that
   broke the structural passes are now phis (non-const) and left alone. A full
   adversarial equivalence battery (short-circuit, reassignment, branch-merge,

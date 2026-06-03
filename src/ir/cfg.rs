@@ -51,8 +51,20 @@ pub enum DefVal<'a> {
     /// `s = { ... }` — name→clone for each inlineable-literal-valued property,
     /// last-writer-wins. Only built when the object has no spread/computed key.
     Object(HashMap<String, Expression<'a>>),
+    /// `s = t` — a copy of another candidate symbol `t`. Propagatable to a use of
+    /// `s` only when `t` holds the same version there (checked during SSA rename).
+    Copy(SymbolId),
     /// Anything else: an opaque value that never folds.
     Opaque,
+}
+
+/// Info attached to a `s = rhs` definition (assignment-expression form only),
+/// enabling flow-sensitive dead-store removal: the node to rewrite and a clone of
+/// the rhs to keep in its place (preserving the rhs value/effects, dropping only
+/// the now-dead store).
+pub struct AssignInfo<'a> {
+    pub node: NodeId,
+    pub rhs: Expression<'a>,
 }
 
 /// How a candidate symbol is read at a use site.
@@ -65,7 +77,7 @@ pub enum UseKind {
 }
 
 pub enum Event<'a> {
-    Def { sym: SymbolId, val: DefVal<'a> },
+    Def { sym: SymbolId, val: DefVal<'a>, assign: Option<AssignInfo<'a>> },
     Use { sym: SymbolId, kind: UseKind, node: NodeId },
 }
 
@@ -221,7 +233,9 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                             Some(init) => self.classify_def(init),
                             None => DefVal::Opaque, // `var x;` → undefined, not folded
                         };
-                        self.emit(Event::Def { sym, val });
+                        // Declarator inits are not removed by the dead-store pass
+                        // (it only rewrites `s = rhs` expression nodes).
+                        self.emit(Event::Def { sym, val, assign: None });
                     }
                 }
             }
@@ -595,7 +609,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                 self.cur = cont;
             }
 
-            Expression::AssignmentExpression(a) => self.lower_assignment(a),
+            Expression::AssignmentExpression(a) => self.lower_assignment(a, e.address()),
 
             Expression::SequenceExpression(s) => {
                 for ex in &s.expressions {
@@ -652,7 +666,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
         }
     }
 
-    fn lower_assignment(&mut self, a: &AssignmentExpression<'a>) {
+    fn lower_assignment(&mut self, a: &AssignmentExpression<'a>, node: NodeId) {
         use oxc_syntax::operator::AssignmentOperator;
         match &a.left {
             AssignmentTarget::AssignmentTargetIdentifier(id) => {
@@ -662,7 +676,8 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                     // `s = rhs`: rhs evaluates, then the def takes effect.
                     self.lower_expr(&a.right);
                     let val = self.classify_def(&a.right);
-                    self.emit(Event::Def { sym: sym.unwrap(), val });
+                    let assign = Some(AssignInfo { node, rhs: a.right.clone_in(self.allocator) });
+                    self.emit(Event::Def { sym: sym.unwrap(), val, assign });
                 } else {
                     // Non-candidate target, or compound assignment to a candidate
                     // (the latter is excluded by escape analysis, so it can't be a
@@ -689,6 +704,12 @@ impl<'a, 'c> Lowerer<'a, 'c> {
     fn classify_def(&self, rhs: &Expression<'a>) -> DefVal<'a> {
         if is_inlineable_literal(rhs) {
             return DefVal::Scalar(rhs.clone_in(self.allocator));
+        }
+        // `s = t` where `t` is another versionable candidate: a copy. Whether it
+        // propagates to a given use is decided during SSA rename (t must hold the
+        // same version there).
+        if let Some(src) = self.is_cand_ident(rhs) {
+            return DefVal::Copy(src);
         }
         match rhs {
             Expression::ArrayExpression(arr) => {

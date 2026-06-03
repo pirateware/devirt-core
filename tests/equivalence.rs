@@ -471,3 +471,47 @@ fn decoder_lift_respects_table_reassignment() {
         "#,
     );
 }
+
+// ---------------------------------------------------------------------------
+// SSA copy propagation and flow-sensitive dead-store removal (src/ir/).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ssa_copy_propagation_preserves_value() {
+    // A proxy variable collapses to its source.
+    assert_equivalent("function g(x){ var b = x; return b + 1; } __r = g(7);");
+    assert_equivalent("var a = 5; var b = a; __r = b * 10;");
+}
+
+#[test]
+fn ssa_copy_propagation_respects_source_reassignment() {
+    // `b` copies `x` while x is 1; x is then reassigned. `b` must stay 1, so the
+    // copy must NOT be propagated to the live `x` (which is 2 at the read).
+    assert_equivalent("var x = 1; var b = x; x = 2; __r = b + ':' + x;");
+    // Source reassigned on a branch between copy and use → phi → no propagation.
+    assert_equivalent(
+        r#"
+        var cond = String(1) === "1";
+        var x = 1;
+        var b = x;
+        if (cond) { x = 9; }
+        __r = b + ":" + x;
+        "#,
+    );
+}
+
+#[test]
+fn ssa_dead_store_removal_preserves_value() {
+    // The overwritten store is dead; the final value is observed.
+    assert_equivalent("var x; x = 1; x = 2; __r = x;");
+    assert_equivalent("var s; s = [1, 2]; s = [3, 4]; __r = s[0] + s[1];");
+}
+
+#[test]
+fn ssa_dead_store_keeps_rhs_effects() {
+    // A dead store whose rhs has a side effect: the store is removed but the
+    // effect (and the rhs value, used by `y`) must remain.
+    assert_equivalent("var log = 0; var x; x = (log = 1, 5); x = 9; __r = x + ':' + log;");
+    // The dead store's value flows to another binding via the assignment value.
+    assert_equivalent("var x; var y = (x = 1); x = 2; __r = y + ':' + x;");
+}
