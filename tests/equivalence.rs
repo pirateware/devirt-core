@@ -804,3 +804,55 @@ fn inline_does_not_touch_captured_temp() {
         "#,
     );
 }
+
+#[test]
+fn math_fingerprint_preserves_value() {
+    // Addition polynomial (full-adder identity) with runtime-variable args. The
+    // proxy collapses to `+`, which must keep the numeric value.
+    assert_equivalent(
+        r#"
+        var a = 5, b = 3;
+        function add(x, y) { return (x ^ y) + 2 * (x & y); }
+        __r = add(a, b) + ":" + add(10, -4);
+        "#,
+    );
+    // Subtraction must keep operand order (a - b, not b - a).
+    assert_equivalent(
+        r#"
+        var a = 10, b = 3;
+        function sub(x, y) { return x + ~y + 1; }
+        __r = sub(a, b) + ":" + sub(b, a);
+        "#,
+    );
+    // Swapped subtraction: `b - a` body must rewrite to `y - x`, same value.
+    assert_equivalent(
+        r#"
+        var a = 10, b = 3;
+        function r(x, y) { return y - x; }
+        __r = r(a, b);
+        "#,
+    );
+    // Bitwise xor proxy.
+    assert_equivalent(
+        r#"
+        var a = 0xF0, b = 0x0F;
+        function x(p, q) { return (p | q) - (p & q); }
+        __r = x(a, b);
+        "#,
+    );
+}
+
+#[test]
+fn math_fingerprint_keeps_argument_side_effects() {
+    // Both arguments carry an effect; collapsing `f(a,b)` to `a + b` evaluates
+    // them in the same left-to-right order, so the trace and value must match.
+    assert_equivalent(
+        r#"
+        var log = "";
+        function tick(n) { log += n; return n; }
+        function add(x, y) { return (x ^ y) + 2 * (x & y); }
+        var s = add(tick(5), tick(3));
+        __r = s + ":" + log;
+        "#,
+    );
+}
