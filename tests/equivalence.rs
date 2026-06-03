@@ -473,6 +473,106 @@ fn decoder_lift_respects_table_reassignment() {
 }
 
 // ---------------------------------------------------------------------------
+// Scoped decoder lifting (Tier C/D, src/passes/decoder_lift.rs): the decoder +
+// table live inside a function scope `collect_top_level` cannot reach. Each pairs
+// a shape that *should* resolve soundly with sibling shapes where baking the
+// table would be wrong (member-mutated / `.push`d / aliased-and-mutated /
+// reassigned). The differential net catches any unsound lift by value mismatch.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn scoped_decoder_lift_preserves_value() {
+    // Decoder nested in a function body — must lift, value preserved.
+    assert_equivalent(
+        r#"
+        function setup() {
+            var tbl = ["lo", "HELLO", "wo"];
+            function dec(i) { return tbl[i]; }
+            return dec(1) + dec(0) + dec(2);
+        }
+        __r = setup();
+        "#,
+    );
+    // Decoder nested in a `var = (function(){…})()` IIFE (the DataDome wall).
+    assert_equivalent(
+        r#"
+        var R = (function () {
+            var tbl = [10, 20, 30];
+            function dec(i) { return tbl[i]; }
+            return dec(1) + 1;
+        })();
+        __r = R;
+        "#,
+    );
+}
+
+#[test]
+fn scoped_decoder_over_member_mutated_table_not_lifted() {
+    // Member write mutates the table; baking the literal would read a stale slot.
+    assert_equivalent(
+        r#"
+        function run() {
+            var tbl = ["a", "b", "c"];
+            function dec(i) { return tbl[i]; }
+            tbl[1] = "Z";
+            return dec(0) + dec(1);
+        }
+        __r = run();
+        "#,
+    );
+}
+
+#[test]
+fn scoped_decoder_over_pushed_table_not_lifted() {
+    // `.push` grows the table after the decoder is defined; dec(2) is runtime-only.
+    assert_equivalent(
+        r#"
+        function run() {
+            var tbl = ["a", "b"];
+            function dec(i) { return tbl[i]; }
+            tbl.push("c");
+            return String(dec(2));
+        }
+        __r = run();
+        "#,
+    );
+}
+
+#[test]
+fn scoped_decoder_over_aliased_mutated_table_not_lifted() {
+    // The table is aliased and the alias is mutated — baking the literal is unsound.
+    assert_equivalent(
+        r#"
+        function run() {
+            var tbl = ["a", "b"];
+            var alias = tbl;
+            function dec(i) { return tbl[i]; }
+            alias[0] = "Z";
+            return dec(0) + dec(1);
+        }
+        __r = run();
+        "#,
+    );
+}
+
+#[test]
+fn scoped_decoder_over_reassigned_table_not_lifted() {
+    // The table binding is reassigned between definition and use (nested variant of
+    // the top-level `decoder_lift_respects_table_reassignment` case).
+    assert_equivalent(
+        r#"
+        function run() {
+            var tbl = ["a", "b"];
+            function dec(i) { return tbl[i]; }
+            tbl = ["x", "y"];
+            return dec(0) + dec(1);
+        }
+        __r = run();
+        "#,
+    );
+}
+
+// ---------------------------------------------------------------------------
 // SSA copy propagation and flow-sensitive dead-store removal (src/ir/).
 // ---------------------------------------------------------------------------
 

@@ -19,6 +19,11 @@ mod cfg;
 mod dom;
 mod ssa;
 
+/// Symbol-precise "which local aggregate tables are NOT provably immutable" query,
+/// reused by `decoder-lift` as the soundness gate for baking a table into the
+/// decoder preamble (plan §5.3). One source of truth for "provably stable local".
+pub use analysis::mutable_aggregate_tables;
+
 use std::collections::HashMap;
 
 use oxc_allocator::{Allocator, CloneIn, GetAddress};
