@@ -8,4 +8,6 @@
 //! original AST by node identity. Anything the lowering can't model ⇒ bail on
 //! that function, leaving its AST untouched (partial coverage is always sound).
 
+mod cfg;
 mod dom;
+mod ssa;
