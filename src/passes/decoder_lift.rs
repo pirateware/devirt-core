@@ -77,7 +77,37 @@ impl Pass for DecoderLift {
         // Excluding them keeps the lift sound by construction.
         let unstable = scan_unstable(program);
 
-        let analysis = classify(&tops, &unstable);
+        // Pure-data tables anywhere in the program (the local key/string tables,
+        // e.g. DataDome's `var597`). Collected here — *before* classification —
+        // so a decoder nested in a function scope whose only free names are such a
+        // table (+ globals) can be proven pure: its table must already be a known
+        // pure name when we run the purity fixpoint. See `collect_scoped_funcs`.
+        // Symbol-precise soundness gate (plan §5.3): identify every *aggregate*
+        // table the SSA escape analysis cannot prove immutable — one reassigned,
+        // member-written (`t[i]=x`), mutated (`t.push`), or aliased anywhere. This
+        // closes the hole the name-based `scan_invariants` count is blind to (it
+        // sees only bare assignments), the hazard scoped lifting widens. One source
+        // of truth: `src/ir/analysis.rs`.
+        let table_scoping = build_scoping(program);
+        let mutable = crate::ir::mutable_aggregate_tables(program, &table_scoping);
+
+        // Feed the exclusion *into* invariant collection so its groundedness
+        // fixpoint also drops anything that transitively depends on an excluded
+        // table (e.g. an identity alias `b = t`), preserving dependency closure —
+        // a post-hoc filter would leave such dependents baked against an undefined
+        // name and break the preamble.
+        let local_data = scan_invariants(program, &mutable);
+        let data_names: HashSet<String> = local_data.iter().map(|(n, _)| n.clone()).collect();
+
+        // Candidate decoder functions at *every* scope depth — not just the
+        // program top level. This is the Tier-C/D generalisation: the DataDome
+        // decoder library lives ~5 scopes deep inside `(() => {…})()`, which
+        // `collect_top_level` never descends into. Name-uniqueness + the
+        // `unstable` gate keep flattening them into one global preamble sound (a
+        // shadowed or reassigned name is dropped).
+        let scoped_funcs = collect_scoped_funcs(program, &unstable);
+
+        let analysis = classify(&tops, &unstable, &data_names, scoped_funcs);
         if analysis.pure_funcs.is_empty() {
             return false;
         }
@@ -87,13 +117,6 @@ impl Pass for DecoderLift {
         // not stable, so drop those too.
         let mut aliases = collect_aliases(program, &analysis.pure_funcs);
         aliases.retain(|k, _| !unstable.contains(k));
-
-        // Pure-data object/array bindings anywhere in the program (e.g. the
-        // local `{g:219,...}` key tables), gated by global name-uniqueness so
-        // flattening them into one global preamble can never collide. After the
-        // rename pass every name is unique, so this captures essentially all of
-        // them on later fixpoint rounds.
-        let local_data = scan_invariants(program);
 
         if std::env::var("DL_DEBUG").is_ok() {
             eprintln!(
@@ -114,7 +137,16 @@ impl Pass for DecoderLift {
         allowed.extend(aliases.keys().cloned());
         allowed.extend(local_data.iter().map(|(n, _)| n.clone()));
 
-        let preamble = build_preamble(&tops, &analysis, &aliases, &allowed, &local_data, allocator);
+        // Serialize *every* pure decoder function — at any scope depth — as a
+        // standalone preamble declaration. This is the one mechanism that emits
+        // functions (the top-level data walk in `build_preamble` emits only pure
+        // data vars), so a multi-declarator or deeply-nested decoder can't fall
+        // through a crack. Names are unique, so flattening is collision-free.
+        let pure_func_decls = serialize_pure_funcs(program, &analysis.pure_funcs, allocator);
+
+        let preamble = build_preamble(
+            &tops, &analysis, &aliases, &allowed, &local_data, &pure_func_decls, allocator,
+        );
         let Some(sandbox) = Sandbox::new() else {
             return false;
         };
@@ -407,51 +439,46 @@ fn is_pure_element(e: &ArrayExpressionElement<'_>) -> bool {
     }
 }
 
-fn classify(tops: &[&Statement<'_>], unstable: &HashSet<String>) -> Analysis {
-    let mut pureset: HashSet<String> = HashSet::new();
+/// A function whose purity is still to be decided: its name and free-var facts.
+struct Pending {
+    name: String,
+    fv: FreeVars,
+}
+
+/// Classify the pure decoder library.
+///
+/// `seed_pure` are names already *proven* pure data (the local key/string tables
+/// from `scan_invariants`) — seeding them lets a decoder whose only free name is
+/// such a table pass the purity gate. `scoped_funcs` are candidate functions
+/// found at *every* scope depth (see `collect_scoped_funcs`); the top-level path
+/// still seeds pure-data vars directly from `tops`.
+fn classify(
+    tops: &[&Statement<'_>],
+    unstable: &HashSet<String>,
+    seed_pure: &HashSet<String>,
+    scoped_funcs: Vec<Pending>,
+) -> Analysis {
+    let mut pureset: HashSet<String> = seed_pure.clone();
     let mut pure_funcs: HashSet<String> = HashSet::new();
 
-    struct Pending {
-        name: String,
-        fv: FreeVars,
-    }
-    let mut pending: Vec<Pending> = Vec::new();
+    let mut pending: Vec<Pending> = scoped_funcs;
 
+    // Top-level pure-data var bindings (`var t = {…}`) seed the pure set even when
+    // `scan_invariants` (which is groundedness-gated) declined them.
     for stmt in tops {
-        match stmt {
-            Statement::FunctionDeclaration(func) => {
-                if let Some(id) = &func.id {
-                    // A reassigned function name (`function f(){} … f = g`) is not
-                    // a stable callee — never bake it as a library member.
-                    if unstable.contains(id.name.as_str()) {
-                        continue;
-                    }
-                    let mut fv = FreeVars::default();
-                    fv.visit_function(func, ScopeFlags::Function);
-                    pending.push(Pending { name: id.name.to_string(), fv });
+        if let Statement::VariableDeclaration(vd) = stmt {
+            for d in &vd.declarations {
+                let BindingPattern::BindingIdentifier(id) = &d.id else {
+                    continue;
+                };
+                let Some(init) = &d.init else { continue };
+                if unstable.contains(id.name.as_str()) {
+                    continue;
+                }
+                if is_pure_data(init) {
+                    pureset.insert(id.name.to_string());
                 }
             }
-            Statement::VariableDeclaration(vd) => {
-                for d in &vd.declarations {
-                    let BindingPattern::BindingIdentifier(id) = &d.id else {
-                        continue;
-                    };
-                    let Some(init) = &d.init else { continue };
-                    // A binding reassigned/mutated elsewhere is not invariant.
-                    if unstable.contains(id.name.as_str()) {
-                        continue;
-                    }
-                    if matches!(
-                        init,
-                        Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_)
-                    ) {
-                        pending.push(Pending { name: id.name.to_string(), fv: freevars_of_expr(init) });
-                    } else if is_pure_data(init) {
-                        pureset.insert(id.name.to_string());
-                    }
-                }
-            }
-            _ => {}
         }
     }
 
@@ -479,8 +506,130 @@ fn classify(tops: &[&Statement<'_>], unstable: &HashSet<String>) -> Analysis {
 }
 
 // ---------------------------------------------------------------------------
-// Stability scan: names that are not safe to bake into the static preamble
+// Scoped function collection (Tier C/D): decoders nested in function scopes
 // ---------------------------------------------------------------------------
+
+/// Every function binding in the program — `function f(){…}` declarations and
+/// `var f = function/arrow` bindings — at *any* depth, as classification
+/// candidates. Two soundness gates make flattening them into one global preamble
+/// safe: the name must be globally unique (declared exactly once; a shadowed name
+/// would make the name-based purity analysis ambiguous), and it must not be
+/// `unstable` (reassigned/mutated). The purity fixpoint in `classify` then proves
+/// each one side-effect-free before it is ever lifted.
+fn collect_scoped_funcs(program: &Program<'_>, unstable: &HashSet<String>) -> Vec<Pending> {
+    let mut c = FuncScan::default();
+    c.visit_program(program);
+    c.funcs
+        .into_iter()
+        .filter(|(name, _)| !unstable.contains(name))
+        .filter(|(name, _)| c.name_counts.get(name).copied() == Some(1))
+        .map(|(name, fv)| Pending { name, fv })
+        .collect()
+}
+
+#[derive(Default)]
+struct FuncScan {
+    funcs: Vec<(String, FreeVars)>,
+    name_counts: HashMap<String, usize>,
+}
+
+impl<'a> Visit<'a> for FuncScan {
+    fn visit_function(&mut self, func: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
+        if let Some(id) = &func.id {
+            *self.name_counts.entry(id.name.to_string()).or_default() += 1;
+            let mut fv = FreeVars::default();
+            fv.visit_function(func, flags);
+            self.funcs.push((id.name.to_string(), fv));
+        }
+        oxc_ast_visit::walk::walk_function(self, func, flags);
+    }
+
+    fn visit_variable_declarator(&mut self, node: &oxc_ast::ast::VariableDeclarator<'a>) {
+        if let BindingPattern::BindingIdentifier(id) = &node.id {
+            if let Some(init) = &node.init {
+                if matches!(
+                    init,
+                    Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_)
+                ) {
+                    *self.name_counts.entry(id.name.to_string()).or_default() += 1;
+                    self.funcs.push((id.name.to_string(), freevars_of_expr(init)));
+                }
+            }
+        }
+        oxc_ast_visit::walk::walk_variable_declarator(self, node);
+    }
+}
+
+/// Collect *every* pure decoder function (classified pure, at any scope depth) as
+/// a standalone preamble statement — an arena clone the preamble codegens as the
+/// decoder library. A `function f(){…}` declaration is cloned verbatim
+/// (declarations hoist, so order among them is irrelevant); a `var f = function…`
+/// becomes a fresh single-declarator `var f = <init>;`. This is the *sole* emitter
+/// of functions into the preamble, so none can be missed or double-defined.
+fn serialize_pure_funcs<'a>(
+    program: &Program<'a>,
+    pure_funcs: &HashSet<String>,
+    allocator: &'a Allocator,
+) -> Vec<Statement<'a>> {
+    let mut c = FuncSerializer { pure_funcs, ast: AstBuilder::new(allocator), out: Vec::new() };
+    c.visit_program(program);
+    c.out
+}
+
+struct FuncSerializer<'a, 'r> {
+    pure_funcs: &'r HashSet<String>,
+    ast: AstBuilder<'a>,
+    out: Vec<Statement<'a>>,
+}
+
+impl<'a, 'r> FuncSerializer<'a, 'r> {
+    fn wants(&self, name: &str) -> bool {
+        self.pure_funcs.contains(name)
+    }
+}
+
+impl<'a, 'r> Visit<'a> for FuncSerializer<'a, 'r> {
+    fn visit_function(&mut self, func: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
+        if let Some(id) = &func.id {
+            if self.wants(id.name.as_str()) {
+                let cloned = func.clone_in(self.ast.allocator);
+                self.out.push(Statement::FunctionDeclaration(
+                    oxc_allocator::Box::new_in(cloned, self.ast.allocator),
+                ));
+            }
+        }
+        oxc_ast_visit::walk::walk_function(self, func, flags);
+    }
+
+    fn visit_variable_declarator(&mut self, node: &oxc_ast::ast::VariableDeclarator<'a>) {
+        if let BindingPattern::BindingIdentifier(id) = &node.id {
+            if let Some(init) = &node.init {
+                if matches!(
+                    init,
+                    Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_)
+                ) && self.wants(id.name.as_str())
+                {
+                    use oxc_ast::ast::VariableDeclarationKind::Var;
+                    let id_pat = self.ast.binding_pattern_binding_identifier(SPAN, id.name);
+                    let decl = self.ast.variable_declarator(
+                        SPAN,
+                        Var,
+                        id_pat,
+                        oxc_ast::NONE,
+                        Some(init.clone_in(self.ast.allocator)),
+                        false,
+                    );
+                    let mut decls = self.ast.vec();
+                    decls.push(decl);
+                    self.out.push(Statement::VariableDeclaration(
+                        self.ast.alloc(self.ast.variable_declaration(SPAN, Var, decls, false)),
+                    ));
+                }
+            }
+        }
+        oxc_ast_visit::walk::walk_variable_declarator(self, node);
+    }
+}
 
 /// Names that are reassigned or mutated, hence not stable library members. A name
 /// qualifies as unstable if it has more than one value-establishing write
@@ -555,7 +704,12 @@ const CONST_GLOBALS: &[&str] = &["undefined", "NaN", "Infinity"];
 /// *every* identifier it references is itself an invariant (a groundedness
 /// fixpoint). Anything reaching a runtime value is dropped, so the sandbox
 /// always computes the true value. Emitted in dependency order.
-fn scan_invariants(program: &Program<'_>) -> Vec<(String, String)> {
+///
+/// `excluded` names (mutable/aliased aggregate tables proven unsafe by the SSA
+/// escape analysis) are treated as conflicts: they are never candidates, and the
+/// groundedness fixpoint therefore also drops anything that references them (e.g.
+/// an identity alias `b = t`), so the emitted set stays dependency-closed.
+fn scan_invariants(program: &Program<'_>, excluded: &HashSet<String>) -> Vec<(String, String)> {
     let mut c = DataCollector::default();
     c.visit_program(program);
 
@@ -566,6 +720,7 @@ fn scan_invariants(program: &Program<'_>) -> Vec<(String, String)> {
             c.counts.get(*n).copied() == Some(1)
                 && c.writes.get(*n).copied() == Some(1)
                 && !c.conflict.contains(*n)
+                && !excluded.contains(*n)
         })
         .map(|(n, v)| (n.clone(), v.clone()))
         .collect();
@@ -710,6 +865,7 @@ fn build_preamble<'a>(
     aliases: &HashMap<String, String>,
     allowed: &HashSet<String>,
     local_data: &[(String, String)],
+    nested_funcs: &[Statement<'a>],
     allocator: &'a Allocator,
 ) -> String {
     // Pure data + decoder function declarations (hoisted, so order is fine).
@@ -719,6 +875,13 @@ fn build_preamble<'a>(
         if statement_is_pure(stmt, analysis) {
             body.push(stmt.clone_in(allocator));
         }
+    }
+    // Pure decoder functions lifted from nested scopes (Tier C/D). Declarations
+    // hoist, so they may safely precede the data tables they index (the tables are
+    // appended as text below; a decoder only reads them when *called*, which never
+    // happens during setup).
+    for stmt in nested_funcs {
+        body.push(stmt.clone_in(allocator));
     }
     let prog = ast.program(SPAN, SourceType::default(), "", ast.vec(), None, ast.vec(), body);
     let mut code = Codegen::new().build(&prog).code;
@@ -752,15 +915,22 @@ fn build_preamble<'a>(
     code
 }
 
+/// Whether a top-level statement is a pure-**data** binding the preamble should
+/// emit. Functions are deliberately excluded here — they are emitted *only* by
+/// `serialize_pure_funcs` (the single function emitter), so a pure data var and a
+/// pure function never both claim the same statement. A var declaration qualifies
+/// only when every declarator is a pure-data initializer in the pure set (a
+/// function-valued declarator returns false and is left to the serializer).
 fn statement_is_pure(stmt: &Statement<'_>, analysis: &Analysis) -> bool {
     match stmt {
-        Statement::FunctionDeclaration(func) => func
-            .id
-            .as_ref()
-            .is_some_and(|id| analysis.pureset.contains(id.name.as_str())),
-        Statement::VariableDeclaration(vd) => !vd.declarations.is_empty() && vd.declarations.iter().all(|d| {
-            matches!(&d.id, BindingPattern::BindingIdentifier(id) if analysis.pureset.contains(id.name.as_str()))
-        }),
+        Statement::VariableDeclaration(vd) => {
+            !vd.declarations.is_empty()
+                && vd.declarations.iter().all(|d| {
+                    matches!(&d.id, BindingPattern::BindingIdentifier(id)
+                        if analysis.pureset.contains(id.name.as_str()))
+                        && d.init.as_ref().is_some_and(is_pure_data)
+                })
+        }
         _ => false,
     }
 }

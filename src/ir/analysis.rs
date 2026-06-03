@@ -68,6 +68,210 @@ pub fn collect_candidates(
         .collect()
 }
 
+/// Names of local **aggregate** (array/object) bindings that are *not* provably
+/// immutable — i.e. unsafe to bake into the decoder preamble (plan §5.3). An
+/// aggregate is unsafe if it is assigned more than once, reassigned, member-written
+/// (`t[k] = …`, `t[k]++`, `delete t[k]`), compound-assigned, mutated by a method
+/// (`t.push(…)`), or read *bare* anywhere (a bare read could alias it into a
+/// binding that is later mutated, or pass it to a callee that mutates it).
+///
+/// `decoder-lift` removes exactly these from its baked table set. The query is
+/// deliberately scoped to *aggregates*: a scalar value is immutable, so a stale
+/// bake is impossible, and scalars are the only things the grounded base-N
+/// arithmetic chain depends on — excluding a scalar would break that chain's
+/// dependency closure and is never necessary for soundness. Read-capture by a
+/// nested closure is fine: a closure that only reads cannot mutate.
+///
+/// This is the symbol-precise complement to the name-based "assigned once"
+/// heuristic in `decoder-lift`, which counts only bare assignments and is
+/// therefore blind to `t[i] = x` / `t.push(x)` / aliasing — exactly the hazard
+/// scoped lifting widens. Returns names (not `SymbolId`s) because `decoder-lift`
+/// is name-keyed; the binding name's uniqueness is separately enforced there.
+pub fn mutable_aggregate_tables(program: &Program<'_>, scoping: &Scoping) -> HashSet<String> {
+    let mut scan = TableScan {
+        scoping,
+        defs: std::collections::HashMap::new(),
+        aggregate_def: HashSet::new(),
+        has_bare_read: HashSet::new(),
+        disqualified: HashSet::new(),
+    };
+    scan.visit_program(program);
+
+    scan.aggregate_def
+        .iter()
+        .filter(|sym| {
+            scan.defs.get(*sym).copied() != Some(1)
+                || scan.disqualified.contains(*sym)
+                || scan.has_bare_read.contains(*sym)
+        })
+        .map(|sym| scoping.symbol_name(*sym).to_string())
+        .collect()
+}
+
+/// Method names that mutate their receiver. A call to one on a candidate table
+/// disqualifies it. Mirrors `decoder-lift`'s list; kept local so this module owns
+/// its own soundness reasoning.
+const MUTATOR_METHODS: &[&str] = &[
+    "push", "pop", "shift", "unshift", "splice", "sort", "reverse", "fill", "copyWithin", "set",
+    "add", "delete", "clear",
+];
+
+struct TableScan<'s> {
+    scoping: &'s Scoping,
+    /// Value-establishing writes per symbol (declarator-with-init or `t = rhs`).
+    defs: std::collections::HashMap<SymbolId, usize>,
+    /// Symbols whose definition is an array/object literal.
+    aggregate_def: HashSet<SymbolId>,
+    /// Symbols read *bare* (not as a member-access object) somewhere — an alias /
+    /// escape hazard for aggregates only.
+    has_bare_read: HashSet<SymbolId>,
+    /// Symbols seen in a shape that mutates them (write / member-write / mutator).
+    disqualified: HashSet<SymbolId>,
+}
+
+impl<'s> TableScan<'s> {
+    fn ref_sym(&self, id: &IdentifierReference<'_>) -> Option<SymbolId> {
+        let rid = id.reference_id.get()?;
+        self.scoping.get_reference(rid).symbol_id()
+    }
+    fn obj_sym(&self, obj: &Expression<'_>) -> Option<SymbolId> {
+        match obj {
+            Expression::Identifier(id) => self.ref_sym(id),
+            _ => None,
+        }
+    }
+}
+
+impl<'a, 's> Visit<'a> for TableScan<'s> {
+    fn visit_variable_declarator(&mut self, decl: &VariableDeclarator<'a>) {
+        if let BindingPattern::BindingIdentifier(id) = &decl.id {
+            if let Some(sym) = id.symbol_id.get() {
+                if let Some(init) = &decl.init {
+                    *self.defs.entry(sym).or_default() += 1;
+                    if is_aggregate_literal(init) {
+                        self.aggregate_def.insert(sym);
+                    }
+                    self.visit_expression(init);
+                    return; // the binding id is not a reference
+                }
+            }
+        }
+        walk::walk_variable_declarator(self, decl);
+    }
+
+    fn visit_assignment_expression(&mut self, node: &AssignmentExpression<'a>) {
+        use oxc_syntax::operator::AssignmentOperator;
+        // Member-write target (`t[k] = …`, `t.x op= …`) mutates the object.
+        if let Some(sym) = member_target_base(&node.left).and_then(|o| self.obj_sym(o)) {
+            self.disqualified.insert(sym);
+        }
+        if let AssignmentTarget::AssignmentTargetIdentifier(id) = &node.left {
+            if let Some(sym) = self.ref_sym(id) {
+                if node.operator == AssignmentOperator::Assign {
+                    *self.defs.entry(sym).or_default() += 1;
+                    if is_aggregate_literal(&node.right) {
+                        self.aggregate_def.insert(sym);
+                    }
+                    self.visit_expression(&node.right);
+                    return;
+                } else {
+                    self.disqualified.insert(sym); // compound read-modify-write
+                }
+            }
+        }
+        walk::walk_assignment_expression(self, node);
+    }
+
+    fn visit_update_expression(&mut self, node: &UpdateExpression<'a>) {
+        match &node.argument {
+            // `t[k]++` / `t.x--`: a member mutation.
+            SimpleAssignmentTarget::ComputedMemberExpression(m) => {
+                if let Some(sym) = self.obj_sym(&m.object) {
+                    self.disqualified.insert(sym);
+                }
+            }
+            SimpleAssignmentTarget::StaticMemberExpression(m) => {
+                if let Some(sym) = self.obj_sym(&m.object) {
+                    self.disqualified.insert(sym);
+                }
+            }
+            // `x++` on a bare candidate: a read-modify-write reassignment.
+            SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
+                if let Some(sym) = self.ref_sym(id) {
+                    self.disqualified.insert(sym);
+                }
+            }
+            _ => {}
+        }
+        walk::walk_update_expression(self, node);
+    }
+
+    fn visit_unary_expression(&mut self, node: &UnaryExpression<'a>) {
+        if node.operator == oxc_syntax::operator::UnaryOperator::Delete {
+            let base = match &node.argument {
+                Expression::ComputedMemberExpression(m) => Some(&m.object),
+                Expression::StaticMemberExpression(m) => Some(&m.object),
+                _ => None,
+            };
+            if let Some(sym) = base.and_then(|o| self.obj_sym(o)) {
+                self.disqualified.insert(sym);
+            }
+        }
+        walk::walk_unary_expression(self, node);
+    }
+
+    fn visit_call_expression(&mut self, node: &CallExpression<'a>) {
+        // A mutator method on a candidate (`t.push(x)`) mutates the table.
+        let recv = match &node.callee {
+            Expression::StaticMemberExpression(m) => {
+                Some((m.property.name.as_str(), &m.object))
+            }
+            Expression::ComputedMemberExpression(m) => match &m.expression {
+                Expression::StringLiteral(s) => Some((s.value.as_str(), &m.object)),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some((name, obj)) = recv {
+            if MUTATOR_METHODS.contains(&name) {
+                if let Some(sym) = self.obj_sym(obj) {
+                    self.disqualified.insert(sym);
+                }
+            }
+        }
+        walk::walk_call_expression(self, node);
+    }
+
+    fn visit_static_member_expression(&mut self, m: &StaticMemberExpression<'a>) {
+        // `t.x` read: a clean member access — don't descend into the object id
+        // (that would count as a bare read and disqualify the table).
+        if self.obj_sym(&m.object).is_some() {
+            return;
+        }
+        walk::walk_static_member_expression(self, m);
+    }
+
+    fn visit_computed_member_expression(&mut self, m: &ComputedMemberExpression<'a>) {
+        if self.obj_sym(&m.object).is_some() {
+            // Skip the object; the index may reference candidates, so visit it.
+            self.visit_expression(&m.expression);
+            return;
+        }
+        walk::walk_computed_member_expression(self, m);
+    }
+
+    fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
+        // Any reference reaching here is a *bare* occurrence (member-access objects
+        // are intercepted above; bare write/def targets are intercepted in the
+        // write visitors and return early). Record it as a bare read — harmless for
+        // a scalar (immutable by value), but for an aggregate it is an alias /
+        // escape hazard that the final filter rejects.
+        if let Some(sym) = self.ref_sym(id) {
+            self.has_bare_read.insert(sym);
+        }
+    }
+}
+
 struct Classifier<'s, 'b> {
     scoping: &'s Scoping,
     base: &'b HashSet<SymbolId>,

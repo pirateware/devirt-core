@@ -84,6 +84,62 @@ fn lifts_computed_index_into_pure_array() {
 }
 
 #[test]
+fn lifts_decoder_nested_in_a_function_scope() {
+    // The Tier-C/D shape: the decoder + table live inside a *function body*, which
+    // `collect_top_level` never descends into (unlike an expression-statement
+    // IIFE). Scoped lifting must still resolve `dec(K)` to its literal.
+    let src = r#"
+        function setup() {
+            var tbl = ["alpha", "beta", "gamma"];
+            function dec(i) { return tbl[i]; }
+            sink(dec(0), dec(2));
+        }
+    "#;
+    let out = deobfuscate(src, "t.js").code;
+    assert!(out.contains("\"alpha\"") && out.contains("\"gamma\""), "nested decoder not lifted: {out}");
+    assert!(!out.contains("dec("), "decoder call survived in nested scope: {out}");
+}
+
+#[test]
+fn lifts_decoder_nested_in_var_assigned_iife() {
+    // Exactly the DataDome wall: the library lives inside `var X = (() => {…})()`,
+    // a VariableDeclaration whose initializer `collect_top_level` cannot reach.
+    let src = r#"
+        var R = (function () {
+            var tbl = ["createElement", "appendChild"];
+            function dec(i) { return tbl[i]; }
+            return win[dec(0)](dec(1));
+        })();
+    "#;
+    let out = deobfuscate(src, "t.js").code;
+    assert!(out.contains("win.createElement"), "computed member not resolved: {out}");
+    assert!(out.contains("\"appendChild\""), "argument decode not lifted: {out}");
+    assert!(!out.contains("dec("), "decoder call survived: {out}");
+}
+
+#[test]
+fn does_not_lift_scoped_decoder_over_member_mutated_table() {
+    // The hazard scoped lifting widens (plan §5.3 / §8): the table is mutated by a
+    // member write, which the name-based "assigned once" count is blind to. The
+    // symbol-precise escape gate must refuse to bake it, leaving the decoder calls
+    // in place rather than resolving them against a stale table.
+    let src = r#"
+        function run() {
+            var tbl = ["a", "b", "c"];
+            function dec(i) { return tbl[i]; }
+            tbl[1] = "Z";
+            sink(dec(0), dec(1));
+        }
+    "#;
+    let out = deobfuscate(src, "t.js").code;
+    // The decoder calls must survive unresolved: the table is mutated, so a baked
+    // ["a","b","c"] would mis-resolve dec(1) (whose slot is overwritten to "Z").
+    assert!(out.contains("dec(0)") && out.contains("dec(1)"),
+        "decoder over a member-mutated table must be left in place: {out}");
+    assert!(out.contains("tbl[1] = \"Z\""), "the mutation must survive: {out}");
+}
+
+#[test]
 fn lifts_object_keyed_arguments() {
     // Argument is a member of a pure object literal — still fully evaluable.
     let src = r#"
