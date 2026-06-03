@@ -615,3 +615,192 @@ fn ssa_dead_store_keeps_rhs_effects() {
     // The dead store's value flows to another binding via the assignment value.
     assert_equivalent("var x; var y = (x = 1); x = 2; __r = y + ':' + x;");
 }
+
+// ---------------------------------------------------------------------------
+// Single-use value inlining (src/ir/inline.rs). Each pairs a temp that *should*
+// fold into its sole use with a sibling where moving the init to the use would
+// reorder an effect, observe a mutated value, or rebind a shadowed name. The
+// differential net catches any unsound move by value mismatch.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn inline_single_use_preserves_value() {
+    // Plain temp chains collapse across rounds; order and value preserved.
+    assert_equivalent("function f(){ var t = 5 + 3; return t * 2; } __r = f();");
+    assert_equivalent(r#"function f(){ var a = "a" + "b"; var b = a + "c"; return b; } __r = f();"#);
+    // The snowball: a decoder temp used once as an index folds next to its access.
+    assert_equivalent(
+        r#"
+        var arr = ["lo", "HELLO", "wo"];
+        function d(i){ return arr[i]; }
+        function run(){ var a = d(1); var b = d(0); var c = d(2); return a + b + c; }
+        __r = run();
+        "#,
+    );
+}
+
+#[test]
+fn inline_effectful_init_across_clean_gap_is_sound() {
+    // The def's init has a side effect but nothing effectful sits between it and
+    // the use, so moving it forward keeps the same observable order.
+    assert_equivalent(
+        r#"
+        var ord = "";
+        function f(){ ord += "f"; return 3; }
+        function run(){ var t = f(); return t + ":" + ord; }
+        __r = run();
+        "#,
+    );
+}
+
+#[test]
+fn inline_must_not_reorder_effects() {
+    // An effect (`g()`) sits between the def `t = f()` and the use of `t`: moving
+    // `f()` past it would swap f/g. Observable order must stay f-before-g.
+    assert_equivalent(
+        r#"
+        var ord = "";
+        function f(){ ord += "f"; return 1; }
+        function g(){ ord += "g"; return 2; }
+        function run(){ var t = f(); g(); return t + ":" + ord; }
+        __r = run();
+        "#,
+    );
+    // The use is not the first sub-evaluation: `g()` is evaluated before `t` in
+    // `g() + t`, so inlining `f()` there would reorder f after g.
+    assert_equivalent(
+        r#"
+        var ord = "";
+        function f(){ ord += "f"; return 1; }
+        function g(){ ord += "g"; return 2; }
+        function run(){ var t = f(); return (g() + t) + ":" + ord; }
+        __r = run();
+        "#,
+    );
+}
+
+#[test]
+fn inline_must_not_observe_mutated_value() {
+    // `t` captures `obj.x` (1); a member write changes it before the use. Folding
+    // the read forward would observe 99 instead of the captured 1.
+    assert_equivalent(
+        r#"
+        function run(){ var obj = { x: 1 }; var t = obj.x; obj.x = 99; return t; }
+        __r = run();
+        "#,
+    );
+    // Same hazard with a plain outer-variable write between def and use.
+    assert_equivalent(
+        r#"
+        function run(){ var n = 1; var t = n + 0; n = 99; return t + ":" + n; }
+        __r = run();
+        "#,
+    );
+}
+
+#[test]
+fn inline_respects_block_scope_shadowing() {
+    // `t = a` reads the outer `a` (1). The use is inside a block that shadows `a`
+    // with a `let` (99). Re-resolving the moved `a` there would bind the shadow.
+    assert_equivalent(
+        r#"
+        function run(){ var a = 1; var t = a; { let a = 99; return t + ":" + a; } }
+        __r = run();
+        "#,
+    );
+}
+
+#[test]
+fn inline_assignment_form_temps() {
+    // `var x; x = rhs;` (the no-init hoist + standalone assignment) folds too.
+    assert_equivalent("function f(){ var x; x = 5 + 3; return x * 2; } __r = f();");
+    // A reassigned parameter whose incoming value is dead before its single use.
+    assert_equivalent("function f(a){ a = a.length + 1; return a; } __r = f([1, 2, 3]);");
+    // Chain of standalone assignments resolves across rounds, order preserved.
+    assert_equivalent(
+        r#"
+        var arr = ["lo", "HELLO", "wo"];
+        function d(i){ return arr[i]; }
+        function run(){ var a, b; a = d(1); b = d(0); return a + b; }
+        __r = run();
+        "#,
+    );
+}
+
+#[test]
+fn inline_assignment_form_must_not_reorder() {
+    // A standalone-assignment def whose rhs is effectful must not jump a barrier.
+    assert_equivalent(
+        r#"
+        var ord = "";
+        function f(){ ord += "f"; return 1; }
+        function g(){ ord += "g"; return 2; }
+        function run(){ var t; t = f(); g(); return t + ":" + ord; }
+        __r = run();
+        "#,
+    );
+}
+
+#[test]
+fn inline_respects_arguments_aliasing() {
+    // Sloppy-mode `arguments[i] = v` aliases the i-th param. `t` captures `a`'s
+    // value (1) before the alias write changes it (99); the member write is a
+    // barrier in the gap, so the read must NOT fold forward to observe 99.
+    assert_equivalent(
+        r#"
+        function f(a){ var t = a; arguments[0] = 99; return t; }
+        __r = f(1);
+        "#,
+    );
+    // The reverse alias: writing the param updates `arguments[0]`; a temp that
+    // captured the old element must stay the old value.
+    assert_equivalent(
+        r#"
+        function f(a){ var t = arguments[0]; a = 99; return t; }
+        __r = f(1);
+        "#,
+    );
+    // Passing `arguments` to a callee that mutates it is a call barrier.
+    assert_equivalent(
+        r#"
+        function mut(args){ args[0] = 99; }
+        function f(a){ var t = a; mut(arguments); return t; }
+        __r = f(1);
+        "#,
+    );
+}
+
+#[test]
+fn inline_in_arguments_function_when_safe() {
+    // `arguments` is used but nothing mutates the read values across the gap, so
+    // the temp chain still folds — exactly the sample_10 shape we want to reach.
+    assert_equivalent(
+        r#"
+        function f(){ var n = arguments.length; var t = n + 1; return t; }
+        __r = f(7, 8, 9);
+        "#,
+    );
+    assert_equivalent(
+        r#"
+        function sum(){ var rest = Array.prototype.slice.call(arguments, 1); var first = arguments[0]; return first + ":" + rest.join(","); }
+        __r = sum(10, 20, 30);
+        "#,
+    );
+}
+
+#[test]
+fn inline_does_not_touch_captured_temp() {
+    // A temp read by a nested closure is excluded (escape analysis); its
+    // effectful init must run exactly once and the closure must see its value.
+    assert_equivalent(
+        r#"
+        var log = "";
+        function run(){
+            var t = (log += "x", 7);
+            var get = function(){ return t; };
+            return get() + ":" + log;
+        }
+        __r = run();
+        "#,
+    );
+}

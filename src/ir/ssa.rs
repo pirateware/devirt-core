@@ -76,6 +76,7 @@ pub fn resolve<'c, 'a>(cfg: &'c Cfg<'a>, dom: &Dominators) -> Vec<Resolved<'c, '
                 Event::Use { sym, .. } => {
                     symbols.insert(*sym);
                 }
+                Event::Barrier => {}
             }
         }
     }
@@ -190,6 +191,7 @@ pub fn resolve<'c, 'a>(cfg: &'c Cfg<'a>, dom: &Dominators) -> Vec<Resolved<'c, '
                             stacks.get_mut(sym).unwrap().push((v, reaching));
                             *pushes.entry(*sym).or_default() += 1;
                         }
+                        Event::Barrier => {}
                     }
                 }
 
@@ -240,7 +242,7 @@ mod tests {
         let s = sym(0);
         let folded = run(
             vec![vec![
-                Event::Def { sym: s, val: DefVal::Array(vec![]), assign: None },
+                Event::Def { sym: s, val: DefVal::Array(vec![]), assign: None, decl_init: None },
                 Event::Use { sym: s, kind: UseKind::Member(Key::Index(0)), node: addr(1) },
             ]],
             vec![vec![]],
@@ -254,7 +256,7 @@ mod tests {
         let folded = run(
             vec![vec![
                 Event::Use { sym: s, kind: UseKind::Scalar, node: addr(1) },
-                Event::Def { sym: s, val: DefVal::Array(vec![]), assign: None },
+                Event::Def { sym: s, val: DefVal::Array(vec![]), assign: None, decl_init: None },
             ]],
             vec![vec![]],
         );
@@ -268,8 +270,8 @@ mod tests {
         let folded = run(
             vec![
                 vec![],                                                          // b0
-                vec![Event::Def { sym: s, val: DefVal::Array(vec![]), assign: None }],         // b1
-                vec![Event::Def { sym: s, val: DefVal::Array(vec![]), assign: None }],         // b2
+                vec![Event::Def { sym: s, val: DefVal::Array(vec![]), assign: None, decl_init: None }],         // b1
+                vec![Event::Def { sym: s, val: DefVal::Array(vec![]), assign: None, decl_init: None }],         // b2
                 vec![Event::Use { sym: s, kind: UseKind::Scalar, node: addr(9) }], // b3
             ],
             vec![vec![1, 2], vec![3], vec![3], vec![]],
@@ -284,8 +286,8 @@ mod tests {
         let s = sym(0);
         let folded = run(
             vec![
-                vec![Event::Def { sym: s, val: DefVal::Array(vec![]), assign: None }], // b0
-                vec![Event::Def { sym: s, val: DefVal::Array(vec![]), assign: None }], // b1
+                vec![Event::Def { sym: s, val: DefVal::Array(vec![]), assign: None, decl_init: None }], // b0
+                vec![Event::Def { sym: s, val: DefVal::Array(vec![]), assign: None, decl_init: None }], // b1
                 vec![Event::Use { sym: s, kind: UseKind::Scalar, node: addr(7) }], // b2
             ],
             vec![vec![1, 2], vec![2], vec![]],
@@ -301,7 +303,7 @@ mod tests {
         let folded = run(
             vec![
                 vec![],                                                            // b0 eval a
-                vec![Event::Def { sym: s, val: DefVal::Array(vec![]), assign: None }],           // b1 s=A
+                vec![Event::Def { sym: s, val: DefVal::Array(vec![]), assign: None, decl_init: None }],           // b1 s=A
                 vec![Event::Use { sym: s, kind: UseKind::Member(Key::Index(0)), node: addr(5) }], // b2 use
                 vec![],                                                            // b3 merge
             ],

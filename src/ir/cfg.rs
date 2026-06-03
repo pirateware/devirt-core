@@ -77,8 +77,25 @@ pub enum UseKind {
 }
 
 pub enum Event<'a> {
-    Def { sym: SymbolId, val: DefVal<'a>, assign: Option<AssignInfo<'a>> },
+    Def {
+        sym: SymbolId,
+        val: DefVal<'a>,
+        assign: Option<AssignInfo<'a>>,
+        /// For a `var/let/const s = <init>` declarator def, a clone of the init
+        /// expression — the payload `inline-single-use` moves to the sole use.
+        /// Populated only when the lowerer is built with [`Lowerer::capture_defs`]
+        /// (`None` otherwise: assignment-form defs, no-init declarators, or when
+        /// capture is off — the SSA fold never needs it, so it skips the clone).
+        decl_init: Option<Expression<'a>>,
+    },
     Use { sym: SymbolId, kind: UseKind, node: NodeId },
+    /// An evaluation point that either has an observable side effect (a call/new,
+    /// `++`/`--`, `delete`, or a write to a non-candidate or a member) or opens /
+    /// closes a nested lexical scope (a `{ … }` block). It marks the ordered event
+    /// stream so a transform can tell whether anything effectful — or any
+    /// scope-rebinding boundary — sits between two events of one straight-line
+    /// block. The SSA reaching-def analysis ignores it.
+    Barrier,
 }
 
 pub struct Block<'a> {
@@ -111,6 +128,8 @@ pub struct Lowerer<'a, 'c> {
     /// Set just before lowering a labeled loop so the loop lowerer can attach the
     /// label to the context it pushes (for `break label` / `continue label`).
     pending_label: Option<String>,
+    /// When set, declarator defs carry a clone of their init in `decl_init`.
+    capture_defs: bool,
     pub bailed: bool,
 }
 
@@ -129,11 +148,20 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             cur: 0,
             loops: Vec::new(),
             pending_label: None,
+            capture_defs: false,
             bailed: false,
         };
         let entry = l.new_block();
         l.cur = entry;
         l
+    }
+
+    /// Capture a clone of each declarator's init into `Event::Def::decl_init`.
+    /// Off by default (the SSA fold doesn't need it); `inline-single-use` turns it
+    /// on, since the init is exactly the payload it moves to the sole use site.
+    pub fn capture_defs(mut self) -> Self {
+        self.capture_defs = true;
+        self
     }
 
     /// Lower the given statements; returns the CFG, or `None` if lowering bailed.
@@ -191,7 +219,16 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             Statement::ExpressionStatement(e) => self.lower_expr(&e.expression),
             Statement::EmptyStatement(_) | Statement::DebuggerStatement(_) => {}
             Statement::VariableDeclaration(d) => self.lower_var_decl(d),
-            Statement::BlockStatement(b) => self.lower_stmts(&b.body),
+            Statement::BlockStatement(b) => {
+                // A `{ … }` opens a fresh lexical scope. Bracket its body with
+                // barriers so a transform reasoning over one straight-line block
+                // (e.g. `inline-single-use`) never treats a def and a use that
+                // straddle the boundary as same-scope — a `let` inside the block
+                // could shadow a name the moved expression reads.
+                self.emit(Event::Barrier);
+                self.lower_stmts(&b.body);
+                self.emit(Event::Barrier);
+            }
             Statement::IfStatement(i) => self.lower_if(i),
             Statement::WhileStatement(w) => self.lower_while(w),
             Statement::DoWhileStatement(w) => self.lower_do_while(w),
@@ -233,9 +270,14 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                             Some(init) => self.classify_def(init),
                             None => DefVal::Opaque, // `var x;` → undefined, not folded
                         };
+                        let decl_init = if self.capture_defs {
+                            decl.init.as_ref().map(|e| e.clone_in(self.allocator))
+                        } else {
+                            None
+                        };
                         // Declarator inits are not removed by the dead-store pass
                         // (it only rewrites `s = rhs` expression nodes).
-                        self.emit(Event::Def { sym, val, assign: None });
+                        self.emit(Event::Def { sym, val, assign: None, decl_init });
                     }
                 }
             }
@@ -560,12 +602,14 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                 for arg in &c.arguments {
                     self.lower_argument(arg);
                 }
+                self.emit(Event::Barrier); // the call itself: an arbitrary effect
             }
             Expression::NewExpression(c) => {
                 self.lower_expr(&c.callee);
                 for arg in &c.arguments {
                     self.lower_argument(arg);
                 }
+                self.emit(Event::Barrier); // construction: an arbitrary effect
             }
 
             Expression::BinaryExpression(b) => {
@@ -617,7 +661,13 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                 }
             }
 
-            Expression::UnaryExpression(u) => self.lower_expr(&u.argument),
+            Expression::UnaryExpression(u) => {
+                self.lower_expr(&u.argument);
+                // `delete obj.k` mutates `obj`; other unary ops are pure.
+                if u.operator == oxc_syntax::operator::UnaryOperator::Delete {
+                    self.emit(Event::Barrier);
+                }
+            }
             Expression::UpdateExpression(u) => {
                 // `++x` / `x--`: a read+write of its target. If the target is a
                 // candidate it was excluded (non-simple write); we only need to
@@ -628,6 +678,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                 } else if let SimpleAssignmentTarget::StaticMemberExpression(m) = &u.argument {
                     self.lower_expr(&m.object);
                 }
+                self.emit(Event::Barrier); // the write side of the update
             }
 
             Expression::TemplateLiteral(t) => {
@@ -677,22 +728,26 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                     self.lower_expr(&a.right);
                     let val = self.classify_def(&a.right);
                     let assign = Some(AssignInfo { node, rhs: a.right.clone_in(self.allocator) });
-                    self.emit(Event::Def { sym: sym.unwrap(), val, assign });
+                    self.emit(Event::Def { sym: sym.unwrap(), val, assign, decl_init: None });
                 } else {
                     // Non-candidate target, or compound assignment to a candidate
                     // (the latter is excluded by escape analysis, so it can't be a
-                    // surviving candidate). Just evaluate the rhs for nested uses.
+                    // surviving candidate). Just evaluate the rhs for nested uses,
+                    // then mark the write to a non-candidate as an effect.
                     self.lower_expr(&a.right);
+                    self.emit(Event::Barrier);
                 }
             }
             AssignmentTarget::ComputedMemberExpression(m) => {
                 self.lower_expr(&m.object);
                 self.lower_expr(&m.expression);
                 self.lower_expr(&a.right);
+                self.emit(Event::Barrier); // member write: mutates the object
             }
             AssignmentTarget::StaticMemberExpression(m) => {
                 self.lower_expr(&m.object);
                 self.lower_expr(&a.right);
+                self.emit(Event::Barrier); // member write: mutates the object
             }
             // Destructuring assignment targets: bail (sound).
             _ => self.bailed = true,

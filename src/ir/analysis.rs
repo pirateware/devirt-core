@@ -31,11 +31,22 @@ use oxc_syntax::symbol::SymbolId;
 ///
 /// `func_scope` is the unit's own scope; candidates are the symbols bound
 /// directly in it (params + function-top-level vars). Returns an empty set if the
-/// function must be abandoned (`eval`/`arguments`).
+/// function must be abandoned (`eval`, always; `arguments` iff `bail_on_arguments`).
+///
+/// `bail_on_arguments` exists because the two consumers need different rigor.
+/// The SSA *value* fold rewrites reads of params too, and in sloppy mode
+/// `arguments[i] = v` aliases the i-th param — a write the dataflow cannot see —
+/// so it must abandon any `arguments`-using function (pass `true`). Single-use
+/// *inlining* never rewrites a param (a param has no declarator def) and only
+/// moves a temp across a gap it has proven holds no side effect — and every way
+/// `arguments` can mutate a param (`arguments[i] = …`, a param assignment/update,
+/// passing `arguments` to a callee) is a barrier in that gap — so it can safely
+/// keep such functions (pass `false`).
 pub fn collect_candidates(
     stmts: &[Statement<'_>],
     func_scope: ScopeId,
     scoping: &Scoping,
+    bail_on_arguments: bool,
 ) -> HashSet<SymbolId> {
     let base: HashSet<SymbolId> = scoping.iter_bindings_in(func_scope).collect();
     if base.is_empty() {
@@ -49,6 +60,7 @@ pub fn collect_candidates(
         excluded: HashSet::new(),
         has_aggregate_def: HashSet::new(),
         has_bare_read: HashSet::new(),
+        bail_on_arguments,
         bail: false,
     };
     for s in stmts {
@@ -280,6 +292,7 @@ struct Classifier<'s, 'b> {
     excluded: HashSet<SymbolId>,
     has_aggregate_def: HashSet<SymbolId>,
     has_bare_read: HashSet<SymbolId>,
+    bail_on_arguments: bool,
     bail: bool,
 }
 
@@ -452,7 +465,7 @@ impl<'a, 's, 'b> Visit<'a> for Classifier<'s, 'b> {
     }
 
     fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
-        if id.name == "eval" || id.name == "arguments" {
+        if id.name == "eval" || (id.name == "arguments" && self.bail_on_arguments) {
             self.bail = true;
             return;
         }

@@ -37,6 +37,12 @@ pub fn default_pipeline() -> Vec<Box<dyn Pass>> {
         Box::new(SequenceSplit::default()),
         Box::new(ConstantFold::default()),
         Box::new(AssignedOnceInline),
+        // Fold single-use temps back into their one read (`var t = decode(5);
+        // obj[t]` → `obj[decode(5)]`), removing indirection and — the real win —
+        // putting expressions back next to each other so proxy-inline, decoder-
+        // lift, and the const folds below reach further. Runs before them so the
+        // exposed work is picked up in the same round. See `src/ir/inline.rs`.
+        Box::new(crate::ir::InlineSingleUse),
         // Collapse operator-proxy wrappers (a OP b) before lifting, so decoder
         // calls hidden inside proxy expansions become visible.
         Box::new(ProxyInline::default()),
