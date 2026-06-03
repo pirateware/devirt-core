@@ -30,3 +30,8 @@ rustc-ice-*.txt
 # Local scratch input/output
 /in.js
 /out.js
+
+# Node deps used only for local obfuscation tooling — never part of the crate
+/node_modules/
+/package.json
+/package-lock.json
