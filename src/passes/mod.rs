@@ -6,6 +6,7 @@ mod dce;
 mod dead_object_prop;
 mod dead_store;
 mod decoder_lift;
+mod demultiplex;
 mod flatten_else;
 mod global_const_inline;
 mod math_fingerprint;
@@ -22,6 +23,7 @@ pub use dce::Dce;
 pub use dead_object_prop::DeadObjectProp;
 pub use dead_store::DeadStore;
 pub use decoder_lift::DecoderLift;
+pub use demultiplex::Demultiplex;
 pub use flatten_else::FlattenElse;
 pub use global_const_inline::GlobalConstInline;
 pub use math_fingerprint::MathFingerprint;
@@ -72,6 +74,12 @@ pub fn default_pipeline() -> Vec<Box<dyn Pass>> {
         // Collapse operator-proxy wrappers (a OP b) before lifting, so decoder
         // calls hidden inside proxy expansions become visible.
         Box::new(ProxyInline::default()),
+        // Specialize constant-selector calls into an immutable function-array
+        // multiplexer (`A[k](C, …)` → a copy of slot k with selector C bound).
+        // Runs after the folds that turn selectors constant and before the next
+        // round's const-fold/flatten-else/DCE, which collapse the guard chains the
+        // bound selector exposes. See `src/passes/demultiplex.rs`.
+        Box::new(Demultiplex),
         // Lift after Phase-1 simplification (so decoder args are literals/pure),
         // before DCE (so spent decoders/arrays become dead and get removed).
         Box::new(DecoderLift::default()),

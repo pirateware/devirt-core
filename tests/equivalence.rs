@@ -792,6 +792,112 @@ fn global_const_compound_write_must_not_inline() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Constant-selector function-array de-multiplexing (Phase 3, Demultiplex). An
+// immutable array of multiplexer functions indexed by a constant `k`, called with
+// a constant selector `C` as its first argument, has a statically-determined live
+// branch. We specialize slot `k` for selector `C` (bind it, const-fold, drop dead
+// branches) — preserving `this` by routing the specialized fn through `.call`.
+// Each "specializes" case is paired with a sibling where specialization would be
+// wrong (mutable array, non-constant selector, reassigned selector param, effect
+// reorder, self-recursion). The differential net catches any unsound change.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn demux_specializes_constant_selector() {
+    // Two constant selectors into the same slot resolve to the right branch.
+    assert_equivalent(
+        r#"
+        var A = [function (s, a) { return s === 1 ? a * 2 : a + 1; }];
+        __r = A[0](1, 5) + ":" + A[0](2, 5);
+        "#,
+    );
+    // Multiple slots, nested guard chain that folds once the selector is bound.
+    assert_equivalent(
+        r#"
+        var A = [
+            function (s, a, b) { return s; },
+            function (s, a, b) { if ((s | 1) === s) { return a + b; } return a - b; }
+        ];
+        __r = A[1](3, 10, 4) + ":" + A[1](2, 10, 4);
+        "#,
+    );
+}
+
+#[test]
+fn demux_preserves_this_via_call() {
+    // A slot that reads `this`: the specialized form must observe the same receiver.
+    assert_equivalent(
+        r#"
+        var obj = { tag: "T" };
+        var A = [function (s, x) { return this.tag + ":" + (s === 1 ? x * 2 : x + 1); }];
+        __r = A[0].call(obj, 1, 5) + "|" + A[0].call(obj, 2, 5);
+        "#,
+    );
+}
+
+#[test]
+fn demux_mutable_array_must_not_specialize() {
+    // An element write makes the array mutable; the live slot is not statically
+    // known, so calls must be left intact.
+    assert_equivalent(
+        r#"
+        var A = [function (s, a) { return s === 1 ? a * 2 : a + 1; }];
+        A[0] = function (s, a) { return s === 1 ? a * 100 : a; };
+        __r = A[0](1, 5) + ":" + A[0](2, 5);
+        "#,
+    );
+}
+
+#[test]
+fn demux_non_constant_selector_must_not_specialize() {
+    // The selector is runtime-variable: the live branch is unknown.
+    assert_equivalent(
+        r#"
+        var A = [function (s, a) { return s === 1 ? a * 2 : a + 1; }];
+        var k = String(1) === "1" ? 1 : 2;
+        __r = A[0](k, 5) + ":" + A[0](k + 1, 5);
+        "#,
+    );
+}
+
+#[test]
+fn demux_reassigned_selector_param_must_not_specialize() {
+    // The slot rewrites its selector param before branching on it; binding the
+    // literal would be wrong.
+    assert_equivalent(
+        r#"
+        var A = [function (s, a) { s = s & 2; return s === 0 ? a * 2 : a + 1; }];
+        __r = A[0](1, 5) + ":" + A[0](2, 5) + ":" + A[0](3, 5);
+        "#,
+    );
+}
+
+#[test]
+fn demux_effectful_trailing_arg_not_reordered() {
+    // A trailing argument with a side effect must still run, in order, exactly once.
+    assert_equivalent(
+        r#"
+        var seen = "";
+        var A = [function (s, a, b) { return s === 1 ? b + a : a; }];
+        var v = A[0](1, (seen += "a", 10), (seen += "b", 4));
+        __r = v + ":" + seen;
+        "#,
+    );
+}
+
+#[test]
+fn demux_self_recursive_slot_preserves_value() {
+    // A slot that calls itself through the array: specialization must remain
+    // bounded and value-preserving (terminating recursion).
+    assert_equivalent(
+        r#"
+        var A = [function (s, n) { return n <= 0 ? s : A[0](s, n - 1) + 1; }];
+        __r = A[0](100, 3);
+        "#,
+    );
+}
+
 #[test]
 fn ssa_copy_propagation_preserves_value() {
     // A proxy variable collapses to its source.
