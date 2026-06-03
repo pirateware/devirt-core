@@ -1297,3 +1297,49 @@ fn math_fingerprint_respects_argument_coercion() {
         "#,
     );
 }
+
+#[test]
+fn unflatten_generalized_shapes_preserve_value() {
+    // while(s != K) non-falsy exit.
+    assert_equivalent(
+        "var s = 1; __r = 0; while (s != 9) { switch (s) { \
+         case 1: __r += 10; s = 2; break; case 2: __r += 5; s = 9; break; } }",
+    );
+    // do-while runs body before test.
+    assert_equivalent(
+        "var s = 1; __r = 0; do { switch (s) { \
+         case 1: __r += 10; s = 2; break; case 2: __r += 5; s = 7; break; } } while (s != 7);",
+    );
+    // do-while runs the body once even when the exit test is immediately false:
+    // s starts at 9, the case transitions 9 -> 9, and `while (s != 9)` exits after
+    // one pass. A plain `while (s != 9)` would not run at all — pins body-before-test.
+    assert_equivalent(
+        "var s = 9; __r = 0; do { switch (s) { \
+         case 9: __r += 3; s = 9; break; } } while (s != 9);",
+    );
+    // Compound (relative) transitions: 1 -> 5 -> 13.
+    assert_equivalent(
+        "var s = 1; __r = 0; while (s != 13) { switch (s) { \
+         case 1: __r += 10; s += 4; break; case 5: __r += 5; s += 8; break; } }",
+    );
+    // Relational exit: while (s < 9).
+    assert_equivalent(
+        "var s = 1; __r = 0; while (s < 9) { switch (s) { \
+         case 1: __r += 10; s = 5; break; case 5: __r += 5; s = 9; break; } }",
+    );
+    // Symbolic write-once constant labels.
+    assert_equivalent(
+        "var A = 1, B = 2, Z = 0; var s = A; __r = 0; while (s) { switch (s) { \
+         case A: __r += 10; s = B; break; case B: __r += 5; s = Z; break; } }",
+    );
+    // Terminal return inside a case (machine stops early).
+    assert_equivalent(
+        "__r = (function(){ var s = 1; while (s != 4) { switch (s) { \
+         case 1: s = 2; break; case 2: return 42; case 3: return 99; } } return 0; })();",
+    );
+    // A genuine loop must be preserved (still equivalent either way).
+    assert_equivalent(
+        "var s = 1, n = 0; __r = 0; do { switch (s) { \
+         case 1: n += 1; s = 2; break; case 2: __r += n; s = (n < 3) ? 1 : 0; break; } } while (s);",
+    );
+}

@@ -11,20 +11,36 @@
 //! the initializer, follow each case's transition, and emit the case bodies in the
 //! order they would run. The result is the original linear code.
 //!
+//! Loop shapes handled (the state var `s` is a local initialized to an integer
+//! literal in the preceding statement):
+//!   * `while (<test>) { switch (s) { … } }`
+//!   * `do { switch (s) { … } } while (<test>)` — body runs before the test.
+//! `<test>` may be `s` (falsy exit), `true` (exit only via a terminal case), or a
+//! comparison `s <op> K` (`!=`, `==`, `<`, `<=`, `>`, `>=`) against an integer
+//! literal on either side. The exit is modelled exactly by `LoopTest::continues`,
+//! so a non-zero terminal state (`while (s != 105)`) is handled, not just `0`.
+//! Transitions may be `s = K` (absolute) or `s += K` / `s -= K` (relative); the
+//! simulator tracks the concrete state so a relative step is fully determined.
+//!
 //! Soundness is by construction + heavy gating. We transform only when every check
 //! below holds, and otherwise leave the construct untouched:
-//!   * the state var `s` is referenced nowhere but the initializer, the `while (s)`
-//!     test, the `switch (s)` discriminant, and top-level `s = <int>` transitions
-//!     inside cases (so emitting bodies can't observe or alter dispatch state);
-//!   * the loop is `while (s) { switch (s) { … } }` with no `default` clause;
+//!   * `s` is referenced nowhere but the initializer, the loop test, the
+//!     `switch (s)` discriminant, and top-level transitions inside cases (so
+//!     emitting bodies can't observe or alter dispatch state);
+//!   * the switch has no `default` clause;
 //!   * each visited case ends in `break`/`continue` (with exactly one top-level
-//!     integer transition) or a `return`/`throw` terminator — never falls through,
-//!     and contains no other top-level `break`/`continue`/`return`/`throw`;
-//!   * the simulated state chain terminates: state `0` (falsy) exits the loop, and
-//!     revisiting a state aborts the whole rewrite (a real loop, not a chain).
+//!     transition) or a `return`/`throw` terminator — never falls through, and
+//!     contains no other top-level `break`/`continue`/`return`/`throw`;
+//!   * the simulated state chain terminates (the loop test goes false) and never
+//!     revisits a state (a revisit is a real loop, not a linear chain → abort).
 //!
 //! Because `s` is dispatch-only and the chain is acyclic and deterministic, the
 //! emitted sequence runs the exact same statements in the exact same order.
+//!
+//! NOT handled (param-state): dispatchers whose state is a *function parameter*
+//! (`function f(s, …) { while (s != K) switch (s) … }`, called `f(CONST, …)`) —
+//! the dominant shape in samples 1 & 4. That needs an interprocedural specialize-
+//! per-entry-constant transform; see issues/01-unflatten-too-narrow.md.
 
 use std::collections::{HashMap, HashSet};
 
@@ -33,6 +49,7 @@ use oxc_ast::ast::{
     AssignmentTarget, BindingPattern, Expression, Program, SimpleAssignmentTarget, Statement,
     SwitchStatement,
 };
+use oxc_syntax::operator::{AssignmentOperator, BinaryOperator};
 use oxc_ast_visit::Visit;
 use oxc_traverse::{traverse_mut, Traverse, TraverseCtx};
 
@@ -70,18 +87,18 @@ impl<'a> Traverse<'a, ()> for Unflatten {
             let Some((s_name, init)) = state_init(&stmts[i]) else {
                 continue;
             };
-            let Some(switch) = while_switch(&stmts[i + 1], &s_name) else {
+            let Some((switch, kind, test)) = detect_loop(&stmts[i + 1], &s_name) else {
                 continue;
             };
             // `s` must not be referenced anywhere in this list except the init and
-            // the while construct (indices i, i+1).
+            // the loop construct (indices i, i+1).
             if !dispatch_only_in_list(stmts, i, &s_name) {
                 continue;
             }
             let Some(cases) = parse_cases(switch, &s_name) else {
                 continue;
             };
-            let Some(seq) = simulate(init, &cases, ctx.ast.allocator) else {
+            let Some(seq) = simulate(init, &cases, &test, kind, ctx.ast.allocator) else {
                 continue;
             };
             hit = Some((i, seq));
@@ -157,17 +174,62 @@ fn int_literal(expr: &Expression<'_>) -> Option<i64> {
     }
 }
 
-/// If `stmt` is `while (<s>) { switch (<s>) { … } }` with no `default`, return the
-/// switch. The test and discriminant must both be the bare identifier `s` (so the
-/// loop exits exactly when `s` becomes `0`).
-fn while_switch<'b, 'a>(stmt: &'b Statement<'a>, s: &str) -> Option<&'b SwitchStatement<'a>> {
-    let Statement::WhileStatement(w) = stmt else {
-        return None;
-    };
-    if !is_ident(&w.test, s) {
-        return None;
+/// Whether the loop tests its condition *before* the body (`while`/`for`) or
+/// *after* (`do…while`, body runs at least once).
+#[derive(Clone, Copy, PartialEq)]
+enum LoopKind {
+    While,
+    DoWhile,
+}
+
+/// The loop's continue condition as a predicate over the integer state. The loop
+/// runs the switch while this holds and exits when it goes false. Modelling the
+/// test exactly (rather than hard-coding the `while (s)` falsy exit) is what lets
+/// us handle `while (s != K)`, `while (s < K)`, etc.
+enum LoopTest {
+    /// `while (s)` — continue while `s` is truthy (non-zero).
+    Truthy,
+    /// `while (true)` / `for (;;)` — never exits via the test (only via a
+    /// terminal `return`/`throw` case).
+    Always,
+    /// `while (s <op> K)`.
+    Cmp(BinaryOperator, i64),
+}
+
+impl LoopTest {
+    /// Does the loop continue (run another switch iteration) at this state?
+    fn continues(&self, state: i64) -> bool {
+        match self {
+            LoopTest::Truthy => state != 0,
+            LoopTest::Always => true,
+            LoopTest::Cmp(op, k) => match op {
+                BinaryOperator::Inequality | BinaryOperator::StrictInequality => state != *k,
+                BinaryOperator::Equality | BinaryOperator::StrictEquality => state == *k,
+                BinaryOperator::LessThan => state < *k,
+                BinaryOperator::LessEqualThan => state <= *k,
+                BinaryOperator::GreaterThan => state > *k,
+                BinaryOperator::GreaterEqualThan => state >= *k,
+                _ => false,
+            },
+        }
     }
-    let switch = match &w.body {
+}
+
+/// If `stmt` is `while (<test>) { switch (<s>) { … } }` or the `do…while` form,
+/// return the switch, the loop kind, and the parsed test. The switch discriminant
+/// must be the bare state identifier; the test must be a predicate over `s` (and
+/// integer constants) so the exit is statically determined. No `default` clause.
+fn detect_loop<'b, 'a>(
+    stmt: &'b Statement<'a>,
+    s: &str,
+) -> Option<(&'b SwitchStatement<'a>, LoopKind, LoopTest)> {
+    let (test_expr, body, kind) = match stmt {
+        Statement::WhileStatement(w) => (&w.test, &w.body, LoopKind::While),
+        Statement::DoWhileStatement(d) => (&d.test, &d.body, LoopKind::DoWhile),
+        _ => return None,
+    };
+    let test = parse_loop_test(test_expr, s)?;
+    let switch = match body {
         Statement::SwitchStatement(sw) => sw,
         Statement::BlockStatement(b) if b.body.len() == 1 => {
             let Statement::SwitchStatement(sw) = &b.body[0] else {
@@ -184,17 +246,88 @@ fn while_switch<'b, 'a>(stmt: &'b Statement<'a>, s: &str) -> Option<&'b SwitchSt
     if switch.cases.iter().any(|c| c.test.is_none()) {
         return None;
     }
-    Some(switch)
+    Some((switch, kind, test))
+}
+
+/// Parse a loop test into a `LoopTest` predicate over state `s`. Accepts the bare
+/// `s` (truthy), `true`, and a binary comparison of `s` against an integer literal
+/// on either side. Anything else → `None` (we won't model it).
+fn parse_loop_test(expr: &Expression<'_>, s: &str) -> Option<LoopTest> {
+    if is_ident(expr, s) {
+        return Some(LoopTest::Truthy);
+    }
+    if matches!(expr, Expression::BooleanLiteral(b) if b.value) {
+        return Some(LoopTest::Always);
+    }
+    let Expression::BinaryExpression(b) = expr else {
+        return None;
+    };
+    if !is_comparison(b.operator) {
+        return None;
+    }
+    // `s <op> K` or `K <op> s` — normalise so state is on the left.
+    if is_ident(&b.left, s) {
+        let k = int_literal(&b.right)?;
+        Some(LoopTest::Cmp(b.operator, k))
+    } else if is_ident(&b.right, s) {
+        let k = int_literal(&b.left)?;
+        Some(LoopTest::Cmp(flip_comparison(b.operator), k))
+    } else {
+        None
+    }
+}
+
+fn is_comparison(op: BinaryOperator) -> bool {
+    matches!(
+        op,
+        BinaryOperator::Inequality
+            | BinaryOperator::StrictInequality
+            | BinaryOperator::Equality
+            | BinaryOperator::StrictEquality
+            | BinaryOperator::LessThan
+            | BinaryOperator::LessEqualThan
+            | BinaryOperator::GreaterThan
+            | BinaryOperator::GreaterEqualThan
+    )
+}
+
+/// Mirror a comparison so `K <op> s` becomes `s <flip(op)> K`.
+fn flip_comparison(op: BinaryOperator) -> BinaryOperator {
+    match op {
+        BinaryOperator::LessThan => BinaryOperator::GreaterThan,
+        BinaryOperator::LessEqualThan => BinaryOperator::GreaterEqualThan,
+        BinaryOperator::GreaterThan => BinaryOperator::LessThan,
+        BinaryOperator::GreaterEqualThan => BinaryOperator::LessEqualThan,
+        other => other, // ==, ===, !=, !== are symmetric
+    }
 }
 
 fn is_ident(expr: &Expression<'_>, name: &str) -> bool {
     matches!(expr, Expression::Identifier(id) if id.name == name)
 }
 
+/// How a case mutates the dispatch state in its trailing transition.
+#[derive(Clone, Copy)]
+enum Trans {
+    /// `s = <int>` — jump to an absolute state.
+    Abs(i64),
+    /// `s += <int>` / `s -= <int>` — relative to the current state.
+    Rel(i64),
+}
+
+impl Trans {
+    fn apply(self, state: i64) -> i64 {
+        match self {
+            Trans::Abs(v) => v,
+            Trans::Rel(d) => state + d,
+        }
+    }
+}
+
 /// What a case does once its body has run.
 enum CaseEnd {
-    /// Transition to a state then re-enter the loop (trailing `break`/`continue`).
-    Goto(i64),
+    /// Transition then re-enter the loop (trailing `break`/`continue`).
+    Step(Trans),
     /// `return`/`throw`: the machine stops here.
     Terminal,
 }
@@ -220,13 +353,13 @@ fn parse_cases<'b, 'a>(
         let last = &body[body.len() - 1];
         let (end, drop_last) = match last {
             Statement::BreakStatement(b) if b.label.is_none() => {
-                // Need exactly one top-level `s = <int>` transition.
+                // Need exactly one top-level transition (`s = K` / `s += K`).
                 let next = sole_transition(&body[..body.len() - 1], s)?;
-                (CaseEnd::Goto(next), true)
+                (CaseEnd::Step(next), true)
             }
             Statement::ContinueStatement(c) if c.label.is_none() => {
                 let next = sole_transition(&body[..body.len() - 1], s)?;
-                (CaseEnd::Goto(next), true)
+                (CaseEnd::Step(next), true)
             }
             Statement::ReturnStatement(_) | Statement::ThrowStatement(_) => {
                 (CaseEnd::Terminal, false)
@@ -265,16 +398,16 @@ fn parse_cases<'b, 'a>(
     Some(out)
 }
 
-/// Among top-level statements, find `s = <int>` transitions. Require exactly one
+/// Among top-level statements, find the state transitions. Require exactly one
 /// (the next state); none or a non-top-level transition → `None` (bail).
-fn sole_transition(stmts: &[Statement<'_>], s: &str) -> Option<i64> {
-    let mut found: Option<i64> = None;
+fn sole_transition(stmts: &[Statement<'_>], s: &str) -> Option<Trans> {
+    let mut found: Option<Trans> = None;
     for st in stmts {
-        if let Some(v) = is_state_transition(st, s) {
+        if let Some(t) = is_state_transition(st, s) {
             if found.is_some() {
                 return None; // more than one unconditional transition
             }
-            found = Some(v);
+            found = Some(t);
         } else if writes_name(st, s) {
             return None; // a transition nested in control flow → branching dispatch
         }
@@ -282,24 +415,29 @@ fn sole_transition(stmts: &[Statement<'_>], s: &str) -> Option<i64> {
     found
 }
 
-/// `s = <int>;` as a top-level statement → the assigned value.
-fn is_state_transition(stmt: &Statement<'_>, s: &str) -> Option<i64> {
+/// `s = <int>;` / `s += <int>;` / `s -= <int>;` as a top-level statement → the
+/// transition it encodes. A compound assignment is sound because the simulator
+/// tracks the concrete current state, so `s += K` is fully determined.
+fn is_state_transition(stmt: &Statement<'_>, s: &str) -> Option<Trans> {
     let Statement::ExpressionStatement(es) = stmt else {
         return None;
     };
     let Expression::AssignmentExpression(a) = &es.expression else {
         return None;
     };
-    if !matches!(a.operator, oxc_syntax::operator::AssignmentOperator::Assign) {
-        return None;
-    }
     let AssignmentTarget::AssignmentTargetIdentifier(id) = &a.left else {
         return None;
     };
     if id.name != s {
         return None;
     }
-    int_literal(&a.right)
+    let v = int_literal(&a.right)?;
+    match a.operator {
+        AssignmentOperator::Assign => Some(Trans::Abs(v)),
+        AssignmentOperator::Addition => Some(Trans::Rel(v)),
+        AssignmentOperator::Subtraction => Some(Trans::Rel(-v)),
+        _ => None,
+    }
 }
 
 fn is_top_level_control(stmt: &Statement<'_>) -> bool {
@@ -313,31 +451,43 @@ fn is_top_level_control(stmt: &Statement<'_>) -> bool {
 }
 
 /// Execute the dispatch chain from `init`, emitting case bodies in run order.
+///
+/// The loop kind decides when the exit test is checked: `while`/`for` test
+/// *before* each switch, `do…while` *after* (so the body runs at least once).
+/// `test.continues(state)` models the real loop condition exactly, so the emitted
+/// sequence runs the same statements in the same order as the dispatcher.
 fn simulate<'a>(
     init: i64,
     cases: &HashMap<i64, ParsedCase<'_, 'a>>,
+    test: &LoopTest,
+    kind: LoopKind,
     alloc: &'a Allocator,
 ) -> Option<Vec<Statement<'a>>> {
     let mut state = init;
     let mut visited: HashSet<i64> = HashSet::new();
     let mut seq: Vec<Statement<'a>> = Vec::new();
     // Bound iterations defensively (cycle detection already covers it).
-    for _ in 0..10_000 {
-        if state == 0 {
-            return Some(seq); // `while (s)` exits on falsy state
+    for _ in 0..100_000 {
+        // `while`/`for`: the test gates entry into the body.
+        if kind == LoopKind::While && !test.continues(state) {
+            return Some(seq);
         }
         if !visited.insert(state) {
             return None; // revisited state → real loop, not a linear chain
         }
-        let case = cases.get(&state)?; // no matching case + no default → infinite no-op
+        let case = cases.get(&state)?; // no matching case + no default → unmodeled
         for st in &case.emit {
             // Deep-clone each emitted statement into the arena so it survives the
             // splice that replaces the original dispatcher.
             seq.push((*st).clone_in(alloc));
         }
         match case.end {
-            CaseEnd::Goto(next) => state = next,
+            CaseEnd::Step(t) => state = t.apply(state),
             CaseEnd::Terminal => return Some(seq),
+        }
+        // `do…while`: the body has run; the test now decides whether to continue.
+        if kind == LoopKind::DoWhile && !test.continues(state) {
+            return Some(seq);
         }
     }
     None
