@@ -18,7 +18,7 @@ fn deob(src: &str) -> String {
 
 #[test]
 fn statement_level_comma_chain_splits() {
-    let out = deob("function g(){ a = f(), b(), c = d; }");
+    let out = deob("function g(){ a = f(), b(), c = d; } sink(g);");
     assert!(out.contains("a = f();"), "got: {out}");
     assert!(out.contains("b();"), "got: {out}");
     assert!(out.contains("c = d;"), "got: {out}");
@@ -28,7 +28,7 @@ fn statement_level_comma_chain_splits() {
 
 #[test]
 fn return_sequence_keeps_last_as_value() {
-    let out = deob("function g(){ return j(), k(), m; }");
+    let out = deob("function g(){ return j(), k(), m; } sink(g);");
     assert!(
         out.contains("j();") && out.contains("k();"),
         "leading effects lost: {out}"
@@ -38,7 +38,7 @@ fn return_sequence_keeps_last_as_value() {
 
 #[test]
 fn throw_sequence_keeps_last_as_value() {
-    let out = deob("function g(){ throw p(), q; }");
+    let out = deob("function g(){ throw p(), q; } sink(g);");
     assert!(out.contains("p();"), "leading effect lost: {out}");
     assert!(out.contains("throw q;"), "thrown value changed: {out}");
 }
@@ -47,7 +47,7 @@ fn throw_sequence_keeps_last_as_value() {
 fn assignment_rhs_sequence_is_not_split() {
     // `a = (b, c)` is one assignment whose value is the sequence; the comma is
     // NOT in statement position and must stay intact.
-    let out = deob("function g(){ a = (sideEffect(), value); return a; }");
+    let out = deob("function g(){ a = (sideEffect(), value); return a; } sink(g);");
     assert!(
         out.contains("(sideEffect(), value)") || out.contains("sideEffect(), value"),
         "RHS sequence wrongly split: {out}"

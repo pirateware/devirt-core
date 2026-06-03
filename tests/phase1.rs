@@ -28,7 +28,7 @@ fn member_normalization_on_assignment_target() {
     // The LHS of an assignment is a SimpleAssignmentTarget, not an Expression;
     // it must normalize just like read-position member access.
     // (param name may be renamed; assert on the access form, not the name.)
-    let out = deob(r#"function g(o){ o["foo"] = o["foo"] || 1; return o; }"#);
+    let out = deob(r#"function g(o){ o["foo"] = o["foo"] || 1; return o; } sink(g);"#);
     assert!(out.contains(".foo = "), "LHS not normalized: {out}");
     assert!(
         !out.contains(r#"["foo"]"#),
@@ -38,7 +38,7 @@ fn member_normalization_on_assignment_target() {
 
 #[test]
 fn assigned_once_inline_and_fold() {
-    let out = deob("function g(){ var n = (0x10, 256); return 5 + n; }");
+    let out = deob("function g(){ var n = (0x10, 256); return 5 + n; } sink(g);");
     assert!(out.contains("261"), "got: {out}");
     assert!(!out.contains("var n"), "declaration should be DCE'd: {out}");
 }
@@ -67,7 +67,7 @@ fn void_literal_folds_to_undefined() {
 fn void_not_folded_when_undefined_is_shadowed() {
     // A local binding named `undefined` shadows the global; rewriting `void 0`
     // to `undefined` here would be unsound.
-    let out = deob("function f(undefined){ return void 0; }");
+    let out = deob("function f(undefined){ return void 0; } sink(f);");
     assert!(
         out.contains("void 0"),
         "unsoundly folded shadowed undefined: {out}"
@@ -92,7 +92,7 @@ fn opaque_predicates() {
 
 #[test]
 fn dead_literal_statements_removed() {
-    let out = deob(r#"function g(){ 80214130; true; null; keep(); }"#);
+    let out = deob(r#"function g(){ 80214130; true; null; keep(); } sink(g);"#);
     assert!(out.contains("keep()"), "real statement dropped: {out}");
     assert!(
         !out.contains("80214130"),
@@ -106,7 +106,7 @@ fn dead_literal_statements_removed() {
 
 #[test]
 fn unreachable_after_return() {
-    let out = deob("function g(){ return 1; sideEffect(); }");
+    let out = deob("function g(){ return 1; sideEffect(); } sink(g);");
     assert!(
         !out.contains("sideEffect"),
         "unreachable code survived: {out}"
@@ -119,7 +119,7 @@ fn reassigned_var_folds_to_last_dominating_value() {
     // definition (`x = 2` dominates the return), so the read folds to 2 and the
     // dead assignments are removed. assigned-once alone bailed on the
     // reassignment; SSA makes this sound by construction.
-    let out = deob("function g(){ var x = 1; x = 2; return x; }");
+    let out = deob("function g(){ var x = 1; x = 2; return x; } sink(g);");
     assert!(
         out.contains("return 2"),
         "should fold to the dominating value: {out}"

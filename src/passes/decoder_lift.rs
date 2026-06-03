@@ -37,7 +37,7 @@ use crate::util::build_scoping;
 /// function whose only free names are these (or other pure bindings) is pure.
 /// The double-eval determinism guard separately rejects any that turn out
 /// non-deterministic (e.g. `Date`), so the list can stay generous.
-const GLOBALS: &[&str] = &[
+pub(crate) const GLOBALS: &[&str] = &[
     "String",
     "Math",
     "Array",
@@ -217,8 +217,191 @@ impl Pass for DecoderLift {
         let scoping = build_scoping(program);
         traverse_mut(&mut lifter, allocator, program, scoping, ());
         self.changed = lifter.changed;
+
+        // Strip spent scaffolding: a string-array rotation IIFE whose only
+        // observable effect is mutating decoder tables that no *real* code reads
+        // anymore (every decode site was lifted). DCE can't remove a bare-call
+        // expression statement, so it would otherwise keep the rotation — and the
+        // array it mutates — alive forever. We own this cleanup because only this
+        // pass knows which bindings are the decoder library.
+        let mut scaffolding: HashSet<String> = analysis.pureset.clone();
+        scaffolding.extend(data_names.iter().cloned());
+        scaffolding.extend(aliases.keys().cloned());
+        if self.cleanup_spent_rotations(program, &scaffolding) {
+            self.changed = true;
+        }
+
         self.changed
     }
+}
+
+impl DecoderLift {
+    /// Remove top-level string-array *rotation* IIFEs that are now dead. A bare
+    /// `(function(arr,n){ … arr.push(arr.shift()) … })(table, k);` statement only
+    /// mutates the decoder `table`; once no live code reads that table (all decode
+    /// sites lifted), the rotation is unobservable and safe to drop. We remove
+    /// only the rotation statement — the now-unreferenced table/decoder bindings
+    /// fall to DCE on the next round.
+    ///
+    /// Liveness is name-based (like the rest of this pass): a scaffolding name is
+    /// *live* if a non-scaffolding statement references it, closed under the
+    /// scaffolding declarations' own dependencies. A rotation IIFE is removable
+    /// iff it touches no live scaffolding name.
+    fn cleanup_spent_rotations(
+        &self,
+        program: &mut Program<'_>,
+        scaffolding: &HashSet<String>,
+    ) -> bool {
+        // Classify each top-level statement and gather the scaffolding names it
+        // references (identifier reads only).
+        let mut decl_deps: HashMap<String, HashSet<String>> = HashMap::new(); // name -> scaffolding refs in its init
+        let mut rotation_idx: Vec<(usize, HashSet<String>)> = Vec::new(); // (stmt index, touched scaffolding names)
+        let mut live: HashSet<String> = HashSet::new();
+
+        for (i, stmt) in program.body.iter().enumerate() {
+            if let Some(names) = scaffold_decl_names(stmt, scaffolding) {
+                let refs = stmt_scaffold_refs(stmt, scaffolding);
+                for n in &names {
+                    decl_deps.insert(n.clone(), refs.clone());
+                }
+                continue;
+            }
+            if let Some(touched) = rotation_iife_touches(stmt, scaffolding) {
+                rotation_idx.push((i, touched));
+                continue;
+            }
+            // Real statement: every scaffolding name it reads is live.
+            live.extend(stmt_scaffold_refs(stmt, scaffolding));
+        }
+
+        if rotation_idx.is_empty() {
+            return false;
+        }
+
+        // Close `live` under declaration dependencies: if a live name is defined
+        // by a scaffolding decl, that decl's own scaffolding references are live.
+        loop {
+            let mut added = false;
+            for (name, deps) in &decl_deps {
+                if live.contains(name) {
+                    for d in deps {
+                        if live.insert(d.clone()) {
+                            added = true;
+                        }
+                    }
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+
+        // Remove rotation IIFEs that touch only dead scaffolding.
+        let dead: HashSet<usize> = rotation_idx
+            .iter()
+            .filter(|(_, touched)| touched.is_disjoint(&live))
+            .map(|(i, _)| *i)
+            .collect();
+        if dead.is_empty() {
+            return false;
+        }
+        let mut idx = 0usize;
+        program.body.retain(|_| {
+            let keep = !dead.contains(&idx);
+            idx += 1;
+            keep
+        });
+        true
+    }
+}
+
+/// If `stmt` is a `var`/`let`/`const` declaration binding only scaffolding names
+/// with pure (data or function) initializers, return those names.
+fn scaffold_decl_names(stmt: &Statement<'_>, scaffolding: &HashSet<String>) -> Option<Vec<String>> {
+    let Statement::VariableDeclaration(vd) = stmt else {
+        return None;
+    };
+    let mut names = Vec::new();
+    for d in &vd.declarations {
+        let BindingPattern::BindingIdentifier(id) = &d.id else {
+            return None;
+        };
+        if !scaffolding.contains(id.name.as_str()) {
+            return None;
+        }
+        match &d.init {
+            Some(init) if is_pure_data(init) || is_function_value(init) => {}
+            _ => return None,
+        }
+        names.push(id.name.to_string());
+    }
+    (!names.is_empty()).then_some(names)
+}
+
+fn is_function_value(expr: &Expression<'_>) -> bool {
+    matches!(
+        expr,
+        Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_)
+    )
+}
+
+/// If `stmt` is a bare, side-effect-free IIFE expression statement that touches
+/// (reads/mutates) at least one scaffolding name and nothing else outside the
+/// safe globals, return the scaffolding names it touches. This is the string-array
+/// rotation: `(function(arr, n){ … })(table, k);`.
+fn rotation_iife_touches(
+    stmt: &Statement<'_>,
+    scaffolding: &HashSet<String>,
+) -> Option<HashSet<String>> {
+    let Statement::ExpressionStatement(es) = stmt else {
+        return None;
+    };
+    let mut expr = &es.expression;
+    while let Expression::UnaryExpression(u) = expr {
+        expr = &u.argument;
+    }
+    let Expression::CallExpression(call) = expr else {
+        return None;
+    };
+    if !matches!(
+        &call.callee,
+        Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_)
+    ) {
+        return None;
+    }
+    let fv = freevars_of_expr(expr);
+    // Pure modulo the table mutation: no `this`, no writes to free vars, every
+    // free name is scaffolding or a side-effect-free global.
+    if !fv.all_allowed(scaffolding, None) {
+        return None;
+    }
+    let touched: HashSet<String> = fv
+        .free()
+        .into_iter()
+        .filter(|n| scaffolding.contains(n))
+        .collect();
+    (!touched.is_empty()).then_some(touched)
+}
+
+/// Scaffolding names read (as identifier references) anywhere in `stmt`.
+fn stmt_scaffold_refs(stmt: &Statement<'_>, scaffolding: &HashSet<String>) -> HashSet<String> {
+    struct RefScan<'r> {
+        scaffolding: &'r HashSet<String>,
+        out: HashSet<String>,
+    }
+    impl<'a, 'r> Visit<'a> for RefScan<'r> {
+        fn visit_identifier_reference(&mut self, it: &oxc_ast::ast::IdentifierReference<'a>) {
+            if self.scaffolding.contains(it.name.as_str()) {
+                self.out.insert(it.name.to_string());
+            }
+        }
+    }
+    let mut s = RefScan {
+        scaffolding,
+        out: HashSet::new(),
+    };
+    s.visit_statement(stmt);
+    s.out
 }
 
 // ---------------------------------------------------------------------------
@@ -286,7 +469,7 @@ fn iife_body<'b, 'a>(stmt: &'b Statement<'a>) -> Option<&'b ArenaVec<'a, Stateme
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
-struct FreeVars {
+pub(crate) struct FreeVars {
     used: HashSet<String>,
     bound: HashSet<String>,
     /// Base names of every write target (`x = …`, `x++`, `o.p = …`, `delete o.p`).
@@ -391,7 +574,7 @@ impl FreeVars {
         }
     }
 
-    fn free(&self) -> HashSet<String> {
+    pub(crate) fn free(&self) -> HashSet<String> {
         self.used.difference(&self.bound).cloned().collect()
     }
 
@@ -402,7 +585,7 @@ impl FreeVars {
         self.written.iter().any(|n| !self.bound.contains(n))
     }
 
-    fn all_allowed(&self, pureset: &HashSet<String>, extra: Option<&str>) -> bool {
+    pub(crate) fn all_allowed(&self, pureset: &HashSet<String>, extra: Option<&str>) -> bool {
         !self.impure
             && !self.writes_free()
             && self.free().iter().all(|n| {
@@ -446,7 +629,7 @@ fn member_base(e: &Expression<'_>) -> Option<String> {
     }
 }
 
-fn freevars_of_expr(expr: &Expression<'_>) -> FreeVars {
+pub(crate) fn freevars_of_expr(expr: &Expression<'_>) -> FreeVars {
     let mut fv = FreeVars::default();
     fv.visit_expression(expr);
     fv

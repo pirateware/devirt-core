@@ -99,12 +99,16 @@ fn is_dead_literal(expr: &oxc_ast::ast::Expression<'_>) -> bool {
     )
 }
 
-/// A binding may be removed only if it is unused AND not declared in the root
-/// (program/global) scope. Top-level bindings in a script become global
-/// properties — observable output we must never delete, even if nothing in this
-/// file references them (they may be the program's public entry point).
+/// A binding may be removed if it is unused anywhere in the program. We delete
+/// root-scope bindings too: the deobfuscator's scope is the file it is given, so
+/// a binding unreferenced *within that file* is dead. A top-level `var` in a
+/// script does become a global property, but whether some *other* script reads
+/// that property is the input's concern, not ours — protecting it here only
+/// keeps spent obfuscator scaffolding (string arrays, decoder fns) alive.
+/// Soundness for the value itself is preserved separately: a declarator is only
+/// dropped when its initializer is pure (see `keep_declarator`).
 fn is_removable_symbol(symbol: oxc_syntax::symbol::SymbolId, scoping: &Scoping) -> bool {
-    scoping.symbol_is_unused(symbol) && scoping.symbol_scope_id(symbol) != scoping.root_scope_id()
+    scoping.symbol_is_unused(symbol)
 }
 
 fn is_terminator(s: &Statement<'_>) -> bool {

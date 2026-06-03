@@ -115,6 +115,7 @@ fn lifts_decoder_nested_in_a_function_scope() {
             function dec(i) { return tbl[i]; }
             sink(dec(0), dec(2));
         }
+        setup();
     "#;
     let out = deobfuscate(src, "t.js").code;
     assert!(
@@ -163,6 +164,7 @@ fn does_not_lift_scoped_decoder_over_member_mutated_table() {
             tbl[1] = "Z";
             sink(dec(0), dec(1));
         }
+        run();
     "#;
     let out = deobfuscate(src, "t.js").code;
     // The decoder calls must survive unresolved: the table is mutated, so a baked

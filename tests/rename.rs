@@ -121,7 +121,11 @@ fn does_not_touch_property_names() {
 
 #[test]
 fn preserves_global_names() {
-    // Top-level (global/observable) bindings must not be renamed.
-    let out = deobfuscate("var Qz = 1; window.x = Qz;", "t.js").code;
+    // Top-level (global/observable) bindings must not be renamed. Run the rename
+    // pass in isolation: in the full pipeline `Qz` is a single-use const, so it is
+    // inlined into `window.x` and the dead `var Qz` removed (the unused-top-level
+    // policy) before rename ever sees it — correct, but it would erase the binding
+    // this test is about. Isolation targets the rename policy directly.
+    let out = run_pass("var Qz = 1; window.x = Qz;", "t.js", "rename");
     assert!(out.contains("Qz"), "global binding renamed: {out}");
 }

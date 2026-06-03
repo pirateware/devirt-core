@@ -10,8 +10,10 @@ mod flatten_else;
 mod math_fingerprint;
 mod member_normalize;
 mod proxy_inline;
+mod pure_eval;
 mod rename;
 mod sequence_split;
+mod unflatten;
 
 pub use assigned_once::AssignedOnceInline;
 pub use const_fold::ConstantFold;
@@ -23,8 +25,10 @@ pub use flatten_else::FlattenElse;
 pub use math_fingerprint::MathFingerprint;
 pub use member_normalize::MemberNormalize;
 pub use proxy_inline::ProxyInline;
+pub use pure_eval::PureEval;
 pub use rename::RenameByRole;
 pub use sequence_split::SequenceSplit;
+pub use unflatten::Unflatten;
 
 use crate::pass::Pass;
 
@@ -37,6 +41,11 @@ pub fn default_pipeline() -> Vec<Box<dyn Pass>> {
         // Split statement-level comma chains into one statement per effect, so
         // later passes (fold, inline, DCE) see individual assignments.
         Box::new(SequenceSplit::default()),
+        // Unflatten the integer-state `while(s){switch(s){…}}` control-flow
+        // dispatcher back into the straight-line sequence it encodes. Runs early
+        // (after sequence-split splits comma chains in cases into clean top-level
+        // transition statements) so the revealed code feeds the folds below.
+        Box::new(Unflatten::default()),
         Box::new(ConstantFold::default()),
         Box::new(AssignedOnceInline),
         // Fingerprint algebraic operator-proxy functions (`fn(a,b)` that is really
@@ -57,6 +66,12 @@ pub fn default_pipeline() -> Vec<Box<dyn Pass>> {
         // Lift after Phase-1 simplification (so decoder args are literals/pure),
         // before DCE (so spent decoders/arrays become dead and get removed).
         Box::new(DecoderLift::default()),
+        // Collapse a self-contained, side-effect-free IIFE (an obfuscated VM /
+        // "compute a constant the hard way" blob) to the primitive it produces,
+        // by running it in the sandbox. Runs after lifting so any decoder calls
+        // inside have already resolved, and before DCE so the now-dead binding
+        // (`var VM = 42` once its single read is inlined) gets removed.
+        Box::new(PureEval::default()),
         // SSA dataflow layer: sound intraprocedural const/copy propagation and
         // const-aggregate index folding. Runs after lifting (so it sees lifted
         // literals) and before DCE (so spent assignments become dead and get
@@ -76,6 +91,6 @@ pub fn default_pipeline() -> Vec<Box<dyn Pass>> {
         // Rename last: decoder-lift's name-based analysis sees original names
         // first, and we only rename what survives DCE.
         Box::new(RenameByRole::default()),
-        // future: Unflatten, ProxyInline, nested-decoder lift, ...
+        // future: nested-decoder lift, string-array-split unflattening, ...
     ]
 }
