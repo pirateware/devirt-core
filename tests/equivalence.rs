@@ -817,6 +817,101 @@ fn inline_does_not_touch_captured_temp() {
 }
 
 #[test]
+fn unflatten_dispatcher_preserves_value() {
+    // A linear integer-state while/switch chain collapses to the straight-line
+    // sequence it encodes. Value must be identical.
+    assert_equivalent(
+        r#"
+        var acc = 0;
+        var s = 1;
+        while (s) {
+            switch (s) {
+                case 1: acc += 10; s = 2; break;
+                case 2: acc += 20; s = 3; break;
+                case 3: acc += 30; s = 0; break;
+            }
+        }
+        __r = acc;
+        "#,
+    );
+    // A case that returns (terminal) inside an IIFE — chain stops there.
+    assert_equivalent(
+        r#"
+        __r = (function () {
+            var s = 1;
+            while (s) {
+                switch (s) {
+                    case 1: var x = 5; s = 2; break;
+                    case 2: return x * 4;
+                }
+            }
+        })();
+        "#,
+    );
+}
+
+#[test]
+fn unflatten_declines_unsound_shapes() {
+    // Conditional transition (real loop): `s` is written inside an `if`, so the
+    // machine is cyclic, not a linear chain. Must NOT be unflattened; value (n=3)
+    // is preserved because the pass declines.
+    assert_equivalent(
+        r#"
+        var n = 0;
+        var s = 1;
+        while (s) {
+            switch (s) {
+                case 1: n = n + 1; if (n < 3) { s = 1; } else { s = 0; } break;
+            }
+        }
+        __r = n;
+        "#,
+    );
+    // The case body READS the state var. Emitting the body without the dispatcher
+    // would make `s` undefined — the pass must decline (the read is observable).
+    assert_equivalent(
+        r#"
+        var acc = 0;
+        var s = 7;
+        while (s) {
+            switch (s) {
+                case 7: acc = s; s = 0; break;
+            }
+        }
+        __r = acc;
+        "#,
+    );
+}
+
+#[test]
+fn pure_iife_eval_preserves_value() {
+    // A self-contained, side-effect-free IIFE (a tiny "bytecode VM") collapses to
+    // the primitive it computes. Value must be preserved.
+    assert_equivalent(
+        r#"
+        __r = (function () {
+            var prog = [1, 7, 1, 35, 2], stack = [];
+            for (var i = 0; i < prog.length; i++) {
+                var op = prog[i];
+                if (op === 1) { stack.push(prog[++i]); }
+                else { var b = stack.pop(), a = stack.pop(); stack.push(a + b); }
+            }
+            return stack.pop();
+        })();
+        "#,
+    );
+    // String result and a Math-using IIFE: deterministic globals are fine.
+    assert_equivalent(r#"__r = (function(){ return "ab".repeat(3); })();"#);
+    assert_equivalent("__r = (function(){ return Math.max(3, 9, 4) + 1; })();");
+    // An IIFE whose result is consumed but which writes an OUTER variable must NOT
+    // be collapsed (the write is observable). Equivalence holds because PureEval
+    // declines (the free write fails its purity gate).
+    assert_equivalent(
+        "var seen = 0; var v = (function(){ seen = 1; return 5; })(); __r = v + ':' + seen;",
+    );
+}
+
+#[test]
 fn math_fingerprint_preserves_value() {
     // Addition polynomial (full-adder identity) with runtime-variable args. The
     // proxy collapses to `+`, which must keep the numeric value.

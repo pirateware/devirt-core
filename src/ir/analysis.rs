@@ -464,23 +464,21 @@ impl<'a, 's, 'b> Visit<'a> for Classifier<'s, 'b> {
     }
 
     fn visit_static_member_expression(&mut self, m: &StaticMemberExpression<'a>) {
-        if self.depth == 0
-            && self.cand_object(&m.object).is_some() {
-                // `s.name` read: a clean member access — do not descend into the
-                // object identifier (that would mark it a bare read / escape).
-                return;
-            }
+        if self.depth == 0 && self.cand_object(&m.object).is_some() {
+            // `s.name` read: a clean member access — do not descend into the
+            // object identifier (that would mark it a bare read / escape).
+            return;
+        }
         walk::walk_static_member_expression(self, m);
     }
 
     fn visit_computed_member_expression(&mut self, m: &ComputedMemberExpression<'a>) {
-        if self.depth == 0
-            && self.cand_object(&m.object).is_some() {
-                // `s[expr]` read: skip the object; the index may itself reference
-                // candidates, so visit it.
-                self.visit_expression(&m.expression);
-                return;
-            }
+        if self.depth == 0 && self.cand_object(&m.object).is_some() {
+            // `s[expr]` read: skip the object; the index may itself reference
+            // candidates, so visit it.
+            self.visit_expression(&m.expression);
+            return;
+        }
         walk::walk_computed_member_expression(self, m);
     }
 
