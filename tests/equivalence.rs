@@ -856,3 +856,25 @@ fn math_fingerprint_keeps_argument_side_effects() {
         "#,
     );
 }
+
+#[test]
+fn math_fingerprint_respects_argument_coercion() {
+    // An MBA `+` proxy equals `+` only for int32 args (its bitwise body
+    // ToInt32-coerces). Rewriting its calls to a bare `+` changes behavior when
+    // it is called with a string or float, so the fingerprint must either decline
+    // or emit the coercion-faithful form (`(a|0)+(b|0)`).
+    assert_equivalent(
+        r#"
+        function add(x, y) { return (x ^ y) + 2 * (x & y); }
+        __r = add(3, 4) + ":" + add("a", "b") + ":" + add(0.5, 0.5);
+        "#,
+    );
+    // A *true* operator proxy (no coercion) stays safe to collapse, including on
+    // non-integer arguments.
+    assert_equivalent(
+        r#"
+        function plus(x, y) { return x + y; }
+        __r = plus(3, 4) + "|" + plus("a", "b");
+        "#,
+    );
+}

@@ -249,9 +249,12 @@ impl Pass for MathFingerprint {
 /// (`swap` = the right argument is the left operand, e.g. `b - a`).
 #[derive(Clone, Copy)]
 enum Matched {
-    Bin { op: BinaryOperator, swap: bool },
+    /// `coerce` = the proxy equals the operator only on ToInt32-coerced operands
+    /// (an MBA reconstruction with a bitwise body), so the rewrite must wrap each
+    /// operand in `| 0` to stay faithful for non-integer arguments.
+    Bin { op: BinaryOperator, swap: bool, coerce: bool },
     Log { op: LogicalOperator, swap: bool },
-    Un { op: UnaryOperator },
+    Un { op: UnaryOperator, coerce: bool },
 }
 
 impl Matched {
@@ -263,10 +266,13 @@ impl Matched {
     }
 
     fn describe(&self) -> String {
+        let c = |coerce: bool| if coerce { "|0" } else { "" };
         match self {
-            Matched::Bin { op, swap } => format!("{}{}", op.as_str(), if *swap { "~" } else { "" }),
+            Matched::Bin { op, swap, coerce } => {
+                format!("{}{}{}", op.as_str(), if *swap { "~" } else { "" }, c(*coerce))
+            }
             Matched::Log { op, swap } => format!("{}{}", op.as_str(), if *swap { "~" } else { "" }),
-            Matched::Un { op } => op.as_str().to_string(),
+            Matched::Un { op, coerce } => format!("{}{}", op.as_str(), c(*coerce)),
         }
     }
 }
@@ -526,57 +532,81 @@ impl<'a> Visit<'a> for NameScan {
 
 /// Candidate operators of the given arity, paired with the JS source token used
 /// to compute the expected value in the battery.
-fn candidates(arity: usize) -> Vec<(String, bool, Matched)> {
-    let mut v: Vec<(String, bool, Matched)> = Vec::new();
+fn candidates(arity: usize) -> Vec<(String, Matched)> {
+    let mut v: Vec<(String, Matched)> = Vec::new();
     if arity == 2 {
-        // Commutative: only one orientation (a swapped form would match
-        // identically and break the unique-match requirement).
+        // Self-coercing bitwise ops: they already operate on ToInt32 of both
+        // operands, so `a OP b` is faithful for every argument type — no coerced
+        // variant (adding one would match identically and look ambiguous).
         for (tok, op) in [
-            ("+", BinaryOperator::Addition),
-            ("*", BinaryOperator::Multiplication),
             ("&", BinaryOperator::BitwiseAnd),
             ("|", BinaryOperator::BitwiseOR),
             ("^", BinaryOperator::BitwiseXOR),
         ] {
-            v.push((tok.to_string(), false, Matched::Bin { op, swap: false }));
+            v.push((tok.to_string(), Matched::Bin { op, swap: false, coerce: false }));
         }
-        // Non-commutative: both operand orders are distinct candidates.
+        for (tok, op) in [
+            ("<<", BinaryOperator::ShiftLeft),
+            (">>", BinaryOperator::ShiftRight),
+            (">>>", BinaryOperator::ShiftRightZeroFill),
+        ] {
+            v.push((tok.to_string(), Matched::Bin { op, swap: false, coerce: false }));
+            v.push((tok.to_string(), Matched::Bin { op, swap: true, coerce: false }));
+        }
+        // Arithmetic/relational ops do NOT coerce to int32, but an MBA
+        // reconstruction (a bitwise body) only equals the operator on coerced
+        // operands. So each gets a bare and a coerced candidate; the non-integer
+        // probes in the battery make the two disagree, so a proxy matches exactly
+        // one (a true `+` matches bare; an MBA `+` matches `(a|0)+(b|0)`).
+        for (tok, op) in [
+            ("+", BinaryOperator::Addition),
+            ("*", BinaryOperator::Multiplication),
+        ] {
+            for coerce in [false, true] {
+                v.push((tok.to_string(), Matched::Bin { op, swap: false, coerce }));
+            }
+        }
         for (tok, op) in [
             ("-", BinaryOperator::Subtraction),
             ("/", BinaryOperator::Division),
             ("%", BinaryOperator::Remainder),
             ("**", BinaryOperator::Exponential),
-            ("<<", BinaryOperator::ShiftLeft),
-            (">>", BinaryOperator::ShiftRight),
-            (">>>", BinaryOperator::ShiftRightZeroFill),
         ] {
-            v.push((tok.to_string(), false, Matched::Bin { op, swap: false }));
-            v.push((tok.to_string(), true, Matched::Bin { op, swap: true }));
+            for swap in [false, true] {
+                for coerce in [false, true] {
+                    v.push((tok.to_string(), Matched::Bin { op, swap, coerce }));
+                }
+            }
         }
-        // Relational: all four are distinct functions of (a, b); `b < a` is just
-        // `a > b`, so swapped forms would duplicate and are omitted.
         for (tok, op) in [
             ("<", BinaryOperator::LessThan),
             (">", BinaryOperator::GreaterThan),
             ("<=", BinaryOperator::LessEqualThan),
             (">=", BinaryOperator::GreaterEqualThan),
         ] {
-            v.push((tok.to_string(), false, Matched::Bin { op, swap: false }));
+            for coerce in [false, true] {
+                v.push((tok.to_string(), Matched::Bin { op, swap: false, coerce }));
+            }
         }
-        // Logical short-circuit returns an operand, so order matters: both forms.
+        // Logical short-circuit returns an actual operand, so a coerced form is
+        // never faithful; only a bare match (across the full battery) is accepted.
         for (tok, op) in [("&&", LogicalOperator::And), ("||", LogicalOperator::Or)] {
-            v.push((tok.to_string(), false, Matched::Log { op, swap: false }));
-            v.push((tok.to_string(), true, Matched::Log { op, swap: true }));
+            v.push((tok.to_string(), Matched::Log { op, swap: false }));
+            v.push((tok.to_string(), Matched::Log { op, swap: true }));
         }
     } else {
+        // `~` self-coerces; negation has a coerced (`-(a|0)`, the `~a+1` MBA) form;
+        // the rest are bare-only.
+        v.push(("~".to_string(), Matched::Un { op: UnaryOperator::BitwiseNot, coerce: false }));
+        for coerce in [false, true] {
+            v.push(("-".to_string(), Matched::Un { op: UnaryOperator::UnaryNegation, coerce }));
+        }
         for (tok, op) in [
-            ("-", UnaryOperator::UnaryNegation),
-            ("~", UnaryOperator::BitwiseNot),
             ("!", UnaryOperator::LogicalNot),
             ("void ", UnaryOperator::Void),
             ("typeof ", UnaryOperator::Typeof),
         ] {
-            v.push((tok.to_string(), false, Matched::Un { op }));
+            v.push((tok.to_string(), Matched::Un { op, coerce: false }));
         }
     }
     v
@@ -586,11 +616,11 @@ fn candidates(arity: usize) -> Vec<(String, bool, Matched)> {
 /// unique matching operator, or `None` if zero or more than one match.
 fn fingerprint(sandbox: &Sandbox, name: &str, arity: usize) -> Option<Matched> {
     let mut found: Option<Matched> = None;
-    for (tok, swap, matched) in candidates(arity) {
+    for (tok, matched) in candidates(arity) {
         let snippet = if arity == 2 {
-            bin_snippet(name, &tok, swap)
+            bin_snippet(name, &tok, &matched)
         } else {
-            un_snippet(name, &tok)
+            un_snippet(name, &tok, &matched)
         };
         if matches_twice(sandbox, &snippet) {
             if found.is_some() {
@@ -609,8 +639,16 @@ fn matches_twice(sandbox: &Sandbox, snippet: &str) -> bool {
         && matches!(sandbox.eval_to_value(snippet), Some(EvalValue::Bool(true)))
 }
 
-fn bin_snippet(name: &str, tok: &str, swap: bool) -> String {
+fn bin_snippet(name: &str, tok: &str, m: &Matched) -> String {
+    let (swap, coerce) = match m {
+        Matched::Bin { swap, coerce, .. } => (*swap, *coerce),
+        Matched::Log { swap, .. } => (*swap, false),
+        Matched::Un { .. } => (false, false),
+    };
     let (l, r) = if swap { ("b", "a") } else { ("a", "b") };
+    // `(a|0)` forces ToInt32 on the operand, matching an MBA reconstruction.
+    let wrap = |x: &str| if coerce { format!("({x}|0)") } else { x.to_string() };
+    let (l, r) = (wrap(l), wrap(r));
     let pairs = bin_inputs_js();
     format!(
         "(function(){{var I={pairs};for(var i=0;i<I.length;i++){{var a=I[i][0],b=I[i][1];\
@@ -618,13 +656,29 @@ fn bin_snippet(name: &str, tok: &str, swap: bool) -> String {
     )
 }
 
-fn un_snippet(name: &str, tok: &str) -> String {
+fn un_snippet(name: &str, tok: &str, m: &Matched) -> String {
+    let coerce = matches!(m, Matched::Un { coerce: true, .. });
+    let a = if coerce { "(a|0)" } else { "a" };
     let vals = un_inputs_js();
     format!(
         "(function(){{var I={vals};for(var i=0;i<I.length;i++){{var a=I[i];\
-         if(!Object.is({name}(a),({tok}(a))))return false;}}return true;}})()"
+         if(!Object.is({name}(a),({tok}({a}))))return false;}}return true;}})()"
     )
 }
+
+/// Non-integer probes appended to the binary battery. These make a bare operator
+/// (`a OP b`) and its ToInt32-coerced form (`(a|0) OP (b|0)`) disagree — via
+/// string concatenation/comparison, fractional values, `-0`, and magnitudes past
+/// int32 — so a proxy matches exactly one of the two and a coercion-divergent
+/// proxy is never rewritten to the wrong form.
+const NONINT_BIN: &[&str] = &[
+    "[0.5,0.5]", "[1.5,2.5]", "[-1.5,2.5]", "[2.5,-0]",
+    "[\"3\",\"4\"]", "[\"a\",\"b\"]", "[\"5\",2]", "[6,\"2\"]",
+    "[4294967296,1]", "[1,4294967296]", "[3000000000,3000000000]",
+];
+
+/// Non-integer probes for the unary battery (same purpose).
+const NONINT_UN: &[&str] = &["0.5", "-0.5", "1.5", "\"5\"", "\"a\"", "-0", "4294967296"];
 
 fn bin_inputs_js() -> String {
     let mut s = String::from("[");
@@ -633,6 +687,10 @@ fn bin_inputs_js() -> String {
             s.push(',');
         }
         s.push_str(&format!("[{a},{b}]"));
+    }
+    for extra in NONINT_BIN {
+        s.push(',');
+        s.push_str(extra);
     }
     s.push(']');
     s
@@ -645,6 +703,10 @@ fn un_inputs_js() -> String {
             s.push(',');
         }
         s.push_str(&a.to_string());
+    }
+    for extra in NONINT_UN {
+        s.push(',');
+        s.push_str(extra);
     }
     s.push(']');
     s
@@ -692,17 +754,24 @@ impl<'a, 'r> Traverse<'a, ()> for Rewriter<'a, 'r> {
 
             let span = call.span();
             match m {
-                Matched::Un { op } => {
-                    let arg = args[0].clone_in(ctx.ast.allocator);
+                Matched::Un { op, coerce } => {
+                    let mut arg = args[0].clone_in(ctx.ast.allocator);
+                    if coerce {
+                        arg = coerce_i32(ctx, arg);
+                    }
                     Some(ctx.ast.expression_unary(span, op, arg))
                 }
-                Matched::Bin { op, swap } => {
+                Matched::Bin { op, swap, coerce } => {
                     if swap && !args.iter().all(|e| is_side_effect_free(e)) {
                         return; // swapping operands would reorder argument effects
                     }
                     let (li, ri) = if swap { (1, 0) } else { (0, 1) };
-                    let left = args[li].clone_in(ctx.ast.allocator);
-                    let right = args[ri].clone_in(ctx.ast.allocator);
+                    let mut left = args[li].clone_in(ctx.ast.allocator);
+                    let mut right = args[ri].clone_in(ctx.ast.allocator);
+                    if coerce {
+                        left = coerce_i32(ctx, left);
+                        right = coerce_i32(ctx, right);
+                    }
                     Some(ctx.ast.expression_binary(span, left, op, right))
                 }
                 Matched::Log { op, swap } => {
@@ -722,6 +791,18 @@ impl<'a, 'r> Traverse<'a, ()> for Rewriter<'a, 'r> {
             self.changed = true;
         }
     }
+}
+
+/// Wrap `e` as `(e | 0)` — forces ToInt32, making a rewrite faithful to an MBA
+/// proxy whose bitwise body coerces its operands.
+fn coerce_i32<'a>(ctx: &TraverseCtx<'a, ()>, e: Expression<'a>) -> Expression<'a> {
+    let zero = ctx.ast.expression_numeric_literal(
+        SPAN,
+        0.0,
+        None,
+        oxc_syntax::number::NumberBase::Decimal,
+    );
+    ctx.ast.expression_binary(SPAN, e, BinaryOperator::BitwiseOR, zero)
 }
 
 fn is_side_effect_free(expr: &Expression<'_>) -> bool {

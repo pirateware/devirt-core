@@ -16,8 +16,10 @@ fn deob(src: &str) -> String {
 
 #[test]
 fn collapses_addition_polynomial() {
-    // The full-adder identity for `a + b`. The proxy must collapse to `x + y`
-    // (numeric add) at the call, even with runtime-variable arguments.
+    // The full-adder identity for `a + b`. Every operand use is bitwise, so the
+    // proxy is `ToInt32(a) + ToInt32(b)` and collapses to the coercion-faithful
+    // `(x | 0) + (y | 0)`, which stays correct even for non-integer arguments
+    // (a bare `x + y` would not — `add("a","b")` is 0, not "ab").
     let src = r#"
         (function () {
             function add(a, b) { return (a ^ b) + 2 * (a & b); }
@@ -26,24 +28,28 @@ fn collapses_addition_polynomial() {
     "#;
     let out = deob(src);
     assert!(
-        out.contains("sink(x + y)"),
-        "addition proxy not collapsed: {out}"
+        out.contains("sink((x | 0) + (y | 0))"),
+        "addition proxy not collapsed to the coerced form: {out}"
     );
     assert!(!out.contains("add("), "dead proxy not removed: {out}");
 }
 
 #[test]
 fn collapses_subtraction_and_keeps_operand_order() {
-    // `a + ~b + 1 == a - b`. Non-commutative: operands must stay (x, y), not swap.
+    // Full-subtractor identity `(a^b) - 2*(~a&b) == a - b`, fully bitwise so it is
+    // `ToInt32(a) - ToInt32(b)` and collapses to `(x | 0) - (y | 0)`. Non-
+    // commutative: operands must stay (x, y), not swap. (A raw-operand form like
+    // `a + ~b + 1` is only `a - b` for integers — e.g. `sub("5",2)` is "5-31" —
+    // and the pass now correctly refuses to collapse it.)
     let src = r#"
         (function () {
-            function sub(a, b) { return a + ~b + 1; }
+            function sub(a, b) { return (a ^ b) - 2 * (~a & b); }
             sink(sub(x, y));
         })();
     "#;
     let out = deob(src);
     assert!(
-        out.contains("sink(x - y)"),
+        out.contains("sink((x | 0) - (y | 0))"),
         "subtraction proxy mis-collapsed: {out}"
     );
 }
@@ -88,11 +94,12 @@ fn collapses_xor_and_bitand() {
 
 #[test]
 fn collapses_unary_bitwise_not() {
-    // `-a - 1 == ~a` for every int32 (and avoids the -0 trap that `~a+1 == -a`
-    // hits at a=0, which the pass correctly refuses under Object.is).
+    // `-(a|0) - 1 == ~a` for all inputs (the `|0` coerces, matching `~`'s own
+    // ToInt32). A raw `-a - 1` is only `~a` for numbers — `bnot("a")` is NaN, not
+    // -1 — so the pass now refuses to collapse the raw form.
     let src = r#"
         (function () {
-            function bnot(a) { return -a - 1; }
+            function bnot(a) { return -(a | 0) - 1; }
             sink(bnot(z));
         })();
     "#;
