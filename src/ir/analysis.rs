@@ -137,6 +137,13 @@ impl<'a, 's, 'b> Visit<'a> for Classifier<'s, 'b> {
     fn visit_assignment_expression(&mut self, node: &AssignmentExpression<'a>) {
         use oxc_syntax::operator::AssignmentOperator;
         if self.depth == 0 {
+            // A member-write target (`s[k] = v`, `s.x op= v`) mutates the object:
+            // exclude its base. Must run before the member-read interception in
+            // `visit_*_member_expression`, which would otherwise misread the write
+            // target as a clean read and leave `s` foldable.
+            if let Some(sym) = member_target_base(&node.left).and_then(|o| self.cand_object(o)) {
+                self.excluded.insert(sym);
+            }
             if let AssignmentTarget::AssignmentTargetIdentifier(id) = &node.left {
                 if let Some(sym) = self.ref_sym(id) {
                     if self.base.contains(&sym) {
@@ -158,6 +165,36 @@ impl<'a, 's, 'b> Visit<'a> for Classifier<'s, 'b> {
             }
         }
         walk::walk_assignment_expression(self, node);
+    }
+
+    fn visit_update_expression(&mut self, node: &UpdateExpression<'a>) {
+        // `s[k]++` / `--s.x`: a member mutation → exclude the base.
+        if self.depth == 0 {
+            let base = match &node.argument {
+                SimpleAssignmentTarget::ComputedMemberExpression(m) => Some(&m.object),
+                SimpleAssignmentTarget::StaticMemberExpression(m) => Some(&m.object),
+                _ => None,
+            };
+            if let Some(sym) = base.and_then(|o| self.cand_object(o)) {
+                self.excluded.insert(sym);
+            }
+        }
+        walk::walk_update_expression(self, node);
+    }
+
+    fn visit_unary_expression(&mut self, node: &UnaryExpression<'a>) {
+        // `delete s[k]` / `delete s.x`: mutates the object → exclude the base.
+        if self.depth == 0 && node.operator == oxc_syntax::operator::UnaryOperator::Delete {
+            let base = match &node.argument {
+                Expression::ComputedMemberExpression(m) => Some(&m.object),
+                Expression::StaticMemberExpression(m) => Some(&m.object),
+                _ => None,
+            };
+            if let Some(sym) = base.and_then(|o| self.cand_object(o)) {
+                self.excluded.insert(sym);
+            }
+        }
+        walk::walk_unary_expression(self, node);
     }
 
     fn visit_static_member_expression(&mut self, m: &StaticMemberExpression<'a>) {
@@ -213,4 +250,14 @@ impl<'a, 's, 'b> Visit<'a> for Classifier<'s, 'b> {
 /// Whether an initializer/rhs is an array or object literal (an aggregate value).
 fn is_aggregate_literal(e: &Expression<'_>) -> bool {
     matches!(e, Expression::ArrayExpression(_) | Expression::ObjectExpression(_))
+}
+
+/// If an assignment target is a member expression (`s[k]` / `s.x`), the base
+/// object expression — whose symbol, if a candidate, is being mutated.
+fn member_target_base<'x, 'a>(target: &'x AssignmentTarget<'a>) -> Option<&'x Expression<'a>> {
+    match target {
+        AssignmentTarget::ComputedMemberExpression(m) => Some(&m.object),
+        AssignmentTarget::StaticMemberExpression(m) => Some(&m.object),
+        _ => None,
+    }
 }

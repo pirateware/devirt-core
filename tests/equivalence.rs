@@ -307,3 +307,132 @@ fn literal_member_fold_preserves_value() {
     // holds precisely because we refuse to drop the impure sibling.
     assert_equivalent("var seen = 0; __r = [ (seen = 1, 'x'), 'y' ][1]; __r = __r + seen;");
 }
+
+// ---------------------------------------------------------------------------
+// SSA dataflow pass (`src/ir/`): adversarial flow-sensitive cases. Each pairs a
+// shape the pass *should* fold soundly with a sibling shape where folding would
+// be wrong (reassignment, branch merge, escape, capture, loop-carried). The
+// differential net catches any unsound fold by value mismatch.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ssa_const_array_fold_preserves_value() {
+    // Plain const-array index/length fold via a binding.
+    assert_equivalent("var s = [3, 31, 5]; __r = s[0] + s[2] + s.length;");
+    // Element type is preserved: a string element must stay a string.
+    assert_equivalent(r#"var s = ["1", "0", "0"]; __r = s[0] + s[1] + s[2];"#);
+    // Const-object property fold (static and numeric-key forms).
+    assert_equivalent("var o = { a: 5, b: 7 }; __r = o.a + o.b;");
+    assert_equivalent(r#"var o = { 0: "x", 1: "y" }; __r = o[0] + o[1];"#);
+    // Cross-fold: an index resolved from another const array (two rounds).
+    assert_equivalent("var idx = [2]; var data = [10, 20, 30]; __r = data[idx[0]];");
+}
+
+#[test]
+fn ssa_short_circuit_dominating_def_folds_soundly() {
+    // The sample_10 shape: array assigned inside a `&&` chain, read after. The
+    // assignment dominates the reads, so folding is sound.
+    assert_equivalent(
+        r#"
+        var a = 1, s = [9, 8];
+        __r = (a && (s = [3, 4], 1) && s[0] * 10 + s[1]);
+        "#,
+    );
+}
+
+#[test]
+fn ssa_reassignment_uses_last_dominating_value() {
+    // Straight-line reassignment: the read must observe the most recent def.
+    assert_equivalent("var s = [1, 2]; s = [3, 4]; __r = s[0] + s[1];");
+    assert_equivalent("var x = 1; x = 2; x = 3; __r = x;");
+}
+
+#[test]
+fn ssa_branch_merge_is_not_folded() {
+    // A reassignment on one path makes the post-merge read a phi: it must not be
+    // folded to either branch's value. `cond` is kept opaque so the branch
+    // survives const-folding; at runtime it is true, selecting [3,4].
+    assert_equivalent(
+        r#"
+        var cond = String(1) === "1";
+        var s = [1, 2];
+        if (cond) { s = [3, 4]; }
+        __r = s[0] + ":" + s[1];
+        "#,
+    );
+    // Scalar phi.
+    assert_equivalent(
+        r#"
+        var cond = String(0) === "0";
+        var x = 1;
+        if (cond) { x = 2; }
+        __r = x;
+        "#,
+    );
+}
+
+#[test]
+fn ssa_escaped_array_is_not_folded() {
+    // The array is passed to a function that mutates it: it escapes, so its
+    // elements may differ from the literal and must not be folded.
+    assert_equivalent(
+        r#"
+        var s = [1, 2];
+        function mut(a){ a[0] = 99; }
+        mut(s);
+        __r = s[0] + ":" + s[1];
+        "#,
+    );
+    // Member write directly: also an escape / mutation.
+    assert_equivalent("var s = [1, 2]; s[0] = 7; __r = s[0] + s[1];");
+}
+
+#[test]
+fn ssa_captured_binding_is_not_folded() {
+    // A closure writes `x` after its initializer; the captured binding must not
+    // be versioned, so the later read observes the mutated value (2, not 1).
+    assert_equivalent(
+        r#"
+        var x = 1;
+        function bump(){ x = x + 1; }
+        bump();
+        __r = x;
+        "#,
+    );
+}
+
+#[test]
+fn ssa_loop_carried_value_is_not_folded() {
+    // `s` changes every iteration: the loop-header phi blocks folding the read.
+    assert_equivalent(
+        r#"
+        var s = [0];
+        var acc = 0;
+        for (var i = 0; i < 3; i++) { acc += s[0]; s = [s[0] + 1]; }
+        __r = acc;
+        "#,
+    );
+}
+
+#[test]
+fn ssa_respects_initialization_order() {
+    // A scalar read textually (and in CFG order) before its initializer must see
+    // the pre-init `undefined`, not the later constant.
+    assert_equivalent(r#"var out = "" + x; var x = 5; __r = out + ":" + x;"#);
+}
+
+#[test]
+fn ssa_keeps_effects_when_folding_reads() {
+    // Folding `s[i]` reads must not disturb side effects elsewhere. The decoder
+    // table assignment also has an observable neighbour.
+    assert_equivalent(
+        r#"
+        var log = "";
+        var s = [10, 20];
+        function note(v){ log += v; return v; }
+        note(s[0]);
+        note(s[1]);
+        __r = log;
+        "#,
+    );
+}
