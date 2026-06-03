@@ -7,6 +7,7 @@ mod dead_object_prop;
 mod dead_store;
 mod decoder_lift;
 mod flatten_else;
+mod math_fingerprint;
 mod member_normalize;
 mod proxy_inline;
 mod rename;
@@ -19,6 +20,7 @@ pub use dead_object_prop::DeadObjectProp;
 pub use dead_store::DeadStore;
 pub use decoder_lift::DecoderLift;
 pub use flatten_else::FlattenElse;
+pub use math_fingerprint::MathFingerprint;
 pub use member_normalize::MemberNormalize;
 pub use proxy_inline::ProxyInline;
 pub use rename::RenameByRole;
@@ -37,6 +39,12 @@ pub fn default_pipeline() -> Vec<Box<dyn Pass>> {
         Box::new(SequenceSplit::default()),
         Box::new(ConstantFold::default()),
         Box::new(AssignedOnceInline),
+        // Fingerprint algebraic operator-proxy functions (`fn(a,b)` that is really
+        // `a+b`, `a^b`, …) by running them in the sandbox and matching a single
+        // operator across a battery, then rewrite calls to that operator. Runs
+        // before ProxyInline so a polynomial proxy collapses to one operator
+        // instead of being inlined verbatim (which only expands it).
+        Box::new(MathFingerprint::default()),
         // Collapse operator-proxy wrappers (a OP b) before lifting, so decoder
         // calls hidden inside proxy expansions become visible.
         Box::new(ProxyInline::default()),
