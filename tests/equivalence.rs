@@ -585,6 +585,114 @@ fn scoped_decoder_over_reassigned_table_not_lifted() {
 // SSA copy propagation and flow-sensitive dead-store removal (src/ir/).
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Memoized ("private-cache") decoder lifting (Phase 1, src/passes/decoder_lift.rs).
+// A decoder that caches its own results — `C[k]===undefined ? (C[k]=miss) : C[k]`
+// — is semantically a pure function of `k` *iff* the cache `C` is private: a fresh
+// empty aggregate, never reassigned, and only ever touched inside the memo idiom.
+// Each "lifts" case is paired with a sibling where the cache is observable (read
+// elsewhere, written non-memo, or the miss has a side effect) and lifting would
+// change behavior. The differential net catches any unsound lift by value mismatch.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn memo_decoder_lifts_and_preserves_value() {
+    // The canonical shape: a guarded miss-write cache. The warm-cache second call
+    // (d(0) again) must still resolve to the same value.
+    assert_equivalent(
+        r#"
+        var c = {}, t = ["a", "b", "c"];
+        function d(i) { return c[i] === undefined ? (c[i] = t[i].toUpperCase()) : c[i]; }
+        __r = d(0) + d(1) + d(0);
+        "#,
+    );
+    // `void 0 ===` spelling and the hit-polarity `!==` ternary (the sample_7 form).
+    assert_equivalent(
+        r#"
+        var c = {}, t = ["x", "y"];
+        function d(i) { return void 0 === c[i] ? (c[i] = t[i] + "!") : c[i]; }
+        __r = d(1) + d(0) + d(1);
+        "#,
+    );
+    assert_equivalent(
+        r#"
+        var c = {}, t = ["p", "q"];
+        function d(i) { return c[i] !== undefined ? c[i] : (c[i] = t[i] + t[i]); }
+        __r = d(0) + d(1) + d(0);
+        "#,
+    );
+}
+
+#[test]
+fn memo_decoder_numeric_result_stays_numeric() {
+    // A numeric memo decoder feeding arithmetic must splice as a number (21), not
+    // the string "201".
+    assert_equivalent(
+        r#"
+        var c = {}, t = [10, 20, 30];
+        function d(i) { return c[i] === undefined ? (c[i] = t[i]) : c[i]; }
+        __r = d(1) + 1;
+        "#,
+    );
+}
+
+#[test]
+fn memo_cache_read_elsewhere_must_not_lift() {
+    // The cache contents are observed *outside* the decoder: `after` reads the warm
+    // slot. Lifting the decode calls (and dropping the cache writes) would make the
+    // cache stay cold, so `after` would change from "A" to undefined.
+    assert_equivalent(
+        r#"
+        var c = {}, t = ["a", "b", "c"];
+        function d(i) { return c[i] === undefined ? (c[i] = t[i].toUpperCase()) : c[i]; }
+        var before = c[0];
+        var x = d(0);
+        var after = c[0];
+        __r = String(before) + ":" + x + ":" + String(after);
+        "#,
+    );
+}
+
+#[test]
+fn memo_cache_escapes_must_not_lift() {
+    // The cache is aliased (read bare). It must stay live and unlifted.
+    assert_equivalent(
+        r#"
+        var c = {}, t = ["a", "b"];
+        function d(i) { return c[i] === undefined ? (c[i] = t[i].toUpperCase()) : c[i]; }
+        var leak = c;
+        var v = d(0) + d(1);
+        __r = v + ":" + (leak === c);
+        "#,
+    );
+}
+
+#[test]
+fn memo_impure_miss_must_not_lift() {
+    // The miss computation has a side effect (`hits.push`). Lifting would drop it.
+    assert_equivalent(
+        r#"
+        var c = {}, t = ["a", "b"], hits = [];
+        function d(i) { return c[i] === undefined ? (c[i] = (hits.push(i), t[i].toUpperCase())) : c[i]; }
+        __r = d(0) + d(1) + d(0) + ":" + hits.length;
+        "#,
+    );
+}
+
+#[test]
+fn memo_non_memo_write_must_not_lift() {
+    // An unconditional, non-memo write to the "cache" makes it real mutable state:
+    // d(0) must observe the pre-set "Z", not recompute "A".
+    assert_equivalent(
+        r#"
+        var c = {}, t = ["a", "b"];
+        function d(i) { return c[i] === undefined ? (c[i] = t[i].toUpperCase()) : c[i]; }
+        c[0] = "Z";
+        __r = d(0) + d(1);
+        "#,
+    );
+}
+
 #[test]
 fn ssa_copy_propagation_preserves_value() {
     // A proxy variable collapses to its source.

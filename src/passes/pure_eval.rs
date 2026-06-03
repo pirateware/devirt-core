@@ -91,7 +91,7 @@ impl<'a> Traverse<'a, ()> for Evaluator {
         }
         // Closed + effect-free gate (empty pureset: only side-effect-free globals
         // are tolerated as free names; no `this`, no writes to outer state).
-        if !freevars_of_expr(&*expr).all_allowed(&Default::default(), None) {
+        if !freevars_of_expr(&*expr).all_allowed(&Default::default(), None, &Default::default()) {
             return;
         }
 

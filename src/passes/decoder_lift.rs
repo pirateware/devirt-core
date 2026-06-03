@@ -146,7 +146,23 @@ impl Pass for DecoderLift {
         // shadowed or reassigned name is dropped).
         let scoped_funcs = collect_scoped_funcs(program, &unstable);
 
-        let analysis = classify(&tops, &unstable, &data_names, scoped_funcs);
+        // Private memoization caches: state a decoder writes to cache a pure result.
+        // Recognizing them lets a memo decoder (`C[k]===undefined?(C[k]=miss):C[k]`)
+        // pass the purity gate despite its free write to `C`. See
+        // `collect_private_caches` for the (strong) soundness conditions.
+        let private_cache_decls = collect_private_caches(program, &unstable);
+        let private_caches: HashSet<String> =
+            private_cache_decls.iter().map(|(n, _)| n.clone()).collect();
+
+        if std::env::var("DL_DEBUG").is_ok() {
+            eprintln!(
+                "[dl] private_caches={} sample={:?}",
+                private_caches.len(),
+                private_caches.iter().take(5).collect::<Vec<_>>()
+            );
+        }
+
+        let analysis = classify(&tops, &unstable, &data_names, scoped_funcs, &private_caches);
         if analysis.pure_funcs.is_empty() {
             return false;
         }
@@ -190,6 +206,7 @@ impl Pass for DecoderLift {
             &allowed,
             &local_data,
             &pure_func_decls,
+            &private_cache_decls,
             allocator,
         );
         let Some(sandbox) = Sandbox::new() else {
@@ -227,6 +244,7 @@ impl Pass for DecoderLift {
         let mut scaffolding: HashSet<String> = analysis.pureset.clone();
         scaffolding.extend(data_names.iter().cloned());
         scaffolding.extend(aliases.keys().cloned());
+        scaffolding.extend(private_caches.iter().cloned());
         if self.cleanup_spent_rotations(program, &scaffolding) {
             self.changed = true;
         }
@@ -371,8 +389,9 @@ fn rotation_iife_touches(
     }
     let fv = freevars_of_expr(expr);
     // Pure modulo the table mutation: no `this`, no writes to free vars, every
-    // free name is scaffolding or a side-effect-free global.
-    if !fv.all_allowed(scaffolding, None) {
+    // free name is scaffolding or a side-effect-free global. A rotation IIFE never
+    // writes a private cache, so no cache whitelist is needed here.
+    if !fv.all_allowed(scaffolding, None, &HashSet::new()) {
         return None;
     }
     let touched: HashSet<String> = fv
@@ -472,10 +491,16 @@ fn iife_body<'b, 'a>(stmt: &'b Statement<'a>) -> Option<&'b ArenaVec<'a, Stateme
 pub(crate) struct FreeVars {
     used: HashSet<String>,
     bound: HashSet<String>,
-    /// Base names of every write target (`x = …`, `x++`, `o.p = …`, `delete o.p`).
-    /// A write whose base is *not* one of `bound` mutates outer/global state — a
-    /// side effect that lifting the value would silently drop.
+    /// Base names of every *strictly disqualifying* write target: bare identifier
+    /// writes (`x = …`, `x++`), compound member writes (`o.p += …`), `delete o.p`,
+    /// and receiver-mutating method calls (`a.push(…)`). A write whose base is not
+    /// one of `bound` mutates outer/global state — a side effect lifting would drop.
     written: HashSet<String>,
+    /// Base names of *simple* member assignments (`o[k] = …` / `o.p = …`, plain `=`).
+    /// Kept separate from `written` so the memoized-decoder relaxation can whitelist
+    /// exactly this class — and only when the base is a proven *private cache*. Any
+    /// other write shape stays in `written` and is never whitelistable.
+    written_member: HashSet<String>,
     impure: bool, // uses `this`, or performs an un-analyzable write → not liftable
 }
 
@@ -491,7 +516,24 @@ impl<'a> Visit<'a> for FreeVars {
     }
 
     fn visit_assignment_expression(&mut self, node: &oxc_ast::ast::AssignmentExpression<'a>) {
-        self.record_write(assign_target_base(&node.left));
+        use oxc_ast::ast::AssignmentTarget as T;
+        let simple = matches!(
+            node.operator,
+            oxc_syntax::operator::AssignmentOperator::Assign
+        );
+        // A *simple* member assignment (`o[k] = …`, `o.p = …`) is the only write
+        // shape the private-cache relaxation may whitelist; record it separately.
+        // Everything else (bare-ident write, compound member write) is strictly
+        // disqualifying and goes to `written`.
+        match (&node.left, simple) {
+            (T::ComputedMemberExpression(m), true) => {
+                self.record_member_write(member_base(&m.object))
+            }
+            (T::StaticMemberExpression(m), true) => {
+                self.record_member_write(member_base(&m.object))
+            }
+            _ => self.record_write(assign_target_base(&node.left)),
+        }
         oxc_ast_visit::walk::walk_assignment_expression(self, node);
     }
 
@@ -574,22 +616,47 @@ impl FreeVars {
         }
     }
 
+    /// Record a *simple* member assignment whose object base resolves to `name`
+    /// (the whitelistable cache-write class). An unresolvable base is impure.
+    fn record_member_write(&mut self, name: Option<String>) {
+        match name {
+            Some(n) => {
+                self.written_member.insert(n);
+            }
+            None => self.impure = true,
+        }
+    }
+
     pub(crate) fn free(&self) -> HashSet<String> {
         self.used.difference(&self.bound).cloned().collect()
     }
 
     /// True if the body writes to any name it does not itself bind — i.e. mutates
     /// an outer variable or a global. Such a function has a side effect beyond its
-    /// return value and must never be lifted away.
-    fn writes_free(&self) -> bool {
+    /// return value and must never be lifted away. A simple member write to a name
+    /// in `caches` (a proven *private memo cache*) is exempt: writing a private
+    /// cache is observationally invisible, so it doesn't count as a free write.
+    fn writes_free(&self, caches: &HashSet<String>) -> bool {
         self.written.iter().any(|n| !self.bound.contains(n))
+            || self
+                .written_member
+                .iter()
+                .any(|n| !self.bound.contains(n) && !caches.contains(n))
     }
 
-    pub(crate) fn all_allowed(&self, pureset: &HashSet<String>, extra: Option<&str>) -> bool {
+    pub(crate) fn all_allowed(
+        &self,
+        pureset: &HashSet<String>,
+        extra: Option<&str>,
+        caches: &HashSet<String>,
+    ) -> bool {
         !self.impure
-            && !self.writes_free()
+            && !self.writes_free(caches)
             && self.free().iter().all(|n| {
-                Some(n.as_str()) == extra || pureset.contains(n) || GLOBALS.contains(&n.as_str())
+                Some(n.as_str()) == extra
+                    || pureset.contains(n)
+                    || caches.contains(n)
+                    || GLOBALS.contains(&n.as_str())
             })
     }
 }
@@ -703,6 +770,7 @@ fn classify(
     unstable: &HashSet<String>,
     seed_pure: &HashSet<String>,
     scoped_funcs: Vec<Pending>,
+    caches: &HashSet<String>,
 ) -> Analysis {
     let mut pureset: HashSet<String> = seed_pure.clone();
     let mut pure_funcs: HashSet<String> = HashSet::new();
@@ -734,7 +802,7 @@ fn classify(
             if p.fv.impure {
                 return false;
             }
-            if p.fv.all_allowed(&pureset, Some(&p.name)) {
+            if p.fv.all_allowed(&pureset, Some(&p.name), caches) {
                 pureset.insert(p.name.clone());
                 pure_funcs.insert(p.name.clone());
                 progressed = true;
@@ -950,6 +1018,262 @@ impl<'a> Visit<'a> for WriteScan {
 }
 
 // ---------------------------------------------------------------------------
+// Private memo-cache detection (Phase 1: memoized decoder lifting)
+// ---------------------------------------------------------------------------
+
+/// Names of bindings that are *private memoization caches*: state whose only role
+/// is to cache a pure function of a key, so writing it is observationally
+/// invisible and a decoder that writes it is liftable.
+///
+/// A name `C` qualifies iff **all** hold:
+///   1. `C` is declared exactly once (globally unique name), initialized to a fresh
+///      *empty* aggregate (`{}`, `[]`, or `Object.create(null)`), and never
+///      reassigned (no later `C = …`, compound, or `++`/`--`) — so baking
+///      `var C = <init>` into the sandbox preamble reproduces the true start state.
+///   2. **Every** reference to `C` in the whole program is the object of a member
+///      access `C[k]` that sits inside a recognized *memo ternary*
+///      `C[k] === undefined ? (C[k] = miss) : C[k]` (and the `void 0` / `!==`
+///      polarities), with the same key `k` in all three positions and a plain `=`
+///      store. There must be at least one such ternary.
+///
+/// Condition 2 is the soundness crux and is *stronger* than escape analysis alone:
+/// it guarantees `C` is never read bare, aliased, passed, returned, deleted from,
+/// or — critically — read **outside** the memo idiom (where a cold/warm cache
+/// would be observable). Because the guarded read always returns the same value
+/// the miss computes, `C` holds no observable state: it is a pure memo of `k`.
+/// The miss expression's own purity is *not* checked here — it is enforced by the
+/// per-function purity gate that classifies the decoder (an impure miss makes the
+/// decoder fail `all_allowed`, so it is never lifted and the side effect survives).
+///
+/// Returns `(name, "var name = <init>;")` pairs: the exact (empty) initializer is
+/// reproduced so the sandbox cache starts in the true state — `{}` and
+/// `Object.create(null)` differ for prototype-named keys, so we never normalize.
+fn collect_private_caches(
+    program: &Program<'_>,
+    unstable: &HashSet<String>,
+) -> Vec<(String, String)> {
+    let mut scan = CacheScan::default();
+    scan.visit_program(program);
+
+    scan.empty_init
+        .iter()
+        .filter(|c| {
+            // Globally unique binding, never reassigned/compound-written.
+            scan.bind_count.get(*c).copied() == Some(1)
+                && !scan.conflict.contains(*c)
+                && !unstable.contains(*c)
+        })
+        .filter(|c| {
+            // At least one memo ternary, and every bare reference is accounted for
+            // by (contained within) a memo-ternary member access.
+            let Some(accounted) = scan.memo_spans.get(*c) else {
+                return false;
+            };
+            let refs = scan.ref_spans.get(*c).map(Vec::as_slice).unwrap_or(&[]);
+            refs.iter().all(|r| {
+                accounted
+                    .iter()
+                    .any(|a| a.start <= r.start && r.end <= a.end)
+            })
+        })
+        .map(|c| (c.clone(), scan.init_src[c].clone()))
+        .collect()
+}
+
+#[derive(Default)]
+struct CacheScan {
+    bind_count: HashMap<String, usize>, // binding-identifier occurrences per name
+    empty_init: HashSet<String>,        // declared once with a fresh empty aggregate
+    init_src: HashMap<String, String>,  // `var name = <init>;` for each empty-init name
+    conflict: HashSet<String>,          // reassigned / non-empty / ambiguous init
+    memo_spans: HashMap<String, Vec<oxc_span::Span>>, // accounted `C[k]` member spans
+    ref_spans: HashMap<String, Vec<oxc_span::Span>>, // all identifier-reference spans
+}
+
+impl<'a> Visit<'a> for CacheScan {
+    fn visit_binding_identifier(&mut self, id: &oxc_ast::ast::BindingIdentifier<'a>) {
+        *self.bind_count.entry(id.name.to_string()).or_default() += 1;
+    }
+
+    fn visit_identifier_reference(&mut self, id: &oxc_ast::ast::IdentifierReference<'a>) {
+        self.ref_spans
+            .entry(id.name.to_string())
+            .or_default()
+            .push(id.span);
+    }
+
+    fn visit_variable_declarator(&mut self, node: &oxc_ast::ast::VariableDeclarator<'a>) {
+        if let BindingPattern::BindingIdentifier(id) = &node.id {
+            match &node.init {
+                Some(init) if is_empty_cache_init(init) => {
+                    self.empty_init.insert(id.name.to_string());
+                    let mut cg = Codegen::new();
+                    cg.print_expression(init);
+                    self.init_src.insert(
+                        id.name.to_string(),
+                        format!("var {} = {};", id.name, cg.into_source_text()),
+                    );
+                }
+                Some(_) => {
+                    // Initialized to something other than a fresh empty aggregate.
+                    self.conflict.insert(id.name.to_string());
+                }
+                None => {}
+            }
+        }
+        oxc_ast_visit::walk::walk_variable_declarator(self, node);
+    }
+
+    fn visit_assignment_expression(&mut self, node: &oxc_ast::ast::AssignmentExpression<'a>) {
+        // A bare `C = …` reassignment disqualifies the candidate.
+        if let oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(t) = &node.left {
+            self.conflict.insert(t.name.to_string());
+        }
+        oxc_ast_visit::walk::walk_assignment_expression(self, node);
+    }
+
+    fn visit_conditional_expression(&mut self, node: &oxc_ast::ast::ConditionalExpression<'a>) {
+        if let Some((cache, spans)) = match_memo_ternary(node) {
+            self.memo_spans.entry(cache).or_default().extend(spans);
+        }
+        oxc_ast_visit::walk::walk_conditional_expression(self, node);
+    }
+}
+
+/// A fresh, empty aggregate initializer (`{}`, `[]`, or `Object.create(null)`).
+fn is_empty_cache_init(expr: &Expression<'_>) -> bool {
+    match expr {
+        Expression::ObjectExpression(o) => o.properties.is_empty(),
+        Expression::ArrayExpression(a) => a.elements.is_empty(),
+        Expression::CallExpression(c) => {
+            // Object.create(null)
+            matches!(&c.callee, Expression::StaticMemberExpression(m)
+                if matches!(&m.object, Expression::Identifier(o) if o.name == "Object")
+                    && m.property.name == "create")
+                && c.arguments.len() == 1
+                && matches!(
+                    c.arguments.first().and_then(|a| a.as_expression()),
+                    Some(Expression::NullLiteral(_))
+                )
+        }
+        _ => false,
+    }
+}
+
+/// `(cacheName, keyText, span)` of a member-read `C[k]` / `C.k` whose object is a
+/// bare identifier — `None` for any other shape.
+fn read_member_cache_key(e: &Expression<'_>) -> Option<(String, String, oxc_span::Span)> {
+    match e {
+        Expression::ComputedMemberExpression(m) => {
+            let Expression::Identifier(obj) = &m.object else {
+                return None;
+            };
+            let mut cg = Codegen::new();
+            cg.print_expression(&m.expression);
+            Some((obj.name.to_string(), cg.into_source_text(), m.span))
+        }
+        Expression::StaticMemberExpression(m) => {
+            let Expression::Identifier(obj) = &m.object else {
+                return None;
+            };
+            Some((obj.name.to_string(), m.property.name.to_string(), m.span))
+        }
+        _ => None,
+    }
+}
+
+/// Same as [`read_member_cache_key`] for a *write target* `C[k] = …` / `C.k = …`.
+fn target_member_cache_key(
+    t: &oxc_ast::ast::AssignmentTarget<'_>,
+) -> Option<(String, String, oxc_span::Span)> {
+    use oxc_ast::ast::AssignmentTarget as T;
+    match t {
+        T::ComputedMemberExpression(m) => {
+            let Expression::Identifier(obj) = &m.object else {
+                return None;
+            };
+            let mut cg = Codegen::new();
+            cg.print_expression(&m.expression);
+            Some((obj.name.to_string(), cg.into_source_text(), m.span))
+        }
+        T::StaticMemberExpression(m) => {
+            let Expression::Identifier(obj) = &m.object else {
+                return None;
+            };
+            Some((obj.name.to_string(), m.property.name.to_string(), m.span))
+        }
+        _ => None,
+    }
+}
+
+/// True if `e` is `undefined` or `void <anything>` (the two cache-miss sentinels).
+fn is_undefined_ish(e: &Expression<'_>) -> bool {
+    match e {
+        Expression::Identifier(id) => id.name == "undefined",
+        Expression::UnaryExpression(u) => {
+            matches!(u.operator, oxc_syntax::operator::UnaryOperator::Void)
+        }
+        _ => false,
+    }
+}
+
+/// Match a cache-miss/hit test `C[k] <eq> undefined` (either operand order). On
+/// success returns `(cache, key, memberSpan, is_miss_test)` where `is_miss_test`
+/// is true for `===`/`==` against undefined (the *miss* arm is then the `then`
+/// branch) and false for `!==`/`!=` (the *miss* arm is the `else` branch).
+fn match_miss_test(test: &Expression<'_>) -> Option<(String, String, oxc_span::Span, bool)> {
+    use oxc_syntax::operator::BinaryOperator as B;
+    let Expression::BinaryExpression(b) = test else {
+        return None;
+    };
+    let is_miss = match b.operator {
+        B::StrictEquality | B::Equality => true,
+        B::StrictInequality | B::Inequality => false,
+        _ => return None,
+    };
+    // One side is the cache member, the other is undefined-ish.
+    let member = if is_undefined_ish(&b.right) {
+        &b.left
+    } else if is_undefined_ish(&b.left) {
+        &b.right
+    } else {
+        return None;
+    };
+    let (c, k, span) = read_member_cache_key(member)?;
+    Some((c, k, span, is_miss))
+}
+
+/// Recognize a memo ternary `C[k] === undefined ? (C[k] = miss) : C[k]` (and the
+/// `void 0` / `!==` polarities). Returns the cache name and the spans of the three
+/// `C[k]` member accesses (so the detector can confirm they account for every
+/// reference to `C`). The key `k` and cache `C` must be identical in all three.
+fn match_memo_ternary(
+    cond: &oxc_ast::ast::ConditionalExpression<'_>,
+) -> Option<(String, [oxc_span::Span; 3])> {
+    let (tc, tk, tspan, is_miss_test) = match_miss_test(&cond.test)?;
+    // The miss arm (the `C[k] = miss` write) is `then` for a miss test, `else` for
+    // a hit test; the other arm is the warm read `C[k]`.
+    let (write_arm, read_arm) = if is_miss_test {
+        (&cond.consequent, &cond.alternate)
+    } else {
+        (&cond.alternate, &cond.consequent)
+    };
+    let Expression::AssignmentExpression(a) = write_arm else {
+        return None;
+    };
+    if !matches!(a.operator, oxc_syntax::operator::AssignmentOperator::Assign) {
+        return None;
+    }
+    let (wc, wk, wspan) = target_member_cache_key(&a.left)?;
+    let (rc, rk, rspan) = read_member_cache_key(read_arm)?;
+    if tc == wc && wc == rc && tk == wk && wk == rk {
+        Some((tc, [tspan, wspan, rspan]))
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Preamble construction
 // ---------------------------------------------------------------------------
 
@@ -1128,6 +1452,7 @@ impl<'a> Visit<'a> for DataCollector {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_preamble<'a>(
     tops: &[&Statement<'a>],
     analysis: &Analysis,
@@ -1135,6 +1460,7 @@ fn build_preamble<'a>(
     allowed: &HashSet<String>,
     local_data: &[(String, String)],
     nested_funcs: &[Statement<'a>],
+    cache_decls: &[(String, String)],
     allocator: &'a Allocator,
 ) -> String {
     // Pure data + decoder function declarations (hoisted, so order is fine).
@@ -1189,6 +1515,17 @@ fn build_preamble<'a>(
     // Local pure-data key tables (`var t = {g:219,...}`), so calls of the form
     // `decoder(t.g)` evaluate.
     for (_, decl) in local_data {
+        code.push('\n');
+        code.push_str(decl);
+    }
+
+    // Private memo caches (`var fu = {};`). Emitted last (after the tables they
+    // sit beside) so each starts as a fresh empty container at eval time, exactly
+    // as in the real program. A memo decoder writes this inside the sandbox; the
+    // write is invisible to the host. A redundant re-declaration (the cache may
+    // also appear among the pure-data vars above) is harmless: it re-empties an
+    // already-empty container in throwaway preamble code.
+    for (_, decl) in cache_decls {
         code.push('\n');
         code.push_str(decl);
     }
@@ -1446,7 +1783,13 @@ impl<'a, 'r> Traverse<'a, ()> for Lifter<'a, 'r> {
                 }
                 _ => return,
             }
-            if !freevars_of_expr(&*expr).all_allowed(self.allowed, None) {
+            // The call/member expression being lifted must reference only allowed
+            // names and perform no free writes. We deliberately pass an empty cache
+            // whitelist here: a bare cache read (`fu[k]`) must NOT be lifted (it
+            // observes cache state), and a lifted call expression never writes a
+            // cache itself — the memo write lives inside the (already-classified)
+            // decoder body, evaluated in the sandbox.
+            if !freevars_of_expr(&*expr).all_allowed(self.allowed, None, &HashSet::new()) {
                 return;
             }
 

@@ -180,6 +180,62 @@ fn does_not_lift_scoped_decoder_over_member_mutated_table() {
 }
 
 #[test]
+fn lifts_memoized_private_cache_decoder() {
+    // The sample_7 shape: a string-array decoder wrapped in a private memo cache.
+    // `ft` writes the free `fu` (its own cache), which the base purity gate rejects;
+    // the private-cache relaxation must recognise the memo idiom and lift `ft(k)` to
+    // the literal it computes, then DCE removes the spent decoder/table/cache.
+    let src = r#"
+        (function () {
+            var fu = {};
+            var fv = ["alpha", "beta", "gamma"];
+            function fs(s) { return s.toUpperCase(); }
+            function ft(t) { return void 0 === fu[t] ? (fu[t] = fs(fv[t])) : fu[t]; }
+            sink(ft(0), ft(2), ft(0));
+        })();
+    "#;
+    let out = deobfuscate(src, "t.js").code;
+    // The memo decode fully resolves (warm-cache repeat included) and the spent
+    // scaffolding — decoder body, string table, cache — is gone after DCE.
+    assert!(
+        out.contains(r#"sink("ALPHA", "GAMMA", "ALPHA")"#),
+        "memo decode not fully lifted: {out}"
+    );
+    assert!(
+        !out.contains("toUpperCase") && !out.contains("==="),
+        "spent memo decoder/table not removed: {out}"
+    );
+}
+
+#[test]
+fn does_not_lift_memo_decoder_with_observed_cache() {
+    // The cache is read outside the decoder (`probe = fu[0]`), so populating it is
+    // an observable side effect. The decoder calls must be left in place rather than
+    // resolved against a cache that the lift would never warm.
+    let src = r#"
+        (function () {
+            var fu = {};
+            var fv = ["alpha", "beta"];
+            function fs(s) { return s.toUpperCase(); }
+            function ft(t) { return void 0 === fu[t] ? (fu[t] = fs(fv[t])) : fu[t]; }
+            var probe = fu[0];
+            sink(ft(0), ft(1), probe);
+        })();
+    "#;
+    let out = deobfuscate(src, "t.js").code;
+    // The cache is observed outside the decoder, so it must NOT lift: the string
+    // table stays un-decoded (lowercase, not "ALPHA") and the decoder body survives.
+    assert!(
+        out.contains("\"alpha\"") && !out.contains("\"ALPHA\""),
+        "decoder over an observed cache must be left in place (un-decoded): {out}"
+    );
+    assert!(
+        out.contains("toUpperCase"),
+        "decoder body must survive when the cache is observed: {out}"
+    );
+}
+
+#[test]
 fn lifts_object_keyed_arguments() {
     // Argument is a member of a pure object literal — still fully evaluable.
     let src = r#"
