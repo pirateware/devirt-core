@@ -32,11 +32,14 @@ Implementation notes vs. the plan below:
   assigned-once. Block-scoped `let`/`const` folding is future work (sound to add).
 - Tiers C/D remain explicitly open, as planned.
 
-Known *pre-existing* unsoundness surfaced (not in scope, not introduced here):
-`decoder-lift` will lift a closure decoder using a stale captured table even
-when the table is reassigned afterwards
-(`var s=[1,2]; function get(){return s[0];} s=[3,4]; get()` → folds to 1, runtime
-3). Left for a separate decoder-lift hardening pass.
+Pre-existing unsoundness surfaced *and fixed* as a follow-up: `decoder-lift`
+would lift a closure decoder using a stale captured table when the table is
+reassigned afterwards (`var s=[1,2]; function get(){return s[0];} s=[3,4]; get()`
+→ folded to 1, runtime 3). `decoder-lift` now excludes any binding that is
+reassigned/mutated (more than one value write, or compound/`++`/`--`) from its
+preamble; the rotation IIFE mutates array *contents* via methods, not the
+identifier, so rotated decoders still lift (no sample regressed). Guarded by
+`decoder_lift_respects_table_reassignment`.
 
 ---
 

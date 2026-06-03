@@ -70,14 +70,23 @@ impl Pass for DecoderLift {
             return false;
         }
 
-        let analysis = classify(&tops);
+        // Names that are reassigned/mutated anywhere (more than one value write,
+        // or a compound/update). Such a binding is NOT a stable library member:
+        // its declaration value, baked into the preamble, may be stale at a decode
+        // site (e.g. `var s=[1,2]; function get(){return s[0]} s=[3,4]; get()`).
+        // Excluding them keeps the lift sound by construction.
+        let unstable = scan_unstable(program);
+
+        let analysis = classify(&tops, &unstable);
         if analysis.pure_funcs.is_empty() {
             return false;
         }
 
         // Resolve simple decoder aliases (`v = decoder`, `var v = decoder`) so
-        // calls through the alias are liftable too.
-        let aliases = collect_aliases(program, &analysis.pure_funcs);
+        // calls through the alias are liftable too. A reassigned/mutated alias is
+        // not stable, so drop those too.
+        let mut aliases = collect_aliases(program, &analysis.pure_funcs);
+        aliases.retain(|k, _| !unstable.contains(k));
 
         // Pure-data object/array bindings anywhere in the program (e.g. the
         // local `{g:219,...}` key tables), gated by global name-uniqueness so
@@ -398,7 +407,7 @@ fn is_pure_element(e: &ArrayExpressionElement<'_>) -> bool {
     }
 }
 
-fn classify(tops: &[&Statement<'_>]) -> Analysis {
+fn classify(tops: &[&Statement<'_>], unstable: &HashSet<String>) -> Analysis {
     let mut pureset: HashSet<String> = HashSet::new();
     let mut pure_funcs: HashSet<String> = HashSet::new();
 
@@ -412,6 +421,11 @@ fn classify(tops: &[&Statement<'_>]) -> Analysis {
         match stmt {
             Statement::FunctionDeclaration(func) => {
                 if let Some(id) = &func.id {
+                    // A reassigned function name (`function f(){} … f = g`) is not
+                    // a stable callee — never bake it as a library member.
+                    if unstable.contains(id.name.as_str()) {
+                        continue;
+                    }
                     let mut fv = FreeVars::default();
                     fv.visit_function(func, ScopeFlags::Function);
                     pending.push(Pending { name: id.name.to_string(), fv });
@@ -423,6 +437,10 @@ fn classify(tops: &[&Statement<'_>]) -> Analysis {
                         continue;
                     };
                     let Some(init) = &d.init else { continue };
+                    // A binding reassigned/mutated elsewhere is not invariant.
+                    if unstable.contains(id.name.as_str()) {
+                        continue;
+                    }
                     if matches!(
                         init,
                         Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_)
@@ -458,6 +476,67 @@ fn classify(tops: &[&Statement<'_>]) -> Analysis {
     }
 
     Analysis { pureset, pure_funcs }
+}
+
+// ---------------------------------------------------------------------------
+// Stability scan: names that are not safe to bake into the static preamble
+// ---------------------------------------------------------------------------
+
+/// Names that are reassigned or mutated, hence not stable library members. A name
+/// qualifies as unstable if it has more than one value-establishing write
+/// (declaration + a later `name = …`), or any compound/`++`/`--` write. The
+/// single declaration write is the only one the preamble reproduces; anything
+/// beyond it could leave the baked value stale at a decode site.
+///
+/// Name-based (like the rest of this pass) and therefore conservative under
+/// shadowing — which is sound: at worst it declines to lift. Note the array
+/// *rotation* mutates contents via methods (`arr.push(arr.shift())`), not an
+/// identifier assignment, so it does not mark the array unstable.
+fn scan_unstable(program: &Program<'_>) -> HashSet<String> {
+    let mut s = WriteScan::default();
+    s.visit_program(program);
+    let mut out = s.flagged;
+    for (n, c) in &s.writes {
+        if *c > 1 {
+            out.insert(n.clone());
+        }
+    }
+    out
+}
+
+#[derive(Default)]
+struct WriteScan {
+    writes: HashMap<String, usize>, // value-establishing writes per name
+    flagged: HashSet<String>,       // compound/update → inherently unstable
+}
+
+impl<'a> Visit<'a> for WriteScan {
+    fn visit_variable_declarator(&mut self, node: &oxc_ast::ast::VariableDeclarator<'a>) {
+        if let BindingPattern::BindingIdentifier(id) = &node.id {
+            if node.init.is_some() {
+                *self.writes.entry(id.name.to_string()).or_default() += 1;
+            }
+        }
+        oxc_ast_visit::walk::walk_variable_declarator(self, node);
+    }
+
+    fn visit_assignment_expression(&mut self, node: &oxc_ast::ast::AssignmentExpression<'a>) {
+        if let oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(t) = &node.left {
+            *self.writes.entry(t.name.to_string()).or_default() += 1;
+            if !matches!(node.operator, oxc_syntax::operator::AssignmentOperator::Assign) {
+                self.flagged.insert(t.name.to_string());
+            }
+        }
+        oxc_ast_visit::walk::walk_assignment_expression(self, node);
+    }
+
+    fn visit_update_expression(&mut self, node: &oxc_ast::ast::UpdateExpression<'a>) {
+        if let oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = &node.argument {
+            *self.writes.entry(id.name.to_string()).or_default() += 1;
+            self.flagged.insert(id.name.to_string());
+        }
+        oxc_ast_visit::walk::walk_update_expression(self, node);
+    }
 }
 
 // ---------------------------------------------------------------------------
