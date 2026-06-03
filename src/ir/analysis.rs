@@ -7,12 +7,14 @@
 //!     declarator with a plain binding identifier;
 //!   - a use: a member read `s[k]` / `s.name`, or — for non-aggregate symbols —
 //!     a bare read `s`.
+//!
 //! Anything else disqualifies the symbol:
 //!   - captured by a nested function/class (closure could observe a stale value);
 //!   - any write that is not a simple `=` def (compound `+=`, `++`, destructuring,
 //!     for-in/of target, member write — i.e. `is_write` reaching a bare ident);
 //!   - an aggregate symbol (one ever assigned an array/object literal) that is
 //!     ever read bare (could be aliased and mutated elsewhere).
+//!
 //! If the function uses `eval` or `arguments`, the whole function is abandoned.
 //!
 //! The guarantee this buys: for every surviving candidate, the CFG provably sees
@@ -67,7 +69,13 @@ pub fn collect_candidates(
         cls.visit_statement(s);
     }
     // Move the verdict out so the borrow of `base` (held by `cls`) ends here.
-    let Classifier { excluded, has_aggregate_def, has_bare_read, bail, .. } = cls;
+    let Classifier {
+        excluded,
+        has_aggregate_def,
+        has_bare_read,
+        bail,
+        ..
+    } = cls;
     if bail {
         return HashSet::new();
     }
@@ -124,8 +132,19 @@ pub fn mutable_aggregate_tables(program: &Program<'_>, scoping: &Scoping) -> Has
 /// disqualifies it. Mirrors `decoder-lift`'s list; kept local so this module owns
 /// its own soundness reasoning.
 const MUTATOR_METHODS: &[&str] = &[
-    "push", "pop", "shift", "unshift", "splice", "sort", "reverse", "fill", "copyWithin", "set",
-    "add", "delete", "clear",
+    "push",
+    "pop",
+    "shift",
+    "unshift",
+    "splice",
+    "sort",
+    "reverse",
+    "fill",
+    "copyWithin",
+    "set",
+    "add",
+    "delete",
+    "clear",
 ];
 
 struct TableScan<'s> {
@@ -235,9 +254,7 @@ impl<'a, 's> Visit<'a> for TableScan<'s> {
     fn visit_call_expression(&mut self, node: &CallExpression<'a>) {
         // A mutator method on a candidate (`t.push(x)`) mutates the table.
         let recv = match &node.callee {
-            Expression::StaticMemberExpression(m) => {
-                Some((m.property.name.as_str(), &m.object))
-            }
+            Expression::StaticMemberExpression(m) => Some((m.property.name.as_str(), &m.object)),
             Expression::ComputedMemberExpression(m) => match &m.expression {
                 Expression::StringLiteral(s) => Some((s.value.as_str(), &m.object)),
                 _ => None,
@@ -310,13 +327,18 @@ impl<'s, 'b> Classifier<'s, 'b> {
     /// block-scoped, hence never candidates.)
     fn exclude_for_head<'a>(&mut self, left: &ForStatementLeft<'a>) {
         if let ForStatementLeft::VariableDeclaration(d) = left {
-            let mut ex = BindingExcluder { excluded: &mut self.excluded, base: self.base };
+            let mut ex = BindingExcluder {
+                excluded: &mut self.excluded,
+                base: self.base,
+            };
             ex.visit_variable_declaration(d);
         }
     }
 
     fn cand_object<'x>(&self, obj: &'x Expression<'x>) -> Option<SymbolId> {
-        let Expression::Identifier(id) = obj else { return None };
+        let Expression::Identifier(id) = obj else {
+            return None;
+        };
         let sym = self.ref_sym(id)?;
         if self.base.contains(&sym) {
             Some(sym)
@@ -442,25 +464,23 @@ impl<'a, 's, 'b> Visit<'a> for Classifier<'s, 'b> {
     }
 
     fn visit_static_member_expression(&mut self, m: &StaticMemberExpression<'a>) {
-        if self.depth == 0 {
-            if self.cand_object(&m.object).is_some() {
+        if self.depth == 0
+            && self.cand_object(&m.object).is_some() {
                 // `s.name` read: a clean member access — do not descend into the
                 // object identifier (that would mark it a bare read / escape).
                 return;
             }
-        }
         walk::walk_static_member_expression(self, m);
     }
 
     fn visit_computed_member_expression(&mut self, m: &ComputedMemberExpression<'a>) {
-        if self.depth == 0 {
-            if self.cand_object(&m.object).is_some() {
+        if self.depth == 0
+            && self.cand_object(&m.object).is_some() {
                 // `s[expr]` read: skip the object; the index may itself reference
                 // candidates, so visit it.
                 self.visit_expression(&m.expression);
                 return;
             }
-        }
         walk::walk_computed_member_expression(self, m);
     }
 
@@ -510,7 +530,10 @@ impl<'a, 'x> Visit<'a> for BindingExcluder<'x> {
 
 /// Whether an initializer/rhs is an array or object literal (an aggregate value).
 fn is_aggregate_literal(e: &Expression<'_>) -> bool {
-    matches!(e, Expression::ArrayExpression(_) | Expression::ObjectExpression(_))
+    matches!(
+        e,
+        Expression::ArrayExpression(_) | Expression::ObjectExpression(_)
+    )
 }
 
 /// If an assignment target is a member expression (`s[k]` / `s.x`), the base

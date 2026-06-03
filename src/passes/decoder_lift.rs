@@ -38,18 +38,57 @@ use crate::util::build_scoping;
 /// The double-eval determinism guard separately rejects any that turn out
 /// non-deterministic (e.g. `Date`), so the list can stay generous.
 const GLOBALS: &[&str] = &[
-    "String", "Math", "Array", "Number", "Boolean", "Object", "JSON", "RegExp", "parseInt",
-    "parseFloat", "isNaN", "isFinite", "decodeURIComponent", "encodeURIComponent", "unescape",
-    "escape", "undefined", "NaN", "Infinity", "Date",
+    "String",
+    "Math",
+    "Array",
+    "Number",
+    "Boolean",
+    "Object",
+    "JSON",
+    "RegExp",
+    "parseInt",
+    "parseFloat",
+    "isNaN",
+    "isFinite",
+    "decodeURIComponent",
+    "encodeURIComponent",
+    "unescape",
+    "escape",
+    "undefined",
+    "NaN",
+    "Infinity",
+    "Date",
     // Collections & symbols — common in modern decoders (e.g. a Map charset
     // lookup). Pure to construct; mutation stays inside the sandbox.
-    "Map", "Set", "WeakMap", "WeakSet", "Symbol", "BigInt",
+    "Map",
+    "Set",
+    "WeakMap",
+    "WeakSet",
+    "Symbol",
+    "BigInt",
     // Binary/typed-array machinery used by byte-oriented decoders.
-    "ArrayBuffer", "SharedArrayBuffer", "DataView", "Int8Array", "Uint8Array",
-    "Uint8ClampedArray", "Int16Array", "Uint16Array", "Int32Array", "Uint32Array", "Float32Array",
-    "Float64Array", "BigInt64Array", "BigUint64Array",
+    "ArrayBuffer",
+    "SharedArrayBuffer",
+    "DataView",
+    "Int8Array",
+    "Uint8Array",
+    "Uint8ClampedArray",
+    "Int16Array",
+    "Uint16Array",
+    "Int32Array",
+    "Uint32Array",
+    "Float32Array",
+    "Float64Array",
+    "BigInt64Array",
+    "BigUint64Array",
     // Error constructors (decoders sometimes build/throw-and-catch internally).
-    "Error", "TypeError", "RangeError", "SyntaxError", "ReferenceError", "EvalError", "URIError",
+    "Error",
+    "TypeError",
+    "RangeError",
+    "SyntaxError",
+    "ReferenceError",
+    "EvalError",
+    "URIError",
     // Pure reflection helpers.
     "Reflect",
 ];
@@ -145,7 +184,13 @@ impl Pass for DecoderLift {
         let pure_func_decls = serialize_pure_funcs(program, &analysis.pure_funcs, allocator);
 
         let preamble = build_preamble(
-            &tops, &analysis, &aliases, &allowed, &local_data, &pure_func_decls, allocator,
+            &tops,
+            &analysis,
+            &aliases,
+            &allowed,
+            &local_data,
+            &pure_func_decls,
+            allocator,
         );
         let Some(sandbox) = Sandbox::new() else {
             return false;
@@ -309,9 +354,29 @@ impl<'a> Visit<'a> for FreeVars {
 /// — an unknown method on a free object is assumed pure, the same optimism every
 /// decoder lifter makes; the double-eval guard catches non-deterministic returns.
 const MUTATOR_METHODS: &[&str] = &[
-    "push", "pop", "shift", "unshift", "splice", "sort", "reverse", "fill", "copyWithin", "set",
-    "add", "delete", "clear", "setItem", "removeItem", "setUint8", "setInt8", "setUint16",
-    "setInt16", "setUint32", "setInt32", "setFloat32", "setFloat64",
+    "push",
+    "pop",
+    "shift",
+    "unshift",
+    "splice",
+    "sort",
+    "reverse",
+    "fill",
+    "copyWithin",
+    "set",
+    "add",
+    "delete",
+    "clear",
+    "setItem",
+    "removeItem",
+    "setUint8",
+    "setInt8",
+    "setUint16",
+    "setInt16",
+    "setUint32",
+    "setInt32",
+    "setFloat32",
+    "setFloat64",
 ];
 
 impl FreeVars {
@@ -341,9 +406,7 @@ impl FreeVars {
         !self.impure
             && !self.writes_free()
             && self.free().iter().all(|n| {
-                Some(n.as_str()) == extra
-                    || pureset.contains(n)
-                    || GLOBALS.contains(&n.as_str())
+                Some(n.as_str()) == extra || pureset.contains(n) || GLOBALS.contains(&n.as_str())
             })
     }
 }
@@ -502,7 +565,10 @@ fn classify(
         }
     }
 
-    Analysis { pureset, pure_funcs }
+    Analysis {
+        pureset,
+        pure_funcs,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -552,7 +618,8 @@ impl<'a> Visit<'a> for FuncScan {
                     Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_)
                 ) {
                     *self.name_counts.entry(id.name.to_string()).or_default() += 1;
-                    self.funcs.push((id.name.to_string(), freevars_of_expr(init)));
+                    self.funcs
+                        .push((id.name.to_string(), freevars_of_expr(init)));
                 }
             }
         }
@@ -571,7 +638,11 @@ fn serialize_pure_funcs<'a>(
     pure_funcs: &HashSet<String>,
     allocator: &'a Allocator,
 ) -> Vec<Statement<'a>> {
-    let mut c = FuncSerializer { pure_funcs, ast: AstBuilder::new(allocator), out: Vec::new() };
+    let mut c = FuncSerializer {
+        pure_funcs,
+        ast: AstBuilder::new(allocator),
+        out: Vec::new(),
+    };
     c.visit_program(program);
     c.out
 }
@@ -593,9 +664,11 @@ impl<'a, 'r> Visit<'a> for FuncSerializer<'a, 'r> {
         if let Some(id) = &func.id {
             if self.wants(id.name.as_str()) {
                 let cloned = func.clone_in(self.ast.allocator);
-                self.out.push(Statement::FunctionDeclaration(
-                    oxc_allocator::Box::new_in(cloned, self.ast.allocator),
-                ));
+                self.out
+                    .push(Statement::FunctionDeclaration(oxc_allocator::Box::new_in(
+                        cloned,
+                        self.ast.allocator,
+                    )));
             }
         }
         oxc_ast_visit::walk::walk_function(self, func, flags);
@@ -621,9 +694,10 @@ impl<'a, 'r> Visit<'a> for FuncSerializer<'a, 'r> {
                     );
                     let mut decls = self.ast.vec();
                     decls.push(decl);
-                    self.out.push(Statement::VariableDeclaration(
-                        self.ast.alloc(self.ast.variable_declaration(SPAN, Var, decls, false)),
-                    ));
+                    self.out
+                        .push(Statement::VariableDeclaration(self.ast.alloc(
+                            self.ast.variable_declaration(SPAN, Var, decls, false),
+                        )));
                 }
             }
         }
@@ -672,7 +746,10 @@ impl<'a> Visit<'a> for WriteScan {
     fn visit_assignment_expression(&mut self, node: &oxc_ast::ast::AssignmentExpression<'a>) {
         if let oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(t) = &node.left {
             *self.writes.entry(t.name.to_string()).or_default() += 1;
-            if !matches!(node.operator, oxc_syntax::operator::AssignmentOperator::Assign) {
+            if !matches!(
+                node.operator,
+                oxc_syntax::operator::AssignmentOperator::Assign
+            ) {
                 self.flagged.insert(t.name.to_string());
             }
         }
@@ -680,7 +757,8 @@ impl<'a> Visit<'a> for WriteScan {
     }
 
     fn visit_update_expression(&mut self, node: &oxc_ast::ast::UpdateExpression<'a>) {
-        if let oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = &node.argument {
+        if let oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = &node.argument
+        {
             *self.writes.entry(id.name.to_string()).or_default() += 1;
             self.flagged.insert(id.name.to_string());
         }
@@ -734,7 +812,9 @@ fn scan_invariants(program: &Program<'_>, excluded: &HashSet<String>) -> Vec<(St
             if grounded.contains(n) {
                 continue;
             }
-            let Some((_, ops)) = cand.get(n) else { continue };
+            let Some((_, ops)) = cand.get(n) else {
+                continue;
+            };
             if ops
                 .iter()
                 .all(|o| grounded.contains(o) || CONST_GLOBALS.contains(&o.as_str()))
@@ -749,16 +829,18 @@ fn scan_invariants(program: &Program<'_>, excluded: &HashSet<String>) -> Vec<(St
         }
     }
 
-    emit.into_iter().map(|n| (n.clone(), cand[&n].0.clone())).collect()
+    emit.into_iter()
+        .map(|n| (n.clone(), cand[&n].0.clone()))
+        .collect()
 }
 
 #[derive(Default)]
 struct DataCollector {
-    counts: HashMap<String, usize>,                     // binding occurrences
-    writes: HashMap<String, usize>,                     // write occurrences
-    value: HashMap<String, (String, HashSet<String>)>,  // name -> (decl, operands)
-    conflict: HashSet<String>,                          // non-invariant / ambiguous
-    order: Vec<String>,                                 // first-seen order
+    counts: HashMap<String, usize>, // binding occurrences
+    writes: HashMap<String, usize>, // write occurrences
+    value: HashMap<String, (String, HashSet<String>)>, // name -> (decl, operands)
+    conflict: HashSet<String>,      // non-invariant / ambiguous
+    order: Vec<String>,             // first-seen order
 }
 
 impl DataCollector {
@@ -841,7 +923,10 @@ impl<'a> Visit<'a> for DataCollector {
     fn visit_assignment_expression(&mut self, node: &oxc_ast::ast::AssignmentExpression<'a>) {
         if let oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(t) = &node.left {
             self.write(t.name.as_str());
-            if matches!(node.operator, oxc_syntax::operator::AssignmentOperator::Assign) {
+            if matches!(
+                node.operator,
+                oxc_syntax::operator::AssignmentOperator::Assign
+            ) {
                 self.value(t.name.as_str(), &node.right);
             } else {
                 self.conflict.insert(t.name.to_string()); // compound assignment
@@ -851,7 +936,8 @@ impl<'a> Visit<'a> for DataCollector {
     }
 
     fn visit_update_expression(&mut self, node: &oxc_ast::ast::UpdateExpression<'a>) {
-        if let oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = &node.argument {
+        if let oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = &node.argument
+        {
             self.write(id.name.as_str());
             self.conflict.insert(id.name.to_string()); // ++ / -- → not constant
         }
@@ -883,14 +969,26 @@ fn build_preamble<'a>(
     for stmt in nested_funcs {
         body.push(stmt.clone_in(allocator));
     }
-    let prog = ast.program(SPAN, SourceType::default(), "", ast.vec(), None, ast.vec(), body);
+    let prog = ast.program(
+        SPAN,
+        SourceType::default(),
+        "",
+        ast.vec(),
+        None,
+        ast.vec(),
+        body,
+    );
     let mut code = Codegen::new().build(&prog).code;
 
     // Pure IIFEs that manipulate a decoder (the array *rotation* — crucially,
     // even when nested inside otherwise-impure init code). Running them in the
     // sandbox is harmless (preamble is throwaway) and is what makes a rotated
     // decoder return the *correct* strings.
-    let mut iifes = IifeCollector { allowed, pure_funcs: &analysis.pure_funcs, out: Vec::new() };
+    let mut iifes = IifeCollector {
+        allowed,
+        pure_funcs: &analysis.pure_funcs,
+        out: Vec::new(),
+    };
     for stmt in tops {
         iifes.visit_statement(stmt);
     }
@@ -943,7 +1041,10 @@ fn collect_aliases(program: &Program<'_>, pure_funcs: &HashSet<String>) -> HashM
     // 1. Collect identifier→identifier assignment edges (`a = b`). A name is
     //    disqualified if it is ever assigned a non-identifier or two different
     //    identifiers (then it isn't a stable alias).
-    let mut c = AliasCollector { edges: HashMap::new(), disqualified: HashSet::new() };
+    let mut c = AliasCollector {
+        edges: HashMap::new(),
+        disqualified: HashSet::new(),
+    };
     c.visit_program(program);
 
     // 2. Resolve each edge transitively to the pure decoder it ultimately
@@ -1085,7 +1186,12 @@ impl<'a, 'r> Lifter<'a, 'r> {
             return;
         }
         let span = rhs.span();
-        *rhs = ctx.ast.expression_numeric_literal(span, n, None, oxc_syntax::number::NumberBase::Decimal);
+        *rhs = ctx.ast.expression_numeric_literal(
+            span,
+            n,
+            None,
+            oxc_syntax::number::NumberBase::Decimal,
+        );
         self.changed = true;
     }
 }
@@ -1204,16 +1310,19 @@ impl<'a, 'r> Traverse<'a, ()> for Lifter<'a, 'r> {
 
 /// Build a numeric literal expression for `n`. A numeric literal is always
 /// non-negative in the grammar, so negatives become `-(lit)` to round-trip.
-fn num_literal<'a>(
-    n: f64,
-    span: oxc_span::Span,
-    ctx: &mut TraverseCtx<'a, ()>,
-) -> Expression<'a> {
+fn num_literal<'a>(n: f64, span: oxc_span::Span, ctx: &mut TraverseCtx<'a, ()>) -> Expression<'a> {
     use oxc_syntax::number::NumberBase;
     if n.is_sign_negative() {
-        let lit = ctx.ast.expression_numeric_literal(span, -n, None, NumberBase::Decimal);
-        ctx.ast.expression_unary(span, oxc_syntax::operator::UnaryOperator::UnaryNegation, lit)
+        let lit = ctx
+            .ast
+            .expression_numeric_literal(span, -n, None, NumberBase::Decimal);
+        ctx.ast.expression_unary(
+            span,
+            oxc_syntax::operator::UnaryOperator::UnaryNegation,
+            lit,
+        )
     } else {
-        ctx.ast.expression_numeric_literal(span, n, None, NumberBase::Decimal)
+        ctx.ast
+            .expression_numeric_literal(span, n, None, NumberBase::Decimal)
     }
 }

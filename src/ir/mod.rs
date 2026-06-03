@@ -84,7 +84,10 @@ impl Pass for SsaOpt {
 
         // Phase 2 (mutating): apply each rewrite to the exact AST node it targets,
         // matched by arena address (stable and unchanged since phase 1).
-        let mut replacer = Replacer { rewrites, changed: false };
+        let mut replacer = Replacer {
+            rewrites,
+            changed: false,
+        };
         traverse_mut(&mut replacer, allocator, program, scoping, ());
         replacer.changed
     }
@@ -145,7 +148,8 @@ fn collect_dead_stores<'a>(
     use cfg::Event;
     for block in &cfg.blocks {
         // Per symbol: the last `s = rhs` store not yet read or overwritten.
-        let mut pending: HashMap<oxc_syntax::symbol::SymbolId, &cfg::AssignInfo<'a>> = HashMap::new();
+        let mut pending: HashMap<oxc_syntax::symbol::SymbolId, &cfg::AssignInfo<'a>> =
+            HashMap::new();
         for ev in &block.events {
             match ev {
                 Event::Def { sym, assign, .. } => {
@@ -202,9 +206,10 @@ fn build_replacement<'a>(
         (UseKind::Scalar, DefVal::Scalar(e)) => Some(e.clone_in(ast.allocator)),
 
         // Const-array element fold: `s[i]` where `s = [ ... ]` reaches.
-        (UseKind::Member(Key::Index(i)), DefVal::Array(elems)) => {
-            elems.get(*i).and_then(|slot| slot.as_ref()).map(|e| e.clone_in(ast.allocator))
-        }
+        (UseKind::Member(Key::Index(i)), DefVal::Array(elems)) => elems
+            .get(*i)
+            .and_then(|slot| slot.as_ref())
+            .map(|e| e.clone_in(ast.allocator)),
         // `s.length` on a known array.
         (UseKind::Member(Key::Name(n)), DefVal::Array(elems)) if n == "length" => {
             Some(num_lit(elems.len() as f64, ast))

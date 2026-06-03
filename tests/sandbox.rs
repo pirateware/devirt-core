@@ -19,8 +19,14 @@ fn evaluates_a_real_base91_style_decoder() {
 fn no_filesystem_access() {
     let sb = Sandbox::new().expect("sandbox");
     // `require` / `process` must not exist → evaluation fails → None.
-    assert_eq!(sb.eval_to_string("typeof require"), Some("undefined".into()));
-    assert_eq!(sb.eval_to_string("typeof process"), Some("undefined".into()));
+    assert_eq!(
+        sb.eval_to_string("typeof require"),
+        Some("undefined".into())
+    );
+    assert_eq!(
+        sb.eval_to_string("typeof process"),
+        Some("undefined".into())
+    );
 }
 
 #[test]

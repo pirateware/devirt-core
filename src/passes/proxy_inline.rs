@@ -54,7 +54,10 @@ impl Pass for ProxyInline {
         if proxies.is_empty() {
             return false;
         }
-        let mut inl = Inliner { proxies, changed: false };
+        let mut inl = Inliner {
+            proxies,
+            changed: false,
+        };
         let scoping = build_scoping(program);
         traverse_mut(&mut inl, allocator, program, scoping, ());
         self.changed = inl.changed;
@@ -81,7 +84,10 @@ struct Proxy<'a> {
 // Collection
 // ---------------------------------------------------------------------------
 
-fn collect_proxies<'a>(program: &Program<'a>, allocator: &'a Allocator) -> HashMap<String, Proxy<'a>> {
+fn collect_proxies<'a>(
+    program: &Program<'a>,
+    allocator: &'a Allocator,
+) -> HashMap<String, Proxy<'a>> {
     let mut c = ProxyCollector {
         allocator,
         counts: HashMap::new(),
@@ -231,7 +237,11 @@ impl<'a> Visit<'a> for ProxyCollector<'a> {
         *self.counts.entry(it.name.to_string()).or_default() += 1;
     }
 
-    fn visit_function(&mut self, func: &oxc_ast::ast::Function<'a>, flags: oxc_syntax::scope::ScopeFlags) {
+    fn visit_function(
+        &mut self,
+        func: &oxc_ast::ast::Function<'a>,
+        flags: oxc_syntax::scope::ScopeFlags,
+    ) {
         if let (Some(id), Some(body)) = (&func.id, &func.body) {
             let name = id.name.to_string();
             *self.value_writes.entry(name.clone()).or_default() += 1;
@@ -325,7 +335,10 @@ fn simple_param_names(params: &FormalParameters<'_>) -> Option<Vec<String>> {
     Some(out)
 }
 
-fn single_return_expr<'b, 'a>(body: &'b FunctionBody<'a>, arrow_expr: bool) -> Option<&'b Expression<'a>> {
+fn single_return_expr<'b, 'a>(
+    body: &'b FunctionBody<'a>,
+    arrow_expr: bool,
+) -> Option<&'b Expression<'a>> {
     if body.statements.len() != 1 {
         return None;
     }
@@ -484,7 +497,12 @@ impl<'a> Traverse<'a, ()> for Inliner<'a> {
             // and member-read args reorder harmlessly, but two args that each
             // carry a *strong* effect (a call/assignment/new/update) could have
             // their effects swapped. Decline when more than one such arg exists.
-            if arg_exprs.iter().filter(|ae| has_strong_side_effect(ae)).count() > 1 {
+            if arg_exprs
+                .iter()
+                .filter(|ae| has_strong_side_effect(ae))
+                .count()
+                > 1
+            {
                 return;
             }
 
@@ -617,10 +635,17 @@ fn contains_scoped_node(expr: &Expression<'_>) -> bool {
         found: bool,
     }
     impl<'a> Visit<'a> for Finder {
-        fn visit_function(&mut self, _f: &oxc_ast::ast::Function<'a>, _flags: oxc_syntax::scope::ScopeFlags) {
+        fn visit_function(
+            &mut self,
+            _f: &oxc_ast::ast::Function<'a>,
+            _flags: oxc_syntax::scope::ScopeFlags,
+        ) {
             self.found = true; // do not recurse: one is enough
         }
-        fn visit_arrow_function_expression(&mut self, _f: &oxc_ast::ast::ArrowFunctionExpression<'a>) {
+        fn visit_arrow_function_expression(
+            &mut self,
+            _f: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+        ) {
             self.found = true;
         }
         fn visit_class(&mut self, _c: &oxc_ast::ast::Class<'a>) {
@@ -693,7 +718,11 @@ fn is_side_effect_free(expr: &Expression<'_>) -> bool {
 
 /// Replace parameter identifiers in `expr` (a clone of a proxy body) with clones
 /// of the corresponding argument expressions.
-fn subst<'a>(expr: &mut Expression<'a>, args: &HashMap<&str, &Expression<'a>>, alloc: &'a Allocator) {
+fn subst<'a>(
+    expr: &mut Expression<'a>,
+    args: &HashMap<&str, &Expression<'a>>,
+    alloc: &'a Allocator,
+) {
     match expr {
         Expression::Identifier(id) => {
             if let Some(arg) = args.get(id.name.as_str()) {

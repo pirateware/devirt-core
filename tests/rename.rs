@@ -10,10 +10,16 @@ fn renames_opaque_bindings_and_all_references() {
         "t.js",
     )
     .code;
-    assert!(!out.contains("WL") && !out.contains("jK"), "opaque names remain: {out}");
+    assert!(
+        !out.contains("WL") && !out.contains("jK"),
+        "opaque names remain: {out}"
+    );
     // The body is a computed lookup `document.body[jK]`, so the function is named
     // for its behavior (a getter), not a generic `fn1`.
-    assert!(out.contains("get"), "function not renamed by behavior: {out}");
+    assert!(
+        out.contains("get"),
+        "function not renamed by behavior: {out}"
+    );
 }
 
 #[test]
@@ -36,7 +42,10 @@ fn names_by_assignment() {
         "rename",
     );
     for name in ["doc", "regex", "date", "arr", "obj"] {
-        assert!(out.contains(name), "missing assignment-based name `{name}`: {out}");
+        assert!(
+            out.contains(name),
+            "missing assignment-based name `{name}`: {out}"
+        );
     }
 }
 
@@ -73,7 +82,10 @@ fn names_array_accumulator_by_usage() {
     .code;
     // The array-literal assignment hint (`arr`) wins over usage here, which is
     // fine — either way it is descriptive and the opaque name is gone.
-    assert!(!out.contains("qq"), "opaque accumulator name remains: {out}");
+    assert!(
+        !out.contains("qq"),
+        "opaque accumulator name remains: {out}"
+    );
 }
 
 #[test]
@@ -91,14 +103,20 @@ fn emitted_names_are_unique_and_collision_free() {
         "t.js",
         "rename",
     );
-    assert!(out.contains("regex1") || out.contains("regex2"), "duplicate base not suffixed: {out}");
+    assert!(
+        out.contains("regex1") || out.contains("regex2"),
+        "duplicate base not suffixed: {out}"
+    );
 }
 
 #[test]
 fn does_not_touch_property_names() {
     // `WL` here is a property key, not a reference to a binding — must survive.
     let out = deobfuscate("var ab = {}; ab.WL = 1; foo(ab.WL);", "t.js").code;
-    assert!(out.contains(".WL"), "property name was wrongly renamed: {out}");
+    assert!(
+        out.contains(".WL"),
+        "property name was wrongly renamed: {out}"
+    );
 }
 
 #[test]

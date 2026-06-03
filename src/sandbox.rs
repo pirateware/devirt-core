@@ -44,12 +44,16 @@ impl Sandbox {
 
         let deadline: Deadline = std::sync::Arc::new(Mutex::new(None));
         let handler_deadline = deadline.clone();
-        rt.set_interrupt_handler(Some(Box::new(move || {
-            matches!(*handler_deadline.lock().unwrap(), Some(d) if Instant::now() >= d)
-        })));
+        rt.set_interrupt_handler(Some(Box::new(
+            move || matches!(*handler_deadline.lock().unwrap(), Some(d) if Instant::now() >= d),
+        )));
 
         let ctx = Context::full(&rt).ok()?;
-        Some(Sandbox { ctx, deadline, _rt: rt })
+        Some(Sandbox {
+            ctx,
+            deadline,
+            _rt: rt,
+        })
     }
 
     /// Run `code` once for its side effects (define the decoder library /
@@ -57,7 +61,9 @@ impl Sandbox {
     /// without throwing. Subsequent `eval_to_string` calls see the definitions.
     pub fn setup(&self, code: &str) -> bool {
         *self.deadline.lock().unwrap() = Some(Instant::now() + EVAL_BUDGET);
-        let ok = self.ctx.with(|ctx| ctx.eval::<rquickjs::Value, _>(code).is_ok());
+        let ok = self
+            .ctx
+            .with(|ctx| ctx.eval::<rquickjs::Value, _>(code).is_ok());
         *self.deadline.lock().unwrap() = None;
         ok
     }

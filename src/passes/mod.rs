@@ -61,7 +61,7 @@ pub fn default_pipeline() -> Vec<Box<dyn Pass>> {
         // const-aggregate index folding. Runs after lifting (so it sees lifted
         // literals) and before DCE (so spent assignments become dead and get
         // removed). See `src/ir/`.
-        Box::new(crate::ir::SsaOpt::default()),
+        Box::new(crate::ir::SsaOpt),
         Box::new(Dce::default()),
         // Remove pure stores to variables that are now read-never (spent
         // decoder-index arithmetic chains).

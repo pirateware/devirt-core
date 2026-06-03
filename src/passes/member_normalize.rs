@@ -54,7 +54,10 @@ fn try_static<'a>(
     let optional = computed.optional;
     let object = computed.object.take_in(ctx.ast);
     let property = ctx.ast.identifier_name(key_span, key_atom);
-    Some(ctx.ast.alloc_static_member_expression(span, object, property, optional))
+    Some(
+        ctx.ast
+            .alloc_static_member_expression(span, object, property, optional),
+    )
 }
 
 impl<'a> Traverse<'a, ()> for MemberNormalize {

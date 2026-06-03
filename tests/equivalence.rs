@@ -24,18 +24,27 @@ fn assert_equivalent(src: &str) {
     // maps a bare undefined to None, same as an error) and so a number vs. the
     // string of that number is never conflated — exactly the soundness we care
     // about (a numeric decode must not become a string, etc.).
-    let wrap =
-        |body: &str| format!("(function(){{ var __r; {body}; return typeof __r + \":\" + String(__r); }})()");
+    let wrap = |body: &str| {
+        format!("(function(){{ var __r; {body}; return typeof __r + \":\" + String(__r); }})()")
+    };
     let original = wrap(src);
 
     let deob = deobfuscate(src, "t.js");
-    assert!(deob.parse_errors.is_empty(), "deob parse errors: {:?}", deob.parse_errors);
+    assert!(
+        deob.parse_errors.is_empty(),
+        "deob parse errors: {:?}",
+        deob.parse_errors
+    );
     let deobbed = wrap(&deob.code);
 
     let a = eval(&original);
     let b = eval(&deobbed);
     assert!(a.is_some(), "original did not evaluate: {original}");
-    assert_eq!(a, b, "value changed by deobfuscation.\n--- src ---\n{src}\n--- deob ---\n{}", deob.code);
+    assert_eq!(
+        a, b,
+        "value changed by deobfuscation.\n--- src ---\n{src}\n--- deob ---\n{}",
+        deob.code
+    );
 }
 
 #[test]
@@ -627,7 +636,9 @@ fn ssa_dead_store_keeps_rhs_effects() {
 fn inline_single_use_preserves_value() {
     // Plain temp chains collapse across rounds; order and value preserved.
     assert_equivalent("function f(){ var t = 5 + 3; return t * 2; } __r = f();");
-    assert_equivalent(r#"function f(){ var a = "a" + "b"; var b = a + "c"; return b; } __r = f();"#);
+    assert_equivalent(
+        r#"function f(){ var a = "a" + "b"; var b = a + "c"; return b; } __r = f();"#,
+    );
     // The snowball: a decoder temp used once as an index folds next to its access.
     assert_equivalent(
         r#"

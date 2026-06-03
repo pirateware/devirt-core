@@ -13,6 +13,7 @@
 //! only fold when the discarded branch is empty-ish (a single non-declaration).
 
 use oxc_allocator::{Allocator, CloneIn, TakeIn};
+use oxc_ast::ast::IdentifierReference;
 use oxc_ast::ast::{Expression, Statement};
 use oxc_ast::AstBuilder;
 use oxc_ecmascript::constant_evaluation::{
@@ -22,7 +23,6 @@ use oxc_ecmascript::side_effects::{
     MayHaveSideEffects, MayHaveSideEffectsContext, PropertyReadSideEffects,
 };
 use oxc_ecmascript::GlobalContext;
-use oxc_ast::ast::IdentifierReference;
 use oxc_semantic::Scoping;
 use oxc_span::GetSpan;
 use oxc_syntax::number::NumberBase;
@@ -83,7 +83,10 @@ impl<'a> Traverse<'a, ()> for ConstantFold {
         // only resolves a pure test, so dropping the untaken branch is sound.
         if let Expression::ConditionalExpression(c) = expr {
             let cond = {
-                let ectx = EvalCtx { ast: ctx.ast, scoping: ctx.scoping() };
+                let ectx = EvalCtx {
+                    ast: ctx.ast,
+                    scoping: ctx.scoping(),
+                };
                 // Collapsing the ternary discards the test, so it must be pure
                 // (a side-effecting test like `(seen = 1, 1) ? a : b` still has
                 // to run). The untaken branch never executes, so dropping it is
@@ -95,15 +98,21 @@ impl<'a> Traverse<'a, ()> for ConstantFold {
                 }
             };
             if let Some(cond) = cond {
-                let taken =
-                    if cond { c.consequent.take_in(ctx.ast) } else { c.alternate.take_in(ctx.ast) };
+                let taken = if cond {
+                    c.consequent.take_in(ctx.ast)
+                } else {
+                    c.alternate.take_in(ctx.ast)
+                };
                 *expr = taken;
                 self.changed = true;
                 return;
             }
         }
         let folded = {
-            let ectx = EvalCtx { ast: ctx.ast, scoping: ctx.scoping() };
+            let ectx = EvalCtx {
+                ast: ctx.ast,
+                scoping: ctx.scoping(),
+            };
             // Replacing the whole expression with its value drops the original,
             // so it must be side-effect free. oxc's `evaluate_value` reports the
             // *value* of e.g. `(seen = 1, 'x')` ("x") but not that discarding the
@@ -127,7 +136,10 @@ impl<'a> Traverse<'a, ()> for ConstantFold {
             return;
         };
         let cond = {
-            let ectx = EvalCtx { ast: ctx.ast, scoping: ctx.scoping() };
+            let ectx = EvalCtx {
+                ast: ctx.ast,
+                scoping: ctx.scoping(),
+            };
             // As with the ternary: the test always runs, so we may only drop it
             // when it is pure.
             if ifs.test.may_have_side_effects(&ectx) {
@@ -210,7 +222,9 @@ enum Key<'k> {
 /// computed string literal or a static `.name` becomes `Name`.
 fn member_key<'a, 'e>(expr: &'e Expression<'a>) -> Option<(&'e Expression<'a>, Key<'e>)> {
     match expr {
-        Expression::StaticMemberExpression(m) => Some((&m.object, Key::Name(m.property.name.as_str()))),
+        Expression::StaticMemberExpression(m) => {
+            Some((&m.object, Key::Name(m.property.name.as_str())))
+        }
         Expression::ComputedMemberExpression(m) => {
             let key = match &m.expression {
                 Expression::NumericLiteral(n) => Key::Index(int_index(n.value)?),
@@ -254,10 +268,17 @@ fn contains_scoped_node(expr: &Expression<'_>) -> bool {
         found: bool,
     }
     impl<'a> Visit<'a> for Finder {
-        fn visit_function(&mut self, _f: &oxc_ast::ast::Function<'a>, _flags: oxc_syntax::scope::ScopeFlags) {
+        fn visit_function(
+            &mut self,
+            _f: &oxc_ast::ast::Function<'a>,
+            _flags: oxc_syntax::scope::ScopeFlags,
+        ) {
             self.found = true;
         }
-        fn visit_arrow_function_expression(&mut self, _f: &oxc_ast::ast::ArrowFunctionExpression<'a>) {
+        fn visit_arrow_function_expression(
+            &mut self,
+            _f: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+        ) {
             self.found = true;
         }
         fn visit_class(&mut self, _c: &oxc_ast::ast::Class<'a>) {
@@ -277,7 +298,11 @@ fn fold_array_member<'a>(
 ) -> Option<Expression<'a>> {
     use oxc_ast::ast::ArrayExpressionElement as El;
     // A spread makes element positions and length unknowable: never fold.
-    if arr.elements.iter().any(|e| matches!(e, El::SpreadElement(_))) {
+    if arr
+        .elements
+        .iter()
+        .any(|e| matches!(e, El::SpreadElement(_)))
+    {
         return None;
     }
     // All non-selected elements must be pure (we are about to drop them).
@@ -285,10 +310,7 @@ fn fold_array_member<'a>(
         arr.elements.iter().enumerate().all(|(i, e)| match e {
             El::Elision(_) => true,
             El::SpreadElement(_) => false,
-            other => {
-                Some(i) == except
-                    || other.as_expression().is_some_and(is_pure_simple)
-            }
+            other => Some(i) == except || other.as_expression().is_some_and(is_pure_simple),
         })
     };
     match key {
@@ -296,7 +318,12 @@ fn fold_array_member<'a>(
             if !all_pure(None) {
                 return None;
             }
-            Some(ast.expression_numeric_literal(span, arr.elements.len() as f64, None, NumberBase::Decimal))
+            Some(ast.expression_numeric_literal(
+                span,
+                arr.elements.len() as f64,
+                None,
+                NumberBase::Decimal,
+            ))
         }
         Key::Index(i) => {
             // A hole (`[1, , 3][1]`) or out-of-range index yields `undefined`;
@@ -348,7 +375,11 @@ fn fold_object_member<'a>(
     if contains_scoped_node(selected) {
         return None;
     }
-    if props.iter().enumerate().any(|(i, (_, v))| i != pos && !is_pure_simple(v)) {
+    if props
+        .iter()
+        .enumerate()
+        .any(|(i, (_, v))| i != pos && !is_pure_simple(v))
+    {
         return None;
     }
     Some(selected.clone_in(ast.allocator))
@@ -367,9 +398,12 @@ fn fold_string_member<'a>(
     }
     let bytes = s.value.as_bytes();
     match key {
-        Key::Name("length") => {
-            Some(ast.expression_numeric_literal(span, bytes.len() as f64, None, NumberBase::Decimal))
-        }
+        Key::Name("length") => Some(ast.expression_numeric_literal(
+            span,
+            bytes.len() as f64,
+            None,
+            NumberBase::Decimal,
+        )),
         Key::Index(i) => {
             let ch = *bytes.get(*i)? as char;
             let atom = ast.str(ch.encode_utf8(&mut [0u8; 1]));

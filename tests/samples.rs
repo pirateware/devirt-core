@@ -43,6 +43,9 @@ fn every_sample_is_safe() {
         );
 
         // Idempotent: the second run's output equals the first's.
-        assert_eq!(first.code, second.code, "{name}: pipeline is not idempotent");
+        assert_eq!(
+            first.code, second.code,
+            "{name}: pipeline is not idempotent"
+        );
     }
 }

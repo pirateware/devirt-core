@@ -1,9 +1,9 @@
 //! Math-proxy fingerprinting.
 //!
 //! Obfuscators replace plain operators with tiny pure functions whose body is an
-//! algebraic identity — `function f(a, b) { return 4*(b|a) - 3*(~b&a) + 6*~(b|a)
-//! - 2*~(b^a) - ~a - (b|~a) - ~b + 1; }` is just `a + b` for every 32-bit
-//! integer. There are thousands of these across samples. Rather than simplify the
+//! algebraic identity — `function f(a, b) { return 4*(b|a) - 3*(~b&a) +
+//! 6*~(b|a) - 2*~(b^a) - ~a - (b|~a) - ~b + 1; }` is just `a + b` for every
+//! 32-bit integer. There are thousands of these across samples. Rather than simplify the
 //! algebra symbolically, we *run* each candidate against a wide battery of integer
 //! inputs in the sandbox and check whether it agrees — value-and-type exactly
 //! (`Object.is`) — with exactly one simple operator (`a+b`, `b-a`, `a^b`, `a<b`,
@@ -252,9 +252,19 @@ enum Matched {
     /// `coerce` = the proxy equals the operator only on ToInt32-coerced operands
     /// (an MBA reconstruction with a bitwise body), so the rewrite must wrap each
     /// operand in `| 0` to stay faithful for non-integer arguments.
-    Bin { op: BinaryOperator, swap: bool, coerce: bool },
-    Log { op: LogicalOperator, swap: bool },
-    Un { op: UnaryOperator, coerce: bool },
+    Bin {
+        op: BinaryOperator,
+        swap: bool,
+        coerce: bool,
+    },
+    Log {
+        op: LogicalOperator,
+        swap: bool,
+    },
+    Un {
+        op: UnaryOperator,
+        coerce: bool,
+    },
 }
 
 impl Matched {
@@ -269,7 +279,12 @@ impl Matched {
         let c = |coerce: bool| if coerce { "|0" } else { "" };
         match self {
             Matched::Bin { op, swap, coerce } => {
-                format!("{}{}{}", op.as_str(), if *swap { "~" } else { "" }, c(*coerce))
+                format!(
+                    "{}{}{}",
+                    op.as_str(),
+                    if *swap { "~" } else { "" },
+                    c(*coerce)
+                )
             }
             Matched::Log { op, swap } => format!("{}{}", op.as_str(), if *swap { "~" } else { "" }),
             Matched::Un { op, coerce } => format!("{}{}", op.as_str(), c(*coerce)),
@@ -543,15 +558,36 @@ fn candidates(arity: usize) -> Vec<(String, Matched)> {
             ("|", BinaryOperator::BitwiseOR),
             ("^", BinaryOperator::BitwiseXOR),
         ] {
-            v.push((tok.to_string(), Matched::Bin { op, swap: false, coerce: false }));
+            v.push((
+                tok.to_string(),
+                Matched::Bin {
+                    op,
+                    swap: false,
+                    coerce: false,
+                },
+            ));
         }
         for (tok, op) in [
             ("<<", BinaryOperator::ShiftLeft),
             (">>", BinaryOperator::ShiftRight),
             (">>>", BinaryOperator::ShiftRightZeroFill),
         ] {
-            v.push((tok.to_string(), Matched::Bin { op, swap: false, coerce: false }));
-            v.push((tok.to_string(), Matched::Bin { op, swap: true, coerce: false }));
+            v.push((
+                tok.to_string(),
+                Matched::Bin {
+                    op,
+                    swap: false,
+                    coerce: false,
+                },
+            ));
+            v.push((
+                tok.to_string(),
+                Matched::Bin {
+                    op,
+                    swap: true,
+                    coerce: false,
+                },
+            ));
         }
         // Arithmetic/relational ops do NOT coerce to int32, but an MBA
         // reconstruction (a bitwise body) only equals the operator on coerced
@@ -563,7 +599,14 @@ fn candidates(arity: usize) -> Vec<(String, Matched)> {
             ("*", BinaryOperator::Multiplication),
         ] {
             for coerce in [false, true] {
-                v.push((tok.to_string(), Matched::Bin { op, swap: false, coerce }));
+                v.push((
+                    tok.to_string(),
+                    Matched::Bin {
+                        op,
+                        swap: false,
+                        coerce,
+                    },
+                ));
             }
         }
         for (tok, op) in [
@@ -585,7 +628,14 @@ fn candidates(arity: usize) -> Vec<(String, Matched)> {
             (">=", BinaryOperator::GreaterEqualThan),
         ] {
             for coerce in [false, true] {
-                v.push((tok.to_string(), Matched::Bin { op, swap: false, coerce }));
+                v.push((
+                    tok.to_string(),
+                    Matched::Bin {
+                        op,
+                        swap: false,
+                        coerce,
+                    },
+                ));
             }
         }
         // Logical short-circuit returns an actual operand, so a coerced form is
@@ -597,9 +647,21 @@ fn candidates(arity: usize) -> Vec<(String, Matched)> {
     } else {
         // `~` self-coerces; negation has a coerced (`-(a|0)`, the `~a+1` MBA) form;
         // the rest are bare-only.
-        v.push(("~".to_string(), Matched::Un { op: UnaryOperator::BitwiseNot, coerce: false }));
+        v.push((
+            "~".to_string(),
+            Matched::Un {
+                op: UnaryOperator::BitwiseNot,
+                coerce: false,
+            },
+        ));
         for coerce in [false, true] {
-            v.push(("-".to_string(), Matched::Un { op: UnaryOperator::UnaryNegation, coerce }));
+            v.push((
+                "-".to_string(),
+                Matched::Un {
+                    op: UnaryOperator::UnaryNegation,
+                    coerce,
+                },
+            ));
         }
         for (tok, op) in [
             ("!", UnaryOperator::LogicalNot),
@@ -647,7 +709,13 @@ fn bin_snippet(name: &str, tok: &str, m: &Matched) -> String {
     };
     let (l, r) = if swap { ("b", "a") } else { ("a", "b") };
     // `(a|0)` forces ToInt32 on the operand, matching an MBA reconstruction.
-    let wrap = |x: &str| if coerce { format!("({x}|0)") } else { x.to_string() };
+    let wrap = |x: &str| {
+        if coerce {
+            format!("({x}|0)")
+        } else {
+            x.to_string()
+        }
+    };
     let (l, r) = (wrap(l), wrap(r));
     let pairs = bin_inputs_js();
     format!(
@@ -672,9 +740,17 @@ fn un_snippet(name: &str, tok: &str, m: &Matched) -> String {
 /// int32 — so a proxy matches exactly one of the two and a coercion-divergent
 /// proxy is never rewritten to the wrong form.
 const NONINT_BIN: &[&str] = &[
-    "[0.5,0.5]", "[1.5,2.5]", "[-1.5,2.5]", "[2.5,-0]",
-    "[\"3\",\"4\"]", "[\"a\",\"b\"]", "[\"5\",2]", "[6,\"2\"]",
-    "[4294967296,1]", "[1,4294967296]", "[3000000000,3000000000]",
+    "[0.5,0.5]",
+    "[1.5,2.5]",
+    "[-1.5,2.5]",
+    "[2.5,-0]",
+    "[\"3\",\"4\"]",
+    "[\"a\",\"b\"]",
+    "[\"5\",2]",
+    "[6,\"2\"]",
+    "[4294967296,1]",
+    "[1,4294967296]",
+    "[3000000000,3000000000]",
 ];
 
 /// Non-integer probes for the unary battery (same purpose).
@@ -802,7 +878,8 @@ fn coerce_i32<'a>(ctx: &TraverseCtx<'a, ()>, e: Expression<'a>) -> Expression<'a
         None,
         oxc_syntax::number::NumberBase::Decimal,
     );
-    ctx.ast.expression_binary(SPAN, e, BinaryOperator::BitwiseOR, zero)
+    ctx.ast
+        .expression_binary(SPAN, e, BinaryOperator::BitwiseOR, zero)
 }
 
 fn is_side_effect_free(expr: &Expression<'_>) -> bool {

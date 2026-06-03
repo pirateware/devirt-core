@@ -32,8 +32,14 @@ fn numeric_decoder_result_stays_numeric() {
     "#;
     let out = deobfuscate(src, "t.js").code;
     // 20 + 1 must fold to 21 (numeric), never "201" (string concat) or "20".
-    assert!(out.contains("sink(21)"), "numeric decode mis-typed as string: {out}");
-    assert!(!out.contains("\"20\""), "spliced a string literal for a number: {out}");
+    assert!(
+        out.contains("sink(21)"),
+        "numeric decode mis-typed as string: {out}"
+    );
+    assert!(
+        !out.contains("\"20\""),
+        "spliced a string literal for a number: {out}"
+    );
 }
 
 #[test]
@@ -47,8 +53,14 @@ fn does_not_lift_impure_decoder() {
     "#;
     let out = deobfuscate(src, "t.js").code;
     // The host access must survive and no string literal may replace the call.
-    assert!(out.contains("window") && out.contains("secret"), "impure decoder body lost: {out}");
-    assert!(!out.contains("\"\"") && !out.contains("foo(\""), "impure call was wrongly lifted: {out}");
+    assert!(
+        out.contains("window") && out.contains("secret"),
+        "impure decoder body lost: {out}"
+    );
+    assert!(
+        !out.contains("\"\"") && !out.contains("foo(\""),
+        "impure call was wrongly lifted: {out}"
+    );
 }
 
 #[test]
@@ -65,8 +77,14 @@ fn does_not_lift_mutating_library_calls() {
         })();
     "#;
     let out = deobfuscate(src, "t.js").code;
-    assert!(out.contains("arr.push(arr.shift())"), "rotation was wrongly lifted: {out}");
-    assert!(out.contains("console.log(\"Hello\")"), "decode corrupted: {out}");
+    assert!(
+        out.contains("arr.push(arr.shift())"),
+        "rotation was wrongly lifted: {out}"
+    );
+    assert!(
+        out.contains("console.log(\"Hello\")"),
+        "decode corrupted: {out}"
+    );
 }
 
 #[test]
@@ -80,7 +98,10 @@ fn lifts_computed_index_into_pure_array() {
         })();
     "#;
     let out = deobfuscate(src, "t.js").code;
-    assert!(out.contains("\"alpha\"") && out.contains("\"gamma\""), "index read not lifted: {out}");
+    assert!(
+        out.contains("\"alpha\"") && out.contains("\"gamma\""),
+        "index read not lifted: {out}"
+    );
 }
 
 #[test]
@@ -96,8 +117,14 @@ fn lifts_decoder_nested_in_a_function_scope() {
         }
     "#;
     let out = deobfuscate(src, "t.js").code;
-    assert!(out.contains("\"alpha\"") && out.contains("\"gamma\""), "nested decoder not lifted: {out}");
-    assert!(!out.contains("dec("), "decoder call survived in nested scope: {out}");
+    assert!(
+        out.contains("\"alpha\"") && out.contains("\"gamma\""),
+        "nested decoder not lifted: {out}"
+    );
+    assert!(
+        !out.contains("dec("),
+        "decoder call survived in nested scope: {out}"
+    );
 }
 
 #[test]
@@ -112,8 +139,14 @@ fn lifts_decoder_nested_in_var_assigned_iife() {
         })();
     "#;
     let out = deobfuscate(src, "t.js").code;
-    assert!(out.contains("win.createElement"), "computed member not resolved: {out}");
-    assert!(out.contains("\"appendChild\""), "argument decode not lifted: {out}");
+    assert!(
+        out.contains("win.createElement"),
+        "computed member not resolved: {out}"
+    );
+    assert!(
+        out.contains("\"appendChild\""),
+        "argument decode not lifted: {out}"
+    );
     assert!(!out.contains("dec("), "decoder call survived: {out}");
 }
 
@@ -134,9 +167,14 @@ fn does_not_lift_scoped_decoder_over_member_mutated_table() {
     let out = deobfuscate(src, "t.js").code;
     // The decoder calls must survive unresolved: the table is mutated, so a baked
     // ["a","b","c"] would mis-resolve dec(1) (whose slot is overwritten to "Z").
-    assert!(out.contains("dec(0)") && out.contains("dec(1)"),
-        "decoder over a member-mutated table must be left in place: {out}");
-    assert!(out.contains("tbl[1] = \"Z\""), "the mutation must survive: {out}");
+    assert!(
+        out.contains("dec(0)") && out.contains("dec(1)"),
+        "decoder over a member-mutated table must be left in place: {out}"
+    );
+    assert!(
+        out.contains("tbl[1] = \"Z\""),
+        "the mutation must survive: {out}"
+    );
 }
 
 #[test]
@@ -151,5 +189,8 @@ fn lifts_object_keyed_arguments() {
         })();
     "#;
     let out = deobfuscate(src, "t.js").code;
-    assert!(out.contains("\"alpha\"") && out.contains("\"beta\""), "got: {out}");
+    assert!(
+        out.contains("\"alpha\"") && out.contains("\"beta\""),
+        "got: {out}"
+    );
 }

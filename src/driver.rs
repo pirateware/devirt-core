@@ -44,5 +44,9 @@ pub fn run_fixpoint<'a>(
         }
     }
 
-    DriverStats { rounds, converged, changes }
+    DriverStats {
+        rounds,
+        converged,
+        changes,
+    }
 }

@@ -117,7 +117,11 @@ impl Pass for RenameByRole {
 /// returned name is recorded in `used` so future calls never repeat it. Because
 /// `used` is seeded with reserved words and `undefined`, those bases are skipped
 /// straight to a (never-reserved) numbered form.
-fn unique_name(base: &str, counters: &mut HashMap<String, usize>, used: &mut HashSet<String>) -> String {
+fn unique_name(
+    base: &str,
+    counters: &mut HashMap<String, usize>,
+    used: &mut HashSet<String>,
+) -> String {
     if !used.contains(base) {
         used.insert(base.to_string());
         return base.to_string();
@@ -224,12 +228,10 @@ fn name_from_expr(expr: &Expression<'_>) -> Option<&'static str> {
         Expression::FunctionExpression(f) => name_from_function_body(f.body.as_deref()),
         // An arrow with an expression body (`() => a < b`) stores that expression
         // as a single `ExpressionStatement` (no `return`); read it directly.
-        Expression::ArrowFunctionExpression(f) if f.expression => {
-            match f.body.statements.first() {
-                Some(Statement::ExpressionStatement(es)) => name_from_returned_expr(&es.expression),
-                _ => None,
-            }
-        }
+        Expression::ArrowFunctionExpression(f) if f.expression => match f.body.statements.first() {
+            Some(Statement::ExpressionStatement(es)) => name_from_returned_expr(&es.expression),
+            _ => None,
+        },
         Expression::ArrowFunctionExpression(f) => name_from_function_body(Some(&*f.body)),
         Expression::NewExpression(n) => Some(name_from_constructor(&n.callee)),
         Expression::CallExpression(c) => name_from_call(&c.callee),
@@ -391,8 +393,21 @@ fn usage_name(props: Option<&Vec<String>>) -> Option<&'static str> {
     let list_like = props.iter().all(|p| {
         matches!(
             p.as_str(),
-            "push" | "pop" | "shift" | "unshift" | "splice" | "length" | "join" | "concat"
-                | "slice" | "indexOf" | "forEach" | "map" | "filter" | "sort" | "reverse"
+            "push"
+                | "pop"
+                | "shift"
+                | "unshift"
+                | "splice"
+                | "length"
+                | "join"
+                | "concat"
+                | "slice"
+                | "indexOf"
+                | "forEach"
+                | "map"
+                | "filter"
+                | "sort"
+                | "reverse"
         )
     });
     if list_like {
@@ -405,11 +420,54 @@ fn usage_name(props: Option<&Vec<String>>) -> Option<&'static str> {
 /// ECMAScript reserved words (and a few contextual ones) we must never emit as a
 /// binding name. Seeding `used` with these forces such a base to a numbered form.
 const RESERVED: &[&str] = &[
-    "await", "break", "case", "catch", "class", "const", "continue", "debugger", "default",
-    "delete", "do", "else", "enum", "export", "extends", "false", "finally", "for", "function",
-    "get", "if", "implements", "import", "in", "instanceof", "interface", "let", "new", "null",
-    "package", "private", "protected", "public", "return", "set", "static", "super", "switch",
-    "this", "throw", "true", "try", "typeof", "var", "void", "while", "with", "yield",
+    "await",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "debugger",
+    "default",
+    "delete",
+    "do",
+    "else",
+    "enum",
+    "export",
+    "extends",
+    "false",
+    "finally",
+    "for",
+    "function",
+    "get",
+    "if",
+    "implements",
+    "import",
+    "in",
+    "instanceof",
+    "interface",
+    "let",
+    "new",
+    "null",
+    "package",
+    "private",
+    "protected",
+    "public",
+    "return",
+    "set",
+    "static",
+    "super",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typeof",
+    "var",
+    "void",
+    "while",
+    "with",
+    "yield",
 ];
 
 // ---------------------------------------------------------------------------

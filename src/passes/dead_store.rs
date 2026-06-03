@@ -49,7 +49,11 @@ impl Pass for DeadStore {
             return false;
         }
 
-        let mut elim = Eliminator { dead: &dead, changed: false, _marker: std::marker::PhantomData };
+        let mut elim = Eliminator {
+            dead: &dead,
+            changed: false,
+            _marker: std::marker::PhantomData,
+        };
         traverse_mut(&mut elim, allocator, program, scoping, ());
         self.changed = elim.changed;
         self.changed

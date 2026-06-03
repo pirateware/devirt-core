@@ -81,8 +81,11 @@ impl Pass for DeadObjectProp {
         cls.visit_program(program);
 
         // 3. A binding is rewritable if it did not escape.
-        let live: HashSet<SymbolId> =
-            candidates.iter().copied().filter(|s| !cls.escaped.contains(s)).collect();
+        let live: HashSet<SymbolId> = candidates
+            .iter()
+            .copied()
+            .filter(|s| !cls.escaped.contains(s))
+            .collect();
         if live.is_empty() {
             return false;
         }
@@ -152,8 +155,10 @@ impl<'a, 's> Visit<'a> for CandidateCollector<'s> {
         if let oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(id) = &node.left {
             if let Some(sym) = self.ref_sym(id) {
                 // A compound assignment (`+=`) never establishes an object value.
-                let is_object = matches!(node.operator, oxc_syntax::operator::AssignmentOperator::Assign)
-                    && matches!(node.right, Expression::ObjectExpression(_));
+                let is_object = matches!(
+                    node.operator,
+                    oxc_syntax::operator::AssignmentOperator::Assign
+                ) && matches!(node.right, Expression::ObjectExpression(_));
                 self.record(sym, is_object);
             }
         }
@@ -183,7 +188,10 @@ impl<'a, 's, 'c> Visit<'a> for Classifier<'s, 'c> {
         if let Expression::Identifier(obj) = &m.object {
             if let Some(sym) = self.ref_sym(obj) {
                 if self.candidates.contains(&sym) {
-                    self.accessed.entry(sym).or_default().insert(m.property.name.to_string());
+                    self.accessed
+                        .entry(sym)
+                        .or_default()
+                        .insert(m.property.name.to_string());
                     return;
                 }
             }
@@ -253,12 +261,18 @@ impl<'a, 'r> Traverse<'a, ()> for Remover<'a, 'r> {
     }
 
     fn enter_expression(&mut self, expr: &mut Expression<'a>, ctx: &mut TraverseCtx<'a, ()>) {
-        let Expression::AssignmentExpression(a) = expr else { return };
+        let Expression::AssignmentExpression(a) = expr else {
+            return;
+        };
         let oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(id) = &a.left else {
             return;
         };
-        let Some(rid) = id.reference_id.get() else { return };
-        let Some(sym) = ctx.scoping().get_reference(rid).symbol_id() else { return };
+        let Some(rid) = id.reference_id.get() else {
+            return;
+        };
+        let Some(sym) = ctx.scoping().get_reference(rid).symbol_id() else {
+            return;
+        };
         if let Expression::ObjectExpression(obj) = &mut a.right {
             self.prune(sym, obj);
         }

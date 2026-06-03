@@ -88,7 +88,11 @@ pub enum Event<'a> {
         /// capture is off — the SSA fold never needs it, so it skips the clone).
         decl_init: Option<Expression<'a>>,
     },
-    Use { sym: SymbolId, kind: UseKind, node: NodeId },
+    Use {
+        sym: SymbolId,
+        kind: UseKind,
+        node: NodeId,
+    },
     /// An evaluation point that either has an observable side effect (a call/new,
     /// `++`/`--`, `delete`, or a write to a non-candidate or a member) or opens /
     /// closes a nested lexical scope (a `{ … }` block). It marks the ordered event
@@ -170,7 +174,11 @@ impl<'a, 'c> Lowerer<'a, 'c> {
         if self.bailed {
             return None;
         }
-        Some(Cfg { blocks: self.blocks, succs: self.succs, entry: 0 })
+        Some(Cfg {
+            blocks: self.blocks,
+            succs: self.succs,
+            entry: 0,
+        })
     }
 
     fn new_block(&mut self) -> BlockId {
@@ -194,7 +202,9 @@ impl<'a, 'c> Lowerer<'a, 'c> {
     }
 
     fn is_cand_ident(&self, e: &Expression<'a>) -> Option<SymbolId> {
-        let Expression::Identifier(idref) = e else { return None };
+        let Expression::Identifier(idref) = e else {
+            return None;
+        };
         let sym = self.ref_sym(idref)?;
         if self.cands.contains(&sym) {
             Some(sym)
@@ -236,8 +246,12 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             Statement::ForOfStatement(f) => self.lower_for_each(&f.right, &f.body),
             Statement::ForInStatement(f) => self.lower_for_each(&f.right, &f.body),
             Statement::SwitchStatement(sw) => self.lower_switch(sw),
-            Statement::BreakStatement(b) => self.lower_jump(b.label.as_ref().map(|l| l.name.as_str()), false),
-            Statement::ContinueStatement(c) => self.lower_jump(c.label.as_ref().map(|l| l.name.as_str()), true),
+            Statement::BreakStatement(b) => {
+                self.lower_jump(b.label.as_ref().map(|l| l.name.as_str()), false)
+            }
+            Statement::ContinueStatement(c) => {
+                self.lower_jump(c.label.as_ref().map(|l| l.name.as_str()), true)
+            }
             Statement::ReturnStatement(r) => {
                 if let Some(arg) = &r.argument {
                     self.lower_expr(arg);
@@ -277,7 +291,12 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                         };
                         // Declarator inits are not removed by the dead-store pass
                         // (it only rewrites `s = rhs` expression nodes).
-                        self.emit(Event::Def { sym, val, assign: None, decl_init });
+                        self.emit(Event::Def {
+                            sym,
+                            val,
+                            assign: None,
+                            decl_init,
+                        });
                     }
                 }
             }
@@ -322,7 +341,12 @@ impl<'a, 'c> Lowerer<'a, 'c> {
         let cont = self.new_block();
         self.add_edge(test_end, body);
         self.add_edge(test_end, cont);
-        self.loops.push(LoopCtx { label, is_loop: true, brk: cont, cont: header });
+        self.loops.push(LoopCtx {
+            label,
+            is_loop: true,
+            brk: cont,
+            cont: header,
+        });
         self.cur = body;
         self.lower_stmt(&w.body);
         let body_end = self.cur;
@@ -338,7 +362,12 @@ impl<'a, 'c> Lowerer<'a, 'c> {
         let latch = self.new_block();
         let cont = self.new_block();
         self.add_edge(after, body);
-        self.loops.push(LoopCtx { label, is_loop: true, brk: cont, cont: latch });
+        self.loops.push(LoopCtx {
+            label,
+            is_loop: true,
+            brk: cont,
+            cont: latch,
+        });
         self.cur = body;
         self.lower_stmt(&w.body);
         let body_end = self.cur;
@@ -377,7 +406,12 @@ impl<'a, 'c> Lowerer<'a, 'c> {
         let cont = self.new_block();
         self.add_edge(test_end, body);
         self.add_edge(test_end, cont);
-        self.loops.push(LoopCtx { label: for_label, is_loop: true, brk: cont, cont: update_b });
+        self.loops.push(LoopCtx {
+            label: for_label,
+            is_loop: true,
+            brk: cont,
+            cont: update_b,
+        });
         self.cur = body;
         self.lower_stmt(&f.body);
         let body_end = self.cur;
@@ -405,7 +439,12 @@ impl<'a, 'c> Lowerer<'a, 'c> {
         self.add_edge(after, header);
         self.add_edge(header, body_b);
         self.add_edge(header, cont);
-        self.loops.push(LoopCtx { label, is_loop: true, brk: cont, cont: header });
+        self.loops.push(LoopCtx {
+            label,
+            is_loop: true,
+            brk: cont,
+            cont: header,
+        });
         self.cur = body_b;
         self.lower_stmt(body);
         let body_end = self.cur;
@@ -438,12 +477,21 @@ impl<'a, 'c> Lowerer<'a, 'c> {
         }
         self.add_edge(test_cur, default_idx.map(|i| bodies[i]).unwrap_or(cont));
 
-        self.loops.push(LoopCtx { label: None, is_loop: false, brk: cont, cont });
+        self.loops.push(LoopCtx {
+            label: None,
+            is_loop: false,
+            brk: cont,
+            cont,
+        });
         for (i, case) in sw.cases.iter().enumerate() {
             self.cur = bodies[i];
             self.lower_stmts(&case.consequent);
             let end = self.cur;
-            let fall = if i + 1 < bodies.len() { bodies[i + 1] } else { cont };
+            let fall = if i + 1 < bodies.len() {
+                bodies[i + 1]
+            } else {
+                cont
+            };
             self.add_edge(end, fall);
         }
         self.loops.pop();
@@ -491,7 +539,12 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             other => {
                 // Labeled non-loop block: only `break label` applies.
                 let cont = self.new_block();
-                self.loops.push(LoopCtx { label: Some(label), is_loop: false, brk: cont, cont });
+                self.loops.push(LoopCtx {
+                    label: Some(label),
+                    is_loop: false,
+                    brk: cont,
+                    cont,
+                });
                 self.lower_stmt(other);
                 let end = self.cur;
                 self.add_edge(end, cont);
@@ -525,7 +578,11 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                         // they are handled at the assignment/declarator level, and
                         // escape analysis excludes any candidate with a non-simple
                         // write). Scalar const-prop target.
-                        self.emit(Event::Use { sym, kind: UseKind::Scalar, node: e.address() });
+                        self.emit(Event::Use {
+                            sym,
+                            kind: UseKind::Scalar,
+                            node: e.address(),
+                        });
                     }
                 }
             }
@@ -727,8 +784,16 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                     // `s = rhs`: rhs evaluates, then the def takes effect.
                     self.lower_expr(&a.right);
                     let val = self.classify_def(&a.right);
-                    let assign = Some(AssignInfo { node, rhs: a.right.clone_in(self.allocator) });
-                    self.emit(Event::Def { sym: sym.unwrap(), val, assign, decl_init: None });
+                    let assign = Some(AssignInfo {
+                        node,
+                        rhs: a.right.clone_in(self.allocator),
+                    });
+                    self.emit(Event::Def {
+                        sym: sym.unwrap(),
+                        val,
+                        assign,
+                        decl_init: None,
+                    });
                 } else {
                     // Non-candidate target, or compound assignment to a candidate
                     // (the latter is excluded by escape analysis, so it can't be a
@@ -768,7 +833,11 @@ impl<'a, 'c> Lowerer<'a, 'c> {
         }
         match rhs {
             Expression::ArrayExpression(arr) => {
-                if arr.elements.iter().any(|e| matches!(e, ArrayExpressionElement::SpreadElement(_))) {
+                if arr
+                    .elements
+                    .iter()
+                    .any(|e| matches!(e, ArrayExpressionElement::SpreadElement(_)))
+                {
                     return DefVal::Opaque;
                 }
                 let mut v = Vec::with_capacity(arr.elements.len());

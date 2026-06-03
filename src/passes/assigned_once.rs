@@ -45,7 +45,10 @@ impl Pass for AssignedOnceInline {
     fn run<'a>(&mut self, program: &mut Program<'a>, allocator: &'a Allocator) -> bool {
         let scoping = build_scoping(program);
 
-        let mut collector = Collector { values: HashMap::new(), poisoned: HashSet::new() };
+        let mut collector = Collector {
+            values: HashMap::new(),
+            poisoned: HashSet::new(),
+        };
         let scoping = traverse_mut(&mut collector, allocator, program, scoping, ());
 
         for sym in &collector.poisoned {
@@ -55,7 +58,10 @@ impl Pass for AssignedOnceInline {
             return false;
         }
 
-        let mut replacer = Replacer { values: &collector.values, changed: false };
+        let mut replacer = Replacer {
+            values: &collector.values,
+            changed: false,
+        };
         traverse_mut(&mut replacer, allocator, program, scoping, ());
         replacer.changed
     }
@@ -123,7 +129,14 @@ impl<'a> Traverse<'a, ()> for Collector<'a> {
             return;
         }
         let value = init.clone_in(ctx.ast.allocator);
-        self.values.insert(sym, Const { value, func_scope: scope, decl_end: node.span.end });
+        self.values.insert(
+            sym,
+            Const {
+                value,
+                func_scope: scope,
+                decl_end: node.span.end,
+            },
+        );
     }
 
     // A `for (var x of/in …)` head rebinds `x` on every iteration, but that write

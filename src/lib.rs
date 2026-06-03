@@ -31,7 +31,10 @@ pub fn format_only(source: &str, filename: &str) -> String {
     let allocator = Allocator::default();
     let source_type = SourceType::from_path(Path::new(filename)).unwrap_or_default();
     let parsed = Parser::new(&allocator, source, source_type)
-        .with_options(ParseOptions { preserve_parens: false, ..ParseOptions::default() })
+        .with_options(ParseOptions {
+            preserve_parens: false,
+            ..ParseOptions::default()
+        })
         .parse();
     Codegen::new()
         .with_options(CodegenOptions::default())
@@ -48,7 +51,10 @@ pub fn run_pass(source: &str, filename: &str, pass_name: &str) -> String {
     let allocator = Allocator::default();
     let source_type = SourceType::from_path(Path::new(filename)).unwrap_or_default();
     let parsed = Parser::new(&allocator, source, source_type)
-        .with_options(ParseOptions { preserve_parens: false, ..ParseOptions::default() })
+        .with_options(ParseOptions {
+            preserve_parens: false,
+            ..ParseOptions::default()
+        })
         .parse();
     let mut program = parsed.program;
     let mut p: Box<dyn pass::Pass> = match pass_name {
@@ -56,7 +62,10 @@ pub fn run_pass(source: &str, filename: &str, pass_name: &str) -> String {
         other => panic!("run_pass: unknown pass {other:?}"),
     };
     p.run(&mut program, &allocator);
-    Codegen::new().with_options(CodegenOptions::default()).build(&program).code
+    Codegen::new()
+        .with_options(CodegenOptions::default())
+        .build(&program)
+        .code
 }
 
 /// Deobfuscate `source`. `filename` is used only to infer the source type
@@ -68,7 +77,10 @@ pub fn deobfuscate(source: &str, filename: &str) -> Report {
     // Drop `ParenthesizedExpression` wrappers — they carry no meaning for
     // deobfuscation and would force every pass to see through them.
     let parsed = Parser::new(&allocator, source, source_type)
-        .with_options(ParseOptions { preserve_parens: false, ..ParseOptions::default() })
+        .with_options(ParseOptions {
+            preserve_parens: false,
+            ..ParseOptions::default()
+        })
         .parse();
     let parse_errors = parsed.errors.iter().map(|e| e.to_string()).collect();
 

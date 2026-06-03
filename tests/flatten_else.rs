@@ -4,7 +4,11 @@ use js_deobfuscator::deobfuscate;
 
 fn deob(src: &str) -> String {
     let r = deobfuscate(src, "t.js");
-    assert!(r.parse_errors.is_empty(), "parse errors: {:?}", r.parse_errors);
+    assert!(
+        r.parse_errors.is_empty(),
+        "parse errors: {:?}",
+        r.parse_errors
+    );
     assert!(r.converged, "did not converge");
     r.code
 }
@@ -13,20 +17,29 @@ fn deob(src: &str) -> String {
 fn else_after_return_is_flattened() {
     let out = deob("function g(c){ if (c) { return 1; } else { sideA(); sideB(); } return 9; }");
     assert!(!out.contains("else"), "else not flattened: {out}");
-    assert!(out.contains("sideA()") && out.contains("sideB()"), "body lost: {out}");
+    assert!(
+        out.contains("sideA()") && out.contains("sideB()"),
+        "body lost: {out}"
+    );
 }
 
 #[test]
 fn else_after_throw_break_continue_is_flattened() {
     let out = deob("function g(c){ for(;;){ if (c) { break; } else { work(); } } }");
-    assert!(!out.contains("else"), "else after break not flattened: {out}");
+    assert!(
+        !out.contains("else"),
+        "else after break not flattened: {out}"
+    );
     assert!(out.contains("work()"), "body lost: {out}");
 }
 
 #[test]
 fn else_kept_when_consequent_may_fall_through() {
     let out = deob("function g(c){ if (c) { maybe(); } else { other(); } return 9; }");
-    assert!(out.contains("else"), "else wrongly flattened (no terminator): {out}");
+    assert!(
+        out.contains("else"),
+        "else wrongly flattened (no terminator): {out}"
+    );
 }
 
 #[test]

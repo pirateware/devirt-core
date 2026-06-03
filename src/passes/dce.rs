@@ -75,10 +75,10 @@ fn keep_statement(s: &Statement<'_>, scoping: &Scoping) -> bool {
     match s {
         Statement::EmptyStatement(_) => false,
         Statement::VariableDeclaration(vd) => !vd.declarations.is_empty(),
-        Statement::FunctionDeclaration(f) => f
-            .id
-            .as_ref()
-            .is_none_or(|id| !is_removable_symbol(id.symbol_id(), scoping)),
+        Statement::FunctionDeclaration(f) => {
+            f.id.as_ref()
+                .is_none_or(|id| !is_removable_symbol(id.symbol_id(), scoping))
+        }
         // A bare literal statement (`80214130;`, `true;`, `null;`) computes a
         // value that is immediately discarded with no side effect — pure
         // obfuscation noise (often a spent opaque-predicate constant). Drop it.
@@ -131,4 +131,3 @@ fn keep_declarator(d: &VariableDeclarator<'_>, scoping: &Scoping) -> bool {
     let pure = d.init.as_ref().is_none_or(|e| is_pure_simple(e));
     !(is_removable_symbol(bid.symbol_id(), scoping) && pure)
 }
-

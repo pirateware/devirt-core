@@ -27,7 +27,11 @@ use super::dom::{BlockId, Dominators};
 /// resolved to the rewrite it enables.
 pub enum Resolved<'c, 'a> {
     /// A use reached by a constant definition — fold to the constant.
-    Const { node: NodeId, kind: &'c UseKind, val: &'c DefVal<'a> },
+    Const {
+        node: NodeId,
+        kind: &'c UseKind,
+        val: &'c DefVal<'a>,
+    },
     /// A scalar use reached by a copy `s = src` where `src` is provably unchanged
     /// since the copy — replace the use with `src`.
     Copy { node: NodeId, src: SymbolId },
@@ -161,7 +165,11 @@ pub fn resolve<'c, 'a>(cfg: &'c Cfg<'a>, dom: &Dominators) -> Vec<Resolved<'c, '
                             let reaching = stacks.get(sym).and_then(|s| s.last()).map(|(_, r)| *r);
                             match reaching {
                                 Some(Reaching::Concrete(val)) => {
-                                    resolved.push(Resolved::Const { node: *node, kind, val });
+                                    resolved.push(Resolved::Const {
+                                        node: *node,
+                                        kind,
+                                        val,
+                                    });
                                 }
                                 Some(Reaching::Copy { src, src_version }) => {
                                     // Propagate only a bare (scalar) read, and only
@@ -183,7 +191,10 @@ pub fn resolve<'c, 'a>(cfg: &'c Cfg<'a>, dom: &Dominators) -> Vec<Resolved<'c, '
                                         .and_then(|s| s.last())
                                         .map(|(v, _)| *v)
                                         .unwrap_or(0);
-                                    Reaching::Copy { src: *src, src_version: sv }
+                                    Reaching::Copy {
+                                        src: *src,
+                                        src_version: sv,
+                                    }
                                 }
                                 other => Reaching::Concrete(other),
                             };
@@ -242,8 +253,17 @@ mod tests {
         let s = sym(0);
         let folded = run(
             vec![vec![
-                Event::Def { sym: s, val: DefVal::Array(vec![]), assign: None, decl_init: None },
-                Event::Use { sym: s, kind: UseKind::Member(Key::Index(0)), node: addr(1) },
+                Event::Def {
+                    sym: s,
+                    val: DefVal::Array(vec![]),
+                    assign: None,
+                    decl_init: None,
+                },
+                Event::Use {
+                    sym: s,
+                    kind: UseKind::Member(Key::Index(0)),
+                    node: addr(1),
+                },
             ]],
             vec![vec![]],
         );
@@ -255,8 +275,17 @@ mod tests {
         let s = sym(0);
         let folded = run(
             vec![vec![
-                Event::Use { sym: s, kind: UseKind::Scalar, node: addr(1) },
-                Event::Def { sym: s, val: DefVal::Array(vec![]), assign: None, decl_init: None },
+                Event::Use {
+                    sym: s,
+                    kind: UseKind::Scalar,
+                    node: addr(1),
+                },
+                Event::Def {
+                    sym: s,
+                    val: DefVal::Array(vec![]),
+                    assign: None,
+                    decl_init: None,
+                },
             ]],
             vec![vec![]],
         );
@@ -269,14 +298,31 @@ mod tests {
         let s = sym(0);
         let folded = run(
             vec![
-                vec![],                                                          // b0
-                vec![Event::Def { sym: s, val: DefVal::Array(vec![]), assign: None, decl_init: None }],         // b1
-                vec![Event::Def { sym: s, val: DefVal::Array(vec![]), assign: None, decl_init: None }],         // b2
-                vec![Event::Use { sym: s, kind: UseKind::Scalar, node: addr(9) }], // b3
+                vec![], // b0
+                vec![Event::Def {
+                    sym: s,
+                    val: DefVal::Array(vec![]),
+                    assign: None,
+                    decl_init: None,
+                }], // b1
+                vec![Event::Def {
+                    sym: s,
+                    val: DefVal::Array(vec![]),
+                    assign: None,
+                    decl_init: None,
+                }], // b2
+                vec![Event::Use {
+                    sym: s,
+                    kind: UseKind::Scalar,
+                    node: addr(9),
+                }], // b3
             ],
             vec![vec![1, 2], vec![3], vec![3], vec![]],
         );
-        assert!(folded.is_empty(), "merge of two defs must be a phi (non-const)");
+        assert!(
+            folded.is_empty(),
+            "merge of two defs must be a phi (non-const)"
+        );
     }
 
     #[test]
@@ -286,13 +332,30 @@ mod tests {
         let s = sym(0);
         let folded = run(
             vec![
-                vec![Event::Def { sym: s, val: DefVal::Array(vec![]), assign: None, decl_init: None }], // b0
-                vec![Event::Def { sym: s, val: DefVal::Array(vec![]), assign: None, decl_init: None }], // b1
-                vec![Event::Use { sym: s, kind: UseKind::Scalar, node: addr(7) }], // b2
+                vec![Event::Def {
+                    sym: s,
+                    val: DefVal::Array(vec![]),
+                    assign: None,
+                    decl_init: None,
+                }], // b0
+                vec![Event::Def {
+                    sym: s,
+                    val: DefVal::Array(vec![]),
+                    assign: None,
+                    decl_init: None,
+                }], // b1
+                vec![Event::Use {
+                    sym: s,
+                    kind: UseKind::Scalar,
+                    node: addr(7),
+                }], // b2
             ],
             vec![vec![1, 2], vec![2], vec![]],
         );
-        assert!(folded.is_empty(), "reassignment on one path must block the fold");
+        assert!(
+            folded.is_empty(),
+            "reassignment on one path must block the fold"
+        );
     }
 
     #[test]
@@ -302,10 +365,19 @@ mod tests {
         let s = sym(0);
         let folded = run(
             vec![
-                vec![],                                                            // b0 eval a
-                vec![Event::Def { sym: s, val: DefVal::Array(vec![]), assign: None, decl_init: None }],           // b1 s=A
-                vec![Event::Use { sym: s, kind: UseKind::Member(Key::Index(0)), node: addr(5) }], // b2 use
-                vec![],                                                            // b3 merge
+                vec![], // b0 eval a
+                vec![Event::Def {
+                    sym: s,
+                    val: DefVal::Array(vec![]),
+                    assign: None,
+                    decl_init: None,
+                }], // b1 s=A
+                vec![Event::Use {
+                    sym: s,
+                    kind: UseKind::Member(Key::Index(0)),
+                    node: addr(5),
+                }], // b2 use
+                vec![], // b3 merge
             ],
             vec![vec![1, 3], vec![2, 3], vec![3], vec![]],
         );

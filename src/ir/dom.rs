@@ -65,7 +65,11 @@ impl Dominators {
         }
 
         let frontier = dominance_frontier(&preds, &idom);
-        Dominators { idom, rpo_num, frontier }
+        Dominators {
+            idom,
+            rpo_num,
+            frontier,
+        }
     }
 
     /// Is `b` reachable from entry?

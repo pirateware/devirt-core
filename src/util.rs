@@ -1,8 +1,6 @@
 //! Shared helpers for passes.
 
-use oxc_ast::ast::{
-    ArrayExpressionElement, Expression, ObjectPropertyKind, Program, PropertyKind,
-};
+use oxc_ast::ast::{ArrayExpressionElement, Expression, ObjectPropertyKind, Program, PropertyKind};
 use oxc_semantic::{Scoping, SemanticBuilder};
 
 /// Build `Scoping` for the current tree. Side effect: `SemanticBuilder` writes
@@ -10,7 +8,10 @@ use oxc_semantic::{Scoping, SemanticBuilder};
 /// after this call binding identifiers and identifier references are annotated
 /// and can be resolved during traversal.
 pub fn build_scoping(program: &Program<'_>) -> Scoping {
-    SemanticBuilder::new().build(program).semantic.into_scoping()
+    SemanticBuilder::new()
+        .build(program)
+        .semantic
+        .into_scoping()
 }
 
 /// A literal that is pure and freely duplicable, so inlining it at any number of
@@ -59,8 +60,10 @@ fn pure_object_property(prop: &ObjectPropertyKind<'_>) -> bool {
     // Getter/setter definitions are themselves side-effect-free to install; a
     // data property is pure iff its value is. In both cases the value is a
     // function or a pure expression, so the same predicate applies.
-    matches!(p.kind, PropertyKind::Init | PropertyKind::Get | PropertyKind::Set)
-        && is_pure_simple(&p.value)
+    matches!(
+        p.kind,
+        PropertyKind::Init | PropertyKind::Get | PropertyKind::Set
+    ) && is_pure_simple(&p.value)
 }
 
 fn pure_array_element(elem: &ArrayExpressionElement<'_>) -> bool {
