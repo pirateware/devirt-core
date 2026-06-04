@@ -19,6 +19,7 @@ mod sequence_split;
 mod unflatten;
 mod unflatten_cfg;
 mod unflatten_param;
+mod unflatten_string_order;
 
 pub use assigned_once::AssignedOnceInline;
 pub use computed_state::ComputedState;
@@ -39,6 +40,7 @@ pub use sequence_split::SequenceSplit;
 pub use unflatten::Unflatten;
 pub use unflatten_cfg::UnflattenCfg;
 pub use unflatten_param::UnflattenParam;
+pub use unflatten_string_order::UnflattenStringOrder;
 
 use crate::pass::Pass;
 
@@ -78,6 +80,14 @@ pub fn default_pipeline() -> Vec<Box<dyn Pass>> {
         // declines (a state that conditionally loops back to itself → do/while).
         // Runs after the linear forms so it only sees what they bailed on.
         Box::new(UnflattenCfg),
+        // String-array-order dispatcher (Cloudflare CFF): a `for (a = "…".split(…),
+        // i = 0; true;) switch (a[i++]) {…}` whose execution order is the static
+        // array order. Linearize by walking the constant key sequence. Runs after the
+        // integer-state unflatteners (a different state encoding) and, like them,
+        // early so the revealed straight-line code feeds the folds below. The order
+        // array becomes a literal once GlobalConstInline / member-normalize resolve
+        // the `a[k]["split"]` accesses upstream, so it fires on a later fixpoint round.
+        Box::new(UnflattenStringOrder),
         Box::new(ConstantFold::default()),
         Box::new(AssignedOnceInline),
         // Fingerprint algebraic operator-proxy functions (`fn(a,b)` that is really

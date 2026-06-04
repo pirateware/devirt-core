@@ -1757,6 +1757,61 @@ fn assert_declined(src: &str) {
 }
 
 #[test]
+fn string_order_chain_preserves_value_and_order() {
+    // The array order "2|0|1" must drive execution order, not the case-label order.
+    assert_equivalent(
+        "var log = ''; \
+         (function () { \
+           for (var a = \"2|0|1\".split(\"|\"), i = 0; true;) { \
+             switch (a[i++]) { \
+               case \"0\": log += 'b'; continue; \
+               case \"1\": log += 'c'; continue; \
+               case \"2\": log += 'a'; continue; \
+             } \
+             break; \
+           } \
+         })(); __r = log;",
+    );
+}
+
+#[test]
+fn string_order_return_terminal_preserves_value() {
+    // A `return` case stops the walk mid-array; later keys must not run.
+    assert_equivalent(
+        "__r = (function () { \
+           var log = ''; \
+           for (var a = \"0|1|2\".split(\"|\"), i = 0; true;) { \
+             switch (a[i++]) { \
+               case \"0\": log += 'x'; continue; \
+               case \"1\": return log + '!'; \
+               case \"2\": log += 'never'; continue; \
+             } \
+             break; \
+           } \
+           return log; \
+         })();",
+    );
+}
+
+#[test]
+fn string_order_param_cursor_preserves_value() {
+    // The real sample shape: `a`/`i` are dispatch-only params, assigned in the
+    // for-init. Side effects must run in array order ("1|0").
+    assert_equivalent(
+        "__r = (function () { \
+           var log = ''; \
+           (function (a, i) { \
+             for (a = \"1|0\".split(\"|\"), i = 0; true;) { \
+               switch (a[i++]) { case \"0\": log += 'p'; continue; case \"1\": log += 'q'; continue; } \
+               break; \
+             } \
+           })(); \
+           return log; \
+         })();",
+    );
+}
+
+#[test]
 fn conditional_nested_region_init_is_not_inlined() {
     // B1 wall (sample_1's shape): a constant written by an init function that runs
     // only inside a *conditionally-reached nested dispatcher case* must NOT be
@@ -2026,5 +2081,24 @@ fn computed_state_mutating_valueof_declines_soundly() {
         } while (b < 10 && out < 1000);
         __r = out;
         "#,
+    );
+}
+
+#[test]
+fn string_order_nonconstant_array_decline_preserves_value() {
+    // Adversarial: the order array is a runtime value (a split of a parameter), so the
+    // pass must decline. The value must still be preserved — proving the decline path
+    // stays sound. Side effects run in the runtime array order ("1|0").
+    assert_equivalent(
+        "__r = (function () { \
+           var log = ''; \
+           (function (src) { \
+             for (var a = src.split(\"|\"), i = 0; true;) { \
+               switch (a[i++]) { case \"0\": log += 'a'; continue; case \"1\": log += 'b'; continue; } \
+               break; \
+             } \
+           })(\"1|0\"); \
+           return log; \
+         })();",
     );
 }
