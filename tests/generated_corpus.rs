@@ -5,10 +5,10 @@
 //! arrays, control-flow flattening, dead-code injection, …) into
 //! `samples/generated/`, recording each sample's *known* console output in
 //! `manifest.json`. This test runs both the obfuscated original and its
-//! deobfuscated form in QuickJS and asserts each reproduces that exact output:
+//! deobfuscated form in Boa and asserts each reproduces that exact output:
 //!
 //!   * **original ≡ expected** — guards that the fixture itself is portable
-//!     (the seed runs the same in QuickJS as in the Node that generated the
+//!     (the seed runs the same in Boa as in the Node that generated the
 //!     manifest); a mismatch flags a non-portable seed, not a deobfuscator bug.
 //!   * **deobfuscated ≡ expected** — the real assertion: deobfuscation preserved
 //!     observable behavior across every obfuscation technique.
@@ -121,7 +121,7 @@ fn deobfuscation_preserves_output_across_obfuscation_profiles() {
                     };
 
                     // 1. The obfuscated fixture must itself reproduce the expected
-                    //    output in QuickJS — else the seed is non-portable (a
+                    //    output in Boa — else the seed is non-portable (a
                     //    fixture problem, recorded separately, not a deob failure).
                     let orig = behavior_signature(&src, budget);
                     if orig.outcome != RunOutcome::Completed || orig.output != case.expected {
@@ -171,7 +171,7 @@ fn deobfuscation_preserves_output_across_obfuscation_profiles() {
     // can't silently shrink the net).
     if !non_portable.is_empty() {
         eprintln!(
-            "\n{} non-portable fixture(s) (seed runs differently in QuickJS — fix the seed):",
+            "\n{} non-portable fixture(s) (seed runs differently in Boa — fix the seed):",
             non_portable.len()
         );
         for n in &non_portable {

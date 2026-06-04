@@ -3,6 +3,48 @@
 use oxc_ast::ast::{ArrayExpressionElement, Expression, ObjectPropertyKind, Program, PropertyKind};
 use oxc_semantic::{Scoping, SemanticBuilder};
 
+/// Run `f` in isolation and report whether it panicked.
+///
+/// On native targets it runs on a dedicated worker thread with an explicit
+/// `stack` size: Boa's recursive parser/VM and oxc's traversal lean hard on the
+/// native stack, and a stack overflow *aborts* (it cannot be caught), so the
+/// depth ceiling is made large and independent of the caller's stack. A panic
+/// inside `f` is contained — `join()` returns `Err(payload)` — so callers can
+/// degrade gracefully instead of crashing the host.
+///
+/// On `wasm32` there are no threads: `f` runs inline and the `stack` is whatever
+/// the module was linked with (see `.cargo/config.toml`). WASM uses `panic =
+/// abort`, so a panic there cannot be contained — it traps the instance. Callers
+/// must treat the `Ok` path as "did not panic" and rely on the linked stack size
+/// being large enough.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn run_isolated<R: Send>(
+    name: &str,
+    stack: usize,
+    f: impl FnOnce() -> R + Send,
+) -> std::thread::Result<R> {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name(name.to_string())
+            .stack_size(stack)
+            .spawn_scoped(scope, f)
+            .expect("spawn isolated worker thread")
+            .join()
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn run_isolated<R: Send>(
+    _name: &str,
+    _stack: usize,
+    f: impl FnOnce() -> R + Send,
+) -> std::thread::Result<R> {
+    // No threads on wasm; run inline. A panic here aborts the instance (wasm is
+    // `panic = abort`), so this never returns `Err` — the contract is upheld
+    // structurally rather than by containment.
+    Ok(f())
+}
+
 /// Build `Scoping` for the current tree. Side effect: `SemanticBuilder` writes
 /// `symbol_id`/`reference_id` back into the AST's interior-mutable cells, so
 /// after this call binding identifiers and identifier references are annotated

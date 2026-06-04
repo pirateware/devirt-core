@@ -261,9 +261,10 @@ impl<'a, 's> Visit<'a> for TableScan<'s> {
         //     read is the soundness hole that let a mutated `[]` keep its
         //     empty-literal identity and fold `t.length`→0 / `t[i]`→undefined.
         let maybe_mutator = match &node.callee {
-            Expression::StaticMemberExpression(m) => {
-                Some((MUTATOR_METHODS.contains(&m.property.name.as_str()), &m.object))
-            }
+            Expression::StaticMemberExpression(m) => Some((
+                MUTATOR_METHODS.contains(&m.property.name.as_str()),
+                &m.object,
+            )),
             Expression::ComputedMemberExpression(m) => {
                 let mutating = match &m.expression {
                     Expression::StringLiteral(s) => MUTATOR_METHODS.contains(&s.value.as_str()),

@@ -2,7 +2,7 @@
 //!
 //! The samples test proves the output re-parses and is idempotent, but not that
 //! it computes the same thing. Here we execute a battery of small obfuscated
-//! snippets and their deobfuscated forms in a fresh QuickJS context and require
+//! snippets and their deobfuscated forms in a fresh Boa context and require
 //! the observable result to match exactly. This is the real soundness net for
 //! every value-changing pass (const-fold, void/string folding, sequence split,
 //! dead-literal DCE, decoder lift): a pass that alters behavior fails here.

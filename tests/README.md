@@ -40,7 +40,7 @@ fn my_real_sample_test() { … }
 | Layer | File(s) | What it pins |
 |-------|---------|--------------|
 | **Pass units** | `const_fold`-style files, `rename.rs`, `unflatten*.rs`, `decoder_lift.rs`, … | Each pass does the right thing in isolation, free of pipeline interactions. |
-| **Snippet equivalence** | `equivalence.rs` | Hand-written obfuscated snippets evaluate to the *same value* before and after (QuickJS). The soundness net for value-changing passes. |
+| **Snippet equivalence** | `equivalence.rs` | Hand-written obfuscated snippets evaluate to the *same value* before and after (Boa). The soundness net for value-changing passes. |
 | **Sample invariants** | `samples.rs` | Every sample's output re-parses and is idempotent (a second run is a no-op). |
 | **Determinism** | `determinism.rs` | Byte-identical output across runs (frozen sandbox clock + stable emission order). |
 | **Golden snapshots** | `golden.rs` + `snapshots/` | Byte-exact output per sample, plus a readability `SCOREBOARD.md`. Catches *any* drift across the corpus. |
