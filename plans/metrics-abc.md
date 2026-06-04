@@ -83,8 +83,18 @@ as a sound decline + adversarial test + issue note:
   deterministic table evaluator with a bloat cap (B2/issue-11).
 - **s7 Base91 table** — host-property-coupled tail; needs a sound host model (F5).
 
+## A4 — dispatcher-agnostic substrate (landed ADDITIVE / unwired)
+`src/ir/dispatch.rs` (new): the `DispatchModel` trait (`entry`/`step`), a dialect-agnostic
+`StateVal` (Int/Str/Bool), one abstract interpreter (`interpret` → BFS state enumeration →
+`cff::RecoveredCfg`, sound-or-declines), the integer-state model, and 3 end-to-end tests
+proving interop with the A2 relooper (`structure_general`). +14 tests, byte-identical on all
+11 deterministic samples — **zero pipeline risk because it is unwired** (no production caller;
+the existing dialect passes remain the recognizers). Wiring a pass through it is the follow-up
+and MUST gate on byte-parity — land F1 (deterministic HashMap iteration) first so s3/s11 parity
+is measurable, or verify on the 11 deterministic samples only.
+
 ## Not attempted in this pass
-- **A4 dispatcher-agnostic substrate** — the architectural unification (`DispatchModel`
-  trait + one abstract interpreter). Best-effort isolated attempt launched separately,
-  strictly gated to zero-regression-or-additive.
+- Wiring an existing dialect pass through the A4 substrate (deferred on F1 determinism).
 - Workstream **D** (bytecode VM, s8/s9/s10) and **E/F** — out of the A/B/C scope.
+
+## Final suite: 268 tests green, clippy 0, fmt clean.
