@@ -1,0 +1,14 @@
+[package]
+name = "deob-server"
+version = "1.0.0"
+edition = "2021"
+description = "Minimal HTTP front end for the `deob` deobfuscator, for request-based deployment (Cloudflare Containers)."
+
+[[bin]]
+name = "server"
+path = "src/main.rs"
+
+# Intentionally dependency-free: the heavy work runs in a `deob` child process, so
+# the server only needs std (TcpListener + threads + std::process). Zero deps keeps
+# the container image tiny and the cold start fast.
+[dependencies]

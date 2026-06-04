@@ -1,0 +1,13 @@
+# Keep the build context small/fast. `target/` is gigabytes and must not be
+# copied; the image rebuilds from source. The runtime needs neither tests,
+# samples, nor docs.
+target/
+out/
+.git/
+deploy/node_modules/
+node_modules/
+samples/
+tests/snapshots/
+plans/
+issues/
+*.md

@@ -1,0 +1,38 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "js-deobfuscator",
+  "main": "worker/index.ts",
+  "compatibility_date": "2025-10-01",
+
+  // The container image. Path is relative to this file; the directory holding the
+  // Dockerfile (the repo root) becomes the Docker build context — so it can see
+  // Cargo.toml, src/, and server/.
+  //
+  // instance_type sizing: this deobfuscator is CPU-bound (~4s for a ~0.9 MB
+  // recaptcha bundle on a FULL core). vCPU is fractional below standard-2, which
+  // scales latency ~linearly, so standard-3 (2 vCPU / 8 GiB) is the recommended
+  // floor — full-core latency plus room to run ~2 deobs per instance. Do not use
+  // lite/basic for this workload.
+  "containers": [
+    {
+      "class_name": "DeobContainer",
+      "image": "../Dockerfile",
+      "instance_type": "standard-3",
+      "max_instances": 10
+    }
+  ],
+
+  "durable_objects": {
+    "bindings": [{ "name": "DEOB_CONTAINER", "class_name": "DeobContainer" }]
+  },
+
+  // Container-backed Durable Objects use SQLite storage.
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["DeobContainer"] }],
+
+  // Edge rate limiting (per client IP). `namespace_id` is just a unique integer
+  // label you choose to scope this limiter — it is not a provisioned resource.
+  // Tune limit/period to taste; this is the public-abuse brake.
+  "ratelimits": [
+    { "name": "RATE_LIMITER", "namespace_id": "1001", "simple": { "limit": 30, "period": 60 } }
+  ]
+}
