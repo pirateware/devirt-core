@@ -50,9 +50,9 @@
 //! This is **new, self-contained scaffolding**. It is unit-tested in isolation and
 //! is *not yet wired* into the pipeline — the existing dialect passes remain the
 //! production recognizers (re-routing them is a follow-up that must prove byte-for-
-//! byte parity on the sample corpus before it lands; see Plan A4). Building the
-//! trait + interpreter + the integer-state model first, green and unwired, is the
-//! low-risk first step the roadmap calls for.
+//! byte parity on the sample corpus before it lands). Building the trait +
+//! interpreter + the integer-state model first, green and unwired, is the
+//! low-risk first step.
 //!
 //! Because the substrate is deliberately unwired, its public surface has no
 //! production caller yet (only the unit tests below exercise it). We therefore

@@ -128,7 +128,7 @@ pub struct Sandbox {
 /// `Arr` carries a flat array of primitives (no nesting, no holes) so an
 /// array-returning decoder can be materialized as an array literal. It is
 /// deliberately shallow: the splice path caps the element count so a huge bytecode
-/// table is never expanded (net-negative — see `issues/09`).
+/// table is never expanded (net-negative — see `MAX_ARRAY_ELEMS`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum EvalValue {
     Str(String),
@@ -175,6 +175,11 @@ impl Sandbox {
     /// both agree — so a value that genuinely depends on RNG (non-reproducible at
     /// runtime) is refused, while one independent of RNG lifts reproducibly.
     pub fn new_seeded(seed: u32) -> Option<Sandbox> {
+        // Experiment hatch: `DEOB_NO_SANDBOX=1` disables all sandbox-backed passes
+        // (decoder_lift / math_fingerprint / pure_eval bail to no-op on None).
+        if std::env::var_os("DEOB_NO_SANDBOX").is_some() {
+            return None;
+        }
         let rt = Runtime::new().ok()?;
         rt.set_memory_limit(128 * 1024 * 1024);
         rt.set_max_stack_size(2 * 1024 * 1024);
@@ -258,7 +263,7 @@ impl Sandbox {
 /// Hard cap on the number of array elements (across all nesting) any single
 /// `eval_to_value` result may materialize. This keeps the array-splice from ever
 /// expanding a large packed table (e.g. a VM bytecode array) into a giant literal,
-/// which would bloat output for no readability win (`issues/09`).
+/// which would bloat output for no readability win.
 const MAX_ARRAY_ELEMS: usize = 64;
 
 // ---------------------------------------------------------------------------
