@@ -1469,7 +1469,7 @@ impl<'a> Visit<'a> for DataCollector {
 fn build_preamble<'a>(
     tops: &[&Statement<'a>],
     analysis: &Analysis,
-    aliases: &HashMap<String, String>,
+    aliases: &HashMap<String, AliasDef>,
     allowed: &HashSet<String>,
     local_data: &[(String, String)],
     nested_funcs: &[Statement<'a>],
@@ -1520,9 +1520,10 @@ fn build_preamble<'a>(
         code.push(';');
     }
 
-    // Alias definitions, so calls through `var v = decoder` resolve.
-    for (a, b) in aliases {
-        code.push_str(&format!("\nvar {a} = {b};"));
+    // Alias definitions, so calls through `var v = decoder` (or `decoder.bind(x)`)
+    // resolve. The `emit` source reproduces the alias exactly as written.
+    for (a, def) in aliases {
+        code.push_str(&format!("\nvar {a} = {};", def.emit));
     }
 
     // Local pure-data key tables (`var t = {g:219,...}`), so calls of the form
@@ -1567,83 +1568,189 @@ fn statement_is_pure(stmt: &Statement<'_>, analysis: &Analysis) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Alias resolution: `v = decoder` / `var v = decoder`
+// Alias resolution: `v = decoder` / `var v = decoder` / `var v = decoder.bind(x)`
 // ---------------------------------------------------------------------------
 
-fn collect_aliases(program: &Program<'_>, pure_funcs: &HashSet<String>) -> HashMap<String, String> {
-    // 1. Collect identifier→identifier assignment edges (`a = b`). A name is
-    //    disqualified if it is ever assigned a non-identifier or two different
-    //    identifiers (then it isn't a stable alias).
+/// A resolved decoder alias. `target` is the pure decoder it ultimately points at
+/// (used for groundedness/cycle resolution); `emit` is the exact RHS source the
+/// preamble re-binds the alias to. For a bare-identifier alias these match
+/// (`emit == target`); for a `.bind()` accessor alias `emit` is the full
+/// `target.bind(<args>)` expression so the sandboxed alias behaves identically.
+#[derive(Clone, Debug)]
+struct AliasDef {
+    #[allow(dead_code)] // retained for groundedness/debugging; emit drives codegen
+    target: String,
+    emit: String,
+}
+
+/// One assignment edge for a candidate alias: the identifier it forwards through
+/// (`target_ident`) and, for a `.bind()` accessor alias, the rendered argument
+/// list (`bind_args = Some("null")` → emit `<resolved>.bind(null)`). A bare-
+/// identifier alias has `bind_args == None` and emits the resolved target name.
+#[derive(Clone, PartialEq)]
+struct AliasEdge {
+    target_ident: String,
+    bind_args: Option<String>,
+}
+
+fn collect_aliases(
+    program: &Program<'_>,
+    pure_funcs: &HashSet<String>,
+) -> HashMap<String, AliasDef> {
+    // 1. Collect alias assignment edges. A name is disqualified if it is ever
+    //    assigned an unrecognized RHS or two different alias edges.
     let mut c = AliasCollector {
         edges: HashMap::new(),
         disqualified: HashSet::new(),
     };
     c.visit_program(program);
 
-    // 2. Resolve each edge transitively to the pure decoder it ultimately
-    //    points at: a -> b -> ... -> decoder.
+    // 2. Resolve each edge transitively to the pure decoder it ultimately points
+    //    at: `a -> b -> ... -> decoder`. Only the *first* edge may carry a `.bind`;
+    //    the remaining hops must be bare-identifier forwards (composing two binds is
+    //    not a simple forwarder, so such a chain is declined). The emitted source is
+    //    rebuilt from the resolved pure-func name so the preamble never depends on an
+    //    intermediate alias's own (possibly out-of-order) declaration.
     let mut out = HashMap::new();
-    for name in c.edges.keys() {
+    for (name, edge) in &c.edges {
         if c.disqualified.contains(name) {
             continue;
         }
-        let mut cur = c.edges[name].clone();
-        for _ in 0..32 {
+        let mut cur = edge.target_ident.clone();
+        let mut ok = true;
+        let mut resolved: Option<String> = None;
+        for hop in 0..32 {
             if c.disqualified.contains(&cur) {
                 break;
             }
             if pure_funcs.contains(&cur) {
-                out.insert(name.clone(), cur);
+                resolved = Some(cur.clone());
                 break;
             }
             match c.edges.get(&cur) {
-                Some(next) => cur = next.clone(),
+                Some(next) => {
+                    // A `.bind` may only appear on the first edge; an intermediate
+                    // bind would compose receivers — decline the whole chain.
+                    if hop > 0 && next.bind_args.is_some() {
+                        ok = false;
+                        break;
+                    }
+                    cur = next.target_ident.clone();
+                }
                 None => break,
             }
+        }
+        if let (true, Some(target)) = (ok, resolved) {
+            let emit = match &edge.bind_args {
+                Some(args) => format!("{target}.bind({args})"),
+                None => target.clone(),
+            };
+            out.insert(name.clone(), AliasDef { target, emit });
         }
     }
     out
 }
 
 struct AliasCollector {
-    edges: HashMap<String, String>,
+    edges: HashMap<String, AliasEdge>,
     disqualified: HashSet<String>,
 }
 
 impl AliasCollector {
-    fn record(&mut self, name: String, rhs: Option<&str>) {
-        match rhs {
-            Some(b) => match self.edges.get(&name) {
-                Some(prev) if prev != b => {
+    fn record(&mut self, name: String, edge: Option<AliasEdge>) {
+        match edge {
+            Some(e) => match self.edges.get(&name) {
+                Some(prev) if *prev != e => {
                     self.disqualified.insert(name); // two different targets
                 }
                 _ => {
-                    self.edges.insert(name, b.to_string());
+                    self.edges.insert(name, e);
                 }
             },
             None => {
-                self.disqualified.insert(name); // assigned a non-identifier
+                self.disqualified.insert(name); // assigned an unrecognized RHS
             }
         }
+    }
+}
+
+/// Recognize an alias RHS. Two sound shapes:
+///   * a bare identifier `dec` — `emit == target == "dec"`;
+///   * `dec.bind(<args>)` where `dec` is a bare identifier and every argument is a
+///     pure-data literal (or `null`/`undefined`/`this`-free). `.bind` only sets the
+///     receiver/leading args; since a classified-pure decoder never uses `this`,
+///     the binding is observationally a no-op forwarder, so `target` is `dec` and
+///     `emit` is the literal `dec.bind(<args>)` source for the sandbox.
+fn classify_alias_rhs(rhs: &Expression<'_>) -> Option<AliasEdge> {
+    match rhs {
+        Expression::Identifier(b) => Some(AliasEdge {
+            target_ident: b.name.to_string(),
+            bind_args: None,
+        }),
+        Expression::CallExpression(call) => {
+            let Expression::StaticMemberExpression(m) = &call.callee else {
+                return None;
+            };
+            if m.property.name != "bind" {
+                return None;
+            }
+            let Expression::Identifier(base) = &m.object else {
+                return None;
+            };
+            // Every bind argument must be pure data (a literal, `null`, or a
+            // global-object handle / `undefined`) so the emitted source carries no
+            // host/runtime dependency the sandbox can't reproduce.
+            let args_ok = call.arguments.iter().all(|a| match a.as_expression() {
+                Some(Expression::Identifier(id)) => {
+                    id.name == "undefined" || GLOBALS.contains(&id.name.as_str())
+                }
+                Some(e) => is_pure_data(e),
+                None => false, // spread
+            });
+            if !args_ok {
+                return None;
+            }
+            // Render just the argument list; the emit is rebuilt against the
+            // *resolved* pure-func name during chain resolution.
+            let mut parts = Vec::new();
+            for a in &call.arguments {
+                let e = a.as_expression()?;
+                let mut cg = Codegen::new();
+                cg.print_expression(e);
+                parts.push(cg.into_source_text());
+            }
+            Some(AliasEdge {
+                target_ident: base.name.to_string(),
+                bind_args: Some(parts.join(", ")),
+            })
+        }
+        _ => None,
     }
 }
 
 impl<'a> Visit<'a> for AliasCollector {
     fn visit_assignment_expression(&mut self, node: &oxc_ast::ast::AssignmentExpression<'a>) {
         if let oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(target) = &node.left {
-            let rhs = match &node.right {
-                Expression::Identifier(b) => Some(b.name.as_str()),
-                _ => None,
+            let edge = if matches!(
+                node.operator,
+                oxc_syntax::operator::AssignmentOperator::Assign
+            ) {
+                classify_alias_rhs(&node.right)
+            } else {
+                None // compound assignment is never a clean alias
             };
-            self.record(target.name.to_string(), rhs);
+            self.record(target.name.to_string(), edge);
         }
         oxc_ast_visit::walk::walk_assignment_expression(self, node);
     }
 
     fn visit_variable_declarator(&mut self, node: &oxc_ast::ast::VariableDeclarator<'a>) {
         if let BindingPattern::BindingIdentifier(id) = &node.id {
-            if let Some(Expression::Identifier(b)) = &node.init {
-                self.record(id.name.to_string(), Some(b.name.as_str()));
+            if let Some(init) = &node.init {
+                // An initializer that is not a recognized alias shape (`dec` /
+                // `dec.bind(x)`) disqualifies the name — same as the old bare-ident
+                // path treated a non-identifier RHS as `None`.
+                self.record(id.name.to_string(), classify_alias_rhs(init));
             }
         }
         oxc_ast_visit::walk::walk_variable_declarator(self, node);

@@ -236,6 +236,51 @@ fn does_not_lift_memo_decoder_with_observed_cache() {
 }
 
 #[test]
+fn lifts_through_bind_accessor_alias() {
+    // C3: a decoder aliased through `.bind()` (`g = dec.bind(null)`). `dec` is a
+    // pure, `this`-free decoder, so `g(i)` is observationally `dec(i)` and the call
+    // through the bound alias must lift to the decoded literal.
+    let src = r#"
+        (function () {
+            var tbl = ["alpha", "beta", "gamma"];
+            function dec(i) { return tbl[i]; }
+            var g = dec.bind(null);
+            sink(g(0), g(2));
+        })();
+    "#;
+    let out = deobfuscate(src, "t.js").code;
+    assert!(
+        out.contains("\"alpha\"") && out.contains("\"gamma\""),
+        "bound accessor-alias decode not lifted: {out}"
+    );
+    assert!(!out.contains("g("), "bound alias call survived: {out}");
+}
+
+#[test]
+fn does_not_lift_reassigned_bind_alias() {
+    // Adversarial: the bound alias `g` is reassigned to something else, so a baked
+    // `g = dec.bind(null)` would be stale at the call site. The `unstable` gate must
+    // drop it and leave the calls in place.
+    let src = r#"
+        (function () {
+            var tbl = ["alpha", "beta", "gamma"];
+            function dec(i) { return tbl[i]; }
+            var g = dec.bind(null);
+            g = other;
+            sink(g(0), g(2));
+        })();
+    "#;
+    let out = deobfuscate(src, "t.js").code;
+    // The alias is reassigned, so it must not be lifted: the calls must NOT be
+    // decoded into `sink("alpha", "gamma")`, and the reassignment must survive.
+    assert!(
+        !out.contains(r#"sink("alpha", "gamma")"#),
+        "reassigned bound alias must not be lifted: {out}"
+    );
+    assert!(out.contains("other"), "reassignment lost: {out}");
+}
+
+#[test]
 fn lifts_object_keyed_arguments() {
     // Argument is a member of a pure object literal — still fully evaluable.
     let src = r#"
