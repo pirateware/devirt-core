@@ -21,8 +21,13 @@ readability metrics over time.
 
 ## Samples
 
+Real-world obfuscated scripts (`samples/sample_*.js`) plus a generated synthetic
+corpus (`samples/generated/`, from `samples/seeds/` via `scripts/gen-samples.js`).
+
 ```
 https://js.datadome.co/tags.js
+https://www.gstatic.com/recaptcha/releases/ne1iDVwClkE7nKD3uA9Vqsvl/recaptcha__en.js   (sample_14)
+https://hcaptcha.com/1/api.js   (sample_15)
 https://www.google.com/recaptcha/api.js
 https://www.gstatic.com/recaptcha/releases/U5VsmTDhJM1iOJUyw4DEUTYv/recaptcha__en.js
 https://grok.com/cdn-cgi/challenge-platform/scripts/jsd/main.js
