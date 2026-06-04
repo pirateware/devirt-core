@@ -23,6 +23,9 @@ mod consts;
 mod dom;
 mod inline;
 mod ordering;
+// Structured relooper over a reducible `RecoveredCfg` (Plan A2). Used by the
+// `unflatten-cfg` pass for general branch/loop dispatcher recovery.
+pub(crate) mod relooper;
 mod ssa;
 
 pub use consts::ConstResolver;

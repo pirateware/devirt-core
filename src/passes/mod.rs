@@ -1,6 +1,7 @@
 //! Pass registry. Add new passes here and to `default_pipeline()`.
 
 mod assigned_once;
+mod computed_state;
 mod const_fold;
 mod dce;
 mod dead_object_prop;
@@ -20,6 +21,7 @@ mod unflatten_cfg;
 mod unflatten_param;
 
 pub use assigned_once::AssignedOnceInline;
+pub use computed_state::ComputedState;
 pub use const_fold::ConstantFold;
 pub use dce::Dce;
 pub use dead_object_prop::DeadObjectProp;
@@ -56,6 +58,12 @@ pub fn default_pipeline() -> Vec<Box<dyn Pass>> {
         // values it consumes are produced upstream by decoder-lift's base-N
         // arithmetic materialization, so it fires on a later fixpoint round.
         Box::new(GlobalConstInline),
+        // Normalize a *computed/object-state* discriminant (`switch(obj + counter)`
+        // where `obj` provably coerces to a constant) into a plain counter
+        // dispatcher (`switch(counter)` with offset labels), so the unflatteners
+        // below can recover it. Declines on a mutating/opaque coercion (sample_4).
+        // Runs before `Unflatten` so the normalized switch feeds it the same round.
+        Box::new(ComputedState::default()),
         // Unflatten the integer-state `while(s){switch(s){…}}` control-flow
         // dispatcher back into the straight-line sequence it encodes. Runs early
         // (after sequence-split splits comma chains in cases into clean top-level

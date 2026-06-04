@@ -1731,6 +1731,31 @@ fn pure_expression_resolution_preserves_value() {
     );
 }
 
+/// Assert the deobfuscation both preserves the value AND removes the flattened
+/// dispatcher (the recovered code contains no `switch`). This is the A2 relooper
+/// firing: the proof that we structured, not just stayed equivalent by declining.
+fn assert_structured(src: &str) {
+    assert_equivalent(src);
+    let deob = js_deobfuscator::deobfuscate(src, "t.js");
+    assert!(
+        !deob.code.contains("switch"),
+        "expected the dispatcher to be structured away, but a switch remains:\n{}",
+        deob.code
+    );
+}
+
+/// Like `assert_structured` but the *opposite*: the pass must DECLINE (a `switch`
+/// remains) — the adversarial / unsupported sibling. Value still preserved.
+fn assert_declined(src: &str) {
+    assert_equivalent(src);
+    let deob = js_deobfuscator::deobfuscate(src, "t.js");
+    assert!(
+        deob.code.contains("switch"),
+        "expected the dispatcher to be left intact (declined), but it was structured:\n{}",
+        deob.code
+    );
+}
+
 #[test]
 fn conditional_nested_region_init_is_not_inlined() {
     // B1 wall (sample_1's shape): a constant written by an init function that runs
@@ -1748,6 +1773,24 @@ fn conditional_nested_region_init_is_not_inlined() {
                case 3: out.push('' + L); s = 0; break; } } \
              function init(){ L = 9; } } \
            disp(1); return out.join(','); })();",
+    );
+}
+
+#[test]
+fn relooper_structures_two_state_loop() {
+    // state1 branches to body(2) or exit; body returns to 1 (a `while` with a guard).
+    assert_structured(
+        r#"
+        var acc = 0, i = 0;
+        var s = 1;
+        while (s) {
+            switch (s) {
+                case 1: if (i < 4) { s = 2; } else { s = 0; } break;
+                case 2: acc += i; i = i + 1; s = 1; break;
+            }
+        }
+        __r = acc + ":" + i;
+        "#,
     );
 }
 
@@ -1772,5 +1815,216 @@ fn nondeterministic_and_nonpure_writes_are_not_resolved() {
            function init(){ T = 100; U = T / 0; } init(); \
            function read(){ return (U === Infinity); } \
            return read(); })();",
+    );
+}
+
+#[test]
+fn relooper_structures_forward_diamond() {
+    // A forward branch that re-merges (an `if/else` with a shared continuation).
+    assert_structured(
+        r#"
+        var v = 0;
+        var cond = String(1) === "1";
+        var s = 1;
+        while (s) {
+            switch (s) {
+                case 1: if (cond) { s = 2; } else { s = 3; } break;
+                case 2: v = 10; s = 4; break;
+                case 3: v = 20; s = 4; break;
+                case 4: v += 1; s = 0; break;
+            }
+        }
+        __r = v;
+        "#,
+    );
+}
+
+#[test]
+fn relooper_structures_loop_containing_branch() {
+    // A loop whose body has an internal diamond (state 2 → {3,4} → 5 → back to 1).
+    assert_structured(
+        r#"
+        var sum = 0, i = 0;
+        var s = 1;
+        while (s) {
+            switch (s) {
+                case 1: if (i >= 5) { s = 0; } else { s = 2; } break;
+                case 2: if (i % 2 === 0) { s = 3; } else { s = 4; } break;
+                case 3: sum += i; s = 5; break;
+                case 4: sum -= i; s = 5; break;
+                case 5: i = i + 1; s = 1; break;
+            }
+        }
+        __r = sum + ":" + i;
+        "#,
+    );
+}
+
+#[test]
+fn relooper_structures_nested_loops() {
+    // An outer loop over `i` containing an inner loop over `j` — two back edges,
+    // distinct headers, break/continue at each level.
+    assert_structured(
+        r#"
+        var total = 0, i = 0, j = 0;
+        var s = 1;
+        while (s) {
+            switch (s) {
+                case 1: if (i < 3) { s = 2; } else { s = 0; } break;
+                case 2: j = 0; s = 3; break;
+                case 3: if (j < 3) { s = 4; } else { s = 5; } break;
+                case 4: total = total + i * j; j = j + 1; s = 3; break;
+                case 5: i = i + 1; s = 1; break;
+            }
+        }
+        __r = total;
+        "#,
+    );
+}
+
+#[test]
+fn relooper_structures_branch_arms_reentering_loop() {
+    // Both arms of an in-loop branch continue the loop (no merge): each arm ends in
+    // its own back edge. Exercises break (state 1 exit) + continue from two arms.
+    assert_structured(
+        r#"
+        var a = 0, b = 0, i = 0;
+        var s = 1;
+        while (s) {
+            switch (s) {
+                case 1: if (i >= 6) { s = 0; } else { s = 2; } break;
+                case 2: if (i % 3 === 0) { s = 3; } else { s = 4; } break;
+                case 3: a += i; i = i + 1; s = 1; break;
+                case 4: b += i; i = i + 1; s = 1; break;
+            }
+        }
+        __r = a + ":" + b;
+        "#,
+    );
+}
+
+#[test]
+fn relooper_structures_loop_with_return_terminator() {
+    // A mixed terminator: one arm `return`s out of the function, the loop exits via
+    // the other. The return content is preserved verbatim.
+    assert_structured(
+        r#"
+        __r = (function () {
+            var n = 0;
+            var s = 1;
+            while (s) {
+                switch (s) {
+                    case 1: if (n >= 10) { return n * 2; } else { s = 2; } break;
+                    case 2: n = n + 3; s = 1; break;
+                }
+            }
+            return -1;
+        })();
+        "#,
+    );
+}
+
+#[test]
+fn relooper_declines_irreducible() {
+    // Two states with cross edges (a jump into a loop body): irreducible. The pass
+    // must decline — the dispatcher stays, value preserved either way.
+    assert_declined(
+        r#"
+        var v = 0, i = 0;
+        var enter = (String(1) === "1") ? 2 : 3;
+        var s = 1;
+        while (s) {
+            switch (s) {
+                case 1: s = enter; break;
+                case 2: v += 1; i = i + 1; if (i < 3) { s = 3; } else { s = 0; } break;
+                case 3: v += 10; i = i + 1; if (i < 3) { s = 2; } else { s = 0; } break;
+            }
+        }
+        __r = v;
+        "#,
+    );
+}
+
+#[test]
+fn computed_state_constant_object_discriminant_preserves_value() {
+    // A3 (deterministic subcase): the discriminant is `obj + counter` where `obj`
+    // provably coerces to a constant. Equivalent to a counter-offset dispatcher,
+    // and the recognizer normalizes + structures it away.
+    assert_structured(
+        r#"
+        var out = 0;
+        var b = 0;
+        var t = { valueOf: function () { return 100; } };
+        do {
+            switch (t + b) {
+                case 100: out += 1; b += 1; break;
+                case 101: out += 10; b += 1; break;
+                case 102: out += 100; b = 99; break;
+            }
+        } while (b < 50);
+        __r = out;
+        "#,
+    );
+    // `new Number(C)` object, subtraction discriminant `obj - counter`.
+    assert_structured(
+        r#"
+        var acc = 0;
+        var i = 0;
+        var t = new Number(10);
+        do {
+            switch (t - i) {
+                case 10: acc += 5; i -= 1; break;
+                case 11: acc += 7; i -= 1; break;
+                case 12: acc += 9; i = -90; break;
+            }
+        } while (i > -50);
+        __r = acc;
+        "#,
+    );
+}
+
+#[test]
+fn computed_state_string_counter_declines_soundly() {
+    // A3 soundness gate: the counter is a STRING, so `t + b` concatenates rather
+    // than adds — `switch(C + b)` is NOT `switch(b)` with offset labels. The
+    // recognizer must decline (the numericness gate fails). Value preserved.
+    assert_declined(
+        r#"
+        var out = "";
+        var b = "x";
+        var t = { valueOf: function () { return 100; } };
+        var guard = 0;
+        do {
+            switch (t + b) {
+                case "100x": out += "A"; b = "y"; break;
+                case "100y": out += "B"; b = "z"; break;
+                default: guard = 1;
+            }
+        } while (guard === 0);
+        __r = out;
+        "#,
+    );
+}
+
+#[test]
+fn computed_state_mutating_valueof_declines_soundly() {
+    // A3 adversarial: a per-read MUTATING valueOf (the sample_4 shape — the object
+    // re-applies a transform on each coercion). The next state is not statically a
+    // pure function of the counter, so the recognizer MUST decline. Value preserved.
+    assert_equivalent(
+        r#"
+        var out = 0;
+        var b = 0;
+        var t = { n: 0, valueOf: function () { this.n = this.n + 1; return this.n; } };
+        do {
+            switch (t + b) {
+                case 1: out += 1; b += 0; break;
+                case 3: out += 10; b += 0; break;
+                case 5: out += 100; b += 0; break;
+                default: b = 99;
+            }
+        } while (b < 10 && out < 1000);
+        __r = out;
+        "#,
     );
 }

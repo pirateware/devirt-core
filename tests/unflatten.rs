@@ -51,15 +51,21 @@ fn dispatcher_with_external_state_use_is_kept() {
 }
 
 #[test]
-fn cyclic_dispatcher_is_kept() {
-    // A revisited state is a real loop, not a linear chain — must not unflatten.
+fn cyclic_dispatcher_is_not_linearized() {
+    // A revisited state is a real loop, not a linear chain — the *linear*
+    // unflattener must not flatten it into a finite `a();b();a();b();…` sequence.
+    // (The A2 relooper legitimately re-structures it into a `while` loop; what must
+    // never happen is a linearization that drops the loop.) We assert the loop is
+    // preserved AS a loop and the body order a-before-b is kept.
     let out = deob(
         "var s = 1; while (s) { switch (s) { case 1: a(); s = 2; break; case 2: b(); s = 1; break; } }",
     );
-    assert!(
-        out.contains("switch"),
-        "cyclic dispatcher wrongly unflattened: {out}"
-    );
+    assert!(out.contains("while"), "loop not preserved: {out}");
+    // Exactly one `a()` and one `b()` — not linearized/unrolled.
+    assert_eq!(out.matches("a()").count(), 1, "a() unrolled: {out}");
+    assert_eq!(out.matches("b()").count(), 1, "b() unrolled: {out}");
+    let (ia, ib) = (out.find("a()").unwrap(), out.find("b()").unwrap());
+    assert!(ia < ib, "body order wrong: {out}");
 }
 
 // --- Generalized loop shapes (redesign) -----------------------------------
@@ -195,16 +201,19 @@ fn fall_through_off_end_is_kept() {
 }
 
 #[test]
-fn real_do_while_loop_is_kept() {
-    // A genuine loop (revisits state 1) must NOT be linearized.
+fn real_do_while_loop_is_not_linearized() {
+    // A genuine loop (revisits state 1) must NOT be linearized into a finite
+    // sequence. The A2 relooper re-structures the dispatcher into a `while` loop;
+    // the loop must survive (one `a()`/`b()`, body order preserved).
     let out = deob(
         "var s = 1; do { switch (s) { \
          case 1: a(); s = 2; break; case 2: b(); s = 1; break; } } while (s);",
     );
-    assert!(
-        out.contains("switch"),
-        "cyclic do-while wrongly unflattened: {out}"
-    );
+    assert!(out.contains("while"), "loop not preserved: {out}");
+    assert_eq!(out.matches("a()").count(), 1, "a() unrolled: {out}");
+    assert_eq!(out.matches("b()").count(), 1, "b() unrolled: {out}");
+    let (ia, ib) = (out.find("a()").unwrap(), out.find("b()").unwrap());
+    assert!(ia < ib, "body order wrong: {out}");
 }
 
 #[test]
