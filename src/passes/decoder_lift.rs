@@ -2168,21 +2168,47 @@ impl<'a, 'r> Traverse<'a, ()> for Lifter<'a, 'r> {
 
         if let Some(val) = lift {
             let span = expr.span();
-            *expr = match val {
-                EvalValue::Str(s) => {
-                    let value = ctx.ast.str(&s);
-                    ctx.ast.expression_string_literal(span, value, None)
-                }
-                // A numeric/boolean decoder result must splice as that literal
-                // kind, not as a string — `dec(x) + 1` must stay arithmetic.
-                EvalValue::Num(n) if n.is_finite() => num_literal(n, span, ctx),
-                EvalValue::Bool(b) => ctx.ast.expression_boolean_literal(span, b),
-                // NaN / Infinity have no literal form; leave the call in place.
-                EvalValue::Num(_) => return,
+            // Build the replacement literal (incl. a size-capped array literal for
+            // an array-returning decoder). A non-finite number, or any array
+            // containing one, has no literal form → decline (leave the call).
+            let Some(replacement) = eval_value_to_expr(&val, span, ctx) else {
+                return;
             };
+            *expr = replacement;
             self.changed = true;
         }
     }
+}
+
+/// Build an AST literal expression for an [`EvalValue`], or `None` when no literal
+/// form exists (NaN/Infinity, or an array containing one). Arrays splice as array
+/// literals — the sandbox already capped their size, and every element is a
+/// primitive — so an array-returning decoder materializes to `[…]`.
+fn eval_value_to_expr<'a>(
+    val: &EvalValue,
+    span: oxc_span::Span,
+    ctx: &mut TraverseCtx<'a, ()>,
+) -> Option<Expression<'a>> {
+    Some(match val {
+        EvalValue::Str(s) => {
+            let value = ctx.ast.str(s);
+            ctx.ast.expression_string_literal(span, value, None)
+        }
+        // A numeric/boolean decoder result must splice as that literal kind, not as
+        // a string — `dec(x) + 1` must stay arithmetic.
+        EvalValue::Num(n) if n.is_finite() => num_literal(*n, span, ctx),
+        EvalValue::Bool(b) => ctx.ast.expression_boolean_literal(span, *b),
+        // NaN / Infinity have no literal form.
+        EvalValue::Num(_) => return None,
+        EvalValue::Arr(elems) => {
+            let mut arr = ctx.ast.vec();
+            for e in elems {
+                let item = eval_value_to_expr(e, span, ctx)?;
+                arr.push(oxc_ast::ast::ArrayExpressionElement::from(item));
+            }
+            ctx.ast.expression_array(span, arr)
+        }
+    })
 }
 
 /// Build a numeric literal expression for `n`. A numeric literal is always

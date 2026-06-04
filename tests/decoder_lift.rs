@@ -344,6 +344,46 @@ fn keeps_rotation_when_table_still_read() {
 }
 
 #[test]
+fn lifts_small_array_returning_decoder() {
+    // B3: a pure decoder that returns a small literal array materializes to an
+    // array literal (the EvalValue::Arr splice). `unpack` builds `[1,2,3]` from a
+    // packed string; the call must become `[1, 2, 3]`.
+    let src = r#"
+        (function () {
+            function unpack(s) { return s.split(",").map(function (x) { return +x; }); }
+            sink(unpack("1,2,3"));
+        })();
+    "#;
+    let out = deobfuscate(src, "t.js").code;
+    assert!(
+        out.contains("[1, 2, 3]") || out.contains("[\n\t\t1,"),
+        "small array decoder not materialized: {out}"
+    );
+    assert!(
+        !out.contains("unpack("),
+        "array decoder call survived: {out}"
+    );
+}
+
+#[test]
+fn does_not_materialize_huge_array() {
+    // B3 bloat cap: a pure decoder returning a large array must NOT be expanded
+    // (materializing thousands of ints as a literal is net-negative — issues/09).
+    // The call must survive rather than splice a giant array literal.
+    let src = r#"
+        (function () {
+            function build(n) { var a = []; for (var i = 0; i < n; i++) a.push(i); return a; }
+            sink(build(500));
+        })();
+    "#;
+    let out = deobfuscate(src, "t.js").code;
+    assert!(
+        out.contains("build(500)"),
+        "huge array must not be materialized (cap): {out}"
+    );
+}
+
+#[test]
 fn lifts_object_keyed_arguments() {
     // Argument is a member of a pure object literal — still fully evaluable.
     let src = r#"

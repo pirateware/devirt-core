@@ -116,6 +116,10 @@ impl<'a> Traverse<'a, ()> for Evaluator {
             EvalValue::Bool(b) => ctx.ast.expression_boolean_literal(span, b),
             // NaN / Infinity have no numeric literal form — leave the IIFE.
             EvalValue::Num(_) => return,
+            // Array results are handled only by decoder-lift's size-capped splice;
+            // pure-eval declines them (a pure IIFE returning an array is rare and
+            // not worth materializing here).
+            EvalValue::Arr(_) => return,
         };
         self.changed = true;
     }
