@@ -106,6 +106,20 @@ pub(crate) const GLOBALS: &[&str] = &[
     "Reflect",
 ];
 
+/// Globals a *value-binding* must not reference. Two reasons, both specific to
+/// value-bindings (functions are exempt — a function body runs lazily, only when
+/// a decode is actually evaluated, and the double-eval guard re-checks its result):
+///
+///   * **Unbound in the sandbox** (`window`/`global`/`self` — only `globalThis`
+///     is bound). A value-binding evaluates *eagerly* at preamble setup, so a bare
+///     `var w = window` throws `ReferenceError` and fails the whole library.
+///   * **Non-deterministic** (`Date`). A value-binding's result is recomputed in
+///     the preamble and feeds decoders as if constant; one reading the wall clock
+///     (`var t = +new Date()`) is neither reproducible nor a sound constant. (The
+///     `Date.now()` sandbox freeze covers *that* reader, but `new Date()` is left
+///     live by design, so the only safe move is to not admit the binding at all.)
+const VALUE_BINDING_FORBIDDEN_GLOBALS: &[&str] = &["window", "global", "self", "Date"];
+
 #[derive(Default)]
 pub struct DecoderLift {
     changed: bool,
@@ -175,10 +189,38 @@ impl Pass for DecoderLift {
             );
         }
 
-        let analysis = classify(&tops, &unstable, &data_names, scoped_funcs, &private_caches);
+        // Pure value-bindings (`var g = or1()||{}`, `var d = (IIFE)()`) at any
+        // scope: the non-data, non-function glue a decoder library threads between
+        // its functions and tables. Classified in the same purity fixpoint so a
+        // decoder depending on one (sample_7's `pick1` → `var10`/`var15`) can be
+        // proven pure and lifted. See `collect_value_bindings`.
+        let value_bindings = collect_value_bindings(program, &unstable, allocator);
+
+        let analysis = classify(
+            &tops,
+            &unstable,
+            &data_names,
+            scoped_funcs,
+            &value_bindings,
+            &private_caches,
+        );
         if analysis.pure_funcs.is_empty() {
             return false;
         }
+
+        // Rendered source for the accepted value-bindings, in the fixpoint's
+        // source order (dependencies before dependents). Appended to the preamble.
+        let value_binding_src: Vec<&str> = {
+            let by_name: HashMap<&str, &str> = value_bindings
+                .iter()
+                .map(|vb| (vb.name.as_str(), vb.emit.as_str()))
+                .collect();
+            analysis
+                .value_bindings
+                .iter()
+                .filter_map(|n| by_name.get(n.as_str()).copied())
+                .collect()
+        };
 
         // Resolve simple decoder aliases (`v = decoder`, `var v = decoder`) so
         // calls through the alias are liftable too. A reassigned/mutated alias is
@@ -193,6 +235,12 @@ impl Pass for DecoderLift {
                 aliases.len(),
                 local_data.len(),
                 aliases.iter().take(3).collect::<Vec<_>>()
+            );
+            eprintln!(
+                "[dl] value_bindings collected={} emitted={} sample={:?}",
+                value_bindings.len(),
+                analysis.value_bindings.len(),
+                analysis.value_bindings.iter().take(8).collect::<Vec<_>>()
             );
         }
 
@@ -220,6 +268,7 @@ impl Pass for DecoderLift {
             &local_data,
             &pure_func_decls,
             &private_cache_decls,
+            &value_binding_src,
             allocator,
         );
         let Some(sandbox) = Sandbox::new() else {
@@ -998,8 +1047,12 @@ pub(crate) fn freevars_of_expr(expr: &Expression<'_>) -> FreeVars {
 // ---------------------------------------------------------------------------
 
 struct Analysis {
-    pureset: HashSet<String>,    // all pure names (data + funcs)
-    pure_funcs: HashSet<String>, // subset that are callable
+    pureset: HashSet<String>, // all pure names (data + funcs + value-bindings)
+    pure_funcs: HashSet<String>, // subset that are callable (the lift targets)
+    /// Accepted pure value-binding names, in source order — the preamble re-emits
+    /// their `var X = <init>;` so dependent decoders resolve. Names only, in order;
+    /// the rendered source lives in the `ValueBinding` list `run` passes through.
+    value_bindings: Vec<String>,
 }
 
 fn is_pure_data(expr: &Expression<'_>) -> bool {
@@ -1061,12 +1114,23 @@ fn classify(
     unstable: &HashSet<String>,
     seed_pure: &HashSet<String>,
     scoped_funcs: Vec<Pending>,
+    value_bindings: &[ValueBinding],
     caches: &HashSet<String>,
 ) -> Analysis {
     let mut pureset: HashSet<String> = seed_pure.clone();
     let mut pure_funcs: HashSet<String> = HashSet::new();
 
     let mut pending: Vec<Pending> = scoped_funcs;
+    // Value-binding candidates ride the same fixpoint, tracked by index so an
+    // accepted one can record its source order for emission. `live` shrinks as
+    // bindings are admitted; `accepted` collects (order, name) for the preamble.
+    let mut live: Vec<usize> = (0..value_bindings.len()).collect();
+    let mut accepted: Vec<(usize, String)> = Vec::new();
+    // Free names referenced by any accepted *pure function*. The seed for deciding
+    // which value-bindings are actually part of the decoder *library* (and so must
+    // be emitted) versus mere pure consumers of it (`var x = pick(123)` — pure, but
+    // a decode result we lift at its use site, never a library dependency).
+    let mut func_dep_names: HashSet<String> = HashSet::new();
 
     // Top-level pure-data var bindings (`var t = {…}`) seed the pure set even when
     // `scan_invariants` (which is groundedness-gated) declined them.
@@ -1096,6 +1160,39 @@ fn classify(
             if p.fv.all_allowed(&pureset, Some(&p.name), caches) {
                 pureset.insert(p.name.clone());
                 pure_funcs.insert(p.name.clone());
+                func_dep_names.extend(p.fv.free());
+                progressed = true;
+                false
+            } else {
+                true
+            }
+        });
+        // A value-binding joins `pureset` only — never `pure_funcs` — once every
+        // free name in its initializer is pure and it performs no free write. No
+        // self-reference allowance (`extra = None`): `var x = … x …` reads an
+        // uninitialized binding, so it must resolve purely through prior names.
+        live.retain(|&i| {
+            let vb = &value_bindings[i];
+            if vb.fv.impure {
+                return false;
+            }
+            // Value-bindings evaluate *eagerly* in the preamble, so a binding that
+            // reads a sandbox-unbound global (`var w = window`) throws at setup, and
+            // one that reads a non-deterministic global (`var t = +new Date()`) is
+            // neither reproducible nor a sound constant. Decline both — a function
+            // that genuinely needs the global object reaches it through `globalThis`
+            // or a try/catch probe (the `or1` idiom). See the constant's doc.
+            if vb
+                .fv
+                .free()
+                .iter()
+                .any(|n| VALUE_BINDING_FORBIDDEN_GLOBALS.contains(&n.as_str()))
+            {
+                return false;
+            }
+            if vb.fv.all_allowed(&pureset, None, caches) {
+                pureset.insert(vb.name.clone());
+                accepted.push((vb.order, vb.name.clone()));
                 progressed = true;
                 false
             } else {
@@ -1107,9 +1204,47 @@ fn classify(
         }
     }
 
+    // Emit only the value-bindings the decoder *library* actually depends on: the
+    // transitive closure of pure functions' free names, restricted to accepted
+    // binding names and expanded through each binding's own free names. This keeps
+    // the environment glue a decoder reads (`var10 = g.TextDecoder`, the closure
+    // `var15`) while dropping pure *consumers* (`var x = pick(123)`) — emitting a
+    // consumer would run a decoder during setup against a not-yet-defined library
+    // (the `var15 is not a function` setup failure) and is pointless besides: a
+    // decode result is folded at its use site, not baked into the library preamble.
+    let accepted_names: HashSet<&str> = accepted.iter().map(|(_, n)| n.as_str()).collect();
+    let fv_by_name: HashMap<&str, &FreeVars> = value_bindings
+        .iter()
+        .map(|vb| (vb.name.as_str(), &vb.fv))
+        .collect();
+    let mut needed: HashSet<String> = HashSet::new();
+    let mut work: Vec<String> = func_dep_names
+        .iter()
+        .filter(|n| accepted_names.contains(n.as_str()))
+        .cloned()
+        .collect();
+    while let Some(n) = work.pop() {
+        if needed.insert(n.clone()) {
+            if let Some(fv) = fv_by_name.get(n.as_str()) {
+                for d in fv.free() {
+                    if accepted_names.contains(d.as_str()) {
+                        work.push(d);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut emit: Vec<(usize, String)> = accepted
+        .into_iter()
+        .filter(|(_, name)| needed.contains(name))
+        .collect();
+    emit.sort_by_key(|(order, _)| *order);
+
     Analysis {
         pureset,
         pure_funcs,
+        value_bindings: emit.into_iter().map(|(_, name)| name).collect(),
     }
 }
 
@@ -1166,6 +1301,139 @@ impl<'a> Visit<'a> for FuncScan {
             }
         }
         oxc_ast_visit::walk::walk_variable_declarator(self, node);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pure value-bindings: `var X = <pure expression>` (not data, not a function)
+// ---------------------------------------------------------------------------
+
+/// A candidate pure *value-binding* — `var X = <init>` where `<init>` is neither
+/// pure data (handled by `is_pure_data`/`scan_invariants`) nor a function
+/// (handled by `serialize_pure_funcs`), but still computes a deterministic,
+/// side-effect-free value from already-pure names. These are the glue a real
+/// decoder library threads between its functions and its data:
+///
+/// ```js
+/// var g  = or1() || {};              // global-object probe (or1 is pure)
+/// var TD = g.TextDecoder;            // member read off a pure value
+/// var u8 = (function(){ … })();      // a pure UTF-8 fallback closure
+/// function pick1(b){ return TD ? new TD().decode(b) : u8(b); }   // depends on them
+/// ```
+///
+/// Without modelling them, `pick1`'s free names (`TD`, `u8`) are unknown, so the
+/// whole chain below it fails the purity gate and nothing lifts (sample_7). We
+/// admit a binding to the pure set once every free name in its initializer is
+/// already pure and the initializer performs no free write — then re-emit it in
+/// the sandbox preamble *exactly as written*, so the sandbox recomputes the same
+/// value (no baked literal, same soundness model as the function preamble).
+///
+/// Crucially these go to `pureset` only, **never** `pure_funcs`: they are
+/// dependencies, not decoders, so no new call site (`or1()`, `u8(x)`) is ever
+/// itself lifted — only the genuine decoders that depend on them.
+struct ValueBinding {
+    name: String,
+    /// Source pre-order index, so dependencies (`g`) emit before dependents
+    /// (`TD = g.TextDecoder`); declarators in one `var a=…, b=…` are separate.
+    order: usize,
+    fv: FreeVars,
+    /// Rendered `var NAME = <init>;` — appended to the preamble verbatim.
+    emit: String,
+}
+
+/// Collect every candidate pure value-binding at any scope depth. Same two
+/// soundness gates as `collect_scoped_funcs`: the name must be globally unique
+/// (declared exactly once — a shadowed name would make the name-based purity
+/// analysis ambiguous) and not `unstable` (reassigned/mutated). The purity
+/// fixpoint in `classify` then proves each initializer side-effect-free before it
+/// is admitted; the rest are simply dropped.
+fn collect_value_bindings<'a>(
+    program: &Program<'a>,
+    unstable: &HashSet<String>,
+    allocator: &'a Allocator,
+) -> Vec<ValueBinding> {
+    let mut c = ValBindScan {
+        ast: AstBuilder::new(allocator),
+        out: Vec::new(),
+        name_counts: HashMap::new(),
+        order: 0,
+    };
+    c.visit_program(program);
+    c.out
+        .into_iter()
+        .filter(|vb| !unstable.contains(&vb.name))
+        .filter(|vb| c.name_counts.get(&vb.name).copied() == Some(1))
+        .collect()
+}
+
+struct ValBindScan<'a> {
+    ast: AstBuilder<'a>,
+    out: Vec<ValueBinding>,
+    name_counts: HashMap<String, usize>,
+    order: usize,
+}
+
+impl<'a> Visit<'a> for ValBindScan<'a> {
+    fn visit_variable_declarator(&mut self, node: &oxc_ast::ast::VariableDeclarator<'a>) {
+        if let BindingPattern::BindingIdentifier(id) = &node.id {
+            if let Some(init) = &node.init {
+                // A value-binding is anything that is *not* a function (the
+                // function serializer's job) and *not* pure data (the data path's
+                // job): a member read, a call, a logical/conditional combinator, …
+                let is_func = matches!(
+                    init,
+                    Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_)
+                );
+                if !is_func && !is_pure_data(init) {
+                    *self.name_counts.entry(id.name.to_string()).or_default() += 1;
+                    let emit = self.render_binding(id.name.as_str(), init);
+                    self.out.push(ValueBinding {
+                        name: id.name.to_string(),
+                        order: self.order,
+                        fv: freevars_of_expr(init),
+                        emit,
+                    });
+                    self.order += 1;
+                }
+            }
+        }
+        oxc_ast_visit::walk::walk_variable_declarator(self, node);
+    }
+}
+
+impl<'a> ValBindScan<'a> {
+    /// Render a single declarator as a standalone `var NAME = <init>;` statement,
+    /// so a multi-declarator `var a=…, b=…` re-emits as independent `var`
+    /// statements (identical semantics — `var` hoists and is function-scoped).
+    fn render_binding(&self, name: &str, init: &Expression<'a>) -> String {
+        use oxc_ast::ast::VariableDeclarationKind::Var;
+        let id_pat = self.ast.binding_pattern_binding_identifier(SPAN, name);
+        let decl = self.ast.variable_declarator(
+            SPAN,
+            Var,
+            id_pat,
+            oxc_ast::NONE,
+            Some(init.clone_in(self.ast.allocator)),
+            false,
+        );
+        let mut decls = self.ast.vec();
+        decls.push(decl);
+        let stmt = Statement::VariableDeclaration(
+            self.ast
+                .alloc(self.ast.variable_declaration(SPAN, Var, decls, false)),
+        );
+        let mut body = self.ast.vec();
+        body.push(stmt);
+        let prog = self.ast.program(
+            SPAN,
+            SourceType::default(),
+            "",
+            self.ast.vec(),
+            None,
+            self.ast.vec(),
+            body,
+        );
+        Codegen::new().build(&prog).code
     }
 }
 
@@ -1752,6 +2020,7 @@ fn build_preamble<'a>(
     local_data: &[(String, String)],
     nested_funcs: &[Statement<'a>],
     cache_decls: &[(String, String)],
+    value_binding_src: &[&str],
     allocator: &'a Allocator,
 ) -> String {
     // Pure data + decoder function declarations (hoisted, so order is fine).
@@ -1780,10 +2049,36 @@ fn build_preamble<'a>(
     );
     let mut code = Codegen::new().build(&prog).code;
 
+    // Pure value-bindings (`var g = or1()||{}`, `var d = (IIFE)()`), in source
+    // order (dependencies first). Emitted *immediately after* the function and
+    // pure-data declarations — which hoist above — and *before* the rotation IIFEs
+    // below, because those IIFEs invoke the decoder library and a decoder may read
+    // these bindings (sample_7's `pick1` reads `var10`/`var15`). They depend only
+    // on the hoisted functions, prior bindings, and globals; the sandbox recomputes
+    // each one exactly as written, so a dependent decoder resolves to the same
+    // value as in the program. (A binding that turned out to need a later-emitted
+    // table simply fails setup and the pass bails — sound, never a wrong lift.)
+    // Each binding is wrapped in its own `try/catch`: a `var` hoists out of the
+    // block, so a throwing initializer (e.g. an environment probe that reads a
+    // global the sandbox lacks) leaves the name *defined-but-undefined* instead of
+    // aborting the whole preamble. A decoder that then reads an undefined binding
+    // simply fails to eval at its call site and is left un-lifted — never a wrong
+    // lift. Real decoder libraries are robust to this by construction (sample_7's
+    // `pick1` falls through `TextDecoder`/`Buffer` to a pure closure fallback).
+    for src in value_binding_src {
+        code.push_str("\ntry { ");
+        code.push_str(src);
+        code.push_str(" } catch (__dlE) {}");
+    }
+
     // Pure IIFEs that manipulate a decoder (the array *rotation* — crucially,
     // even when nested inside otherwise-impure init code). Running them in the
     // sandbox is harmless (preamble is throwaway) and is what makes a rotated
-    // decoder return the *correct* strings.
+    // decoder return the *correct* strings. Each is `try/catch`-guarded: an
+    // anti-tamper IIFE that *throws* (obfuscators plant `(function(){throw …})()`
+    // among the real rotations) must not take the library down with it — in the
+    // real, non-crashing program that throw is caught upstream, so swallowing it
+    // here makes the sandbox *more* faithful, and a genuine rotation never throws.
     let mut iifes = IifeCollector {
         allowed,
         pure_funcs: &analysis.pure_funcs,
@@ -1793,9 +2088,9 @@ fn build_preamble<'a>(
         iifes.visit_statement(stmt);
     }
     for src in iifes.out {
-        code.push_str("\n;");
+        code.push_str("\ntry { ");
         code.push_str(&src);
-        code.push(';');
+        code.push_str("; } catch (__dlE) {}");
     }
 
     // Alias definitions, so calls through `var v = decoder` (or `decoder.bind(x)`)
@@ -2206,15 +2501,19 @@ impl<'a, 'r> Traverse<'a, ()> for Lifter<'a, 'r> {
                 cached.clone()
             } else {
                 // The library is already defined in the persistent context;
-                // evaluate just the call expression. Evaluate twice and require
-                // agreement: this refuses to lift any non-deterministic "decoder"
-                // (e.g. one reaching Math.random / Date), so a lift is only ever
-                // a stable, reproducible value.
+                // evaluate just the call expression. Evaluate under two *different*
+                // `Math.random` seeds and require agreement: a decode that depends
+                // on RNG yields different values and is refused, while one
+                // independent of RNG (the norm) agrees and lifts. This is a
+                // deterministic test — unlike a plain double-eval, which misses the
+                // ~1% collision of two real low-entropy `Math.random()` draws (the
+                // `Math.floor(100*Math.random())` token that jittered sample_7).
+                // `Date` is frozen in the sandbox prelude, so RNG is the only
+                // remaining entropy a lift must guard against.
                 let call = format!("({});", src);
-                let result = match self.sandbox.eval_to_value(&call) {
-                    Some(a) if self.sandbox.eval_to_value(&call).as_ref() == Some(&a) => Some(a),
-                    _ => None,
-                };
+                let a = self.sandbox.eval_to_value_seeded(&call, 0.137_f64);
+                let b = self.sandbox.eval_to_value_seeded(&call, 0.911_f64);
+                let result = if a.is_some() && a == b { a } else { None };
                 self.memo.insert(src, result.clone());
                 result
             }

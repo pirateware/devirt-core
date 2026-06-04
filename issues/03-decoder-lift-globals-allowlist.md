@@ -4,6 +4,24 @@
 - **Impact:** Very high · **Effort:** ~~Low~~ **High** (re-scoped, see Status) · **Risk:** Low
 - **Pass:** `src/passes/decoder_lift.rs` (GLOBALS `:39-94`); sandbox `src/sandbox.rs`
 
+> **RESOLVED (2026-06, branch `feat/regression-suite`, commit 1c574ab).** The
+> Base91 `arr1` chain now lifts: **1,579 / 1,611 `pick2(N)` calls fold to string
+> literals** (636K→610K bytes, opaque 7%→6%), the 1,268-entry table goes dead.
+> The unblock was *not* the GLOBALS list (that part was already in) but a new
+> **pure value-binding** class in the purity classifier: `pick1` depends on
+> `var X = <pure call/member>` glue (`var9 = or1()||{}`, `var10 = var9.TextDecoder`,
+> `var15 = (IIFE)()`) that is neither pure data nor a function. `collect_value_bindings`
+> + a classify-fixpoint pass admit those to `pureset` (dependency only, never a
+> lift target) and re-emit them in the sandbox preamble (closure of the library's
+> free names, source order, after the hoisted functions). Plus: try/catch-guard
+> each preamble IIFE/binding so a planted `(function(){throw …})()` anti-tamper
+> doesn't fail setup; freeze the whole `new Date()` clock (token-timestamp leak);
+> and a differential two-seed `Math.random` lift guard (defeats the ~1%
+> low-entropy double-eval collision). Validated by the behavior-equivalence
+> harness + determinism pin + a positive unit test. Sound by construction (the
+> lifted strings are coherent DOM/JS identifiers; a wrong decode would be mojibake).
+> The post-line-1637 sensor + MD5-HMAC layer stays out of scope as documented.
+
 > **STATUS (2026-06):** The GLOBALS allowlist additions (`globalThis`, `window`,
 > `global`, `self`) are **implemented** — they are correct and safe, but they do
 > **not** unblock sample_7 on their own. Empirically the lift count and `varNNN`

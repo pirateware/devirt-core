@@ -46,7 +46,11 @@ jobs:
       - name: Build
         run: cargo build --release
 
-      # The 279-test suite — including the differential equivalence harness and
-      # the robustness/panic-containment battery — gates every change.
+      # The full suite gates every change. Beyond the per-pass units it includes
+      # the differential snippet-equivalence harness, the robustness /
+      # panic-containment battery, and the regression net: byte-exact golden
+      # snapshots of every sample (`tests/golden.rs`) plus whole-pipeline
+      # behavior-equivalence on the real corpus (`tests/sample_equivalence.rs`).
+      # A snapshot mismatch fails here with a re-bless hint; see tests/README.md.
       - name: Test
         run: cargo test --release

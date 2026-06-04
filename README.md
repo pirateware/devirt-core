@@ -2,6 +2,23 @@
 
 A JavaScript deobfuscator built as a compiler.
 
+## Testing & regressions
+
+```sh
+cargo test --release                 # full suite (units + equivalence + goldens)
+cargo run --release --bin report     # live readability dashboard
+./scripts/run-samples.sh             # write in/out pairs to out/ for diffing
+./scripts/run-samples.sh sample_5    # side-by-side diff for one sample
+./scripts/bless.sh                   # re-bless golden snapshots after an intended change
+```
+
+The regression net (see [`tests/README.md`](tests/README.md)) pins every
+sample's output **byte-for-byte** (`tests/snapshots/`) and proves the whole
+pipeline **preserves observable behavior** on the real corpus
+(`tests/sample_equivalence.rs`), so no pass change can silently move output.
+[`tests/snapshots/SCOREBOARD.md`](tests/snapshots/SCOREBOARD.md) tracks the
+readability metrics over time.
+
 ## Samples
 
 ```
