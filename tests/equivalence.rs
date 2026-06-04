@@ -731,6 +731,39 @@ fn global_const_inline_preserves_value() {
 }
 
 #[test]
+fn global_const_inline_nested_iife_init() {
+    // Constant written in an init fn called inside a `var X = (IIFE)()` setup
+    // block, read by a function defined inside the same IIFE. The IIFE body is a
+    // setup region, so the write happens-before the read → resolves soundly.
+    assert_equivalent(
+        r#"
+        var R = (function () {
+            var k;
+            function init(){ k = 19; }
+            init();
+            function use(){ return k; }
+            return use();
+        })();
+        __r = R;
+        "#,
+    );
+    // Sibling (must NOT resolve): a read textually before the init call inside the
+    // IIFE observes the pre-init undefined. Resolving would change "undefined"→"19".
+    assert_equivalent(
+        r#"
+        var R = (function () {
+            var k;
+            var snap = "" + k;
+            function init(){ k = 5; }
+            init();
+            return snap + ":" + k;
+        })();
+        __r = R;
+        "#,
+    );
+}
+
+#[test]
 fn global_const_read_before_init_must_not_inline() {
     // `out` reads `k` before `init()` runs, observing the pre-init undefined.
     assert_equivalent(r#"var out = "" + k; var k; function init(){ k = 5; } init(); __r = out;"#);

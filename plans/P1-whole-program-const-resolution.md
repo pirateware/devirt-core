@@ -197,3 +197,21 @@ and `tests/global_const_inline.rs` must still pass after the rewrite-as-client.
 General interprocedural constant propagation (only **write-once**); values that
 depend on host state; non-integer symbolic resolution beyond inlineable literals.
 Full VM bytecode materialization (the size cap excludes it — that is Phase 3).
+
+---
+
+## STATUS (P0 execution)
+
+- **M1/S1 — DONE.** `OrderingOracle` (`src/ir/ordering.rs`) + `ConstResolver`
+  (`src/ir/consts.rs`) extracted; `global_const_inline` is a thin materialization
+  client. Parity verified (174→175 green); see commit `refactor(P1/S1)`.
+- **M2/S2 — partial + re-diagnosed.** Sound widening landed: `var X = (IIFE)()`
+  and `X = (IIFE)()` declarator/assignment IIFE bodies are now setup regions
+  (adversarial pair `global_const_inline_nested_iife_init`). **But the headline
+  premise was wrong** — s1/s4/s11 labels are NOT setup-scoped symbolic constants:
+  s1 is a VM-in-a-constructor, s4's labels are already numeric (structural
+  blocker), s11's are 2D const-array reads. See `issues/12`. `[gci]` on s1/s4/s11
+  is unchanged by design; effort routed to S3 + P2 per P0 §8.
+- **M3/S3 — wiring `resolve_int`** into the unflatteners (sound; resolver only
+  widens vs the local `int_literal`).
+- **M4/S4 — deferred** (value-axis; independent of the firing path).

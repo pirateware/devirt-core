@@ -77,7 +77,13 @@ impl<'b, 'a> OrderingOracle<'b, 'a> {
             }
         }
 
-        // Regions: the program body and every top-level IIFE body.
+        // Regions: the program body and every top-level IIFE body. A top-level
+        // IIFE runs exactly once, in program order, when its statement executes —
+        // so its body's statement indices are a valid happens-before axis, exactly
+        // like the program body. Three IIFE-statement shapes are recognized:
+        //   * `(function(){…})();`              (bare expression-statement IIFE)
+        //   * `var X = (function(){…})();`       (declarator-init IIFE)
+        //   * `X = (function(){…})();`           (assignment-expression IIFE)
         let mut regions: Vec<Region> = vec![Region {
             scope: scoping.root_scope_id(),
             stmts: &program.body,
@@ -222,13 +228,33 @@ fn child_index(stmts: &[Statement<'_>], span: Span) -> Option<usize> {
         .position(|s| s.span().start <= span.start && span.end <= s.span().end)
 }
 
-/// If `stmt` is a top-level IIFE expression statement, return its body scope and
-/// statements.
+/// If `stmt` is a top-level IIFE statement — `(IIFE)();`, `var X = (IIFE)();`, or
+/// `X = (IIFE)();` — return the invoked function's body scope and statements.
 fn iife_region<'b, 'a>(stmt: &'b Statement<'a>) -> Option<(ScopeId, &'b [Statement<'a>])> {
-    let Statement::ExpressionStatement(es) = stmt else {
-        return None;
+    let expr = match stmt {
+        Statement::ExpressionStatement(es) => match &es.expression {
+            // `X = (IIFE)();` — the IIFE is the assignment RHS.
+            Expression::AssignmentExpression(a)
+                if matches!(a.operator, oxc_syntax::operator::AssignmentOperator::Assign) =>
+            {
+                &a.right
+            }
+            // `(IIFE)();` — the IIFE is the statement expression.
+            other => other,
+        },
+        // `var X = (IIFE)();` — single declarator initialized by the IIFE.
+        Statement::VariableDeclaration(vd) if vd.declarations.len() == 1 => {
+            vd.declarations[0].init.as_ref()?
+        }
+        _ => return None,
     };
-    let mut expr = &es.expression;
+    iife_call_body(expr)
+}
+
+/// If `expr` is an immediately-invoked function expression (possibly behind unary
+/// operators like `!`/`void`), return the function body scope and statements.
+fn iife_call_body<'b, 'a>(expr: &'b Expression<'a>) -> Option<(ScopeId, &'b [Statement<'a>])> {
+    let mut expr = expr;
     while let Expression::UnaryExpression(u) = expr {
         expr = &u.argument;
     }
