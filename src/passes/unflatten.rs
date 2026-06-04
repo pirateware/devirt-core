@@ -20,8 +20,10 @@
 //! comparison `s <op> K` (`!=`, `==`, `<`, `<=`, `>`, `>=`) against an integer
 //! literal on either side. The exit is modelled exactly by `LoopTest::continues`,
 //! so a non-zero terminal state (`while (s != 105)`) is handled, not just `0`.
-//! Transitions may be `s = K` (absolute), `s += K` / `s -= K` (additive), or
-//! `s *= K` (multiplicative); the simulator tracks the concrete state so any such
+//! Transitions may be `s = K` (absolute), `s += K` / `s -= K` (additive),
+//! `s *= K` (multiplicative), or `s = next[s]` / `s = next[K]` (a lookup into a
+//! *provably-immutable* const integer table `next`, gated by
+//! `mutable_aggregate_tables`); the simulator tracks the concrete state so any such
 //! step is fully determined. A cycle (a revisited state, e.g. `s *= 1`) aborts.
 //!
 //! Soundness is by construction + heavy gating. We transform only when every check
@@ -45,6 +47,7 @@
 //! per-entry-constant transform; see issues/01-unflatten-too-narrow.md.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use oxc_allocator::{Allocator, CloneIn, Vec as ArenaVec};
 use oxc_ast::ast::VariableDeclarationKind;
@@ -53,6 +56,7 @@ use oxc_ast::ast::{
     Statement, SwitchStatement,
 };
 use oxc_ast_visit::Visit;
+use oxc_semantic::Scoping;
 use oxc_syntax::operator::{AssignmentOperator, BinaryOperator};
 use oxc_traverse::{traverse_mut, Traverse, TraverseCtx};
 
@@ -61,6 +65,10 @@ use crate::pass::Pass;
 #[derive(Default)]
 pub struct Unflatten {
     changed: bool,
+    /// Resolved, provably-immutable const integer tables (name → values), used to
+    /// model `s = next[…]` lookup transitions. Computed once per `run` from the
+    /// whole program under the `mutable_aggregate_tables` gate.
+    tables: LookupTables,
 }
 
 impl Pass for Unflatten {
@@ -70,12 +78,84 @@ impl Pass for Unflatten {
 
     fn run<'a>(&mut self, program: &mut Program<'a>, allocator: &'a Allocator) -> bool {
         self.changed = false;
-        // No scoping needed: the analysis is structural/name-based within one
-        // statement list.
+        // Scoping is needed by the immutability gate (it resolves member-writes /
+        // aliasing to symbols). The unflatten analysis itself is name-based.
         let scoping = crate::util::build_scoping(program);
+        self.tables = resolve_const_int_tables(program, &scoping);
         traverse_mut(self, allocator, program, scoping, ());
         self.changed
     }
+}
+
+/// Resolve every top-level (and nested-function) binding whose single value is a
+/// const integer-array literal AND which is provably immutable per
+/// `mutable_aggregate_tables` (never reassigned, member-written, `.push`-ed, or
+/// read bare into a mutable alias). The resulting `name → values` map is the only
+/// thing the lookup-transition form trusts; a table absent from it is declined.
+///
+/// Soundness: a name present here is write-once to a literal int array and never
+/// mutated anywhere in the program, so indexing it at compile time yields exactly
+/// the value the runtime would read. Object-map tables are NOT resolved (array
+/// form only, per the milestone); a non-integer element makes the binding absent.
+pub(crate) fn resolve_const_int_tables(program: &Program<'_>, scoping: &Scoping) -> LookupTables {
+    let mutable = crate::ir::mutable_aggregate_tables(program, scoping);
+    let mut collector = TableCollector {
+        out: HashMap::new(),
+        seen_twice: HashSet::new(),
+    };
+    collector.visit_program(program);
+    collector
+        .out
+        .into_iter()
+        .filter(|(name, _)| !mutable.contains(name) && !collector.seen_twice.contains(name))
+        .map(|(name, values)| (name, Rc::new(values)))
+        .collect()
+}
+
+/// Collects bindings initialized to a const int-array literal. A name initialized
+/// more than once (across any scope) is recorded in `seen_twice` and dropped:
+/// even though `mutable_aggregate_tables` is symbol-precise, this collector is
+/// name-keyed (matching the unflattener's name-based lookups), so two distinct
+/// same-named const arrays in different scopes must not be conflated.
+struct TableCollector {
+    out: HashMap<String, Vec<i64>>,
+    seen_twice: HashSet<String>,
+}
+
+impl<'a> oxc_ast_visit::Visit<'a> for TableCollector {
+    fn visit_variable_declarator(&mut self, decl: &oxc_ast::ast::VariableDeclarator<'a>) {
+        if let BindingPattern::BindingIdentifier(id) = &decl.id {
+            if let Some(init) = &decl.init {
+                if let Some(values) = const_int_array(init) {
+                    let name = id.name.to_string();
+                    if self.out.insert(name.clone(), values).is_some() {
+                        self.seen_twice.insert(name);
+                    }
+                }
+            }
+        }
+        oxc_ast_visit::walk::walk_variable_declarator(self, decl);
+    }
+}
+
+/// An array literal all of whose elements are integer literals → their values.
+/// Holes, spreads, or any non-integer element → `None` (not a usable lookup table).
+fn const_int_array(expr: &Expression<'_>) -> Option<Vec<i64>> {
+    let Expression::ArrayExpression(arr) = expr else {
+        return None;
+    };
+    let mut out = Vec::with_capacity(arr.elements.len());
+    for el in &arr.elements {
+        let oxc_ast::ast::ArrayExpressionElement::SpreadElement(_) = el else {
+            // A non-spread element: it must be an integer-literal expression (a hole
+            // — `Elision` — is `None` here and rejects the whole table).
+            let e = el.as_expression()?;
+            out.push(int_literal(e)?);
+            continue;
+        };
+        return None; // spread → unmodellable
+    }
+    Some(out)
 }
 
 impl<'a> Traverse<'a, ()> for Unflatten {
@@ -112,8 +192,14 @@ impl<'a> Traverse<'a, ()> for Unflatten {
                 continue; // the loop must run after the initializer
             }
             // Try the integer engine first; fall back to the string/boolean engine.
-            let seq = simulate_int_at(&stmts[i], &stmts[j], &s_name, ctx.ast.allocator)
-                .or_else(|| simulate_sval_at(&stmts[i], &stmts[j], &s_name, ctx.ast.allocator));
+            let seq = simulate_int_at(
+                &stmts[i],
+                &stmts[j],
+                &s_name,
+                &self.tables,
+                ctx.ast.allocator,
+            )
+            .or_else(|| simulate_sval_at(&stmts[i], &stmts[j], &s_name, ctx.ast.allocator));
             let Some(seq) = seq else {
                 continue;
             };
@@ -161,11 +247,12 @@ fn simulate_int_at<'a>(
     init_stmt: &Statement<'a>,
     loop_stmt: &Statement<'a>,
     s_name: &str,
+    tables: &LookupTables,
     alloc: &'a Allocator,
 ) -> Option<Vec<Statement<'a>>> {
     let (_, init) = state_init(init_stmt)?;
     let (switch, kind, test) = detect_loop(loop_stmt, s_name)?;
-    let cases = parse_cases(switch, s_name)?;
+    let cases = parse_cases(switch, s_name, tables)?;
     // The local form replaces only the dispatcher; statements after it stay in the
     // list, so the exit mode is irrelevant here.
     let (seq, _exit) = simulate(init, &cases, &test, kind, alloc)?;
@@ -368,8 +455,24 @@ fn is_ident(expr: &Expression<'_>, name: &str) -> bool {
     matches!(expr, Expression::Identifier(id) if id.name == name)
 }
 
-/// How a case mutates the dispatch state in its trailing transition.
+/// A resolved, provably-immutable const integer table keyed by name, used to model
+/// `s = next[…]` lookup transitions. Threaded into `parse_cases` by the caller,
+/// which resolves the tables and applies the immutability gate
+/// (`mutable_aggregate_tables`). An empty map disables the lookup form entirely
+/// (the caller has no const tables) — a sound decline.
+pub(crate) type LookupTables = HashMap<String, Rc<Vec<i64>>>;
+
+/// How a lookup transition (`s = next[idx]`) computes its index into the table.
 #[derive(Clone, Copy)]
+enum LookupIndex {
+    /// `s = next[s]` — index by the current dispatch state.
+    State,
+    /// `s = next[<int>]` — index by a fixed constant.
+    Const(i64),
+}
+
+/// How a case mutates the dispatch state in its trailing transition.
+#[derive(Clone)]
 enum Trans {
     /// `s = <int>` — jump to an absolute state.
     Abs(i64),
@@ -377,14 +480,35 @@ enum Trans {
     Rel(i64),
     /// `s *= <int>` — multiplicative relative to the current state.
     Mul(i64),
+    /// `s = next[s]` / `s = next[<int>]` — the next state is read from a
+    /// provably-immutable const integer table. The table values are resolved and
+    /// baked in at parse time; the index is the current state or a constant. This
+    /// subsumes `Abs` as the degenerate constant-index case, but we keep `Abs`
+    /// distinct so the common literal-transition path needs no table.
+    Lookup {
+        table: Rc<Vec<i64>>,
+        index: LookupIndex,
+    },
 }
 
 impl Trans {
-    fn apply(self, state: i64) -> i64 {
+    /// Compute the next state from the current one. Returns `None` only for a
+    /// lookup whose index is out of the table's bounds — a JS `undefined` read we
+    /// will not model, so the simulator declines the whole transform.
+    fn apply(&self, state: i64) -> Option<i64> {
         match self {
-            Trans::Abs(v) => v,
-            Trans::Rel(d) => state + d,
-            Trans::Mul(f) => state * f,
+            Trans::Abs(v) => Some(*v),
+            Trans::Rel(d) => Some(state + d),
+            Trans::Mul(f) => Some(state * f),
+            Trans::Lookup { table, index } => {
+                let i = match index {
+                    LookupIndex::State => state,
+                    LookupIndex::Const(k) => *k,
+                };
+                // Out of range (incl. negative) → `undefined` in JS → decline.
+                let idx = usize::try_from(i).ok()?;
+                table.get(idx).copied()
+            }
         }
     }
 }
@@ -412,6 +536,7 @@ pub(crate) struct ParsedCase<'b, 'a> {
 pub(crate) fn parse_cases<'b, 'a>(
     switch: &'b SwitchStatement<'a>,
     s: &str,
+    tables: &LookupTables,
 ) -> Option<HashMap<i64, ParsedCase<'b, 'a>>> {
     let mut out = HashMap::new();
     // Each case's integer label, in textual order, so a fall-through case (no
@@ -461,11 +586,11 @@ pub(crate) fn parse_cases<'b, 'a>(
         };
         let (end, upto, terminal_incl) = match flat[term_idx] {
             Statement::BreakStatement(b) if b.label.is_none() => {
-                let next = sole_transition(&flat[..term_idx], s)?;
+                let next = sole_transition(&flat[..term_idx], s, tables)?;
                 (CaseEnd::Step(next), term_idx, false)
             }
             Statement::ContinueStatement(c) if c.label.is_none() => {
-                let next = sole_transition(&flat[..term_idx], s)?;
+                let next = sole_transition(&flat[..term_idx], s, tables)?;
                 (CaseEnd::Step(next), term_idx, false)
             }
             Statement::ReturnStatement(_) | Statement::ThrowStatement(_) => {
@@ -482,7 +607,7 @@ pub(crate) fn parse_cases<'b, 'a>(
         let mut emit = Vec::new();
         for (k, &st) in flat[..upto].iter().enumerate() {
             let is_terminal_stmt = terminal_incl && k == upto - 1;
-            if is_state_transition(st, s).is_some() {
+            if is_state_transition(st, s, tables).is_some() {
                 continue; // drop the transition assignment
             }
             if mentions(st, s) {
@@ -528,10 +653,10 @@ fn block_is_transparent(b: &BlockStatement<'_>) -> bool {
 
 /// Among (flattened) top-level statements, find the state transitions. Require
 /// exactly one (the next state); none or a non-top-level transition → `None`.
-fn sole_transition(stmts: &[&Statement<'_>], s: &str) -> Option<Trans> {
+fn sole_transition(stmts: &[&Statement<'_>], s: &str, tables: &LookupTables) -> Option<Trans> {
     let mut found: Option<Trans> = None;
     for &st in stmts {
-        if let Some(t) = is_state_transition(st, s) {
+        if let Some(t) = is_state_transition(st, s, tables) {
             if found.is_some() {
                 return None; // more than one unconditional transition
             }
@@ -543,10 +668,13 @@ fn sole_transition(stmts: &[&Statement<'_>], s: &str) -> Option<Trans> {
     found
 }
 
-/// `s = <int>;` / `s += <int>;` / `s -= <int>;` as a top-level statement → the
-/// transition it encodes. A compound assignment is sound because the simulator
-/// tracks the concrete current state, so `s += K` is fully determined.
-fn is_state_transition(stmt: &Statement<'_>, s: &str) -> Option<Trans> {
+/// `s = <int>;` / `s += <int>;` / `s -= <int>;` / `s = next[s|<int>];` as a
+/// top-level statement → the transition it encodes. A compound assignment is sound
+/// because the simulator tracks the concrete current state, so `s += K` is fully
+/// determined; a lookup is sound because `next` is a resolved const-immutable table
+/// (gated by the caller via `mutable_aggregate_tables`) and the simulator computes
+/// the concrete index.
+fn is_state_transition(stmt: &Statement<'_>, s: &str, tables: &LookupTables) -> Option<Trans> {
     let Statement::ExpressionStatement(es) = stmt else {
         return None;
     };
@@ -559,6 +687,12 @@ fn is_state_transition(stmt: &Statement<'_>, s: &str) -> Option<Trans> {
     if id.name != s {
         return None;
     }
+    // `s = next[idx]` lookup form (absolute assignment only).
+    if matches!(a.operator, AssignmentOperator::Assign) {
+        if let Some(t) = parse_lookup_rhs(&a.right, s, tables) {
+            return Some(t);
+        }
+    }
     let v = int_literal(&a.right)?;
     match a.operator {
         AssignmentOperator::Assign => Some(Trans::Abs(v)),
@@ -567,6 +701,29 @@ fn is_state_transition(stmt: &Statement<'_>, s: &str) -> Option<Trans> {
         AssignmentOperator::Multiplication => Some(Trans::Mul(v)),
         _ => None,
     }
+}
+
+/// The RHS of an assignment `s = <rhs>` as a lookup transition `next[s]` /
+/// `next[<int>]`, where `next` is a *resolved const-immutable* table (present in
+/// `tables`). The index is the bare state identifier or an integer constant.
+/// Anything else (non-member, computed-key expression, unknown/mutable table,
+/// non-state non-const index) → `None` (decline).
+fn parse_lookup_rhs(rhs: &Expression<'_>, s: &str, tables: &LookupTables) -> Option<Trans> {
+    let Expression::ComputedMemberExpression(m) = rhs else {
+        return None;
+    };
+    // The object must be a bare identifier naming a resolved const table.
+    let Expression::Identifier(obj) = &m.object else {
+        return None;
+    };
+    let table = tables.get(obj.name.as_str())?.clone();
+    // The index is `s` (the current state) or an integer literal.
+    let index = if is_ident(&m.expression, s) {
+        LookupIndex::State
+    } else {
+        LookupIndex::Const(int_literal(&m.expression)?)
+    };
+    Some(Trans::Lookup { table, index })
 }
 
 pub(crate) fn is_top_level_control(stmt: &Statement<'_>) -> bool {
@@ -629,19 +786,19 @@ pub(crate) fn simulate<'a>(
                 // splice that replaces the original dispatcher.
                 seq.push((*st).clone_in(alloc));
             }
-            match case.end {
+            match &case.end {
                 CaseEnd::Step(t) => {
-                    state = t.apply(state);
+                    state = t.apply(state)?;
                     break;
                 }
                 CaseEnd::Terminal => return Some((seq, ExitMode::Terminal)),
                 CaseEnd::FallThrough(next) => {
                     // Continue into the successor case body; mark it visited at the
                     // outer level too so a later `break` back to it is still a cycle.
-                    if !visited.insert(next) {
+                    if !visited.insert(*next) {
                         return None;
                     }
-                    state = next;
+                    state = *next;
                 }
             }
         }

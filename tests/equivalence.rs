@@ -358,6 +358,36 @@ fn nested_const_array_2d_and_alias_fold_preserves_value() {
 }
 
 #[test]
+fn lookup_table_unflatten_preserves_value() {
+    // A5: the dispatch transition reads the next state from a provably-immutable
+    // const int array (`s = next[s]` / `s = next[CONST]`). Linearizing the machine
+    // must compute the exact same accumulated value as the original dispatcher.
+    assert_equivalent(
+        "var next = [0, 2, 9]; var acc = 0; var s = 1; \
+         while (s != 9) { switch (s) { \
+           case 1: acc += 10; s = next[s]; break; \
+           case 2: acc += 5; s = next[2]; break; } } __r = acc;",
+    );
+    // Const-index form, falsy exit.
+    assert_equivalent(
+        "var nx = [5, 0]; var acc = 0; var s = 1; \
+         while (s) { switch (s) { \
+           case 1: acc += 1; s = nx[0]; break; \
+           case 5: acc += 2; s = nx[1]; break; } } __r = acc;",
+    );
+    // Adversarial: a pushed (mutable) table must NOT drive a lookup transition —
+    // the unflattener declines and the dispatcher is preserved. Equivalence holds
+    // because the (kept) loop runs as written. (Indices 1 and 2 are read; the push
+    // only appends, so the read values match the original literal array.)
+    assert_equivalent(
+        "var next = [0, 2, 9]; next.push(7); var acc = 0; var s = 1; \
+         while (s != 9) { switch (s) { \
+           case 1: acc += 10; s = next[s]; break; \
+           case 2: acc += 5; s = next[2]; break; } } __r = acc;",
+    );
+}
+
+#[test]
 fn member_written_table_is_not_resolved() {
     // B2 adversarial sibling (sample_11's shape): a table built by *member writes*
     // (`base[i][j] = …`) is mutable, so `T = base[0]; T[i]` must NOT be resolved to

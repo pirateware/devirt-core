@@ -314,3 +314,108 @@ fn param_state_dispatcher_specializes() {
     );
     assert!(out.contains("__pf_"), "no specialization emitted: {out}");
 }
+
+// --- A5: lookup-table transitions (`s = next[s]`) -------------------------
+
+#[test]
+fn lookup_table_transition_collapses() {
+    // The next state is read from a provably-immutable const int array indexed by
+    // the current state: next[1] = 2, next[2] = 9. Run order a(), b(), exit at 9.
+    let out = deob(
+        "var next = [0, 2, 9]; var s = 1; while (s != 9) { switch (s) { \
+         case 1: a(); s = next[s]; break; case 2: b(); s = next[2]; break; } }",
+    );
+    assert!(
+        !out.contains("switch") && !out.contains("while"),
+        "lookup-table machine not unflattened: {out}"
+    );
+    let (ia, ib) = (out.find("a()").unwrap(), out.find("b()").unwrap());
+    assert!(ia < ib, "order wrong: {out}");
+}
+
+#[test]
+fn lookup_table_const_index_collapses() {
+    // Index by a constant, not the state: next[0] = 5, next[1] = 0. 1 -> 5 -> exit.
+    let out = deob(
+        "var nx = [5, 0]; var s = 1; while (s) { switch (s) { \
+         case 1: a(); s = nx[0]; break; case 5: b(); s = nx[1]; break; } }",
+    );
+    assert!(
+        !out.contains("switch") && !out.contains("while"),
+        "const-index lookup not unflattened: {out}"
+    );
+    let (ia, ib) = (out.find("a()").unwrap(), out.find("b()").unwrap());
+    assert!(ia < ib, "order wrong: {out}");
+}
+
+#[test]
+fn lookup_table_mutated_by_push_is_kept() {
+    // `next.push(...)` makes the table non-immutable — the resolved values are not
+    // trustworthy, so the lookup transition must decline.
+    let out = deob(
+        "var next = [0, 2, 9]; next.push(7); var s = 1; \
+         while (s != 9) { switch (s) { \
+         case 1: a(); s = next[s]; break; case 2: b(); s = next[2]; break; } }",
+    );
+    assert!(
+        out.contains("switch"),
+        "pushed-table lookup wrongly unflattened: {out}"
+    );
+}
+
+#[test]
+fn lookup_table_member_write_is_kept() {
+    // An element write (`next[0] = 1`) mutates the table → decline.
+    let out = deob(
+        "var next = [0, 2, 9]; next[0] = 1; var s = 1; \
+         while (s != 9) { switch (s) { \
+         case 1: a(); s = next[s]; break; case 2: b(); s = next[2]; break; } }",
+    );
+    assert!(
+        out.contains("switch"),
+        "member-written-table lookup wrongly unflattened: {out}"
+    );
+}
+
+#[test]
+fn lookup_table_reassigned_is_kept() {
+    // The table binding is assigned twice (not write-once) → not provably the value
+    // we resolved → decline.
+    let out = deob(
+        "var next = [0, 2, 9]; next = [0, 0]; var s = 1; \
+         while (s != 9) { switch (s) { \
+         case 1: a(); s = next[s]; break; case 2: b(); s = next[2]; break; } }",
+    );
+    assert!(
+        out.contains("switch"),
+        "reassigned-table lookup wrongly unflattened: {out}"
+    );
+}
+
+#[test]
+fn lookup_table_param_is_kept() {
+    // `next` is a function parameter, not a const literal array — its value is not
+    // statically known, so the lookup transition must decline.
+    let out = deob(
+        "function f(next) { var s = 1; while (s != 9) { switch (s) { \
+         case 1: a(); s = next[s]; break; case 2: b(); s = next[2]; break; } } } f(g());",
+    );
+    assert!(
+        out.contains("switch"),
+        "param-table lookup wrongly unflattened: {out}"
+    );
+}
+
+#[test]
+fn lookup_table_out_of_range_is_kept() {
+    // next[2] is past the end of a 2-element array → out-of-range index, which is
+    // not soundly resolvable (`undefined`), so decline.
+    let out = deob(
+        "var next = [0, 2]; var s = 1; while (s != 9) { switch (s) { \
+         case 1: a(); s = next[s]; break; case 2: b(); s = next[2]; break; } }",
+    );
+    assert!(
+        out.contains("switch"),
+        "out-of-range lookup wrongly unflattened: {out}"
+    );
+}

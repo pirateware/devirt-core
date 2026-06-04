@@ -44,7 +44,9 @@ use oxc_ast_visit::Visit;
 use oxc_span::SPAN;
 use oxc_traverse::{traverse_mut, Traverse, TraverseCtx};
 
-use super::unflatten::{detect_loop, parse_cases, simulate, ExitMode};
+use super::unflatten::{
+    detect_loop, parse_cases, resolve_const_int_tables, simulate, ExitMode, LookupTables,
+};
 use crate::pass::Pass;
 use crate::util::build_scoping;
 
@@ -73,10 +75,17 @@ impl Pass for UnflattenParam {
         //    specializations, which it never re-visits.
         self.plan.clear();
         let existing = census.binding_names();
+        // Resolve provably-immutable const int tables once so a param-state
+        // dispatcher's `s = next[…]` lookup transitions are modelled consistently
+        // with the local unflattener. The gate (immutability + write-once) lives in
+        // `resolve_const_int_tables`; an absent table declines the lookup form.
+        let scoping = build_scoping(program);
+        let tables = resolve_const_int_tables(program, &scoping);
         let builder = Builder {
             ast: AstBuilder::new(allocator),
             census: &census,
             existing: &existing,
+            tables: &tables,
         };
         builder.specialize_lists(&mut program.body, &mut self.plan);
         if self.plan.is_empty() {
@@ -165,6 +174,8 @@ struct Builder<'a, 'c> {
     ast: AstBuilder<'a>,
     census: &'c Census,
     existing: &'c HashSet<String>,
+    /// Resolved const-immutable int tables for `s = next[…]` lookup transitions.
+    tables: &'c LookupTables,
 }
 
 /// A function that is a param-state dispatcher: its binding names and the
@@ -202,7 +213,7 @@ impl<'a, 'c> Builder<'a, 'c> {
         stmt: &Statement<'a>,
         plan: &mut HashMap<(String, i64), String>,
     ) -> Vec<Statement<'a>> {
-        let Some(cand) = candidate(stmt) else {
+        let Some(cand) = candidate(stmt, self.tables) else {
             return Vec::new();
         };
         let Some(entries) = self.validate(&cand) else {
@@ -374,7 +385,7 @@ impl<'a, 'c> Builder<'a, 'c> {
         let loop_stmt = body.statements.first()?;
         let state = param0_name(cand.func)?;
         let (switch, kind, test) = detect_loop(loop_stmt, &state)?;
-        let cases = parse_cases(switch, &state)?;
+        let cases = parse_cases(switch, &state, self.tables)?;
         let (mut seq, exit) = simulate(c, &cases, &test, kind, alloc)?;
         // Statements after the loop run only when the machine exits via the loop
         // test; a terminal (`return`/`throw`) case makes them unreachable.
@@ -414,7 +425,7 @@ impl<'a, 'c> Builder<'a, 'c> {
 
 /// A statement that binds a param-state dispatcher function, if any. Handles a
 /// `function f(s, …) {…}` declaration and a `var f = function [name](s, …) {…}`.
-fn candidate<'b, 'a>(stmt: &'b Statement<'a>) -> Option<Candidate<'b, 'a>> {
+fn candidate<'b, 'a>(stmt: &'b Statement<'a>, tables: &LookupTables) -> Option<Candidate<'b, 'a>> {
     match stmt {
         Statement::FunctionDeclaration(f) => {
             let id = f.id.as_ref()?;
@@ -422,7 +433,7 @@ fn candidate<'b, 'a>(stmt: &'b Statement<'a>) -> Option<Candidate<'b, 'a>> {
                 func: f,
                 names: vec![id.name.to_string()],
             };
-            shape_ok(&cand).then_some(cand)
+            shape_ok(&cand, tables).then_some(cand)
         }
         Statement::VariableDeclaration(vd) if vd.declarations.len() == 1 => {
             let d: &VariableDeclarator = &vd.declarations[0];
@@ -437,7 +448,7 @@ fn candidate<'b, 'a>(stmt: &'b Statement<'a>) -> Option<Candidate<'b, 'a>> {
                 names.push(inner.name.to_string());
             }
             let cand = Candidate { func: f, names };
-            shape_ok(&cand).then_some(cand)
+            shape_ok(&cand, tables).then_some(cand)
         }
         _ => None,
     }
@@ -445,7 +456,7 @@ fn candidate<'b, 'a>(stmt: &'b Statement<'a>) -> Option<Candidate<'b, 'a>> {
 
 /// Structural gate: the body is exactly the dispatch loop over a plain first
 /// parameter, params are simple, and the body does not use `arguments`.
-fn shape_ok(cand: &Candidate<'_, '_>) -> bool {
+fn shape_ok(cand: &Candidate<'_, '_>, tables: &LookupTables) -> bool {
     let f = cand.func;
     if f.params.rest.is_some() || f.params.items.is_empty() {
         return false;
@@ -479,7 +490,7 @@ fn shape_ok(cand: &Candidate<'_, '_>) -> bool {
     let Some((switch, _, _)) = detect_loop(loop_stmt, &state) else {
         return false;
     };
-    parse_cases(switch, &state).is_some()
+    parse_cases(switch, &state, tables).is_some()
 }
 
 /// Does `stmt` reference `name` (read or write) anywhere, not descending into
