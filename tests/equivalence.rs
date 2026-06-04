@@ -1725,3 +1725,87 @@ fn relooper_declines_irreducible() {
         "#,
     );
 }
+
+#[test]
+fn computed_state_constant_object_discriminant_preserves_value() {
+    // A3 (deterministic subcase): the discriminant is `obj + counter` where `obj`
+    // provably coerces to a constant. Equivalent to a counter-offset dispatcher,
+    // and the recognizer normalizes + structures it away.
+    assert_structured(
+        r#"
+        var out = 0;
+        var b = 0;
+        var t = { valueOf: function () { return 100; } };
+        do {
+            switch (t + b) {
+                case 100: out += 1; b += 1; break;
+                case 101: out += 10; b += 1; break;
+                case 102: out += 100; b = 99; break;
+            }
+        } while (b < 50);
+        __r = out;
+        "#,
+    );
+    // `new Number(C)` object, subtraction discriminant `obj - counter`.
+    assert_structured(
+        r#"
+        var acc = 0;
+        var i = 0;
+        var t = new Number(10);
+        do {
+            switch (t - i) {
+                case 10: acc += 5; i -= 1; break;
+                case 11: acc += 7; i -= 1; break;
+                case 12: acc += 9; i = -90; break;
+            }
+        } while (i > -50);
+        __r = acc;
+        "#,
+    );
+}
+
+#[test]
+fn computed_state_string_counter_declines_soundly() {
+    // A3 soundness gate: the counter is a STRING, so `t + b` concatenates rather
+    // than adds — `switch(C + b)` is NOT `switch(b)` with offset labels. The
+    // recognizer must decline (the numericness gate fails). Value preserved.
+    assert_declined(
+        r#"
+        var out = "";
+        var b = "x";
+        var t = { valueOf: function () { return 100; } };
+        var guard = 0;
+        do {
+            switch (t + b) {
+                case "100x": out += "A"; b = "y"; break;
+                case "100y": out += "B"; b = "z"; break;
+                default: guard = 1;
+            }
+        } while (guard === 0);
+        __r = out;
+        "#,
+    );
+}
+
+#[test]
+fn computed_state_mutating_valueof_declines_soundly() {
+    // A3 adversarial: a per-read MUTATING valueOf (the sample_4 shape — the object
+    // re-applies a transform on each coercion). The next state is not statically a
+    // pure function of the counter, so the recognizer MUST decline. Value preserved.
+    assert_equivalent(
+        r#"
+        var out = 0;
+        var b = 0;
+        var t = { n: 0, valueOf: function () { this.n = this.n + 1; return this.n; } };
+        do {
+            switch (t + b) {
+                case 1: out += 1; b += 0; break;
+                case 3: out += 10; b += 0; break;
+                case 5: out += 100; b += 0; break;
+                default: b = 99;
+            }
+        } while (b < 10 && out < 1000);
+        __r = out;
+        "#,
+    );
+}
