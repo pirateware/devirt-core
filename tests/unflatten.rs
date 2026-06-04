@@ -107,6 +107,34 @@ fn compound_transition_collapses() {
 }
 
 #[test]
+fn mul_transition_collapses() {
+    // Multiplicative transition: s *= K (1 -> 3 -> 12, exit at 12).
+    let out = deob(
+        "var s = 1; while (s != 12) { switch (s) { \
+         case 1: a(); s *= 3; break; case 3: b(); s *= 4; break; } }",
+    );
+    assert!(
+        !out.contains("switch"),
+        "mul-transition not unflattened: {out}"
+    );
+    let (ia, ib) = (out.find("a()").unwrap(), out.find("b()").unwrap());
+    assert!(ia < ib, "order wrong: {out}");
+}
+
+#[test]
+fn cyclic_mul_transition_is_kept() {
+    // `s *= 1` revisits the same state forever — a real loop, must NOT linearize.
+    let out = deob(
+        "var s = 1; while (s) { switch (s) { \
+         case 1: a(); s *= 1; break; } }",
+    );
+    assert!(
+        out.contains("switch"),
+        "cyclic mul-transition wrongly unflattened: {out}"
+    );
+}
+
+#[test]
 fn symbolic_const_labels_collapse() {
     // Write-once integer constants used as labels/transitions/init resolve.
     let out = deob(

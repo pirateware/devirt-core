@@ -20,8 +20,9 @@
 //! comparison `s <op> K` (`!=`, `==`, `<`, `<=`, `>`, `>=`) against an integer
 //! literal on either side. The exit is modelled exactly by `LoopTest::continues`,
 //! so a non-zero terminal state (`while (s != 105)`) is handled, not just `0`.
-//! Transitions may be `s = K` (absolute) or `s += K` / `s -= K` (relative); the
-//! simulator tracks the concrete state so a relative step is fully determined.
+//! Transitions may be `s = K` (absolute), `s += K` / `s -= K` (additive), or
+//! `s *= K` (multiplicative); the simulator tracks the concrete state so any such
+//! step is fully determined. A cycle (a revisited state, e.g. `s *= 1`) aborts.
 //!
 //! Soundness is by construction + heavy gating. We transform only when every check
 //! below holds, and otherwise leave the construct untouched:
@@ -349,6 +350,8 @@ enum Trans {
     Abs(i64),
     /// `s += <int>` / `s -= <int>` — relative to the current state.
     Rel(i64),
+    /// `s *= <int>` — multiplicative relative to the current state.
+    Mul(i64),
 }
 
 impl Trans {
@@ -356,6 +359,7 @@ impl Trans {
         match self {
             Trans::Abs(v) => v,
             Trans::Rel(d) => state + d,
+            Trans::Mul(f) => state * f,
         }
     }
 }
@@ -495,6 +499,7 @@ fn is_state_transition(stmt: &Statement<'_>, s: &str) -> Option<Trans> {
         AssignmentOperator::Assign => Some(Trans::Abs(v)),
         AssignmentOperator::Addition => Some(Trans::Rel(v)),
         AssignmentOperator::Subtraction => Some(Trans::Rel(-v)),
+        AssignmentOperator::Multiplication => Some(Trans::Mul(v)),
         _ => None,
     }
 }
