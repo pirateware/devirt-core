@@ -26,6 +26,35 @@
 > Recommend moving the **full sample_7 unblock** to the high-effort bucket
 > alongside issue 01. The GLOBALS widening stays as a standalone correctness
 > improvement for guarded detection idioms in other inputs.
+>
+> **STATUS UPDATE (2026-06, branch `ws-c-decoders`): the value-axis primitive
+> landed; the s7 `this`/`Function` + value-binding chain is a SOUND DECLINE.**
+> - The `EvalValue::Arr` value axis (issue 09 / B3.1) is now implemented and
+>   tested — the sandbox can return arrays, so the *array-valued* half of the
+>   value axis is done.
+> - The remaining s7 blocker is unchanged and now **pinned by an adversarial
+>   must-decline test** (`does_not_lift_decoder_through_this_global_detection` in
+>   `tests/decoder_lift.rs`): a decoder whose chain bottoms out in `or1`'s
+>   `return … || this` + `new Function("return this")()` is correctly **not**
+>   lifted, because the static purity gate (rightly) treats `this`/`Function` as
+>   poison and declines (no transform = always safe).
+> - **Precise requirement for a future sound lift** (verified end-to-end in node:
+>   `call(arr1[0]) → "DA2i3kpR5zIUP"`, deterministic, side-effect-free):
+>   1. A *contained* global-idiom relaxation — tolerate `this` and the exact
+>      zero-arg `Function("return this")`/`new Function("return this")()` form
+>      **only** on the function-classification path (NOT in rotation/IIFE
+>      detection), keeping `writes_free()` strict so no side-effecting function is
+>      ever admitted. Sound because we only ever replace *bare-call* sites and the
+>      sandbox evaluates the bare form (so `this` = global in both program and
+>      sandbox), and the double-eval determinism guard backstops reproducibility.
+>   2. A *pure-call value-binding* preamble class — emit `var v = <expr>;` (e.g.
+>      `var9 = or1()||{}`, `var10 = var9.TextDecoder`, `var15 = (IIFE)()`) when
+>      every free name in `<expr>` is already pure and it performs no free write,
+>      ordered by dependency, so `pick1`'s free vars resolve.
+>   This is a multi-touch change to the core purity classifier (the `all_allowed`
+>   signature is shared by 5 callers) and was **declined this pass** to keep the
+>   branch green-and-committed under the soundness-over-coverage invariant; the
+>   array primitive + the decline test are the safe, shippable slice.
 
 ## Symptom
 

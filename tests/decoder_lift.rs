@@ -384,6 +384,33 @@ fn does_not_materialize_huge_array() {
 }
 
 #[test]
+fn does_not_lift_decoder_through_this_global_detection() {
+    // B3/C2 sound decline: the sample_7 Base91 chain bottoms out in a global-object
+    // detector that uses `this` and `new Function("return this")()`. Until a sound
+    // pure-call value-binding preamble + a narrowly-scoped global-idiom relaxation
+    // exist, such a decoder must NOT be lifted — `this`/`Function` poison the static
+    // purity gate, and that is the safe outcome (no transform). This locks in the
+    // decline so a future relaxation can't silently start lifting it unchecked.
+    let src = r#"
+        (function () {
+            function glob() { try { return new Function("return this")(); } catch (e) {} return this; }
+            var g = glob() || {};
+            var dec = g.TextDecoder;
+            var tbl = ["AAAA", "BBBB"];
+            function pick(i) { return dec ? new dec().decode(tbl[i]) : tbl[i]; }
+            sink(pick(0), pick(1));
+        })();
+    "#;
+    let out = deobfuscate(src, "t.js").code;
+    // The decoder chain must survive unresolved (the `this`/Function detector keeps
+    // it static-impure); no decode literal may replace the calls.
+    assert!(
+        out.contains("pick(0)") && out.contains("pick(1)"),
+        "this/Function-rooted decoder must be left in place: {out}"
+    );
+}
+
+#[test]
 fn lifts_object_keyed_arguments() {
     // Argument is a member of a pure object literal — still fully evaluable.
     let src = r#"
