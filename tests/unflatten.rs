@@ -208,6 +208,88 @@ fn real_do_while_loop_is_kept() {
 }
 
 #[test]
+fn string_state_dispatcher_collapses() {
+    // The dispatch state is a string; transitions are `s = "label"`. Run order
+    // "a" -> "b" -> exit.
+    let out = deob(
+        "var s = \"a\"; while (s) { switch (s) { \
+         case \"a\": a(); s = \"b\"; break; case \"b\": b(); s = \"\"; break; } }",
+    );
+    assert!(
+        !out.contains("switch") && !out.contains("while"),
+        "string-state machine not unflattened: {out}"
+    );
+    let (ia, ib) = (out.find("a()").unwrap(), out.find("b()").unwrap());
+    assert!(ia < ib, "order wrong: {out}");
+}
+
+#[test]
+fn string_state_neq_terminal_collapses() {
+    // Non-falsy string exit: `while (s != "done")`.
+    let out = deob(
+        "var s = \"x\"; while (s != \"done\") { switch (s) { \
+         case \"x\": a(); s = \"y\"; break; case \"y\": b(); s = \"done\"; break; } }",
+    );
+    assert!(!out.contains("switch"), "not unflattened: {out}");
+    let (ia, ib) = (out.find("a()").unwrap(), out.find("b()").unwrap());
+    assert!(ia < ib, "order wrong: {out}");
+}
+
+#[test]
+fn boolean_state_dispatcher_collapses() {
+    // Boolean state: start true, case true does work and flips to false; exit on
+    // `while (s)` going false.
+    let out = deob(
+        "var s = true; while (s) { switch (s) { \
+         case true: a(); s = false; break; } }",
+    );
+    assert!(
+        !out.contains("switch"),
+        "boolean-state not unflattened: {out}"
+    );
+    assert!(out.contains("a()"), "body lost: {out}");
+}
+
+#[test]
+fn cyclic_string_state_is_kept() {
+    // A string-state machine that revisits "a" is a real loop — must NOT linearize.
+    let out = deob(
+        "var s = \"a\"; while (s) { switch (s) { \
+         case \"a\": a(); s = \"b\"; break; case \"b\": b(); s = \"a\"; break; } }",
+    );
+    assert!(
+        out.contains("switch"),
+        "cyclic string-state wrongly unflattened: {out}"
+    );
+}
+
+#[test]
+fn string_state_external_use_is_kept() {
+    // `s` (string) is read after the loop — not a private dispatch var, keep it.
+    let out = deob(
+        "var s = \"a\"; while (s) { switch (s) { case \"a\": a(); s = \"\"; break; } } sink(s);",
+    );
+    assert!(
+        out.contains("switch"),
+        "string dispatcher wrongly removed: {out}"
+    );
+}
+
+#[test]
+fn semantic_string_switch_is_kept() {
+    // A real (non-CFF) switch on an externally-supplied string: the discriminant
+    // is a parameter, not a dispatch-only local with literal transitions. Must NOT
+    // be touched.
+    let out = deob(
+        "function f(ev) { switch (ev) { case \"open\": a(); break; case \"close\": b(); break; } } f(x);",
+    );
+    assert!(
+        out.contains("switch"),
+        "semantic string switch wrongly unflattened: {out}"
+    );
+}
+
+#[test]
 fn param_state_dispatcher_specializes() {
     // State is a function parameter, selected by a constant entry at the call site.
     // The machine must specialize per entry and the switch must vanish.

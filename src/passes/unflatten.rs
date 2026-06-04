@@ -94,8 +94,11 @@ impl<'a> Traverse<'a, ()> for Unflatten {
         // the loop is entered, and they stay in place before the linear sequence.
         let mut hit: Option<(usize, usize, Vec<Statement<'a>>)> = None;
         for i in 0..stmts.len() {
-            let Some((s_name, init)) = state_init(&stmts[i]) else {
-                continue;
+            // The state initializer may be an integer (the primary engine) or a
+            // string/boolean literal (`sval`). Both share the dispatch-only gate.
+            let s_name = match init_state_name(&stmts[i]) {
+                Some(n) => n,
+                None => continue,
             };
             // `s` must appear in exactly one OTHER statement — the dispatcher.
             let others: Vec<usize> = (0..stmts.len())
@@ -108,15 +111,10 @@ impl<'a> Traverse<'a, ()> for Unflatten {
             if j <= i {
                 continue; // the loop must run after the initializer
             }
-            let Some((switch, kind, test)) = detect_loop(&stmts[j], &s_name) else {
-                continue;
-            };
-            let Some(cases) = parse_cases(switch, &s_name) else {
-                continue;
-            };
-            // The local form replaces only the dispatcher; statements after it stay
-            // in the list, so the exit mode is irrelevant here.
-            let Some((seq, _exit)) = simulate(init, &cases, &test, kind, ctx.ast.allocator) else {
+            // Try the integer engine first; fall back to the string/boolean engine.
+            let seq = simulate_int_at(&stmts[i], &stmts[j], &s_name, ctx.ast.allocator)
+                .or_else(|| simulate_sval_at(&stmts[i], &stmts[j], &s_name, ctx.ast.allocator));
+            let Some(seq) = seq else {
                 continue;
             };
             hit = Some((i, j, seq));
@@ -145,6 +143,33 @@ impl<'a> Traverse<'a, ()> for Unflatten {
         }
         self.changed = true;
     }
+}
+
+/// The dispatch-state variable name if `stmt` initializes one to an integer,
+/// string, or boolean literal. Used to find dispatch candidates before deciding
+/// which engine (integer vs. string/boolean) applies.
+fn init_state_name(stmt: &Statement<'_>) -> Option<String> {
+    if let Some((name, _)) = state_init(stmt) {
+        return Some(name);
+    }
+    sval_init(stmt).map(|(name, _)| name)
+}
+
+/// Run the integer engine on the (init, dispatcher) statement pair, returning the
+/// linearized sequence. `None` if the integer engine declines.
+fn simulate_int_at<'a>(
+    init_stmt: &Statement<'a>,
+    loop_stmt: &Statement<'a>,
+    s_name: &str,
+    alloc: &'a Allocator,
+) -> Option<Vec<Statement<'a>>> {
+    let (_, init) = state_init(init_stmt)?;
+    let (switch, kind, test) = detect_loop(loop_stmt, s_name)?;
+    let cases = parse_cases(switch, s_name)?;
+    // The local form replaces only the dispatcher; statements after it stay in the
+    // list, so the exit mode is irrelevant here.
+    let (seq, _exit) = simulate(init, &cases, &test, kind, alloc)?;
+    Some(seq)
 }
 
 /// `var s = <int>;` (single declarator) or `s = <int>;` → `(name, value)`.
@@ -719,4 +744,371 @@ fn for_init_writes(init: &oxc_ast::ast::ForStatementInit<'_>, name: &str) -> boo
             w.found
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// String / boolean state engine (`sval`)
+// ---------------------------------------------------------------------------
+//
+// The integer engine above models a dispatch state that is an integer. Some
+// obfuscators use a *string* (or *boolean*) state variable instead: the cases are
+// `case "label":` and transitions are `s = "next"`. The recovery is identical —
+// the chain is still acyclic, deterministic, and dispatch-only — so we mirror the
+// integer engine over a hashable `StateVal`. Transitions are absolute only
+// (`+=`/`*=` are meaningless on string labels here); the loop test compares the
+// state against a literal with `==`/`!=`/`===`/`!==` or is the bare `s` (truthy).
+//
+// Soundness gates are exactly the integer engine's: `s` referenced only in the
+// init, loop test, switch discriminant, and top-level transitions; no `default`;
+// each visited case ends in `break`/`continue` (one transition) or `return`/
+// `throw`, or falls through to the textual successor; the chain terminates and
+// never revisits a state. A *semantic* switch on external data (e.g. a function
+// parameter) never matches: there is no dispatch-only local string initializer.
+
+/// A non-integer dispatch state value: a string or boolean. (Integers go through
+/// the dedicated `i64` engine, which also supports compound transitions.)
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum StateVal {
+    Str(String),
+    Bool(bool),
+}
+
+impl StateVal {
+    /// Truthiness for the `while (s)` falsy-exit test. `""` and `false` are falsy.
+    fn is_truthy(&self) -> bool {
+        match self {
+            StateVal::Str(s) => !s.is_empty(),
+            StateVal::Bool(b) => *b,
+        }
+    }
+}
+
+/// A string/boolean literal expression → `StateVal`.
+fn sval_literal(expr: &Expression<'_>) -> Option<StateVal> {
+    match expr {
+        Expression::StringLiteral(s) => Some(StateVal::Str(s.value.to_string())),
+        Expression::BooleanLiteral(b) => Some(StateVal::Bool(b.value)),
+        _ => None,
+    }
+}
+
+/// `var s = <str|bool>;` (single declarator) or `s = <str|bool>;` → `(name, val)`.
+fn sval_init(stmt: &Statement<'_>) -> Option<(String, StateVal)> {
+    match stmt {
+        Statement::VariableDeclaration(vd) if vd.declarations.len() == 1 => {
+            let d = &vd.declarations[0];
+            let BindingPattern::BindingIdentifier(id) = &d.id else {
+                return None;
+            };
+            let v = sval_literal(d.init.as_ref()?)?;
+            Some((id.name.to_string(), v))
+        }
+        Statement::ExpressionStatement(es) => {
+            let Expression::AssignmentExpression(a) = &es.expression else {
+                return None;
+            };
+            if !matches!(a.operator, AssignmentOperator::Assign) {
+                return None;
+            }
+            let AssignmentTarget::AssignmentTargetIdentifier(id) = &a.left else {
+                return None;
+            };
+            let v = sval_literal(&a.right)?;
+            Some((id.name.to_string(), v))
+        }
+        _ => None,
+    }
+}
+
+/// The loop continue-condition over a string/boolean state.
+enum SvalTest {
+    /// `while (s)` — continue while truthy.
+    Truthy,
+    /// `while (true)` — exit only via a terminal case.
+    Always,
+    /// `while (s ==/!= LIT)`. `strict` records `===`/`!==` (vs `==`/`!=`); `eq`
+    /// records `==`/`===` (vs `!=`/`!==`). The literal is a string/boolean.
+    Cmp {
+        eq: bool,
+        strict: bool,
+        lit: StateVal,
+    },
+}
+
+impl SvalTest {
+    /// Does the loop continue at `state`? `None` ⇒ the comparison's JS coercion is
+    /// not soundly modellable (a *loose* compare across different types), so the
+    /// caller must decline the whole transform rather than guess.
+    fn continues(&self, state: &StateVal) -> Option<bool> {
+        match self {
+            SvalTest::Truthy => Some(state.is_truthy()),
+            SvalTest::Always => Some(true),
+            SvalTest::Cmp { eq, strict, lit } => {
+                let same_variant = matches!(
+                    (state, lit),
+                    (StateVal::Str(_), StateVal::Str(_)) | (StateVal::Bool(_), StateVal::Bool(_))
+                );
+                // Strict `===`/`!==`: different variants are never equal (no
+                // coercion). Same-variant strict/loose reduce to value equality
+                // (string↔string and bool↔bool have no `==` coercion gap).
+                if *strict || same_variant {
+                    let equal = state == lit;
+                    Some(if *eq { equal } else { !equal })
+                } else {
+                    // Loose `==`/`!=` across types (e.g. `"" == false` is *true* in
+                    // JS) — don't model it; decline.
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// Parse a loop test over a string/boolean state. Accepts bare `s` (truthy),
+/// `true`, and `s ==/!=/===/!== LIT` (literal on either side). `None` otherwise.
+fn parse_sval_test(expr: &Expression<'_>, s: &str) -> Option<SvalTest> {
+    if is_ident(expr, s) {
+        return Some(SvalTest::Truthy);
+    }
+    if matches!(expr, Expression::BooleanLiteral(b) if b.value) {
+        return Some(SvalTest::Always);
+    }
+    let Expression::BinaryExpression(b) = expr else {
+        return None;
+    };
+    let (eq, strict) = match b.operator {
+        BinaryOperator::Equality => (true, false),
+        BinaryOperator::StrictEquality => (true, true),
+        BinaryOperator::Inequality => (false, false),
+        BinaryOperator::StrictInequality => (false, true),
+        _ => return None,
+    };
+    let lit = if is_ident(&b.left, s) {
+        sval_literal(&b.right)?
+    } else if is_ident(&b.right, s) {
+        sval_literal(&b.left)?
+    } else {
+        return None;
+    };
+    Some(SvalTest::Cmp { eq, strict, lit })
+}
+
+/// `s = <str|bool literal>;` as a top-level statement → the next state. (Only
+/// absolute transitions are meaningful for string/boolean labels.)
+fn sval_transition(stmt: &Statement<'_>, s: &str) -> Option<StateVal> {
+    let Statement::ExpressionStatement(es) = stmt else {
+        return None;
+    };
+    let Expression::AssignmentExpression(a) = &es.expression else {
+        return None;
+    };
+    if !matches!(a.operator, AssignmentOperator::Assign) {
+        return None;
+    }
+    let AssignmentTarget::AssignmentTargetIdentifier(id) = &a.left else {
+        return None;
+    };
+    if id.name != s {
+        return None;
+    }
+    sval_literal(&a.right)
+}
+
+/// The sole top-level transition among `stmts` (exactly one; a transition nested
+/// in control flow → branching dispatch → `None`).
+fn sole_sval_transition(stmts: &[&Statement<'_>], s: &str) -> Option<StateVal> {
+    let mut found: Option<StateVal> = None;
+    for &st in stmts {
+        if let Some(t) = sval_transition(st, s) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(t);
+        } else if writes_name(st, s) {
+            return None;
+        }
+    }
+    found
+}
+
+/// Per-case end behavior for the string/boolean engine (mirrors `CaseEnd`).
+enum SvalEnd {
+    Step(StateVal),
+    Terminal,
+    FallThrough(StateVal),
+}
+
+struct SvalCase<'b, 'a> {
+    emit: Vec<&'b Statement<'a>>,
+    end: SvalEnd,
+}
+
+/// Parse every case into (emitted body, end), keyed by its string/boolean label.
+fn parse_sval_cases<'b, 'a>(
+    switch: &'b SwitchStatement<'a>,
+    s: &str,
+) -> Option<HashMap<StateVal, SvalCase<'b, 'a>>> {
+    let mut out: HashMap<StateVal, SvalCase> = HashMap::new();
+    let mut labels: Vec<StateVal> = Vec::with_capacity(switch.cases.len());
+    for case in &switch.cases {
+        labels.push(sval_literal(case.test.as_ref()?)?);
+    }
+    for (ci, case) in switch.cases.iter().enumerate() {
+        let state = labels[ci].clone();
+        let mut flat: Vec<&Statement> = Vec::new();
+        flatten_case(&case.consequent, &mut flat);
+        let Some(term_idx) = flat.iter().position(|st| is_top_level_control(st)) else {
+            // Fall-through into the textually-next case.
+            let Some(next_state) = labels.get(ci + 1).cloned() else {
+                return None; // off the end of the switch
+            };
+            let mut emit = Vec::new();
+            for &st in &flat {
+                if mentions(st, s) {
+                    return None;
+                }
+                emit.push(st);
+            }
+            if out
+                .insert(
+                    state,
+                    SvalCase {
+                        emit,
+                        end: SvalEnd::FallThrough(next_state),
+                    },
+                )
+                .is_some()
+            {
+                return None;
+            }
+            continue;
+        };
+        let (end, upto, terminal_incl) = match flat[term_idx] {
+            Statement::BreakStatement(b) if b.label.is_none() => {
+                let next = sole_sval_transition(&flat[..term_idx], s)?;
+                (SvalEnd::Step(next), term_idx, false)
+            }
+            Statement::ContinueStatement(c) if c.label.is_none() => {
+                let next = sole_sval_transition(&flat[..term_idx], s)?;
+                (SvalEnd::Step(next), term_idx, false)
+            }
+            Statement::ReturnStatement(_) | Statement::ThrowStatement(_) => {
+                (SvalEnd::Terminal, term_idx + 1, true)
+            }
+            _ => return None,
+        };
+        let mut emit = Vec::new();
+        for (k, &st) in flat[..upto].iter().enumerate() {
+            let is_terminal_stmt = terminal_incl && k == upto - 1;
+            if sval_transition(st, s).is_some() {
+                continue;
+            }
+            if mentions(st, s) {
+                return None;
+            }
+            if !is_terminal_stmt && is_top_level_control(st) {
+                return None;
+            }
+            emit.push(st);
+        }
+        if out.insert(state, SvalCase { emit, end }).is_some() {
+            return None; // duplicate case label
+        }
+    }
+    Some(out)
+}
+
+/// Run the string/boolean engine on the (init, dispatcher) statement pair.
+fn simulate_sval_at<'a>(
+    init_stmt: &Statement<'a>,
+    loop_stmt: &Statement<'a>,
+    s_name: &str,
+    alloc: &'a Allocator,
+) -> Option<Vec<Statement<'a>>> {
+    let (_, init) = sval_init(init_stmt)?;
+    // Reuse the integer `detect_loop` only for its structural shape extraction
+    // (while/do/for + single switch + no-default + discriminant is `s`); but the
+    // test must be parsed over `StateVal`, so re-derive it here from the loop node.
+    let (test, body, kind) = match loop_stmt {
+        Statement::WhileStatement(w) => {
+            (parse_sval_test(&w.test, s_name)?, &w.body, LoopKind::While)
+        }
+        Statement::DoWhileStatement(d) => (
+            parse_sval_test(&d.test, s_name)?,
+            &d.body,
+            LoopKind::DoWhile,
+        ),
+        Statement::ForStatement(f) => {
+            if f.init.as_ref().is_some_and(|i| for_init_writes(i, s_name)) {
+                return None;
+            }
+            if f.update.as_ref().is_some_and(|u| writes_in_expr(u, s_name)) {
+                return None;
+            }
+            let test = match &f.test {
+                Some(t) => parse_sval_test(t, s_name)?,
+                None => SvalTest::Always,
+            };
+            (test, &f.body, LoopKind::While)
+        }
+        _ => return None,
+    };
+    let switch = match body {
+        Statement::SwitchStatement(sw) => sw,
+        Statement::BlockStatement(b) if b.body.len() == 1 => {
+            let Statement::SwitchStatement(sw) = &b.body[0] else {
+                return None;
+            };
+            sw
+        }
+        _ => return None,
+    };
+    if !is_ident(&switch.discriminant, s_name) {
+        return None;
+    }
+    if switch.cases.iter().any(|c| c.test.is_none()) {
+        return None; // no `default`
+    }
+    let cases = parse_sval_cases(switch, s_name)?;
+
+    // Simulate, mirroring the integer `simulate` (including fall-through chains and
+    // cycle detection).
+    let mut state = init;
+    let mut visited: HashSet<StateVal> = HashSet::new();
+    let mut seq: Vec<Statement<'a>> = Vec::new();
+    for _ in 0..100_000 {
+        if kind == LoopKind::While && !test.continues(&state)? {
+            return Some(seq);
+        }
+        if !visited.insert(state.clone()) {
+            return None; // revisited → real loop
+        }
+        let mut ft_seen: HashSet<StateVal> = HashSet::new();
+        loop {
+            if !ft_seen.insert(state.clone()) {
+                return None;
+            }
+            let case = cases.get(&state)?;
+            for st in &case.emit {
+                seq.push((*st).clone_in(alloc));
+            }
+            match &case.end {
+                SvalEnd::Step(next) => {
+                    state = next.clone();
+                    break;
+                }
+                SvalEnd::Terminal => return Some(seq),
+                SvalEnd::FallThrough(next) => {
+                    if !visited.insert(next.clone()) {
+                        return None;
+                    }
+                    state = next.clone();
+                }
+            }
+        }
+        if kind == LoopKind::DoWhile && !test.continues(&state)? {
+            return Some(seq);
+        }
+    }
+    None
 }
