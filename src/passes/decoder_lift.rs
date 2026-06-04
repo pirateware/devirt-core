@@ -1799,8 +1799,15 @@ fn build_preamble<'a>(
     }
 
     // Alias definitions, so calls through `var v = decoder` (or `decoder.bind(x)`)
-    // resolve. The `emit` source reproduces the alias exactly as written.
-    for (a, def) in aliases {
+    // resolve. The `emit` source reproduces the alias exactly as written. Emit in
+    // a stable name order: iterating the `aliases` HashMap directly let the
+    // preamble text — and thus the sandbox setup — depend on per-process hash
+    // seeding, which is a latent nondeterminism (an alias-of-an-alias whose RHS
+    // is declared later would resolve to `undefined` for some seeds only). A
+    // deterministic order makes the lift reproducible.
+    let mut alias_list: Vec<_> = aliases.iter().collect();
+    alias_list.sort_by_key(|(a, _)| *a);
+    for (a, def) in alias_list {
         code.push_str(&format!("\nvar {a} = {};", def.emit));
     }
 

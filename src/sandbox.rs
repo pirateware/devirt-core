@@ -24,6 +24,23 @@ const EVAL_BUDGET: Duration = Duration::from_secs(2);
 /// input correctly; both return/consume Latin-1 "binary strings" like the host.
 const SANDBOX_PRELUDE: &str = r#"
 (function(g){
+  // Determinism freeze. Partial evaluation must be reproducible: a decoder we
+  // run in the sandbox that happens to read the wall clock would otherwise fold
+  // to a different literal on every run (the `report` jitter on s3/s11 was a
+  // `Date.now()` seed/timestamp leaking into a lifted value). The in-process
+  // double-eval determinism guard MISSES `Date.now()` because two back-to-back
+  // millisecond reads agree, yet they differ across processes — so we pin the
+  // clock itself to a constant. We freeze only `Date.now()` (the value-returning
+  // reader), leaving the `Date` constructor and instance methods intact so
+  // feature-detection and `new Date(x)` inside a real decoder keep working.
+  //
+  // `Math.random` is deliberately NOT frozen: the double-eval guard already
+  // catches RNG-dependent values (two reads disagree), and pinning it to a
+  // constant instead corrupts seed/charset setup in legitimate string decoders,
+  // mass-declining sound lifts (observed: ~+10% bloat on sample_11). Freezing a
+  // clock read is independently unsound; this only makes the tool deterministic.
+  if (typeof g.Date === "function") { g.Date.now = function(){ return 0; }; }
+
   var B="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   if (typeof g.atob === "undefined") {
     g.atob = function(input){

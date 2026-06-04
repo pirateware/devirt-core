@@ -109,7 +109,15 @@ impl Pass for Demultiplex {
         for (region, stmt) in rw.new_defs {
             by_region.entry(region).or_default().push(stmt);
         }
-        for (region, defs) in by_region {
+        // Drain in a deterministic region order. Distinct regions append into
+        // disjoint scopes, so cross-region order can't change emitted output
+        // today — but iterating a `HashMap` for emission is a latent
+        // nondeterminism, so we sort by the region's stable key (Program first,
+        // then IIFEs by body index). Within a region the `Vec` keeps insertion
+        // order, which is the source order of the specializations.
+        let mut regions: Vec<(Region, Vec<Statement<'a>>)> = by_region.into_iter().collect();
+        regions.sort_by_key(|(r, _)| region_key(*r));
+        for (region, defs) in regions {
             append_to_region(program, region, defs);
         }
         true
@@ -125,6 +133,16 @@ enum Region {
     Program,
     /// A top-level IIFE expression statement at this index of `program.body`.
     Iife(usize),
+}
+
+/// Stable total order over regions, so emission never depends on `HashMap`
+/// iteration order. `Program` sorts before any `Iife`, and IIFEs sort by their
+/// `program.body` index.
+fn region_key(region: Region) -> (u8, usize) {
+    match region {
+        Region::Program => (0, 0),
+        Region::Iife(i) => (1, i),
+    }
 }
 
 fn append_to_region<'a>(program: &mut Program<'a>, region: Region, defs: Vec<Statement<'a>>) {
