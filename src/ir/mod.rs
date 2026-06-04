@@ -20,6 +20,12 @@ mod analysis;
 pub(crate) mod cff;
 mod cfg;
 mod consts;
+// Dispatcher-agnostic recovery substrate (Plan A4): a `DispatchModel` trait + one
+// abstract interpreter that recovers a `cff::RecoveredCfg` for any flattening
+// dialect. Additive scaffolding — unit-tested in isolation, not yet wired into the
+// pipeline (the dialect passes remain the production recognizers). See the module
+// docs for the wiring criteria.
+pub(crate) mod dispatch;
 mod dom;
 mod inline;
 mod ordering;
