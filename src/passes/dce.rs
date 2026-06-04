@@ -77,7 +77,7 @@ fn keep_statement(s: &Statement<'_>, scoping: &Scoping) -> bool {
         Statement::VariableDeclaration(vd) => !vd.declarations.is_empty(),
         Statement::FunctionDeclaration(f) => {
             f.id.as_ref()
-                .is_none_or(|id| !is_removable_symbol(id.symbol_id(), scoping))
+                .is_none_or(|id| !fn_decl_is_dead(id.symbol_id(), scoping))
         }
         // A bare literal statement (`80214130;`, `true;`, `null;`) computes a
         // value that is immediately discarded with no side effect — pure
@@ -109,6 +109,22 @@ fn is_dead_literal(expr: &oxc_ast::ast::Expression<'_>) -> bool {
 /// dropped when its initializer is pure (see `keep_declarator`).
 fn is_removable_symbol(symbol: oxc_syntax::symbol::SymbolId, scoping: &Scoping) -> bool {
     scoping.symbol_is_unused(symbol)
+}
+
+/// A function declaration is dead if its name is never *read* anywhere — i.e. it
+/// is never called or otherwise observed. Defining a function declaration has no
+/// side effect, so when nothing reads the binding, neither its body nor any
+/// self-reassignment inside it can ever run, and the whole statement is inert.
+///
+/// This is strictly broader than `symbol_is_unused`, which counts a *write* as a
+/// use. The obfuscator string-array accessor relies on that gap: after every
+/// call site is inlined away, all that remains is the self-memoizing write inside
+/// its own body —
+///   `function f(){ const a=[…]; f = function(){ return a; }; return […]; }`
+/// — a lone write reference that pins the function alive even though it is dead.
+/// Keying on read references instead lets it be collected.
+fn fn_decl_is_dead(symbol: oxc_syntax::symbol::SymbolId, scoping: &Scoping) -> bool {
+    !scoping.get_resolved_references(symbol).any(|r| r.is_read())
 }
 
 fn is_terminator(s: &Statement<'_>) -> bool {
