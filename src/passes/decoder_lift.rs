@@ -745,7 +745,17 @@ pub(crate) struct FreeVars {
     /// exactly this class — and only when the base is a proven *private cache*. Any
     /// other write shape stays in `written` and is never whitelistable.
     written_member: HashSet<String>,
-    impure: bool, // uses `this`, or performs an un-analyzable write → not liftable
+    impure: bool, // performs an un-analyzable write / reaches non-modelable state → not liftable
+    /// The body uses the *global-object idiom* — `this` in value position and/or
+    /// `new Function("return this")()`. These resolve to the (frozen) global object
+    /// in the sandbox and are deterministic under the QuickJS-relative oracle (the
+    /// equivalence harness executes original-vs-deobfuscated in the *same* engine),
+    /// so they do NOT poison `impure`. A bare `this` in a liftable decoder is the
+    /// global: decoder-lift only ever lifts bare-identifier calls (`dec(x)`, never
+    /// `o.m(x)`), whose `this` is the sloppy-mode global the sandbox supplies,
+    /// re-checked by the double-eval determinism guard. Tracked separately (rather
+    /// than silently dropped) so the relaxation stays explicit and auditable.
+    uses_global_idiom: bool,
 }
 
 impl<'a> Visit<'a> for FreeVars {
@@ -756,7 +766,27 @@ impl<'a> Visit<'a> for FreeVars {
         self.bound.insert(it.name.to_string());
     }
     fn visit_this_expression(&mut self, _it: &oxc_ast::ast::ThisExpression) {
-        self.impure = true;
+        // `this` in a liftable decoder is the global object (decoder-lift only ever
+        // lifts bare-identifier calls, whose `this` is the sloppy-mode global the
+        // sandbox supplies — never a method receiver). Model it as the frozen
+        // global-object idiom rather than poisoning purity; the determinism guard
+        // re-validates the concrete value.
+        self.uses_global_idiom = true;
+    }
+
+    fn visit_new_expression(&mut self, node: &oxc_ast::ast::NewExpression<'a>) {
+        // The exact global-detection idiom `new Function("return this")()` yields
+        // the global object deterministically. Recognize only this precise zero-arg
+        // `return this` form: consume the `Function` reference (so it is not treated
+        // as a free name) and mark the global idiom, leaving the rest of the gate
+        // (writes, host reads) intact. Any *other* use of `Function` flows through
+        // as a free name and is rejected (it is not in GLOBALS) — `Function` stays
+        // an injection vector everywhere except this one shape.
+        if is_function_return_this(node) {
+            self.uses_global_idiom = true;
+            return; // do not walk into `Function` / the "return this" string literal
+        }
+        oxc_ast_visit::walk::walk_new_expression(self, node);
     }
 
     fn visit_assignment_expression(&mut self, node: &oxc_ast::ast::AssignmentExpression<'a>) {
@@ -847,6 +877,23 @@ const MUTATOR_METHODS: &[&str] = &[
     "setFloat32",
     "setFloat64",
 ];
+
+/// Recognize the exact global-detection idiom `new Function("return this")` — a
+/// constructor call on the bare identifier `Function` with a single string-literal
+/// argument whose (whitespace-trimmed) text is `return this`. Nothing else matches,
+/// so `Function` keeps its injection-vector treatment everywhere else.
+fn is_function_return_this(node: &oxc_ast::ast::NewExpression<'_>) -> bool {
+    let Expression::Identifier(callee) = &node.callee else {
+        return false;
+    };
+    if callee.name != "Function" || node.arguments.len() != 1 {
+        return false;
+    }
+    match node.arguments[0].as_expression() {
+        Some(Expression::StringLiteral(s)) => s.value.trim() == "return this",
+        _ => false,
+    }
+}
 
 impl FreeVars {
     /// Record a write whose target base resolves to `name`. An unresolvable shape

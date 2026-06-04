@@ -385,29 +385,87 @@ fn does_not_materialize_huge_array() {
 
 #[test]
 fn does_not_lift_decoder_through_this_global_detection() {
-    // B3/C2 sound decline: the sample_7 Base91 chain bottoms out in a global-object
-    // detector that uses `this` and `new Function("return this")()`. Until a sound
-    // pure-call value-binding preamble + a narrowly-scoped global-idiom relaxation
-    // exist, such a decoder must NOT be lifted — `this`/`Function` poison the static
-    // purity gate, and that is the safe outcome (no transform). This locks in the
-    // decline so a future relaxation can't silently start lifting it unchecked.
+    // B3/C2 sound decline (TIGHTENED): the global-object idiom (`this` /
+    // `new Function("return this")()`) is now modeled as the frozen sandbox global
+    // and is admissible *only where pure-relative-to-host*. A decoder that detects
+    // the global and then reads a genuinely *non-deterministic* value off it
+    // (`Math.random()`) must NOT lift — the double-eval determinism guard (two
+    // back-to-back evals must agree) refuses it. (The earlier `g.TextDecoder` form
+    // was wrong as an adversary: under QuickJS-relative soundness the host-property
+    // branch is unreachable in the sandbox and both sides agree, so the
+    // global-detector idiom itself is a *legitimate* lift — see
+    // `lifts_decoder_through_pure_global_detection`. The real must-decline is a
+    // genuinely non-deterministic value, locked in here.)
     let src = r#"
         (function () {
-            function glob() { try { return new Function("return this")(); } catch (e) {} return this; }
-            var g = glob() || {};
-            var dec = g.TextDecoder;
             var tbl = ["AAAA", "BBBB"];
-            function pick(i) { return dec ? new dec().decode(tbl[i]) : tbl[i]; }
+            function pick(i) {
+                var g = (function () { try { return new Function("return this")(); } catch (e) {} return this; })();
+                var rnd = g.Math.random() < 2 ? g.Math.random() : 0;
+                return tbl[i] + rnd;
+            }
             sink(pick(0), pick(1));
         })();
     "#;
     let out = deobfuscate(src, "t.js").code;
-    // The decoder chain must survive unresolved (the `this`/Function detector keeps
-    // it static-impure); no decode literal may replace the calls.
+    // The decoder chain must survive unresolved (the random read is non-deterministic,
+    // so the determinism guard declines); no decode literal may replace the calls.
     assert!(
         out.contains("pick(0)") && out.contains("pick(1)"),
-        "this/Function-rooted decoder must be left in place: {out}"
+        "non-deterministic decoder must be left in place: {out}"
     );
+}
+
+#[test]
+fn does_not_lift_impure_call_preamble_binding() {
+    // B3 adversarial: a decoder whose value derives from an *impure* call (one that
+    // mutates outer state) must NOT be lifted. `bump` increments a shared counter —
+    // lifting a decode that consumes its result would drop that side effect. The
+    // decoder must stay in place. (`bump` writes a free name, so it never classifies
+    // pure; `tick`/`dec` are poisoned transitively.)
+    let src = r#"
+        (function () {
+            var counter = 0;
+            function bump() { counter++; return counter; }
+            var tick = bump();
+            var tbl = ["a", "b", "c"];
+            function dec(i) { return tbl[(i + tick) % 3]; }
+            sink(dec(0));
+        })();
+    "#;
+    let out = deobfuscate(src, "t.js").code;
+    assert!(
+        out.contains("dec(0)"),
+        "decoder over an impure-call binding must be left in place: {out}"
+    );
+}
+
+#[test]
+fn lifts_decoder_through_pure_global_detection() {
+    // B3 global-object idiom used *pure-relative-to-host*. The decoder detects the
+    // global via the standard idiom (`new Function("return this")()` / `this`) and
+    // reads only a *standard built-in* (`String.fromCharCode`) off it — deterministic
+    // and identical on every conforming host, and present in the QuickJS sandbox. So
+    // it is a legitimate lift: `this`/`Function("return this")()` are modeled as the
+    // frozen sandbox global rather than poisoning the purity gate, and the decoder
+    // resolves under the double-eval determinism guard.
+    let src = r#"
+        (function () {
+            var tbl = [72, 73];
+            function dec(i) {
+                var g = (function () { try { return new Function("return this")(); } catch (e) {} return this; })();
+                var SC = (g && g.String) || String;
+                return SC.fromCharCode(tbl[i]);
+            }
+            sink(dec(0), dec(1));
+        })();
+    "#;
+    let out = deobfuscate(src, "t.js").code;
+    assert!(
+        out.contains("\"H\"") && out.contains("\"I\""),
+        "pure global-detector decoder not resolved: {out}"
+    );
+    assert!(!out.contains("dec("), "decoder call survived: {out}");
 }
 
 #[test]
