@@ -1555,3 +1555,173 @@ fn unflatten_param_state_preserves_value() {
            f(1, (log += 'a', 'b')); return log; })();",
     );
 }
+
+/// Assert the deobfuscation both preserves the value AND removes the flattened
+/// dispatcher (the recovered code contains no `switch`). This is the A2 relooper
+/// firing: the proof that we structured, not just stayed equivalent by declining.
+fn assert_structured(src: &str) {
+    assert_equivalent(src);
+    let deob = js_deobfuscator::deobfuscate(src, "t.js");
+    assert!(
+        !deob.code.contains("switch"),
+        "expected the dispatcher to be structured away, but a switch remains:\n{}",
+        deob.code
+    );
+}
+
+/// Like `assert_structured` but the *opposite*: the pass must DECLINE (a `switch`
+/// remains) — the adversarial / unsupported sibling. Value still preserved.
+fn assert_declined(src: &str) {
+    assert_equivalent(src);
+    let deob = js_deobfuscator::deobfuscate(src, "t.js");
+    assert!(
+        deob.code.contains("switch"),
+        "expected the dispatcher to be left intact (declined), but it was structured:\n{}",
+        deob.code
+    );
+}
+
+#[test]
+fn relooper_structures_two_state_loop() {
+    // state1 branches to body(2) or exit; body returns to 1 (a `while` with a guard).
+    assert_structured(
+        r#"
+        var acc = 0, i = 0;
+        var s = 1;
+        while (s) {
+            switch (s) {
+                case 1: if (i < 4) { s = 2; } else { s = 0; } break;
+                case 2: acc += i; i = i + 1; s = 1; break;
+            }
+        }
+        __r = acc + ":" + i;
+        "#,
+    );
+}
+
+#[test]
+fn relooper_structures_forward_diamond() {
+    // A forward branch that re-merges (an `if/else` with a shared continuation).
+    assert_structured(
+        r#"
+        var v = 0;
+        var cond = String(1) === "1";
+        var s = 1;
+        while (s) {
+            switch (s) {
+                case 1: if (cond) { s = 2; } else { s = 3; } break;
+                case 2: v = 10; s = 4; break;
+                case 3: v = 20; s = 4; break;
+                case 4: v += 1; s = 0; break;
+            }
+        }
+        __r = v;
+        "#,
+    );
+}
+
+#[test]
+fn relooper_structures_loop_containing_branch() {
+    // A loop whose body has an internal diamond (state 2 → {3,4} → 5 → back to 1).
+    assert_structured(
+        r#"
+        var sum = 0, i = 0;
+        var s = 1;
+        while (s) {
+            switch (s) {
+                case 1: if (i >= 5) { s = 0; } else { s = 2; } break;
+                case 2: if (i % 2 === 0) { s = 3; } else { s = 4; } break;
+                case 3: sum += i; s = 5; break;
+                case 4: sum -= i; s = 5; break;
+                case 5: i = i + 1; s = 1; break;
+            }
+        }
+        __r = sum + ":" + i;
+        "#,
+    );
+}
+
+#[test]
+fn relooper_structures_nested_loops() {
+    // An outer loop over `i` containing an inner loop over `j` — two back edges,
+    // distinct headers, break/continue at each level.
+    assert_structured(
+        r#"
+        var total = 0, i = 0, j = 0;
+        var s = 1;
+        while (s) {
+            switch (s) {
+                case 1: if (i < 3) { s = 2; } else { s = 0; } break;
+                case 2: j = 0; s = 3; break;
+                case 3: if (j < 3) { s = 4; } else { s = 5; } break;
+                case 4: total = total + i * j; j = j + 1; s = 3; break;
+                case 5: i = i + 1; s = 1; break;
+            }
+        }
+        __r = total;
+        "#,
+    );
+}
+
+#[test]
+fn relooper_structures_branch_arms_reentering_loop() {
+    // Both arms of an in-loop branch continue the loop (no merge): each arm ends in
+    // its own back edge. Exercises break (state 1 exit) + continue from two arms.
+    assert_structured(
+        r#"
+        var a = 0, b = 0, i = 0;
+        var s = 1;
+        while (s) {
+            switch (s) {
+                case 1: if (i >= 6) { s = 0; } else { s = 2; } break;
+                case 2: if (i % 3 === 0) { s = 3; } else { s = 4; } break;
+                case 3: a += i; i = i + 1; s = 1; break;
+                case 4: b += i; i = i + 1; s = 1; break;
+            }
+        }
+        __r = a + ":" + b;
+        "#,
+    );
+}
+
+#[test]
+fn relooper_structures_loop_with_return_terminator() {
+    // A mixed terminator: one arm `return`s out of the function, the loop exits via
+    // the other. The return content is preserved verbatim.
+    assert_structured(
+        r#"
+        __r = (function () {
+            var n = 0;
+            var s = 1;
+            while (s) {
+                switch (s) {
+                    case 1: if (n >= 10) { return n * 2; } else { s = 2; } break;
+                    case 2: n = n + 3; s = 1; break;
+                }
+            }
+            return -1;
+        })();
+        "#,
+    );
+}
+
+#[test]
+fn relooper_declines_irreducible() {
+    // Two states with cross edges (a jump into a loop body): irreducible. The pass
+    // must decline — the dispatcher stays, value preserved either way.
+    assert_declined(
+        r#"
+        var v = 0, i = 0;
+        var enter = (String(1) === "1") ? 2 : 3;
+        var s = 1;
+        while (s) {
+            switch (s) {
+                case 1: s = enter; break;
+                case 2: v += 1; i = i + 1; if (i < 3) { s = 3; } else { s = 0; } break;
+                case 3: v += 10; i = i + 1; if (i < 3) { s = 2; } else { s = 0; } break;
+            }
+        }
+        __r = v;
+        "#,
+    );
+}

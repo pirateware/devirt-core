@@ -90,6 +90,11 @@ pub struct RecoveredCfg {
 impl RecoveredCfg {
     /// Dense successor list over `order` indexing, with a synthetic `Exit` node at
     /// the end. Used to compute dominators / back edges.
+    ///
+    /// The relooper (`super::relooper`) builds its own dense view with predecessors;
+    /// these helpers remain the canonical back-edge oracle exercised by the unit
+    /// tests below and available for diagnostics.
+    #[allow(dead_code)]
     fn dense_succs(&self) -> (Vec<Vec<usize>>, usize) {
         let index: HashMap<i64, usize> = self
             .order
@@ -116,6 +121,7 @@ impl RecoveredCfg {
 
     /// The back edges `(from_state, to_state)` of the recovered graph — transitions
     /// `u → v` where `v` dominates `u`. Each back edge is a recovered loop.
+    #[allow(dead_code)]
     pub fn back_edges(&self) -> Vec<(i64, i64)> {
         let (succs, _exit) = self.dense_succs();
         let entry_idx = 0usize; // entry is always order[0]
@@ -132,6 +138,7 @@ impl RecoveredCfg {
     }
 
     /// Whether the recovered graph contains any loop (back edge).
+    #[allow(dead_code)]
     pub fn has_loop(&self) -> bool {
         !self.back_edges().is_empty()
     }
@@ -516,6 +523,86 @@ pub fn structure<'a>(
     let body_block = ast.statement_block(SPAN, body);
     let do_while = ast.statement_do_while(SPAN, body_block, cond);
     Some(vec![do_while])
+}
+
+// ---------------------------------------------------------------------------
+// General structuring (Plan A2): RecoveredCfg → if/else + while via the relooper
+// ---------------------------------------------------------------------------
+
+/// A [`super::relooper::CaseSource`] backed by the original switch: it resolves a
+/// recovered state's content statements and guard condition straight from the
+/// case AST, cloning verbatim into the arena. This is the bridge from the
+/// read-only recovered model to re-emitted structured AST — every statement and
+/// condition the relooper places comes through here, so nothing is synthesized.
+struct SwitchSource<'b, 'a> {
+    switch: &'b SwitchStatement<'a>,
+    s: &'b str,
+    cfg: &'b RecoveredCfg,
+    ast: AstBuilder<'a>,
+}
+
+impl<'b, 'a> SwitchSource<'b, 'a> {
+    /// Re-flatten the case for state `k` (same flattening the builder used), so the
+    /// stored content/cond indices resolve to the exact statements.
+    fn flat_case(&self, k: i64) -> Option<Vec<&'b Statement<'a>>> {
+        let case = self
+            .switch
+            .cases
+            .iter()
+            .find(|c| c.test.as_ref().and_then(int_literal) == Some(k))?;
+        let mut flat: Vec<&Statement> = Vec::new();
+        flatten_case(&case.consequent, &mut flat);
+        Some(flat)
+    }
+}
+
+impl<'b, 'a> super::relooper::CaseSource<'a> for SwitchSource<'b, 'a> {
+    fn content(&self, k: i64) -> Vec<Statement<'a>> {
+        let (Some(block), Some(flat)) = (self.cfg.blocks.get(&k), self.flat_case(k)) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for &i in &block.content {
+            if let Some(st) = flat.get(i) {
+                // The builder guaranteed content never mentions the dispatch var.
+                debug_assert!(!mentions_state(st, self.s));
+                out.push(st.clone_in(self.ast.allocator));
+            }
+        }
+        out
+    }
+
+    fn cond(&self, k: i64) -> Option<Expression<'a>> {
+        let block = self.cfg.blocks.get(&k)?;
+        let cond_idx = block.cond_stmt?;
+        let flat = self.flat_case(k)?;
+        let Statement::IfStatement(iff) = flat.get(cond_idx)? else {
+            return None;
+        };
+        Some(iff.test.clone_in(self.ast.allocator))
+    }
+}
+
+/// Structure an arbitrary **reducible** recovered dispatcher into `if/else` +
+/// `while(true){…}` via the general relooper (Plan A2). The condition emitted for a
+/// two-way split is the verbatim original `if` test, oriented for the `IfTrue` arm
+/// (the relooper places `IfTrue` as the `then` branch, `IfFalse` as the `else`).
+///
+/// Declines (`None`) on any irreducible graph or any shape the relooper cannot
+/// place soundly (the caller then leaves the dispatcher untouched).
+pub fn structure_general<'a>(
+    switch: &SwitchStatement<'a>,
+    s: &str,
+    cfg: &RecoveredCfg,
+    ast: AstBuilder<'a>,
+) -> Option<Vec<Statement<'a>>> {
+    let src = SwitchSource {
+        switch,
+        s,
+        cfg,
+        ast,
+    };
+    super::relooper::structure_general(cfg, &src, ast)
 }
 
 #[cfg(test)]

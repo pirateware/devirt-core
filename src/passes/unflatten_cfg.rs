@@ -85,11 +85,13 @@ impl<'a> Walker<'a> {
             let Some(cfg) = cff::build(switch, &s_name, entry, &continues) else {
                 continue;
             };
-            // Only engage on a genuine loop (what the linear form declined).
-            if !cfg.has_loop() {
-                continue;
-            }
-            let Some(seq) = cff::structure(switch, &s_name, &cfg, self.ast) else {
+            // Try the specialized self-loop → do/while first (it reads nicest), then
+            // fall back to the general relooper for arbitrary reducible branch/loop
+            // graphs the linear form declined on. Either declines soundly (→ leave
+            // the dispatcher) on shapes it cannot place.
+            let seq = cff::structure(switch, &s_name, &cfg, self.ast)
+                .or_else(|| cff::structure_general(switch, &s_name, &cfg, self.ast));
+            let Some(seq) = seq else {
                 continue;
             };
             hit = Some((i, j, seq));
