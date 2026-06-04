@@ -27,8 +27,11 @@
 
 use std::collections::{HashMap, HashSet};
 
+use oxc_allocator::CloneIn;
 use oxc_ast::ast::*;
-use oxc_syntax::operator::{AssignmentOperator, BinaryOperator};
+use oxc_ast::AstBuilder;
+use oxc_span::SPAN;
+use oxc_syntax::operator::{AssignmentOperator, UnaryOperator};
 
 use super::dom::Dominators;
 
@@ -156,10 +159,6 @@ fn int_literal(expr: &Expression<'_>) -> Option<i64> {
     }
 }
 
-fn is_ident(expr: &Expression<'_>, name: &str) -> bool {
-    matches!(expr, Expression::Identifier(id) if id.name == name)
-}
-
 /// `s = <int>` as a top-level expression statement → the absolute target state.
 /// (P2-v1 models only absolute transitions in conditional arms; relative steps
 /// inside branches are left to the linear simulator's enumeration and decline
@@ -234,7 +233,11 @@ fn mentions_state(stmt: &Statement<'_>, s: &str) -> bool {
 ///   * `if (c) s = A; break;` (no else, falls through to a trailing `s = B`)
 ///   * `return`/`throw`                             → one `Exit` edge
 ///   * `break`/`continue` with a preceding sole `s = K` (the linear shape)
-fn parse_case_block(flat: &[&Statement<'_>], s: &str, loop_test_exit: bool) -> Option<CaseBlock> {
+fn parse_case_block(
+    flat: &[&Statement<'_>],
+    s: &str,
+    continues: &dyn Fn(i64) -> bool,
+) -> Option<CaseBlock> {
     // Find the terminator (first top-level break/continue/return/throw).
     let term_idx = flat.iter().position(|st| is_top_level_control(st))?;
 
@@ -250,16 +253,26 @@ fn parse_case_block(flat: &[&Statement<'_>], s: &str, loop_test_exit: bool) -> O
         Statement::ReturnStatement(_) | Statement::ThrowStatement(_)
     );
 
+    // A transition to state `k` leaves the machine iff the loop test goes false
+    // there (`s = 0` under `while (s)`); otherwise it is an in-machine edge.
+    let target_of = |k: i64| {
+        if continues(k) {
+            Target::State(k)
+        } else {
+            Target::Exit
+        }
+    };
+
     for (k, &st) in flat.iter().enumerate().take(term_idx) {
         if let Some(t) = abs_transition(st, s) {
             // Unconditional absolute transition.
             edges.push(Edge {
                 guard: Guard::Always,
-                target: Target::State(t),
+                target: target_of(t),
             });
             continue;
         }
-        if let Some((cond_true, cond_false)) = conditional_transition(st, s) {
+        if let Some((cond_true, cond_false)) = conditional_transition(st, s, &target_of) {
             cond_stmt = Some(k);
             edges.push(Edge {
                 guard: Guard::IfTrue,
@@ -295,16 +308,11 @@ fn parse_case_block(flat: &[&Statement<'_>], s: &str, loop_test_exit: bool) -> O
     }
 
     // Non-terminal (break/continue): there must be at least one transition edge.
-    // A bare break with a loop-test exit and no transition means "fall to Exit".
+    // A bare break with no transition means the loop test is re-checked at the
+    // unchanged state; if the test still continues there we cannot model it (would
+    // spin), so require at least one edge.
     if edges.is_empty() {
-        if loop_test_exit {
-            edges.push(Edge {
-                guard: Guard::Always,
-                target: Target::Exit,
-            });
-        } else {
-            return None;
-        }
+        return None;
     }
     Some(CaseBlock {
         content,
@@ -314,27 +322,36 @@ fn parse_case_block(flat: &[&Statement<'_>], s: &str, loop_test_exit: bool) -> O
 }
 
 /// `if (cond) s = A; else s = B;` (each arm exactly one absolute transition) →
-/// `(State(A), State(B))`. Also accepts an arm that is a `{ s = X }` block.
-fn conditional_transition(stmt: &Statement<'_>, s: &str) -> Option<(Target, Target)> {
+/// `(target A, target B)`, each mapped through `target_of` (so an exit-state
+/// transition becomes `Exit`). Also accepts an arm that is a `{ s = X }` block.
+fn conditional_transition(
+    stmt: &Statement<'_>,
+    s: &str,
+    target_of: &dyn Fn(i64) -> Target,
+) -> Option<(Target, Target)> {
     let Statement::IfStatement(iff) = stmt else {
         return None;
     };
-    let then_t = arm_transition(&iff.consequent, s)?;
+    let then_t = arm_transition(&iff.consequent, s, target_of)?;
     let else_t = match &iff.alternate {
-        Some(alt) => arm_transition(alt, s)?,
+        Some(alt) => arm_transition(alt, s, target_of)?,
         None => return None, // no else → not a clean two-way split (v1 declines)
     };
     Some((then_t, else_t))
 }
 
 /// A branch arm that is exactly one absolute transition `s = K` (optionally
-/// wrapped in a single-statement block) → its target.
-fn arm_transition(stmt: &Statement<'_>, s: &str) -> Option<Target> {
+/// wrapped in a single-statement block) → its target (via `target_of`).
+fn arm_transition(
+    stmt: &Statement<'_>,
+    s: &str,
+    target_of: &dyn Fn(i64) -> Target,
+) -> Option<Target> {
     match stmt {
         Statement::BlockStatement(b) if b.body.len() == 1 => {
-            abs_transition(&b.body[0], s).map(Target::State)
+            abs_transition(&b.body[0], s).map(target_of)
         }
-        other => abs_transition(other, s).map(Target::State),
+        other => abs_transition(other, s).map(target_of),
     }
 }
 
@@ -376,14 +393,14 @@ pub fn build(
     switch: &SwitchStatement<'_>,
     s: &str,
     entry: i64,
-    loop_test_exit: bool,
+    continues: &dyn Fn(i64) -> bool,
 ) -> Option<RecoveredCfg> {
     let mut blocks: HashMap<i64, CaseBlock> = HashMap::new();
     for case in &switch.cases {
         let state = int_literal(case.test.as_ref()?)?;
         let mut flat: Vec<&Statement> = Vec::new();
         flatten_case(&case.consequent, &mut flat);
-        let block = parse_case_block(&flat, s, loop_test_exit)?;
+        let block = parse_case_block(&flat, s, continues)?;
         if blocks.insert(state, block).is_some() {
             return None; // duplicate label
         }
@@ -420,19 +437,85 @@ pub fn build(
     })
 }
 
-/// Like `LoopTest` in `unflatten`, but local: does the loop continue at `state`?
-/// Used to validate the recovered model against the test's exits.
-#[allow(dead_code)]
-pub fn cmp_continues(op: BinaryOperator, k: i64, state: i64) -> bool {
-    match op {
-        BinaryOperator::Inequality | BinaryOperator::StrictInequality => state != k,
-        BinaryOperator::Equality | BinaryOperator::StrictEquality => state == k,
-        BinaryOperator::LessThan => state < k,
-        BinaryOperator::LessEqualThan => state <= k,
-        BinaryOperator::GreaterThan => state > k,
-        BinaryOperator::GreaterEqualThan => state >= k,
-        _ => false,
+// ---------------------------------------------------------------------------
+// Structuring (Plan P2/M2): RecoveredCfg → structured AST
+// ---------------------------------------------------------------------------
+
+/// Structure a recovered self-loop into a `do { … } while (cond)`.
+///
+/// v1 handles exactly the shape the linear `simulate` declines on but which is a
+/// single recovered loop: **one** entry state whose only transition is a
+/// conditional split with one arm back to itself and the other to `Exit`:
+///
+/// ```text
+/// case E: <content>; if (cond) s = E; else s = <exit>; break;   (while/do over s)
+/// ```
+///
+/// → `do { <content> } while (cond)`  (or `while (!cond)` when the self-arm is the
+/// `else`). Sound: the body runs at least once (the machine always enters state E
+/// since the loop test continues there), the content runs in the same order each
+/// iteration, and the loop repeats exactly while the original transition pointed
+/// back to E. Returns `None` (decline → no transform) on any other shape.
+pub fn structure<'a>(
+    switch: &SwitchStatement<'a>,
+    s: &str,
+    cfg: &RecoveredCfg,
+    ast: AstBuilder<'a>,
+) -> Option<Vec<Statement<'a>>> {
+    // Exactly one recovered state, and it is the entry.
+    if cfg.order.len() != 1 || cfg.order[0] != cfg.entry {
+        return None;
     }
+    let block = cfg.blocks.get(&cfg.entry)?;
+    // A single conditional split: IfTrue + IfFalse, one to self, one to Exit.
+    if block.edges.len() != 2 {
+        return None;
+    }
+    let cond_idx = block.cond_stmt?;
+    let (mut if_true, mut if_false) = (None, None);
+    for e in &block.edges {
+        match e.guard {
+            Guard::IfTrue => if_true = Some(e.target),
+            Guard::IfFalse => if_false = Some(e.target),
+            Guard::Always => return None, // a stray unconditional edge → not this shape
+        }
+    }
+    let (if_true, if_false) = (if_true?, if_false?);
+    // One arm loops back to the entry, the other exits.
+    let self_on_true = match (if_true, if_false) {
+        (Target::State(t), Target::Exit) if t == cfg.entry => true,
+        (Target::Exit, Target::State(t)) if t == cfg.entry => false,
+        _ => return None,
+    };
+
+    // Re-flatten the entry case to resolve content/cond by index.
+    let case = switch
+        .cases
+        .iter()
+        .find(|c| c.test.as_ref().and_then(int_literal) == Some(cfg.entry))?;
+    let mut flat: Vec<&Statement> = Vec::new();
+    flatten_case(&case.consequent, &mut flat);
+
+    // The conditional guard's test expression (preserved verbatim).
+    let Statement::IfStatement(iff) = flat.get(cond_idx)? else {
+        return None;
+    };
+    let mut cond = iff.test.clone_in(ast.allocator);
+    if !self_on_true {
+        // Self-arm is the `else`: loop while the condition is false.
+        cond = ast.expression_unary(SPAN, UnaryOperator::LogicalNot, cond);
+    }
+
+    // Body = the content statements, in order, cloned into the arena.
+    let mut body = ast.vec();
+    for &i in &block.content {
+        // Content must never reference the dispatch var (parse guaranteed it).
+        debug_assert!(!mentions_state(flat[i], s));
+        body.push(flat[i].clone_in(ast.allocator));
+    }
+    let body_block = ast.statement_block(SPAN, body);
+    let do_while = ast.statement_do_while(SPAN, body_block, cond);
+    Some(vec![do_while])
 }
 
 #[cfg(test)]

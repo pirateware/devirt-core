@@ -1230,6 +1230,50 @@ fn unflatten_declines_unsound_shapes() {
 }
 
 #[test]
+fn unflatten_cfg_recovers_self_loop() {
+    // A conditional self-transition (the shape linear `simulate` declines): state 1
+    // loops back to itself while n < 3, else exits. P2 recovers it as a do/while.
+    // Value (n) must be identical whether or not the recovery fires.
+    assert_equivalent(
+        r#"
+        var n = 0;
+        var s = 1;
+        while (s) {
+            switch (s) {
+                case 1: n = n + 1; if (n < 3) { s = 1; } else { s = 0; } break;
+            }
+        }
+        __r = n;
+        "#,
+    );
+    // Self-arm in the `else` (loop while cond is false) + a relational exit test.
+    assert_equivalent(
+        r#"
+        var acc = 0, i = 0;
+        var s = 5;
+        while (s != 9) {
+            switch (s) {
+                case 5: acc += i; i = i + 1; if (i >= 4) { s = 9; } else { s = 5; } break;
+            }
+        }
+        __r = acc + ":" + i;
+        "#,
+    );
+    // A do-while-form dispatcher with a self loop.
+    assert_equivalent(
+        r#"
+        var p = 1, s = 2;
+        do {
+            switch (s) {
+                case 2: p = p * 2; if (p < 100) { s = 2; } else { s = 0; } break;
+            }
+        } while (s);
+        __r = p;
+        "#,
+    );
+}
+
+#[test]
 fn pure_iife_eval_preserves_value() {
     // A self-contained, side-effect-free IIFE (a tiny "bytecode VM") collapses to
     // the primitive it computes. Value must be preserved.

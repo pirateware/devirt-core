@@ -147,7 +147,7 @@ impl<'a> Traverse<'a, ()> for Unflatten {
 }
 
 /// `var s = <int>;` (single declarator) or `s = <int>;` → `(name, value)`.
-fn state_init(stmt: &Statement<'_>) -> Option<(String, i64)> {
+pub(crate) fn state_init(stmt: &Statement<'_>) -> Option<(String, i64)> {
     match stmt {
         Statement::VariableDeclaration(vd) if vd.declarations.len() == 1 => {
             let d = &vd.declarations[0];
@@ -216,7 +216,7 @@ pub(crate) enum LoopTest {
 
 impl LoopTest {
     /// Does the loop continue (run another switch iteration) at this state?
-    fn continues(&self, state: i64) -> bool {
+    pub(crate) fn continues(&self, state: i64) -> bool {
         match self {
             LoopTest::Truthy => state != 0,
             LoopTest::Always => true,
@@ -586,7 +586,7 @@ impl<'a, 'r> Visit<'a> for NameScan<'r> {
 }
 
 /// Does `stmt` reference `name` at all (read or write)?
-fn mentions(stmt: &Statement<'_>, name: &str) -> bool {
+pub(crate) fn mentions(stmt: &Statement<'_>, name: &str) -> bool {
     let mut s = NameScan {
         name,
         reads_or_writes: false,
