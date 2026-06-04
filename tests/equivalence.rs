@@ -338,6 +338,44 @@ fn ssa_const_array_fold_preserves_value() {
 }
 
 #[test]
+fn nested_const_array_2d_and_alias_fold_preserves_value() {
+    // B2: a provably-immutable 2-D const array, read `T[i][j]`. Resolving the
+    // nested element must not change the value.
+    assert_equivalent("var T = [[10, 20], [30, 40]]; __r = T[0][0] + T[1][1];");
+    // Aliased element of a 3-D const array (`T = base[1]` then `T[i][j]`), read in
+    // a nested function — the cross-function 2-D-alias case from the roadmap.
+    assert_equivalent(
+        "__r = (function(){ \
+           var base = [[[1, 2], [3, 4]], [[5, 6], [7, 8]]]; \
+           var T = base[1]; \
+           function run(s){ var acc = 0; while (s != 0) { switch (s) { \
+             case T[0][0]: acc += 1; s = T[0][1]; break; \
+             case T[0][1]: acc += 2; s = T[1][0]; break; \
+             case T[1][0]: acc += 3; s = T[1][1]; break; \
+             case T[1][1]: acc += 4; s = 0; break; } } return acc; } \
+           return run(T[0][0]); })();",
+    );
+}
+
+#[test]
+fn member_written_table_is_not_resolved() {
+    // B2 adversarial sibling (sample_11's shape): a table built by *member writes*
+    // (`base[i][j] = …`) is mutable, so `T = base[0]; T[i]` must NOT be resolved to
+    // a literal. Equivalence guards soundness regardless of the (correct) decline.
+    assert_equivalent(
+        "__r = (function(){ \
+           var base = []; \
+           for (var i = 0; i < 2; i++) base[i] = new Array(2); \
+           base[0][0] = 5; base[0][1] = 6; base[1][0] = 7; base[1][1] = 8; \
+           var T = base[0]; \
+           function run(s){ var acc = 0; while (s != 0) { switch (s) { \
+             case T[0]: acc += 1; s = T[1]; break; \
+             case T[1]: acc += 2; s = 0; break; } } return acc; } \
+           return run(base[0][0]); })();",
+    );
+}
+
+#[test]
 fn ssa_short_circuit_dominating_def_folds_soundly() {
     // The sample_10 shape: array assigned inside a `&&` chain, read after. The
     // assignment dominates the reads, so folding is sound.
