@@ -15,6 +15,10 @@
 //! give (see `memory/soundness-audit.md`).
 
 mod analysis;
+// Read-only recovered-CFG model for flattened dispatchers (Plan P2/M1). Wired
+// into a mutating pass by the structuring step (P2/M2); dead until then.
+#[allow(dead_code)]
+mod cff;
 mod cfg;
 mod consts;
 mod dom;
