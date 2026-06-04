@@ -3940,7 +3940,7 @@ var DataDomeJsTag = (() => {
 							for (var arr34 = [], num73 = 0; num73 < var948.length; num73++) for (var var951, var952 = var401[154][187]; true;) {
 								switch (var952) {
 									case var401[252][189]:
-										0 != num73 && arr34[0 - 1] == var951 || arr34.push(var951);
+										0 != num73 && arr34[arr34.length - 1] == var951 || arr34.push(var951);
 										var952 = var401[137][236];
 										continue;
 									case var401[1][96]:
@@ -3952,7 +3952,7 @@ var DataDomeJsTag = (() => {
 								break;
 							}
 							var str15 = "";
-							return false && 500 < (str15 = arr34.join()).length || (-404 | 0) + (-44 | 0) > -12 * (var950 & var949) + 1 * (var950 & ~var949) + 7 * var949 + 7 * ~(var950 ^ var949) - 7 * ~(var950 | var949) - 6 * ~(var950 | ~var949) ? str15.slice(0, 500) + "..." : str15;
+							return 0 < arr34.length && 500 < (str15 = arr34.join()).length || (-404 | 0) + (-44 | 0) > -12 * (var950 & var949) + 1 * (var950 & ~var949) + 7 * var949 + 7 * ~(var950 ^ var949) - 7 * ~(var950 | var949) - 6 * ~(var950 | ~var949) ? str15.slice(0, 500) + "..." : str15;
 						}
 					}
 					function fn46(var953, var954) {

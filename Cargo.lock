@@ -152,6 +152,7 @@ dependencies = [
  "oxc_syntax",
  "oxc_traverse",
  "rquickjs",
+ "serde_json",
 ]
 
 [[package]]

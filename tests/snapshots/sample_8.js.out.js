@@ -2738,7 +2738,8 @@ window._cf_chl_opt.mJFtX5 = {
 		fn81();
 		fn90("error-overrun");
 		fn119("fail", "grid");
-		call1("fr-fail-troubleshoot-link") && var2124.addEventListener("click", function(var2129) {
+		var2124 = call1("fr-fail-troubleshoot-link");
+		var2124 && var2124.addEventListener("click", function(var2129) {
 			var15.parent.postMessage({
 				source: "cloudflare-challenge",
 				widgetId: var15._cf_chl_opt.xpbnF3,

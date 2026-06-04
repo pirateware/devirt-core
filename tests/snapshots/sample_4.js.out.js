@@ -572,8 +572,10 @@
 															fn6(var84, var82, true);
 														});
 													}
+													var var85;
+													var85 = var83;
 													list26.pop();
-													return var83;
+													return var85;
 												};
 											})(var71));
 											list26.pop();

@@ -38,6 +38,26 @@ use oxc_syntax::symbol::SymbolId;
 use crate::ir::ordering::OrderingOracle;
 use crate::util::is_inlineable_literal;
 
+/// Receiver-mutating method names. A call to one through a binding
+/// (`a.push(…)`) mutates it, disqualifying its single-literal initializer from
+/// being folded in. Mirrors the lists in `decoder_lift` / `ir::analysis` — kept
+/// local so this module owns its own soundness reasoning.
+const MUTATOR_METHODS: &[&str] = &[
+    "push",
+    "pop",
+    "shift",
+    "unshift",
+    "splice",
+    "sort",
+    "reverse",
+    "fill",
+    "copyWithin",
+    "set",
+    "add",
+    "delete",
+    "clear",
+];
+
 /// A whole-program map from symbol to its resolved constant literal.
 pub struct ConstResolver<'a> {
     accepted: HashMap<SymbolId, Expression<'a>>,
@@ -327,6 +347,28 @@ impl<'a, 's> Census<'a, 's> {
         self.scoping.get_reference(rid).symbol_id()
     }
 
+    /// Disqualify the *root binding* of a member expression (`a` for `a`, `a.b`,
+    /// `a[i].c`) — the symbol whose value is mutated by a write/mutator through it.
+    /// A base that is not rooted in a plain identifier (e.g. `f().x`) mutates
+    /// nothing we track, so it is ignored.
+    fn disqualify_member_base(&mut self, obj: &Expression<'a>) {
+        let mut e = obj;
+        loop {
+            match e {
+                Expression::Identifier(id) => {
+                    if let Some(sym) = self.ref_sym(id) {
+                        self.disqualified.insert(sym);
+                    }
+                    return;
+                }
+                Expression::StaticMemberExpression(m) => e = &m.object,
+                Expression::ComputedMemberExpression(m) => e = &m.object,
+                Expression::PrivateFieldExpression(m) => e = &m.object,
+                _ => return,
+            }
+        }
+    }
+
     fn record_value_write(&mut self, sym: SymbolId, rhs: &Expression<'a>) {
         *self.value_writes.entry(sym).or_default() += 1;
         if is_inlineable_literal(rhs) {
@@ -435,28 +477,74 @@ impl<'a, 's> Visit<'a> for Census<'a, 's> {
                 };
                 c.visit_assignment_target(&node.left);
             }
+            // A member write (`a[k] = …`, `a.p = …`, compound or not) mutates `a`,
+            // so its literal initializer is stale — disqualify the base binding.
+            AssignmentTarget::StaticMemberExpression(m) => self.disqualify_member_base(&m.object),
+            AssignmentTarget::ComputedMemberExpression(m) => self.disqualify_member_base(&m.object),
+            AssignmentTarget::PrivateFieldExpression(m) => self.disqualify_member_base(&m.object),
             _ => {}
         }
         walk::walk_assignment_expression(self, node);
     }
 
     fn visit_update_expression(&mut self, node: &UpdateExpression<'a>) {
-        if let SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = &node.argument {
-            if let Some(sym) = self.ref_sym(id) {
-                self.disqualified.insert(sym);
+        match &node.argument {
+            SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
+                if let Some(sym) = self.ref_sym(id) {
+                    self.disqualified.insert(sym);
+                }
             }
+            // `a[k]++` / `a.p++` mutates `a`.
+            SimpleAssignmentTarget::StaticMemberExpression(m) => {
+                self.disqualify_member_base(&m.object)
+            }
+            SimpleAssignmentTarget::ComputedMemberExpression(m) => {
+                self.disqualify_member_base(&m.object)
+            }
+            _ => {}
         }
         walk::walk_update_expression(self, node);
     }
 
     fn visit_call_expression(&mut self, node: &CallExpression<'a>) {
-        if let Expression::Identifier(callee) = &node.callee {
-            if let Some(sym) = self.ref_sym(callee) {
-                *self.call_count.entry(sym).or_default() += 1;
-                self.raw_calls.push((self.cur_fn(), sym));
+        match &node.callee {
+            Expression::Identifier(callee) => {
+                if let Some(sym) = self.ref_sym(callee) {
+                    *self.call_count.entry(sym).or_default() += 1;
+                    self.raw_calls.push((self.cur_fn(), sym));
+                }
             }
+            // A mutator method on a binding (`a.push(x)`, `a.splice(…)`, `m.set(…)`)
+            // mutates its receiver, so the receiver's single literal initializer
+            // (e.g. `const a = []`) is *stale* at later reads — disqualify it.
+            // Without this, `const a = []; a.push(x); … a.length` folds `a` to the
+            // empty literal and `a.length` to 0 (a soundness bug).
+            Expression::StaticMemberExpression(m)
+                if MUTATOR_METHODS.contains(&m.property.name.as_str()) =>
+            {
+                self.disqualify_member_base(&m.object);
+            }
+            Expression::ComputedMemberExpression(m) => match &m.expression {
+                Expression::StringLiteral(s) if MUTATOR_METHODS.contains(&s.value.as_str()) => {
+                    self.disqualify_member_base(&m.object)
+                }
+                // A statically-known non-mutator method name (`a["slice"]()`): no mutation.
+                Expression::StringLiteral(_) => {}
+                // Computed method name we can't read statically (`a[_dec("push")](x)`
+                // before the decode lands) — could be a mutator; disqualify the base.
+                _ => self.disqualify_member_base(&m.object),
+            },
+            _ => {}
         }
         walk::walk_call_expression(self, node);
+    }
+
+    fn visit_unary_expression(&mut self, node: &UnaryExpression<'a>) {
+        // `delete a[k]` / `delete a.p` mutates `a`.
+        if matches!(node.operator, oxc_syntax::operator::UnaryOperator::Delete) {
+            self.disqualify_member_base(&node.argument);
+        }
+        walk::walk_unary_expression(self, node);
     }
 
     fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {

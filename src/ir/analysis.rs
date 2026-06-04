@@ -463,6 +463,39 @@ impl<'a, 's, 'b> Visit<'a> for Classifier<'s, 'b> {
         walk::walk_unary_expression(self, node);
     }
 
+    fn visit_call_expression(&mut self, node: &CallExpression<'a>) {
+        // A mutator method on a candidate (`s.push(x)`, `s.splice(…)`, `m.set(…)`)
+        // mutates it, so the CFG no longer sees its only definition — exclude it.
+        // Without this, `const a = []; a.push(x); … a.length` folds `a` to the
+        // empty literal and `a.length` to 0 (a soundness bug). Mirrors the same
+        // rule in `mutable_aggregate_tables`'s scan; the member-read interception
+        // below would otherwise treat `a.push` as a clean read and never exclude.
+        let (mutates, obj) = match &node.callee {
+            Expression::StaticMemberExpression(m) => (
+                MUTATOR_METHODS.contains(&m.property.name.as_str()),
+                Some(&m.object),
+            ),
+            Expression::ComputedMemberExpression(m) => match &m.expression {
+                Expression::StringLiteral(s) => {
+                    (MUTATOR_METHODS.contains(&s.value.as_str()), Some(&m.object))
+                }
+                // A computed method name we can't read statically could be a
+                // mutator — e.g. `a[_dec("push")](x)` *before* the string decode
+                // lands (string-array obfuscation). Exclude the receiver
+                // conservatively; otherwise the array folds to its empty literal
+                // and a later `a.length` reads 0.
+                _ => (true, Some(&m.object)),
+            },
+            _ => (false, None),
+        };
+        if mutates {
+            if let Some(sym) = obj.and_then(|o| self.cand_object(o)) {
+                self.excluded.insert(sym);
+            }
+        }
+        walk::walk_call_expression(self, node);
+    }
+
     fn visit_static_member_expression(&mut self, m: &StaticMemberExpression<'a>) {
         if self.depth == 0 && self.cand_object(&m.object).is_some() {
             // `s.name` read: a clean member access — do not descend into the
