@@ -185,6 +185,233 @@ impl Sandbox {
 /// which would bloat output for no readability win (`issues/09`).
 const MAX_ARRAY_ELEMS: usize = 64;
 
+// ---------------------------------------------------------------------------
+// Whole-program behavior signatures (regression / equivalence harness).
+// ---------------------------------------------------------------------------
+
+/// The terminal outcome of running a *whole program* under the equivalence
+/// harness. This is the half of a [`BehaviorSignature`] that captures *how* a
+/// program ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// Ran to completion without throwing.
+    Completed,
+    /// Threw. Carries the error's constructor name (`"TypeError"`,
+    /// `"ReferenceError"`, …). The *message* is deliberately excluded: it embeds
+    /// identifiers the deobfuscator renames, so comparing messages would flag a
+    /// sound rename as a behavior change. Built-in error names are rename-stable.
+    Threw(String),
+    /// Hit the wall-clock budget without terminating — e.g. a polling /
+    /// animation loop the permissive host shim never lets the program break out
+    /// of. Not a comparable outcome; the equivalence harness skips these.
+    TimedOut,
+}
+
+/// A deterministic, observable behavior signature of a whole program: its
+/// terminal [`RunOutcome`] plus the exact sequence of `console` output it
+/// produced. Two programs with equal signatures are observably equivalent under
+/// the harness — this is the soundness contract a deobfuscation pass must keep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BehaviorSignature {
+    pub outcome: RunOutcome,
+    pub output: Vec<String>,
+}
+
+/// Run `source` as a whole program under a deterministic, permissive
+/// browser-host shim and capture its [`BehaviorSignature`].
+///
+/// The shim makes adversarial browser code *runnable* off a real browser so we
+/// can observe it end-to-end:
+///
+/// * **Permissive host.** Every browser global in [`HOST_GLOBALS`] (`window`,
+///   `document`, `navigator`, …) is a single deep [`Proxy`] that is callable,
+///   constructable, and indexable, and returns itself for any access. So
+///   `window.foo.bar()` and `new navigator.x()` resolve instead of throwing —
+///   the program runs far enough to exercise the deobfuscated logic.
+/// * **Determinism.** `Date.now` and `Math.random` are frozen to constants and
+///   timers (`setTimeout`/`requestAnimationFrame`) are inert, so the same
+///   program yields the same signature every run — a precondition for comparing
+///   original against deobfuscated.
+/// * **Isolation + bounds.** A fresh runtime per call (no cross-run state), a
+///   128 MiB memory cap, and a wall-clock `budget` enforced from the interrupt
+///   handler (a non-terminating program becomes [`RunOutcome::TimedOut`], never
+///   a hang).
+///
+/// This is the engine behind the full-sample equivalence regression test: run a
+/// sample and its deobfuscated form, require identical signatures.
+pub fn behavior_signature(source: &str, budget: Duration) -> BehaviorSignature {
+    behavior_signature_impl(source, budget).unwrap_or(BehaviorSignature {
+        // A harness that fails to even construct its runtime is reported as a
+        // distinct, comparable outcome rather than panicking the test.
+        outcome: RunOutcome::Threw("HarnessError".to_string()),
+        output: Vec::new(),
+    })
+}
+
+/// Browser globals the shim installs as the permissive host proxy. Covers what
+/// the sample corpus reaches for (DOM, navigator, storage, timers, workers,
+/// messaging); unknown accesses *through* the proxy already resolve to itself,
+/// so this list only needs the bare *global* entry points.
+const HOST_GLOBALS: &[&str] = &[
+    "window",
+    "document",
+    "self",
+    "navigator",
+    "location",
+    "Image",
+    "screen",
+    "history",
+    "localStorage",
+    "sessionStorage",
+    "XMLHttpRequest",
+    "fetch",
+    "top",
+    "parent",
+    "frames",
+    "WebSocket",
+    "performance",
+    "crypto",
+    "postMessage",
+    "addEventListener",
+    "removeEventListener",
+    "HTMLScriptElement",
+    "HTMLElement",
+    "Node",
+    "Element",
+    "Worker",
+    "requestAnimationFrame",
+    "cancelAnimationFrame",
+    "setTimeout",
+    "setInterval",
+    "clearTimeout",
+    "clearInterval",
+    "getComputedStyle",
+    "MutationObserver",
+    "Notification",
+];
+
+/// One-time harness prelude: determinism freeze, a `console` that records into a
+/// global `__lines` array, and a deep permissive host proxy bound to every name
+/// in [`HOST_GLOBALS`]. Kept self-contained (no host calls of its own) so it
+/// installs cleanly in a bare QuickJS context.
+const HARNESS_PRELUDE: &str = r#"
+(function(g){
+  // Determinism: pin the two ambient nondeterminism sources so a program's
+  // signature is reproducible (and so original vs. deobfuscated see identical
+  // values). Unlike the partial-evaluation sandbox, here we DO freeze
+  // Math.random — we are comparing two whole-program runs, not lifting a value,
+  // so a stable RNG is exactly what we want.
+  if (typeof g.Date === "function") { g.Date.now = function(){ return 0; }; }
+  g.Math.random = function(){ return 0.5; };
+
+  // Console capture. Every variant funnels into one recorder that stringifies
+  // each argument defensively (a throwing toString must not abort the program).
+  g.__lines = [];
+  var rec = function(){
+    var parts = [];
+    for (var i = 0; i < arguments.length; i++) {
+      try { parts.push(String(arguments[i])); } catch (e) { parts.push("?"); }
+    }
+    g.__lines.push(parts.join(" "));
+  };
+  g.console = { log: rec, info: rec, warn: rec, error: rec, debug: rec, trace: rec };
+
+  // Deep permissive host proxy: callable, constructable, indexable; returns
+  // itself for any access so chained host expressions resolve instead of
+  // throwing. A handful of well-known keys get sensible primitives so coercions
+  // (`+host`, `"" + host`, `for…of host`) don't throw either.
+  function makeProxy(){
+    var f = function(){ return P; };
+    var P = new Proxy(f, {
+      get: function(t, k){
+        if (k === "toString" || k === "valueOf" || k === Symbol.toPrimitive) return function(){ return 0; };
+        if (k === "length") return 0;
+        if (k === Symbol.iterator) return function(){ return { next: function(){ return { done: true, value: undefined }; } }; };
+        if (k === "then") return undefined;            // not a thenable
+        return P;
+      },
+      set: function(){ return true; },
+      apply: function(){ return P; },
+      construct: function(){ return P; },
+      has: function(){ return true; }
+    });
+    return P;
+  }
+  g.__hostProxy = makeProxy();
+})(globalThis);
+"#;
+
+fn behavior_signature_impl(source: &str, budget: Duration) -> Option<BehaviorSignature> {
+    let rt = Runtime::new().ok()?;
+    rt.set_memory_limit(128 * 1024 * 1024);
+    rt.set_max_stack_size(2 * 1024 * 1024);
+
+    let deadline: Deadline = std::sync::Arc::new(Mutex::new(None));
+    let handler_deadline = deadline.clone();
+    rt.set_interrupt_handler(Some(Box::new(
+        move || matches!(*handler_deadline.lock().unwrap(), Some(d) if Instant::now() >= d),
+    )));
+
+    let ctx = Context::full(&rt).ok()?;
+
+    // Install the harness, then bind every host global to the shared proxy.
+    let bind_hosts = HOST_GLOBALS
+        .iter()
+        .map(|n| format!("try {{ globalThis[{n:?}] = globalThis.__hostProxy; }} catch (e) {{}}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let installed = ctx.with(|ctx| {
+        ctx.eval::<rquickjs::Value, _>(HARNESS_PRELUDE).is_ok()
+            && ctx
+                .eval::<rquickjs::Value, _>(bind_hosts.as_bytes())
+                .is_ok()
+    });
+    if !installed {
+        return None;
+    }
+
+    let deadline_at = Instant::now() + budget;
+    *deadline.lock().unwrap() = Some(deadline_at);
+    let outcome = ctx.with(|ctx| {
+        let result = ctx.eval::<rquickjs::Value, _>(source);
+        // A budget-exhausted run surfaces as an exception (QuickJS raises an
+        // InternalError when the interrupt handler trips). Distinguish it by the
+        // clock, not the error kind — robust regardless of how the engine maps
+        // the interrupt.
+        if Instant::now() >= deadline_at {
+            return RunOutcome::TimedOut;
+        }
+        match result {
+            Ok(_) => RunOutcome::Completed,
+            Err(_) => {
+                let exc = ctx.catch();
+                let name = exc
+                    .as_object()
+                    .and_then(|o| o.get::<_, String>("name").ok())
+                    .unwrap_or_else(|| "Error".to_string());
+                RunOutcome::Threw(name)
+            }
+        }
+    });
+    *deadline.lock().unwrap() = None;
+
+    // Read back the captured console output. A missing / clobbered `__lines`
+    // (a program could overwrite the global) degrades to "no output".
+    let output = ctx.with(|ctx| {
+        let mut out = Vec::new();
+        if let Ok(arr) = ctx.globals().get::<_, rquickjs::Array>("__lines") {
+            for i in 0..arr.len() {
+                if let Ok(s) = arr.get::<String>(i) {
+                    out.push(s);
+                }
+            }
+        }
+        out
+    });
+
+    Some(BehaviorSignature { outcome, output })
+}
+
 /// Convert a QuickJS value to an [`EvalValue`], counting array elements against
 /// `budget`. Returns `None` for any non-primitive/non-flat-array value, a hole, or
 /// when the element budget is exhausted — those are not safe/desirable to splice.
