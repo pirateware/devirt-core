@@ -1274,6 +1274,41 @@ fn unflatten_cfg_recovers_self_loop() {
 }
 
 #[test]
+fn unflatten_cfg_declines_unsupported_shapes() {
+    // A two-state loop (header + body, body returns to header). P2-v1 structures
+    // only the single-state self-loop, so this is left untouched — but must stay
+    // equivalent (the pass declines, no mis-structuring, no panic).
+    assert_equivalent(
+        r#"
+        var acc = 0, i = 0, s = 1;
+        while (s) {
+            switch (s) {
+                case 1: if (i < 4) { s = 2; } else { s = 0; } break;
+                case 2: acc += i; i = i + 1; s = 1; break;
+            }
+        }
+        __r = acc + ":" + i;
+        "#,
+    );
+    // A forward branch that re-merges (diamond, no loop) — declined, equivalent.
+    assert_equivalent(
+        r#"
+        var v = 0, s = 1;
+        var cond = String(1) === "1";
+        while (s) {
+            switch (s) {
+                case 1: if (cond) { s = 2; } else { s = 3; } break;
+                case 2: v = 10; s = 4; break;
+                case 3: v = 20; s = 4; break;
+                case 4: v += 1; s = 0; break;
+            }
+        }
+        __r = v;
+        "#,
+    );
+}
+
+#[test]
 fn pure_iife_eval_preserves_value() {
     // A self-contained, side-effect-free IIFE (a tiny "bytecode VM") collapses to
     // the primitive it computes. Value must be preserved.

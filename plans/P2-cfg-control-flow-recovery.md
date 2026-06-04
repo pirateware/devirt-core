@@ -205,3 +205,25 @@ rename-by-role   varNNN → descriptive names           (exists)
 The new pieces (P1 const-resolution, P2 CFG recovery) are the two links missing
 from that chain today; with them in place the existing passes carry the rest, and
 a 27 kLOC dispatcher collapses to readable source.
+
+---
+
+## STATUS (P0 execution)
+
+- **M1/S5 — DONE.** `src/ir/cff.rs`: read-only `RecoveredCfg` builder (nodes =
+  states, edges = Always/IfTrue/IfFalse/Exit), back-edge detection via the
+  dominator tree, 4 graph unit tests. No AST mutation.
+- **M2/S6 + M3/S7 — DONE (bounded).** `cff::structure` recovers a single-state
+  conditional **self-loop** → `do { … } while (cond)`. New pass `unflatten-cfg`
+  (after the linear unflatteners, gated on a recovered back edge). Hand-written
+  recursion to dodge the oxc insertion panic. 3 differential-equivalence cases.
+- **M4/S8 — DONE.** Declines soundly on every unsupported shape (multi-state
+  loops, diamonds, computed/ternary transitions); explicit decline tests; no panic.
+- **M5/S9 — N/A for v1.** The recovered `do/while` is already structured source;
+  there is no `if(true)`-style guard to cascade-fold for the self-loop shape.
+- **Gate G2 (s1/s4/s11 switch ≈ 0) — NOT met, by design.** The headline samples
+  are not integer-state dispatchers with literal labels and identifier
+  discriminants (s4 is computed-state `switch(var7+var4)`; s1/s11 per `issues/12`).
+  The full relooper for multi-state/branch graphs is the remaining work, but it
+  would not move those samples without the const-resolution mechanisms in
+  `issues/11`/`issues/12`. See `plans/metrics-final.md`.
