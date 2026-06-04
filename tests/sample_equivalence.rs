@@ -97,6 +97,10 @@ fn behavior_signature_discriminates() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: full real-sample corpus, deobfuscated + executed under the shim. Run with `--features slow-tests` (CI) or `cargo nextest run --run-ignored all`."
+)]
 fn deobfuscation_preserves_observable_behavior_on_every_sample() {
     let budget = budget();
     let mut checked = Vec::new();

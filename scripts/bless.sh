@@ -15,7 +15,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 echo ">> regenerating golden snapshots + scoreboard" >&2
-UPDATE_SNAPSHOTS=1 cargo test --manifest-path "$ROOT/Cargo.toml" --release --test golden
+# The golden tests are gated behind `slow-tests` (skipped in the default fast run);
+# blessing must enable the feature or nothing regenerates.
+UPDATE_SNAPSHOTS=1 cargo test --manifest-path "$ROOT/Cargo.toml" --release \
+  --features slow-tests --test golden
 
 echo >&2
 echo ">> done. Review the diff:" >&2

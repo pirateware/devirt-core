@@ -53,6 +53,10 @@ fn fully_static_samples_fold_to_console_log() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: full real-sample corpus (run twice for idempotency). Run with `--features slow-tests` (CI) or `cargo nextest run --run-ignored all`."
+)]
 fn every_sample_is_safe() {
     let samples = samples();
     assert!(!samples.is_empty(), "no samples found");

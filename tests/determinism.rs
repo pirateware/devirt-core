@@ -54,6 +54,10 @@ fn sample_11_is_deterministic() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 745KB sample deobfuscated 5×. Run with `--features slow-tests` (CI) or `cargo nextest run --run-ignored all`."
+)]
 fn sample_7_is_deterministic() {
     // sample_7 jittered on a `+new Date()` token timestamp once decoder-lift began
     // folding its decoder chain: the double-eval guard misses sub-millisecond
@@ -77,6 +81,10 @@ fn small_samples_are_deterministic() {
 /// binary in subprocesses with perturbed `TZ`/`LANG`, since those are read from
 /// the process environment, not settable per in-process call.
 #[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 745KB sample deobfuscated in 4 subprocesses. Run with `--features slow-tests` (CI) or `cargo nextest run --run-ignored all`."
+)]
 fn output_is_environment_invariant() {
     use std::process::Command;
 

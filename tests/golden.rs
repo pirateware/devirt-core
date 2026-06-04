@@ -80,6 +80,10 @@ fn truncate(s: &str) -> String {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: full real-sample corpus. Run with `--features slow-tests` (CI) or `cargo nextest run --run-ignored all`."
+)]
 fn sample_outputs_match_golden_snapshots() {
     let dir = snapshots_dir();
     fs::create_dir_all(&dir).unwrap();
@@ -128,6 +132,10 @@ fn sample_outputs_match_golden_snapshots() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: full real-sample corpus. Run with `--features slow-tests` (CI) or `cargo nextest run --run-ignored all`."
+)]
 fn scoreboard_is_current() {
     let table = render_scoreboard();
     let path = snapshots_dir().join("SCOREBOARD.md");

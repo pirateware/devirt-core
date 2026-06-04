@@ -2,8 +2,38 @@
 
 The suite is layered: each layer catches a different class of regression, from
 "this one pass mis-folds a literal" up to "the whole pipeline changed what a real
-obfuscated sample *does*". Everything runs under `cargo test --release` and gates
-CI.
+obfuscated sample *does*".
+
+## Running it — fast vs. full
+
+The slow part of the suite is the handful of tests that run the whole pipeline
+over the *multi-megabyte real-world samples* (golden snapshots, whole-corpus
+behavior-equivalence, idempotency, large-sample determinism). They are gated
+behind the `slow-tests` feature and **skipped by default** so local iteration is
+fast (~2s); the broad behavior coverage that *is* fast (the 140-sample generated
+corpus, the snippet-equivalence battery, every pass unit) still runs.
+
+```sh
+cargo nextest run --release                          # fast: skips slow real-sample tests (~2s)
+cargo nextest run --release --features slow-tests     # full net (CI runs this, ~30s)
+cargo nextest run --release --run-ignored all         # full net without the feature flag
+cargo test --release                                  # fast, without nextest
+```
+
+`nextest` runs every test across all binaries in one thread pool, so the heavy
+whole-corpus tests overlap instead of running binary-by-binary; on a multi-core
+box that roughly halves the full-suite wall time. Config: `.config/nextest.toml`.
+CI (`.github/workflows/ci.yml`) runs `cargo nextest run --features slow-tests
+--profile ci`, so the full net still gates every change.
+
+When adding a test that deobfuscates a large real sample (≫100 KB), gate it the
+same way so the default run stays fast:
+
+```rust
+#[test]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: <why>")]
+fn my_real_sample_test() { … }
+```
 
 ## Layers
 

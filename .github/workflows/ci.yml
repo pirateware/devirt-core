@@ -27,6 +27,9 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -52,5 +55,8 @@ jobs:
       # snapshots of every sample (`tests/golden.rs`) plus whole-pipeline
       # behavior-equivalence on the real corpus (`tests/sample_equivalence.rs`).
       # A snapshot mismatch fails here with a re-bless hint; see tests/README.md.
+      #
+      # `--features slow-tests` runs the slow real-sample tests that are skipped by
+      # default for fast local iteration; nextest runs all binaries concurrently.
       - name: Test
-        run: cargo test --release
+        run: cargo nextest run --release --features slow-tests --profile ci
