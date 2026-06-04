@@ -44,7 +44,7 @@
 //! NOT handled (param-state): dispatchers whose state is a *function parameter*
 //! (`function f(s, …) { while (s != K) switch (s) … }`, called `f(CONST, …)`) —
 //! the dominant shape in samples 1 & 4. That needs an interprocedural specialize-
-//! per-entry-constant transform; see issues/01-unflatten-too-narrow.md.
+//! per-entry-constant transform.
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;

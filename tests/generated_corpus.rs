@@ -34,7 +34,7 @@ fn generated_dir() -> PathBuf {
 
 /// Samples with a *known, open* deobfuscator bug — excluded from the hard
 /// assertion but reported loudly every run so they are never silently forgotten.
-/// See `issues/13-mutated-array-length-fold.md`.
+/// (an open mutated-array `.length`/element-fold soundness bug).
 ///
 /// Empty: the mutated-array `.length`/element fold (`a.length`→0, `a[i]`→undefined
 /// for a `const a=[]` that is later `a.push(…)`-ed) is now fully fixed under every
@@ -200,7 +200,7 @@ fn deobfuscation_preserves_output_across_obfuscation_profiles() {
     if !known.is_empty() {
         eprintln!(
             "\n⚠ {} KNOWN-BUG sample(s) excluded (open deobfuscator soundness bug — \
-             see issues/13): {known:?}",
+             the mutated-array length fold): {known:?}",
             known.len()
         );
     }

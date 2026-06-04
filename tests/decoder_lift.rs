@@ -398,7 +398,7 @@ fn lifts_small_array_returning_decoder() {
 #[test]
 fn does_not_materialize_huge_array() {
     // B3 bloat cap: a pure decoder returning a large array must NOT be expanded
-    // (materializing thousands of ints as a literal is net-negative — issues/09).
+    // (materializing thousands of ints as a literal is net-negative).
     // The call must survive rather than splice a giant array literal.
     let src = r#"
         (function () {

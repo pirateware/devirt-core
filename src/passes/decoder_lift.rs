@@ -203,7 +203,7 @@ impl Pass for DecoderLift {
         // is length-preserving. But a table the *live* program mutates (a base64
         // `bytes.push(b)` accumulator, a `log.push(msg)` sink) is NOT reproduced in
         // the preamble: baking its `[]` and folding `t.length`→0 / `t[i]`→undefined
-        // is the soundness bug in issues/13. `mutable_aggregate_tables` (used for the
+        // is the mutated-aggregate soundness bug. `mutable_aggregate_tables` (used for the
         // SSA-grade `local_data` gate) cannot be used here because it also rejects
         // the legitimately-rotated decoder tables this pass exists to lift.
         let live_mutated = scan_live_mutated(program);
@@ -1173,7 +1173,7 @@ fn classify(
                 // a stable immutable table: baking its initial `[]`/`{}` into the
                 // sandbox preamble would fold reads like `t.length`→0 / `t[i]`→
                 // undefined against a value the live mutation has since changed
-                // (issues/13). `unstable` (bare reassigns/updates only) is blind to
+                // against the live mutation. `unstable` (bare reassigns/updates only) is blind to
                 // method/member mutation, so this closes that hole — while still
                 // admitting a table that is *only* rotated (replayed in the preamble).
                 if live_mutated.contains(id.name.as_str()) {

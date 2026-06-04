@@ -20,7 +20,7 @@ mod analysis;
 pub(crate) mod cff;
 mod cfg;
 mod consts;
-// Dispatcher-agnostic recovery substrate (Plan A4): a `DispatchModel` trait + one
+// Dispatcher-agnostic recovery substrate: a `DispatchModel` trait + one
 // abstract interpreter that recovers a `cff::RecoveredCfg` for any flattening
 // dialect. Additive scaffolding — unit-tested in isolation, not yet wired into the
 // pipeline (the dialect passes remain the production recognizers). See the module
@@ -29,7 +29,7 @@ pub(crate) mod dispatch;
 mod dom;
 mod inline;
 mod ordering;
-// Structured relooper over a reducible `RecoveredCfg` (Plan A2). Used by the
+// Structured relooper over a reducible `RecoveredCfg`. Used by the
 // `unflatten-cfg` pass for general branch/loop dispatcher recovery.
 pub(crate) mod relooper;
 mod ssa;

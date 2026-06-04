@@ -1,4 +1,4 @@
-//! Computed / object-state discriminant recognition (Plan A3, sample_4 shape).
+//! Computed / object-state discriminant recognition (sample_4 shape).
 //!
 //! Some flatteners do not switch on a bare integer state variable. Instead the
 //! discriminant is an **expression over a dispatch object and a counter**:

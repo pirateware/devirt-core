@@ -1,4 +1,4 @@
-//! A structured **relooper** for reducible recovered CFGs (Plan A2).
+//! A structured **relooper** for reducible recovered CFGs.
 //!
 //! `cff::structure` handles exactly one shape — a single-state conditional
 //! self-loop → `do/while`. This module generalizes that to an *arbitrary reducible*

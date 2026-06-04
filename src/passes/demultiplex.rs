@@ -315,7 +315,7 @@ impl<'a> ArrayCollector<'a> {
         // binding the selector only removes the dispatch guard and leaves the large
         // live body, duplicated once per distinct selector. Only the trivial
         // single-`return` slots fold to nothing; for everything else specialization
-        // bloats. See issues/02-demultiplex-slot-gate.md.
+        // bloats.
         let selector = selector?;
         let single_return = body.statements.len() == 1
             && matches!(

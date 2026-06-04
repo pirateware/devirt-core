@@ -1,4 +1,4 @@
-//! Dispatcher-agnostic recovery substrate (Plan A4 — the unification).
+//! Dispatcher-agnostic recovery substrate — the unification of the dialect passes.
 //!
 //! Every control-flow-flattening *dialect* the deobfuscator recognizes today is a
 //! separate narrow pass: integer-state (`passes::unflatten`), string/bool-state
@@ -19,7 +19,7 @@
 //! and provides **one** abstract interpreter ([`interpret`]) that enumerates the
 //! reachable states from the entry and emits the exact transition edges into a
 //! [`cff::RecoveredCfg`] — *regardless of dialect*. The recovered graph is then
-//! handed to [`cff::structure_general`] / [`relooper`] (the Plan A2 relooper) to be
+//! handed to [`cff::structure_general`] / [`relooper`] (the structured relooper) to be
 //! structured back into `if`/`else`/`while`/`for`.
 //!
 //! The end goal: **a new obfuscator dialect is a small `DispatchModel` impl, not a

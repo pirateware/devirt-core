@@ -526,7 +526,7 @@ pub fn structure<'a>(
 }
 
 // ---------------------------------------------------------------------------
-// General structuring (Plan A2): RecoveredCfg → if/else + while via the relooper
+// General structuring: RecoveredCfg → if/else + while via the relooper
 // ---------------------------------------------------------------------------
 
 /// A [`super::relooper::CaseSource`] backed by the original switch: it resolves a
@@ -584,7 +584,7 @@ impl<'b, 'a> super::relooper::CaseSource<'a> for SwitchSource<'b, 'a> {
 }
 
 /// Structure an arbitrary **reducible** recovered dispatcher into `if/else` +
-/// `while(true){…}` via the general relooper (Plan A2). The condition emitted for a
+/// `while(true){…}` via the general relooper. The condition emitted for a
 /// two-way split is the verbatim original `if` test, oriented for the `IfTrue` arm
 /// (the relooper places `IfTrue` as the `then` branch, `IfFalse` as the `else`).
 ///
