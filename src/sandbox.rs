@@ -58,6 +58,21 @@ const SANDBOX_PRELUDE: &str = r#"
     FrozenDate.parse = _RealDate.parse;
     FrozenDate.UTC = _RealDate.UTC;
     g.Date = FrozenDate;
+    // Pin the timezone to UTC. `getTimezoneOffset()` reads the *host* timezone
+    // (sample_7 fingerprints with it — it lifted to -60/+300/-330 per machine),
+    // and the local-time getters depend on it too. Force them to UTC so any
+    // Date-derived lift is portable across machines, matching the frozen clock.
+    var DP = _RealDate.prototype;
+    DP.getTimezoneOffset = function(){ return 0; };
+    DP.getFullYear = DP.getUTCFullYear; DP.getMonth = DP.getUTCMonth;
+    DP.getDate = DP.getUTCDate; DP.getDay = DP.getUTCDay;
+    DP.getHours = DP.getUTCHours; DP.getMinutes = DP.getUTCMinutes;
+    DP.getSeconds = DP.getUTCSeconds; DP.getMilliseconds = DP.getUTCMilliseconds;
+    // String formatters embed the host TZ *name* and locale (a fingerprint hash
+    // of `new Date().toString()` jittered across machines). Pin them all to the
+    // TZ/locale-independent UTC string so any Date-derived lift is portable.
+    DP.toString = DP.toDateString = DP.toTimeString =
+      DP.toLocaleString = DP.toLocaleDateString = DP.toLocaleTimeString = DP.toUTCString;
   }
 
   var B="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -373,6 +388,21 @@ const HARNESS_PRELUDE: &str = r#"
     FrozenDate.parse = _RealDate.parse;
     FrozenDate.UTC = _RealDate.UTC;
     g.Date = FrozenDate;
+    // Pin the timezone to UTC. `getTimezoneOffset()` reads the *host* timezone
+    // (sample_7 fingerprints with it — it lifted to -60/+300/-330 per machine),
+    // and the local-time getters depend on it too. Force them to UTC so any
+    // Date-derived lift is portable across machines, matching the frozen clock.
+    var DP = _RealDate.prototype;
+    DP.getTimezoneOffset = function(){ return 0; };
+    DP.getFullYear = DP.getUTCFullYear; DP.getMonth = DP.getUTCMonth;
+    DP.getDate = DP.getUTCDate; DP.getDay = DP.getUTCDay;
+    DP.getHours = DP.getUTCHours; DP.getMinutes = DP.getUTCMinutes;
+    DP.getSeconds = DP.getUTCSeconds; DP.getMilliseconds = DP.getUTCMilliseconds;
+    // String formatters embed the host TZ *name* and locale (a fingerprint hash
+    // of `new Date().toString()` jittered across machines). Pin them all to the
+    // TZ/locale-independent UTC string so any Date-derived lift is portable.
+    DP.toString = DP.toDateString = DP.toTimeString =
+      DP.toLocaleString = DP.toLocaleDateString = DP.toLocaleTimeString = DP.toUTCString;
   }
   g.Math.random = function(){ return 0.5; };
 

@@ -68,3 +68,50 @@ fn small_samples_are_deterministic() {
         assert_stable(s, 3);
     }
 }
+
+/// Output must not depend on the host *environment* (timezone, locale) — only on
+/// the input. A decoder that reads `new Date().getTimezoneOffset()` or hashes
+/// `Date.prototype.toString()` (sample_7 fingerprinting) would otherwise lift to a
+/// machine-local value and jitter across CI runners — the bug this pins (the
+/// sandbox pins all TZ/locale-dependent `Date` methods to UTC). Runs the built
+/// binary in subprocesses with perturbed `TZ`/`LANG`, since those are read from
+/// the process environment, not settable per in-process call.
+#[test]
+fn output_is_environment_invariant() {
+    use std::process::Command;
+
+    let bin = env!("CARGO_BIN_EXE_deob");
+    let envs = [
+        ("UTC", "C"),
+        ("America/New_York", "en_US.UTF-8"),
+        ("Asia/Kolkata", "de_DE.UTF-8"),
+        ("Pacific/Auckland", "C"),
+    ];
+    // sample_7 is the known carrier (timezone + Date-string fingerprints); a few
+    // others guard against regressions elsewhere.
+    for sample in ["sample_7.js", "sample_3.js", "sample_11.js"] {
+        let path = format!("{}/samples/{sample}", env!("CARGO_MANIFEST_DIR"));
+        let mut baseline: Option<Vec<u8>> = None;
+        for (tz, lang) in envs {
+            let out = Command::new(bin)
+                .arg(&path)
+                .env("TZ", tz)
+                .env("LANG", lang)
+                .env("LC_ALL", lang)
+                .output()
+                .unwrap_or_else(|e| panic!("run {bin} on {sample}: {e}"));
+            assert!(
+                out.status.success(),
+                "{sample}: deob exited non-zero under TZ={tz} LANG={lang}"
+            );
+            match &baseline {
+                None => baseline = Some(out.stdout),
+                Some(b) => assert!(
+                    *b == out.stdout,
+                    "{sample}: output differs under TZ={tz} LANG={lang} \
+                     — a lift depends on the host environment (not portable)"
+                ),
+            }
+        }
+    }
+}

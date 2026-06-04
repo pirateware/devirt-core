@@ -8045,7 +8045,7 @@
 					var2206["In1ReGQRXUs="] = nav.languages;
 					var2206["bHcfcioaHkQ="] = nav.userAgent;
 					var2206["Mk1BCHcnRj0="] = !!(nav.doNotTrack || null === nav.doNotTrack || nav.msDoNotTrack || win.doNotTrack);
-					var2206["FmklbFAAKF4="] = -60;
+					var2206["FmklbFAAKF4="] = 0;
 					var2206["bjEdNChdGwc="] = nav.deviceMemory;
 					var2206["PkFNBHgtTDE="] = nav.languages && nav.languages.length;
 				} catch (var2210) {}
@@ -9914,7 +9914,7 @@
 				});
 			}
 			function fn577(var2539, var2540) {
-				var2540 = var2540 || "12662275";
+				var2540 = var2540 || "79ce3e5a";
 				var var2541 = obj64[var2540];
 				obj64[var2540] = var2541 = [];
 				var2541.done = function(var2542) {
