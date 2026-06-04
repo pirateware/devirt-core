@@ -35,3 +35,6 @@ rustc-ice-*.txt
 /node_modules/
 /package.json
 /package-lock.json
+
+# Worker (deploy/) installed deps
+deploy/node_modules/
