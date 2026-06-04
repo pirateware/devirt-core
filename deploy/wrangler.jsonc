@@ -4,6 +4,11 @@
   "main": "worker/index.ts",
   "compatibility_date": "2025-10-01",
 
+  // Custom domain. `custom_domain: true` makes wrangler create the DNS record and
+  // managed edge certificate for this hostname on the (Cloudflare-managed)
+  // devirt.dev zone. The *.workers.dev URL keeps working alongside it.
+  "routes": [{ "pattern": "api.devirt.dev", "custom_domain": true }],
+
   // The container image. Path is relative to this file; the directory holding the
   // Dockerfile (the repo root) becomes the Docker build context — so it can see
   // Cargo.toml, src/, and server/.
