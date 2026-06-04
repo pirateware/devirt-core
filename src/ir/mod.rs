@@ -16,10 +16,13 @@
 
 mod analysis;
 mod cfg;
+mod consts;
 mod dom;
 mod inline;
+mod ordering;
 mod ssa;
 
+pub use consts::ConstResolver;
 pub use inline::InlineSingleUse;
 
 /// Symbol-precise "which local aggregate tables are NOT provably immutable" query,
