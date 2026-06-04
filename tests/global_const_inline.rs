@@ -67,3 +67,70 @@ fn does_not_inline_read_before_init() {
         "snapshot read was unsoundly folded to a literal: {out}"
     );
 }
+
+#[test]
+fn inlines_pure_expression_chain_once_leaves_resolve() {
+    // B4: `B = A + 1`, `C = B * 2 - 3` resolve once `A` resolves, via the bounded
+    // pure-expression fixpoint. All three are single, unconditional writes in an
+    // init function run once up top, read only in a later dispatcher → the case
+    // labels become numeric literals.  A=10 → B=11 → C=19.
+    let src = r#"
+        (function () {
+            var A, B, C, STOP;
+            function init() { A = 10; B = A + 1; C = B * 2 - 3; STOP = 0; }
+            init();
+            var run = function (s) {
+                var acc = 0;
+                while (s != STOP) {
+                    switch (s) {
+                        case A: acc += 1; s = B; break;
+                        case B: acc += 2; s = C; break;
+                        case C: acc += 3; s = STOP; break;
+                    }
+                }
+                return acc;
+            };
+            sink(run);
+        })();
+    "#;
+    let out = deobfuscate(src, "t.js").code;
+    assert!(
+        out.contains("case 10") && out.contains("case 11") && out.contains("case 19"),
+        "pure-expression chain not resolved into case labels: {out}"
+    );
+}
+
+#[test]
+fn does_not_inline_pure_expression_when_operand_not_write_once() {
+    // B4 adversarial sibling: `B = A + 1`, but `A` is written twice (10 then 9), so
+    // `A` is not a write-once constant → `B` must NOT resolve.  Both `= 10`/`= 9`
+    // writes survive and no numeric case label appears for the symbolic ones.
+    let src = r#"
+        (function () {
+            var A, B, STOP;
+            function init() { A = 10; A = 9; B = A + 1; STOP = 0; }
+            init();
+            var run = function (s) {
+                var acc = 0;
+                while (s != STOP) {
+                    switch (s) {
+                        case B: acc += 1; s = STOP; break;
+                    }
+                }
+                return acc;
+            };
+            sink(run);
+        })();
+    "#;
+    let out = deobfuscate(src, "t.js").code;
+    // A's two writes are not removed (A unresolved), and `B = A + 1` is not folded
+    // to a literal `case` — the symbolic label survives.
+    assert!(
+        out.contains("= 9"),
+        "A's second write was unsoundly removed (A treated as write-once): {out}"
+    );
+    assert!(
+        !out.contains("case 11"),
+        "B was unsoundly resolved despite A not being write-once: {out}"
+    );
+}
