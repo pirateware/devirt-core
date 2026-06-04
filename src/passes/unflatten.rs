@@ -83,20 +83,33 @@ impl<'a> Traverse<'a, ()> for Unflatten {
         stmts: &mut ArenaVec<'a, Statement<'a>>,
         ctx: &mut TraverseCtx<'a, ()>,
     ) {
-        // Find a `<state init>; while (s) { switch (s) {…} }` adjacent pair.
-        let mut hit: Option<(usize, Vec<Statement<'a>>)> = None;
-        for i in 0..stmts.len().saturating_sub(1) {
+        // Find a `<state init> … while (s) { switch (s) {…} }` pair. The init and
+        // the dispatcher loop need NOT be adjacent: the state var may have a
+        // declaration or two between them (`var s = 1; var acc = 0; while(s){…}`),
+        // as long as `s` is referenced *only* in the init and the loop. That
+        // "dispatch-only" invariant — the same one the adjacent form relies on —
+        // is what keeps the relaxation sound: statements between the init and the
+        // loop cannot observe or alter `s`, so the simulated state still holds when
+        // the loop is entered, and they stay in place before the linear sequence.
+        let mut hit: Option<(usize, usize, Vec<Statement<'a>>)> = None;
+        for i in 0..stmts.len() {
             let Some((s_name, init)) = state_init(&stmts[i]) else {
                 continue;
             };
-            let Some((switch, kind, test)) = detect_loop(&stmts[i + 1], &s_name) else {
-                continue;
-            };
-            // `s` must not be referenced anywhere in this list except the init and
-            // the loop construct (indices i, i+1).
-            if !dispatch_only_in_list(stmts, i, &s_name) {
+            // `s` must appear in exactly one OTHER statement — the dispatcher.
+            let others: Vec<usize> = (0..stmts.len())
+                .filter(|&k| k != i && mentions(&stmts[k], &s_name))
+                .collect();
+            if others.len() != 1 {
                 continue;
             }
+            let j = others[0];
+            if j <= i {
+                continue; // the loop must run after the initializer
+            }
+            let Some((switch, kind, test)) = detect_loop(&stmts[j], &s_name) else {
+                continue;
+            };
             let Some(cases) = parse_cases(switch, &s_name) else {
                 continue;
             };
@@ -105,22 +118,23 @@ impl<'a> Traverse<'a, ()> for Unflatten {
             let Some((seq, _exit)) = simulate(init, &cases, &test, kind, ctx.ast.allocator) else {
                 continue;
             };
-            hit = Some((i, seq));
+            hit = Some((i, j, seq));
             break;
         }
 
-        let Some((i, seq)) = hit else {
+        let Some((i, j, seq)) = hit else {
             return;
         };
-        // Splice: replace the init (i) and while (i+1) with the linear sequence.
-        // `seq` already holds arena clones, so move them in directly.
+        // Splice: drop the state initializer (i) and replace the dispatcher loop
+        // (j) with the linear sequence. Statements between i and j (and elsewhere)
+        // are preserved in order. `seq` already holds arena clones.
         let old = std::mem::replace(stmts, ctx.ast.vec());
         let mut seq = Some(seq);
-        for (j, s) in old.into_iter().enumerate() {
-            if j == i {
+        for (k, s) in old.into_iter().enumerate() {
+            if k == i {
                 continue; // drop the state initializer
             }
-            if j == i + 1 {
+            if k == j {
                 for st in seq.take().unwrap() {
                     stmts.push(st);
                 }
@@ -550,20 +564,6 @@ pub(crate) fn simulate<'a>(
 // ---------------------------------------------------------------------------
 // Name-reference helpers (the pass is name-based, like decoder-lift)
 // ---------------------------------------------------------------------------
-
-/// True unless `s` is referenced only within `stmts[i]` (init) and `stmts[i+1]`
-/// (the while). Any other reference means `s` is not a private dispatch var.
-fn dispatch_only_in_list(stmts: &[Statement<'_>], i: usize, s: &str) -> bool {
-    for (j, st) in stmts.iter().enumerate() {
-        if j == i || j == i + 1 {
-            continue;
-        }
-        if mentions(st, s) {
-            return false;
-        }
-    }
-    true
-}
 
 struct NameScan<'r> {
     name: &'r str,

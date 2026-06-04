@@ -1378,6 +1378,52 @@ fn unflatten_generalized_shapes_preserve_value() {
 }
 
 #[test]
+fn unflatten_nonadjacent_init_preserves_value() {
+    // The state initializer and the dispatcher loop are NOT adjacent — an
+    // unrelated declaration sits between them. The dispatch var is still
+    // referenced only in the init and the loop, so unflattening is sound.
+    assert_equivalent(
+        r#"
+        var s = 1;
+        var acc = 0;
+        while (s) { switch (s) {
+            case 1: acc += 10; s = 2; break;
+            case 2: acc += 5; s = 0; break;
+        } }
+        __r = acc;
+        "#,
+    );
+    // Symbolic labels + non-adjacent init: GCI materializes the labels, then the
+    // relaxed unflattener fires across the gap.
+    assert_equivalent(
+        r#"
+        var A = 1, B = 2, Z = 0;
+        var s = A;
+        var acc = 0;
+        while (s) { switch (s) {
+            case A: acc += 10; s = B; break;
+            case B: acc += 5; s = Z; break;
+        } }
+        __r = acc;
+        "#,
+    );
+    // Sibling (must stay equivalent): a statement BETWEEN init and loop that reads
+    // s — the dispatch var is no longer private, so the pass must decline.
+    assert_equivalent(
+        r#"
+        var s = 1;
+        var peek = s + 100;
+        var acc = 0;
+        while (s) { switch (s) {
+            case 1: acc += 10; s = 2; break;
+            case 2: acc += 5; s = 0; break;
+        } }
+        __r = acc + ":" + peek;
+        "#,
+    );
+}
+
+#[test]
 fn unflatten_param_state_preserves_value() {
     // Param-state dispatcher: state is param 0, called with a constant entry.
     assert_equivalent(
