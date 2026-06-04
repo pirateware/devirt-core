@@ -7,6 +7,11 @@ edition = "2021"
 name = "deob"
 path = "src/main.rs"
 
+[lib]
+# `cdylib` is the artifact shipped to WASM hosts (Cloudflare Workers etc.);
+# `rlib` keeps the bins and the test suite linking against the crate as usual.
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 oxc_allocator = "0.134.0"
 oxc_parser    = "0.134.0"
@@ -17,8 +22,16 @@ oxc_codegen   = "0.134.0"
 oxc_span      = "0.134.0"
 oxc_syntax    = "0.134.0"
 oxc_ecmascript = "0.134.0"
-rquickjs = "0.12.0"
+boa_engine = "0.21.1"
 oxc_ast_visit = "0.134.0"
+
+# WASM-only deps. `wasm-bindgen` provides the JS-callable `deobfuscate_js` entry
+# point; `getrandom`'s `wasm_js` feature selects its JS backend (the matching
+# `--cfg` lives in .cargo/config.toml). Both are target-gated, so native builds
+# never compile them.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+wasm-bindgen = "0.2"
 
 [dev-dependencies]
 # Parses the generated-corpus manifest in tests/generated_corpus.rs.

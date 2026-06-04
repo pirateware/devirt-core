@@ -1,0 +1,23 @@
+name = "js-deobfuscator"
+main = "index.js"
+compatibility_date = "2024-11-01"
+
+# Serve on the custom domain. Must be a top-level key (before any [table], or TOML
+# folds it into that table). The `devirt.dev` zone must be active on this account;
+# `custom_domain = true` provisions the DNS record + TLS cert automatically.
+routes = [
+  { pattern = "worker.devirt.dev", custom_domain = true },
+]
+
+# Deobfuscating large samples takes seconds of CPU. The default 30s ceiling
+# requires the Workers Standard (paid) usage model; the Free plan's 10ms budget
+# is not enough for big inputs.
+[limits]
+cpu_ms = 30000
+
+# Build the WASM from the Rust crate one directory up, before every deploy.
+# Requires `wasm-pack` and the wasm32-unknown-unknown target (see ./README.md).
+# `wasm-pack` resolves --out-dir relative to the crate path (`..`), so this lands
+# in worker/pkg; it also runs wasm-opt, shrinking the module.
+[build]
+command = "wasm-pack build .. --release --target web --out-dir worker/pkg"

@@ -32,7 +32,7 @@ use crate::pass::Pass;
 use crate::sandbox::{EvalValue, Sandbox};
 use crate::util::build_scoping;
 
-/// Globals a pure decoder may reference (present in QuickJS, side-effect free).
+/// Globals a pure decoder may reference (present in Boa, side-effect free).
 /// Referencing/constructing any of these has no host-visible effect, so a
 /// function whose only free names are these (or other pure bindings) is pure.
 /// The double-eval determinism guard separately rejects any that turn out
@@ -820,7 +820,7 @@ pub(crate) struct FreeVars {
     impure: bool, // performs an un-analyzable write / reaches non-modelable state → not liftable
     /// The body uses the *global-object idiom* — `this` in value position and/or
     /// `new Function("return this")()`. These resolve to the (frozen) global object
-    /// in the sandbox and are deterministic under the QuickJS-relative oracle (the
+    /// in the sandbox and are deterministic under the Boa-relative oracle (the
     /// equivalence harness executes original-vs-deobfuscated in the *same* engine),
     /// so they do NOT poison `impure`. A bare `this` in a liftable decoder is the
     /// global: decoder-lift only ever lifts bare-identifier calls (`dec(x)`, never

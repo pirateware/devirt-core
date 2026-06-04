@@ -421,7 +421,7 @@ fn does_not_lift_decoder_through_this_global_detection() {
     // the global and then reads a genuinely *non-deterministic* value off it
     // (`Math.random()`) must NOT lift — the double-eval determinism guard (two
     // back-to-back evals must agree) refuses it. (The earlier `g.TextDecoder` form
-    // was wrong as an adversary: under QuickJS-relative soundness the host-property
+    // was wrong as an adversary: under Boa-relative soundness the host-property
     // branch is unreachable in the sandbox and both sides agree, so the
     // global-detector idiom itself is a *legitimate* lift — see
     // `lifts_decoder_through_pure_global_detection`. The real must-decline is a
@@ -475,7 +475,7 @@ fn lifts_decoder_through_pure_global_detection() {
     // B3 global-object idiom used *pure-relative-to-host*. The decoder detects the
     // global via the standard idiom (`new Function("return this")()` / `this`) and
     // reads only a *standard built-in* (`String.fromCharCode`) off it — deterministic
-    // and identical on every conforming host, and present in the QuickJS sandbox. So
+    // and identical on every conforming host, and present in the Boa sandbox. So
     // it is a legitimate lift: `this`/`Function("return this")()` are modeled as the
     // frozen sandbox global rather than poisoning the purity gate, and the decoder
     // resolves under the double-eval determinism guard.

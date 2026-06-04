@@ -39,3 +39,59 @@ https://www.godaddy.com/6E0qyK/xa/TJ/W2yd/bxZ7lgJLhd/Jb/IwhwOXwD/K1/cNegQ9Sgsq
 https://client.px-cdn.net/PXK3bezZfO/main.min.js
 https://sso.godaddy.com/149e9513-01fa-4fb0-aad4-566afd725d1b/2d206a39-8ed7-437e-a3be-862e0f06eea3/p.js?v=20588
 ```
+
+## WebAssembly / Cloudflare Workers
+
+The sandbox is [Boa](https://github.com/boa-dev/boa) (pure Rust), so the whole
+deobfuscator compiles to one `wasm32-unknown-unknown` module — no C toolchain,
+no WASI. The crate builds a `cdylib` and exposes a JS entry point:
+
+```rust
+// src/lib.rs — only compiled for wasm
+pub fn deobfuscate_js(source: &str, filename: &str) -> String
+```
+
+### Build
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli        # one-time; generates the JS glue
+cargo build --lib --release --target wasm32-unknown-unknown
+wasm-bindgen target/wasm32-unknown-unknown/release/js_deobfuscator.wasm \
+  --out-dir pkg --target bundler
+wasm-opt -Oz pkg/js_deobfuscator_bg.wasm -o pkg/js_deobfuscator_bg.wasm  # optional, shrinks ~20-40%
+```
+
+Size (release, before `wasm-opt`): ~10.4 MB raw, **~2.4 MB gzip / ~1.5 MB
+brotli** — within the Cloudflare Workers compressed-bundle cap on every plan
+(3 MiB Free, 10 MiB Paid).
+
+### Cloudflare Worker
+
+A complete, deployable Worker lives in [`worker/`](worker/) (serves
+`worker.devirt.dev`). It builds this crate to WASM via `wasm-pack` and exposes a
+POST endpoint:
+
+```sh
+cd worker && npm install && npm run deploy
+curl -X POST --data-binary @obfuscated.js https://worker.devirt.dev
+```
+
+See [`worker/README.md`](worker/README.md) for prerequisites and details.
+
+### Constraints to know
+
+- **CPU time.** Deobfuscating large samples takes seconds; the Free plan's 10 ms
+  budget won't fit. Use a paid/Standard plan with `cpu_ms` raised. The 10 M
+  loop-iteration sandbox budget bounds the riskiest part.
+- **Memory.** Workers cap at 128 MiB; the 2 MB monster samples (oxc arena + Boa
+  heap) may not fit. The wasm stack is fixed at link time (16 MiB, in
+  `.cargo/config.toml`) — raise it if deeply nested input traps, lower it to
+  reclaim heap.
+- **No threads, `panic = abort`.** On wasm the pipeline runs inline (native uses a
+  big-stack worker thread) and panics cannot be caught. Boa 0.21 has one
+  process-fatal bug — `i32::MIN % -1` panics (see `src/sandbox.rs`). The one
+  deterministic trigger (the math-fingerprint probe battery) is already avoided,
+  so the current corpus does not hit it; a decoder whose *own* arithmetic computes
+  it would trap that one request. To fully harden, pin a patched Boa:
+  `[patch.crates-io] boa_engine = { git = "<your fork with wrapping_rem>" }`.

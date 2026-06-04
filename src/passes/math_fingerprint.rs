@@ -100,7 +100,12 @@ const BIN_INPUTS: &[(i64, i64)] = &[
     (789, 123456),
     (-123456, 789),
     (2147483647, 1),
-    (-2147483648, -1),
+    // int32 MIN with a negative divisor. The divisor is -2, not -1, on purpose:
+    // the Boa sandbox evaluates `%` via an integer fast path that computes
+    // `i32::MIN % -1` directly, which panics in Rust (overflow) and would make
+    // every `%`-proxy fingerprint attempt bail. -2 keeps the same extreme without
+    // the trap; the discriminating `-1` divisor is already probed by (±1, -1).
+    (-2147483648, -2),
     (100, 3),
     (3, 100),
     (8, 2),

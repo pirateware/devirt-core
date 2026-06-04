@@ -15,6 +15,18 @@ use oxc_parser::{ParseOptions, Parser};
 use oxc_span::SourceType;
 use std::path::Path;
 
+/// WASM/JS entry point (browser, Cloudflare Workers, Node). Deobfuscates
+/// `source` and returns the transformed code. `filename` only steers source-type
+/// inference (module vs script, jsx, ts) — pass e.g. `"input.js"`. On an internal
+/// pipeline panic it returns the input cleanly reformatted, the same graceful
+/// fallback as the native [`deobfuscate`] API (callers never see a trap on the
+/// normal error paths; see the crate's WASM notes for the one engine edge case).
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn deobfuscate_js(source: &str, filename: &str) -> String {
+    deobfuscate(source, filename).code
+}
+
 pub struct Report {
     pub code: String,
     pub parse_errors: Vec<String>,
@@ -83,7 +95,7 @@ pub fn run_pass(source: &str, filename: &str, pass_name: &str) -> String {
 /// (module vs script, jsx, ts). The pipeline is the sample-agnostic default.
 ///
 /// A deobfuscator runs over adversarial input through deep machinery (oxc
-/// traversal, the SSA IR, the QuickJS sandbox). Two host-crash vectors are
+/// traversal, the SSA IR, the Boa sandbox). Two host-crash vectors are
 /// contained here so a malicious file degrades gracefully instead of taking down
 /// the process:
 ///
@@ -105,13 +117,8 @@ pub fn deobfuscate(source: &str, filename: &str) -> Report {
     // known limit; a stack overflow there aborts, as it must).
     const WORKER_STACK: usize = 256 * 1024 * 1024;
 
-    let joined = std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .name("deob-pipeline".into())
-            .stack_size(WORKER_STACK)
-            .spawn_scoped(scope, || run_pipeline(source, filename))
-            .expect("spawn deobfuscation worker thread")
-            .join()
+    let joined = util::run_isolated("deob-pipeline", WORKER_STACK, || {
+        run_pipeline(source, filename)
     });
 
     match joined {
