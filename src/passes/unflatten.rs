@@ -435,7 +435,7 @@ pub(crate) fn parse_cases<'b, 'a>(
 /// block-scoped declarations — `let`/`const`/`class`/`function`). A `var` block is
 /// transparent (var is function-scoped). An opaque block is pushed as one
 /// statement (so a transition hidden inside it trips the `mentions` guard).
-fn flatten_case<'b, 'a>(stmts: &'b [Statement<'a>], out: &mut Vec<&'b Statement<'a>>) {
+pub(crate) fn flatten_case<'b, 'a>(stmts: &'b [Statement<'a>], out: &mut Vec<&'b Statement<'a>>) {
     for st in stmts {
         if let Statement::BlockStatement(b) = st {
             if block_is_transparent(b) {
@@ -499,7 +499,7 @@ fn is_state_transition(stmt: &Statement<'_>, s: &str) -> Option<Trans> {
     }
 }
 
-fn is_top_level_control(stmt: &Statement<'_>) -> bool {
+pub(crate) fn is_top_level_control(stmt: &Statement<'_>) -> bool {
     matches!(
         stmt,
         Statement::BreakStatement(_)
