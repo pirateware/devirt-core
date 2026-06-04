@@ -22,6 +22,10 @@ pub struct Report {
     pub converged: bool,
     /// (pass name, number of rounds in which it changed the tree)
     pub changes: Vec<(String, usize)>,
+    /// `Some(msg)` when the transform pipeline panicked and the deobfuscator fell
+    /// back to returning the input cleanly reformatted (an identity transform).
+    /// `None` on the normal path. Callers can surface this without crashing.
+    pub error: Option<String>,
 }
 
 /// Parse and re-print `source` with no transforms. Useful as the "before" side
@@ -59,7 +63,14 @@ pub fn run_pass(source: &str, filename: &str, pass_name: &str) -> String {
     let mut program = parsed.program;
     let mut p: Box<dyn pass::Pass> = match pass_name {
         "rename" => Box::new(passes::RenameByRole::default()),
-        other => panic!("run_pass: unknown pass {other:?}"),
+        // Unknown pass: identity (reprint unchanged). Test-support only, but a
+        // public entry point should not panic on bad input.
+        _ => {
+            return Codegen::new()
+                .with_options(CodegenOptions::default())
+                .build(&program)
+                .code;
+        }
     };
     p.run(&mut program, &allocator);
     Codegen::new()
@@ -70,7 +81,73 @@ pub fn run_pass(source: &str, filename: &str, pass_name: &str) -> String {
 
 /// Deobfuscate `source`. `filename` is used only to infer the source type
 /// (module vs script, jsx, ts). The pipeline is the sample-agnostic default.
+///
+/// A deobfuscator runs over adversarial input through deep machinery (oxc
+/// traversal, the SSA IR, the QuickJS sandbox). Two host-crash vectors are
+/// contained here so a malicious file degrades gracefully instead of taking down
+/// the process:
+///
+/// * **Panics** (an invariant violation, an oxc internal panic) — the worker
+///   thread's `join()` returns `Err`; we fall back to returning the input cleanly
+///   reformatted (an identity transform) with [`Report::error`] set.
+/// * **Stack overflow** from deeply nested input — `catch_unwind` *cannot* catch
+///   this (it aborts, not unwinds), so the pipeline runs on a dedicated worker
+///   thread with a large explicit stack. This also makes the depth ceiling
+///   independent of the caller's stack (a 2 MiB server worker thread would
+///   otherwise overflow on a few hundred nesting levels).
+///
+/// Either way the contract holds: never a host-process crash, and never a
+/// half-transformed (possibly non-equivalent) program — correctness over
+/// completeness.
 pub fn deobfuscate(source: &str, filename: &str) -> Report {
+    // 256 MiB ≈ tens of thousands of nesting levels — far beyond any realistic
+    // input, while still bounded (truly unbounded adversarial depth remains a
+    // known limit; a stack overflow there aborts, as it must).
+    const WORKER_STACK: usize = 256 * 1024 * 1024;
+
+    let joined = std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("deob-pipeline".into())
+            .stack_size(WORKER_STACK)
+            .spawn_scoped(scope, || run_pipeline(source, filename))
+            .expect("spawn deobfuscation worker thread")
+            .join()
+    });
+
+    match joined {
+        Ok(report) => report,
+        Err(payload) => {
+            let msg = panic_message(payload.as_ref());
+            // Fallback: reparse and reprint with no transforms. Guard this too —
+            // if even formatting panics, hand back the source verbatim.
+            let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                format_only(source, filename)
+            }))
+            .unwrap_or_else(|_| source.to_string());
+            Report {
+                code,
+                parse_errors: Vec::new(),
+                rounds: 0,
+                converged: false,
+                changes: Vec::new(),
+                error: Some(format!(
+                    "transform pipeline panicked; returned input unchanged: {msg}"
+                )),
+            }
+        }
+    }
+}
+
+/// The uncontained body of [`deobfuscate`]: parse, run the fixpoint pipeline, and
+/// reprint. Any panic here is caught by [`deobfuscate`].
+fn run_pipeline(source: &str, filename: &str) -> Report {
+    // Test-only hook to exercise the panic-containment path deterministically.
+    // Entirely absent from production builds (`#[cfg(test)]`).
+    #[cfg(test)]
+    if source.contains("__DEOB_FORCE_PANIC__") {
+        panic!("forced pipeline panic (test)");
+    }
+
     let allocator = Allocator::default();
     let source_type = SourceType::from_path(Path::new(filename)).unwrap_or_default();
 
@@ -99,5 +176,51 @@ pub fn deobfuscate(source: &str, filename: &str) -> Report {
         rounds: stats.rounds,
         converged: stats.converged,
         changes: stats.changes,
+        error: None,
+    }
+}
+
+/// Best-effort human-readable text from a `catch_unwind` payload.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
+#[cfg(test)]
+mod containment_tests {
+    use super::*;
+
+    #[test]
+    fn pipeline_panic_degrades_to_identity_reprint() {
+        // The forced-panic hook fires inside the pipeline; deobfuscate must
+        // contain it, set `error`, and return the input cleanly reformatted
+        // rather than crashing or emitting a half-transformed program.
+        let src = r#"var x = "__DEOB_FORCE_PANIC__"; console.log(x);"#;
+        let report = deobfuscate(src, "t.js");
+        assert!(
+            report
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("panicked")),
+            "expected contained-panic error, got {:?}",
+            report.error
+        );
+        // Fallback output is the formatted input — same as a transform-free run.
+        assert_eq!(report.code, format_only(src, "t.js"));
+        assert!(!report.converged);
+        // And it must re-parse (i.e. be valid JS, not corrupt).
+        let reparse = deobfuscate(&report.code, "t.js");
+        assert!(reparse.parse_errors.is_empty());
+    }
+
+    #[test]
+    fn normal_input_has_no_error() {
+        let report = deobfuscate("var a = 1 + 2; console.log(a);", "t.js");
+        assert!(report.error.is_none());
     }
 }
