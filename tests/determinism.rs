@@ -54,6 +54,15 @@ fn sample_11_is_deterministic() {
 }
 
 #[test]
+fn sample_7_is_deterministic() {
+    // sample_7 jittered on a `+new Date()` token timestamp once decoder-lift began
+    // folding its decoder chain: the double-eval guard misses sub-millisecond
+    // `new Date()` reads, so the whole `new Date()` wall clock (not just
+    // `Date.now()`) is frozen in the sandbox. This pins that fix.
+    assert_stable("sample_7.js", 5);
+}
+
+#[test]
 fn small_samples_are_deterministic() {
     for s in ["sample_2.js", "sample_5.js", "sample_6.js"] {
         assert_stable(s, 3);

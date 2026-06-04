@@ -152,6 +152,36 @@ fn lifts_decoder_nested_in_var_assigned_iife() {
 }
 
 #[test]
+fn lifts_decoder_depending_on_pure_value_bindings() {
+    // The sample_7 (HUMAN/PerimeterX) wall: the decoder is pure, but its purity
+    // depends on a chain of *value-bindings* — `var X = <pure call/member>` that
+    // are neither pure data nor functions — built off a global-object probe. The
+    // env-glue (`g`, `Conv`, `fromCC`, the closure `mk`) must be admitted to the
+    // pure set and re-emitted in the sandbox preamble so the decoder resolves.
+    let src = r#"
+        (function () {
+            function probe() { try { return globalThis; } catch (e) {} return this; }
+            var g = probe() || {};
+            var Conv = g.String || String;
+            var fromCC = Conv.fromCharCode;
+            var mk = (function () {
+                var lut = [104, 105, 33];          // "hi!"
+                return function (i) { return fromCC(lut[i]); };
+            })();
+            function dec(i) { return mk(i); }
+            sink(dec(0) + dec(1) + dec(2));
+        })();
+    "#;
+    let out = deobfuscate(src, "t.js").code;
+    // The whole chain folds to the decoded string; no decoder call survives.
+    assert!(
+        out.contains(r#"sink("hi!")"#),
+        "value-binding-dependent decoder did not fold: {out}"
+    );
+    assert!(!out.contains("dec("), "decoder call survived: {out}");
+}
+
+#[test]
 fn does_not_lift_scoped_decoder_over_member_mutated_table() {
     // The hazard scoped lifting widens (plan §5.3 / §8): the table is mutated by a
     // member write, which the name-based "assigned once" count is blind to. The

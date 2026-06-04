@@ -1167,351 +1167,329 @@
 	function fn47() {
 		var371 !== undefined && (window.clearTimeout(var371), var371 = undefined);
 	}
-	function fn48() {
-		var flag16 = true, flag17 = false, var387 = undefined;
-		try {
-			for (var var388 = obj9.widgetMap.values()[Symbol.iterator](), var389; !(flag16 = (var389 = var388.next()).done); flag16 = true) {
-				var var390 = var389.value;
-				if (var390.chlPageData) return true;
-			}
-		} catch (var391) {
-			flag17 = true;
-			var387 = var391;
-		} finally {
-			try {
-				!flag16 && var388.return != null && var388.return();
-			} finally {
-				if (flag17) throw var387;
-			}
-		}
-		return false;
-	}
-	function fn49(var392) {
-		var var393 = obj9.widgetMap.get(var392), var394 = call8(var392);
-		if (!(!var393 || !var394)) {
-			var elem7 = var393.shadow.querySelector("#".concat(var394));
+	function fn48(var387) {
+		var var388 = obj9.widgetMap.get(var387), var389 = call8(var387);
+		if (!(!var388 || !var389)) {
+			var elem7 = var388.shadow.querySelector("#".concat(var389));
 			elem7 && fn30(elem7, {
 				apiJsMismatchReloadAttempts: obj9.apiJsMismatchReloadAttempts,
 				apiJsMismatchReloadCompletedCount: obj9.apiJsMismatchReloadCompletedCount,
 				event: "reloadApiJsRejected",
 				source: str1,
-				widgetId: var392
-			}, var393.iframeOrigin);
+				widgetId: var387
+			}, var388.iframeOrigin);
 		}
 	}
-	function fn50() {
-		var var395 = (arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {}).preserveMismatchReloadPending, var396 = var395 === undefined ? false : var395;
+	function fn49() {
+		var var390 = (arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {}).preserveMismatchReloadPending, var391 = var390 === undefined ? false : var390;
 		var373 = undefined;
-		var396 || (obj9.apiJsMismatchReloadPending = false);
+		var391 || (obj9.apiJsMismatchReloadPending = false);
 		var372 !== undefined && (window.clearTimeout(var372), var372 = undefined);
 	}
+	function fn50() {
+		var var392 = var373;
+		fn49();
+		var392 !== undefined && fn48(var392);
+	}
 	function fn51() {
-		var var397 = var373;
-		fn50();
-		var397 !== undefined && fn49(var397);
+		var var393 = obj9.apiJsReloadBackoffMs, var394 = Number.isFinite(var393) && var393 > 0 ? Math.min(var393, num10) : num9;
+		obj9.apiJsReloadNextAllowedTsMs = 0 + Math.round(var394 * (.8 + Math.random() * .4));
+		obj9.apiJsReloadBackoffMs = Math.min(var394 * 2, num10);
 	}
-	function lessThan() {
-		return 0 < obj9.apiJsReloadNextAllowedTsMs;
-	}
-	function fn52() {
-		var var398 = obj9.apiJsReloadBackoffMs, var399 = Number.isFinite(var398) && var398 > 0 ? Math.min(var398, num10) : num9;
-		obj9.apiJsReloadNextAllowedTsMs = 0 + Math.round(var399 * (.8 + Math.random() * .4));
-		obj9.apiJsReloadBackoffMs = Math.min(var399 * 2, num10);
-	}
-	function fn53(var401) {
-		fn50({ preserveMismatchReloadPending: true });
+	function fn52(var396) {
+		fn49({ preserveMismatchReloadPending: true });
 		obj9.apiJsMismatchReloadPending = true;
-		var373 = var401;
+		var373 = var396;
 		var372 = window.setTimeout(function() {
-			fn51();
+			fn50();
 		}, num11);
 	}
-	function fn54() {
+	function fn53() {
 		fn47();
-		!fn48() && (var371 = window.setTimeout(function() {
+		true && (var371 = window.setTimeout(function() {
 			var371 = undefined;
 			pick22();
 		}, num13));
 	}
-	function fn55(var402, var403) {
-		fn59(var402, var403, "");
+	function fn54(var397, var398) {
+		fn58(var397, var398, "");
 	}
 	var arr7 = [];
-	function fn56() {
+	function fn55() {
 		obj9.isReady = true;
-		var flag18 = true, flag19 = false, var404 = undefined;
+		var flag16 = true, flag17 = false, var399 = undefined;
 		try {
-			for (var var405 = arr7[Symbol.iterator](), var406; !(flag18 = (var406 = var405.next()).done); flag18 = true) {
-				var var407 = var406.value;
-				var407();
+			for (var var400 = arr7[Symbol.iterator](), var401; !(flag16 = (var401 = var400.next()).done); flag16 = true) {
+				var var402 = var401.value;
+				var402();
 			}
-		} catch (var408) {
-			flag19 = true;
-			var404 = var408;
+		} catch (var403) {
+			flag17 = true;
+			var399 = var403;
 		} finally {
 			try {
-				!flag18 && var405.return != null && var405.return();
+				!flag16 && var400.return != null && var400.return();
 			} finally {
-				if (flag19) throw var404;
+				if (flag17) throw var399;
 			}
 		}
 	}
-	function fn57(var409, var410) {
-		var409.onerror = function() {
-			fn44(var410, var410.cbError);
+	function fn56(var404, var405) {
+		var404.onerror = function() {
+			fn44(var405, var405.cbError);
 		};
 	}
-	function fn58(var411, var412) {
-		var var413, var414, var415 = (var413 = var411.params["response-field"]) !== null && var413 !== undefined ? var413 : true, var416 = var415 && typeof var411.params["response-field-name"] != "string" && or3((var414 = var411.params.sitekey) !== null && var414 !== undefined ? var414 : ""), var417 = obj9.isRecaptchaCompatibilityMode, var418 = "".concat(var412, "_response"), var419 = "".concat(var412, "_legacy_response"), var420 = "".concat(var412, "_g_response"), var421 = (!var415 || instanceOf(document.getElementById(var418), HTMLInputElement)) && (!var416 || instanceOf(document.getElementById(var419), HTMLInputElement)) && (!var417 || instanceOf(document.getElementById(var420), HTMLInputElement));
-		if (!(var411.responseElementsBuilt && var421)) {
-			if (var415 && !instanceOf(document.getElementById(var418), HTMLInputElement)) {
-				var var422, elem8 = document.createElement("input");
+	function fn57(var406, var407) {
+		var var408, var409, var410 = (var408 = var406.params["response-field"]) !== null && var408 !== undefined ? var408 : true, var411 = var410 && typeof var406.params["response-field-name"] != "string" && or3((var409 = var406.params.sitekey) !== null && var409 !== undefined ? var409 : ""), var412 = obj9.isRecaptchaCompatibilityMode, var413 = "".concat(var407, "_response"), var414 = "".concat(var407, "_legacy_response"), var415 = "".concat(var407, "_g_response"), var416 = (!var410 || instanceOf(document.getElementById(var413), HTMLInputElement)) && (!var411 || instanceOf(document.getElementById(var414), HTMLInputElement)) && (!var412 || instanceOf(document.getElementById(var415), HTMLInputElement));
+		if (!(var406.responseElementsBuilt && var416)) {
+			if (var410 && !instanceOf(document.getElementById(var413), HTMLInputElement)) {
+				var var417, elem8 = document.createElement("input");
 				elem8.type = "hidden";
-				elem8.name = (var422 = var411.params["response-field-name"]) !== null && var422 !== undefined ? var422 : str6;
-				elem8.id = var418;
-				var411.wrapper.appendChild(elem8);
+				elem8.name = (var417 = var406.params["response-field-name"]) !== null && var417 !== undefined ? var417 : str6;
+				elem8.id = var413;
+				var406.wrapper.appendChild(elem8);
 			}
-			if (var416 && !instanceOf(document.getElementById(var419), HTMLInputElement)) {
+			if (var411 && !instanceOf(document.getElementById(var414), HTMLInputElement)) {
 				var elem9 = document.createElement("input");
 				elem9.type = "hidden";
 				elem9.name = str5;
-				elem9.id = var419;
-				var411.wrapper.appendChild(elem9);
+				elem9.id = var414;
+				var406.wrapper.appendChild(elem9);
 			}
-			if (var417 && !instanceOf(document.getElementById(var420), HTMLInputElement)) {
+			if (var412 && !instanceOf(document.getElementById(var415), HTMLInputElement)) {
 				var elem10 = document.createElement("input");
 				elem10.type = "hidden";
 				elem10.name = str7;
-				elem10.id = var420;
-				var411.wrapper.appendChild(elem10);
+				elem10.id = var415;
+				var406.wrapper.appendChild(elem10);
 			}
-			var411.responseElementsBuilt = true;
+			var406.responseElementsBuilt = true;
 		}
 	}
-	function fn59(var423, var424, var425) {
-		fn58(var423, var424);
-		var elem11 = document.getElementById("".concat(var424, "_response"));
-		elem11 !== null && instanceOf(elem11, HTMLInputElement) && (elem11.value = var425);
-		var elem12 = document.getElementById("".concat(var424, "_legacy_response"));
-		if (elem12 !== null && instanceOf(elem12, HTMLInputElement) && (elem12.value = var425), obj9.isRecaptchaCompatibilityMode) {
-			var elem13 = document.getElementById("".concat(var424, "_g_response"));
-			elem13 !== null && instanceOf(elem13, HTMLInputElement) && (elem13.value = var425);
+	function fn58(var418, var419, var420) {
+		fn57(var418, var419);
+		var elem11 = document.getElementById("".concat(var419, "_response"));
+		elem11 !== null && instanceOf(elem11, HTMLInputElement) && (elem11.value = var420);
+		var elem12 = document.getElementById("".concat(var419, "_legacy_response"));
+		if (elem12 !== null && instanceOf(elem12, HTMLInputElement) && (elem12.value = var420), obj9.isRecaptchaCompatibilityMode) {
+			var elem13 = document.getElementById("".concat(var419, "_g_response"));
+			elem13 !== null && instanceOf(elem13, HTMLInputElement) && (elem13.value = var420);
 		}
 	}
-	function negate(var426, var427) {
-		var var428;
-		return !!(!((var428 = var427.kills) === null || var428 === undefined) && var428.includes(var426));
+	function negate(var421, var422) {
+		var var423;
+		return !!(!((var423 = var422.kills) === null || var423 === undefined) && var423.includes(var421));
 	}
-	function fn60(var429, var430) {
-		var var431 = var430.params.size, var432 = var431 === undefined ? "normal" : var431, var433 = var430.mode;
-		switch (var433) {
+	function fn59(var424, var425) {
+		var var426 = var425.params.size, var427 = var426 === undefined ? "normal" : var426, var428 = var425.mode;
+		switch (var428) {
 			case var60.NonInteractive:
 			case var60.Managed:
-				switch (var429.style.opacity = "", var429.style.position = "", var429.style.left = "", var429.style.top = "", var429.style.visibility = "", var429.style.pointerEvents = "", var429.style.zIndex = "", var432) {
+				switch (var424.style.opacity = "", var424.style.position = "", var424.style.left = "", var424.style.top = "", var424.style.visibility = "", var424.style.pointerEvents = "", var424.style.zIndex = "", var427) {
 					case var62.Compact:
-						var429.style.width = "150px";
-						var429.style.height = "140px";
+						var424.style.width = "150px";
+						var424.style.height = "140px";
 						break;
-					case var62.Invisible: fn23("Invalid value for parameter \"size\", expected \"".concat(var62.Compact, "\", \"").concat(var62.Flexible, "\", or \"").concat(var62.Normal, "\", got \"").concat(var432, "\""), 2817);
+					case var62.Invisible: fn23("Invalid value for parameter \"size\", expected \"".concat(var62.Compact, "\", \"").concat(var62.Flexible, "\", or \"").concat(var62.Normal, "\", got \"").concat(var427, "\""), 2817);
 					case var62.Normal:
-						var429.style.width = "300px";
-						var429.style.height = "65px";
+						var424.style.width = "300px";
+						var424.style.height = "65px";
 						break;
 					case var62.Flexible:
-						var429.style.width = "100%";
-						var429.style.maxWidth = "100vw";
-						var429.style.minWidth = "300px";
-						var429.style.height = "65px";
+						var424.style.width = "100%";
+						var424.style.maxWidth = "100vw";
+						var424.style.minWidth = "300px";
+						var424.style.height = "65px";
 						break;
 					default: break;
 				}
 				break;
 			case var60.Invisible:
-				negate("floating-invisible", var430) ? (var429.style.width = "0", var429.style.height = "0", var429.style.position = "absolute", var429.style.visibility = "hidden") : (var429.style.width = "1px", var429.style.height = "1px", var429.style.opacity = "0.01", var429.style.position = "fixed", var429.style.left = "0", var429.style.top = "0", var429.style.visibility = "visible", var429.style.pointerEvents = "none", var429.style.zIndex = "-1");
-				var429.setAttribute("tabindex", "-1");
-				var429.setAttribute("aria-hidden", "true");
+				negate("floating-invisible", var425) ? (var424.style.width = "0", var424.style.height = "0", var424.style.position = "absolute", var424.style.visibility = "hidden") : (var424.style.width = "1px", var424.style.height = "1px", var424.style.opacity = "0.01", var424.style.position = "fixed", var424.style.left = "0", var424.style.top = "0", var424.style.visibility = "visible", var424.style.pointerEvents = "none", var424.style.zIndex = "-1");
+				var424.setAttribute("tabindex", "-1");
+				var424.setAttribute("aria-hidden", "true");
 				break;
-			default: fn23("Invalid value for parameter \"mode\", expected \"".concat(var60.NonInteractive, "\", \"").concat(var60.Managed, "\" or \"").concat(var60.Invisible, "\", got \"").concat(var433, "\""), 2818);
+			default: fn23("Invalid value for parameter \"mode\", expected \"".concat(var60.NonInteractive, "\", \"").concat(var60.Managed, "\" or \"").concat(var60.Invisible, "\", got \"").concat(var428, "\""), 2818);
 		}
 	}
-	function fn61(var434) {
-		var434.style.width = "1px";
-		var434.style.height = "1px";
-		var434.style.opacity = "0.01";
-		var434.style.position = "fixed";
-		var434.style.left = "0";
-		var434.style.top = "0";
-		var434.style.visibility = "visible";
-		var434.style.pointerEvents = "none";
-		var434.style.zIndex = "-1";
+	function fn60(var429) {
+		var429.style.width = "1px";
+		var429.style.height = "1px";
+		var429.style.opacity = "0.01";
+		var429.style.position = "fixed";
+		var429.style.left = "0";
+		var429.style.top = "0";
+		var429.style.visibility = "visible";
+		var429.style.pointerEvents = "none";
+		var429.style.zIndex = "-1";
 	}
-	function fn62(var435, var436) {
-		var var437 = var436.get("turnstile_iframe_alt");
-		var437 && (var435.title = var437);
+	function fn61(var430, var431) {
+		var var432 = var431.get("turnstile_iframe_alt");
+		var432 && (var430.title = var432);
 	}
-	function pick16(var438, var439) {
-		var var440, var441;
-		return (var440 = (var441 = var438.wrapper.parentNode) === null || var441 === undefined ? undefined : var441.querySelector("#".concat(var439, "-fr"))) !== null && var440 !== undefined ? var440 : null;
+	function pick16(var433, var434) {
+		var var435, var436;
+		return (var435 = (var436 = var433.wrapper.parentNode) === null || var436 === undefined ? undefined : var436.querySelector("#".concat(var434, "-fr"))) !== null && var435 !== undefined ? var435 : null;
 	}
-	function pick17(var442) {
-		var var443, var444;
-		return !((var444 = var442.feedbackPopup) === null || var444 === undefined) && var444.closed ? (var442.feedbackPopup = undefined, var442.feedbackPopupOrigin = undefined, null) : (var443 = var442.feedbackPopup) !== null && var443 !== undefined ? var443 : null;
+	function pick17(var437) {
+		var var438, var439;
+		return !((var439 = var437.feedbackPopup) === null || var439 === undefined) && var439.closed ? (var437.feedbackPopup = undefined, var437.feedbackPopupOrigin = undefined, null) : (var438 = var437.feedbackPopup) !== null && var438 !== undefined ? var438 : null;
 	}
-	function fn63(var445, var446) {
-		var var447, var448, var449 = (var447 = (var448 = pick16(var445, var446)) === null || var448 === undefined ? undefined : var448.contentWindow) !== null && var447 !== undefined ? var447 : null;
-		if (var449) return {
-			targetOrigin: var445.feedbackIframeOrigin,
-			targetWindow: var449
+	function fn62(var440, var441) {
+		var var442, var443, var444 = (var442 = (var443 = pick16(var440, var441)) === null || var443 === undefined ? undefined : var443.contentWindow) !== null && var442 !== undefined ? var442 : null;
+		if (var444) return {
+			targetOrigin: var440.feedbackIframeOrigin,
+			targetWindow: var444
 		};
-		var var450 = pick17(var445);
+		var var445 = pick17(var440);
 		return {
-			targetOrigin: var450 ? var445.feedbackPopupOrigin : undefined,
-			targetWindow: var450
+			targetOrigin: var445 ? var440.feedbackPopupOrigin : undefined,
+			targetWindow: var445
 		};
 	}
-	function and5(var451) {
-		if ((typeof var451 == "undefined" ? "undefined" : typeOf(var451)) !== "object" || var451 === null) return false;
-		var var452 = var451;
-		return var452.source === str1 && typeof var452.event == "string" && typeof var452.widgetId == "string";
+	function and5(var446) {
+		if ((typeof var446 == "undefined" ? "undefined" : typeOf(var446)) !== "object" || var446 === null) return false;
+		var var447 = var446;
+		return var447.source === str1 && typeof var447.event == "string" && typeof var447.widgetId == "string";
 	}
-	function and6(var453) {
-		return var453.isTrusted && and5(var453.data);
+	function and6(var448) {
+		return var448.isTrusted && and5(var448.data);
 	}
-	function call18(var454) {
-		return pick7(var454.origin, false);
+	function call18(var449) {
+		return pick7(var449.origin, false);
 	}
-	function fn64(var455, var456, var457) {
-		var var458, var459, var460 = (var458 = (var459 = var456.shadow.querySelector("#".concat(var457))) === null || var459 === undefined ? undefined : var459.contentWindow) !== null && var458 !== undefined ? var458 : null, var461 = fn63(var456, var457).targetWindow, and7 = function(var462) {
-			return var462 !== null && var455.source === var462;
+	function fn63(var450, var451, var452) {
+		var var453, var454, var455 = (var453 = (var454 = var451.shadow.querySelector("#".concat(var452))) === null || var454 === undefined ? undefined : var454.contentWindow) !== null && var453 !== undefined ? var453 : null, var456 = fn62(var451, var452).targetWindow, and7 = function(var457) {
+			return var457 !== null && var450.source === var457;
 		};
-		switch (var455.data.event) {
+		switch (var450.data.event) {
 			case "requestFeedbackData":
-			case "closeFeedbackReportIframe": return and7(var461);
-			case "refreshRequest": return and7(var460) || var455.data.reason === "feedback_refresh" && and7(var461);
-			default: return and7(var460);
+			case "closeFeedbackReportIframe": return and7(var456);
+			case "refreshRequest": return and7(var455) || var450.data.reason === "feedback_refresh" && and7(var456);
+			default: return and7(var455);
 		}
 	}
-	function or3(var463) {
-		return var463.startsWith("0x4AAAAAAAAAA") || var463.startsWith("0x4AAAAAAAAj");
+	function or3(var458) {
+		return var458.startsWith("0x4AAAAAAAAAA") || var458.startsWith("0x4AAAAAAAAj");
 	}
 	function call19() {
 		return pick9(window);
 	}
-	function pick18(var464, var465, var466) {
-		return var464 === null ? var465 : notEqual7(var464) ? var464 === "true" : (fn24(var466(var464)), var465);
+	function pick18(var459, var460, var461) {
+		return var459 === null ? var460 : notEqual7(var459) ? var459 === "true" : (fn24(var461(var459)), var460);
 	}
-	function fn65() {
+	function fn64() {
 		try {
-			var var467 = fn26();
-			if (!var467) return;
-			var var468 = var467.src, flag20 = true, flag21 = false, var469 = undefined;
+			var var462 = fn26();
+			if (!var462) return;
+			var var463 = var462.src, flag18 = true, flag19 = false, var464 = undefined;
 			try {
-				for (var var470 = performance.getEntriesByType("resource")[Symbol.iterator](), var471; !(flag20 = (var471 = var470.next()).done); flag20 = true) {
-					var var472 = var471.value;
-					if (instanceOf(var472, PerformanceResourceTiming) && var472.name.includes(var468)) return var472;
+				for (var var465 = performance.getEntriesByType("resource")[Symbol.iterator](), var466; !(flag18 = (var466 = var465.next()).done); flag18 = true) {
+					var var467 = var466.value;
+					if (instanceOf(var467, PerformanceResourceTiming) && var467.name.includes(var463)) return var467;
 				}
-			} catch (var473) {
-				flag21 = true;
-				var469 = var473;
+			} catch (var468) {
+				flag19 = true;
+				var464 = var468;
 			} finally {
 				try {
-					!flag20 && var470.return != null && var470.return();
+					!flag18 && var465.return != null && var465.return();
 				} finally {
-					if (flag21) throw var469;
+					if (flag19) throw var464;
 				}
 			}
-		} catch (var474) {}
+		} catch (var469) {}
 	}
-	var var475 = (function() {
-		var call20 = function(var476, var477, var478, var479, var480, var481) {
+	var var470 = (function() {
+		var call20 = function(var471, var472, var473, var474, var475, var476) {
 			return fn2(function() {
-				var var482, var483, var484, var485, var486, var487, var488, var489, var490, var491;
-				return fn14(this, function(var492) {
-					switch (var492.label) {
+				var var477, var478, var479, var480, var481, var482, var483, var484, var485, var486;
+				return fn14(this, function(var487) {
+					switch (var487.label) {
 						case 0:
-							if (var482 = function(var493, var494) {
-								var var495 = obj9.widgetMap.get(var477);
-								var495 !== var476 || var495.isComplete || var495.isResetting || var495.response !== var479 || (!var493 && var494 && fn24(var494), var504(var495, var478, var493));
-							}, var483 = var476.params.sitekey, var484 = call19(), !var484) return fn24("Cannot determine Turnstile's embedded location, aborting clearance redemption."), var504(var476, var478, false), [2];
-							var485 = "h/".concat("b", "/");
-							var486 = new URL(var484);
-							var487 = "https";
-							var488 = "";
-							var489 = "".concat(var487, "://").concat(var486.host, "/cdn-cgi/challenge-platform/").concat(var485, "rc/").concat(var481).concat(var488);
-							var492.label = 1;
+							if (var477 = function(var488, var489) {
+								var var490 = obj9.widgetMap.get(var472);
+								var490 !== var471 || var490.isComplete || var490.isResetting || var490.response !== var474 || (!var488 && var489 && fn24(var489), var499(var490, var473, var488));
+							}, var478 = var471.params.sitekey, var479 = call19(), !var479) return fn24("Cannot determine Turnstile's embedded location, aborting clearance redemption."), var499(var471, var473, false), [2];
+							var480 = "h/".concat("b", "/");
+							var481 = new URL(var479);
+							var482 = "https";
+							var483 = "";
+							var484 = "".concat(var482, "://").concat(var481.host, "/cdn-cgi/challenge-platform/").concat(var480, "rc/").concat(var476).concat(var483);
+							var487.label = 1;
 						case 1:
-							var492.trys.push([
+							var487.trys.push([
 								1,
 								3,
 								,
 								4
 							]);
-							return [4, fetch(var489, {
+							return [4, fetch(var484, {
 								body: JSON.stringify({
-									secondaryToken: var480,
-									sitekey: var483
+									secondaryToken: var475,
+									sitekey: var478
 								}),
 								headers: { "Content-Type": "application/json" },
 								method: "POST",
 								redirect: "manual"
 							})];
 						case 2:
-							var490 = var492.sent();
-							var490.status === 200 ? var482(true) : var482(false, "Cannot determine Turnstile's embedded location, aborting clearance redemption, are you running Turnstile on a Cloudflare Zone?");
+							var485 = var487.sent();
+							var485.status === 200 ? var477(true) : var477(false, "Cannot determine Turnstile's embedded location, aborting clearance redemption, are you running Turnstile on a Cloudflare Zone?");
 							return [3, 4];
 						case 3:
-							var491 = var492.sent();
-							var482(false, "Error contacting Turnstile, aborting clearance redemption.");
+							var486 = var487.sent();
+							var477(false, "Error contacting Turnstile, aborting clearance redemption.");
 							return [3, 4];
 						case 4: return [2];
 					}
 				});
 			})();
-		}, var496 = function(var497, var498, var499) {
-			if (var497.params.retry === var68.Auto || var499) {
-				var var500;
-				var497.retryTimeout = window.setTimeout(function() {
-					var539(var499 ? var80.CrashedRetry : var80.FailureRetry, var498);
-				}, var499 ? 0 : 2e3 + ((var500 = var497.params["retry-interval"]) !== null && var500 !== undefined ? var500 : 0));
+		}, var491 = function(var492, var493, var494) {
+			if (var492.params.retry === var68.Auto || var494) {
+				var var495;
+				var492.retryTimeout = window.setTimeout(function() {
+					var534(var494 ? var80.CrashedRetry : var80.FailureRetry, var493);
+				}, var494 ? 0 : 2e3 + ((var495 = var492.params["retry-interval"]) !== null && var495 !== undefined ? var495 : 0));
 			}
-		}, pick19 = function(var501, var502, var503) {
-			return var501.params.execution === var76.Render ? true : (var502 === var80.CrashedRetry || var502 === var80.FailureRetry || var502 === var80.CheckDelays || var502 === var80.UpgradeReload) && var501.params.execution === var76.Execute && var503;
-		}, var504 = function(var505, var506, var507) {
-			var var508;
-			var505.response === undefined && fn23("[Internal Error] Widget was completed but no response was given", 1362);
-			var505.isExecuting = false;
-			var505.isComplete = true;
-			fn59(var505, var506, var505.response);
-			(var508 = var505.cbSuccess) === null || var508 === undefined || var508.call(var505, var505.response, var507);
-		}, var509 = function(var510) {
-			if (!var510) return [];
-			for (var list6 = var510.attributes, var511 = list6.length, arr8 = new Array(var511), num27 = 0; num27 < var511; num27++) arr8[num27] = list6[num27].name;
+		}, pick19 = function(var496, var497, var498) {
+			return var496.params.execution === var76.Render ? true : (var497 === var80.CrashedRetry || var497 === var80.FailureRetry || var497 === var80.CheckDelays || var497 === var80.UpgradeReload) && var496.params.execution === var76.Execute && var498;
+		}, var499 = function(var500, var501, var502) {
+			var var503;
+			var500.response === undefined && fn23("[Internal Error] Widget was completed but no response was given", 1362);
+			var500.isExecuting = false;
+			var500.isComplete = true;
+			fn58(var500, var501, var500.response);
+			(var503 = var500.cbSuccess) === null || var503 === undefined || var503.call(var500, var500.response, var502);
+		}, var504 = function(var505) {
+			if (!var505) return [];
+			for (var list6 = var505.attributes, var506 = list6.length, arr8 = new Array(var506), num27 = 0; num27 < var506; num27++) arr8[num27] = list6[num27].name;
 			return arr8;
-		}, var512 = function() {
+		}, var507 = function() {
 			for (var obj10 = {}, arr9 = [], elems1 = document.getElementsByTagName("*"), num28 = 0; num28 < elems1.length && arr9.length < 50; num28++) {
 				var list7 = elems1[num28].tagName.toLowerCase();
 				list7.indexOf("-") !== -1 && !obj10[list7] && (obj10[list7] = true, arr9.push(list7));
 			}
 			return arr9;
-		}, var513 = function(var514, var515, var516) {
-			if (var514.rcV = var515, 0) var var517;
-		}, var518 = function() {
+		}, var508 = function(var509, var510, var511) {
+			if (var509.rcV = var510, 0) var var512;
+		}, var513 = function() {
 			var str16 = "";
 			do {
 				str16 = "";
 				for (var num29 = 0; num29 < 5; num29++) str16 += "abcdefghijklmnopqrstuvwxyz0123456789".charAt(Math.floor(Math.random() * 36));
 			} while (obj9.widgetMap.has(str16));
 			return str16;
-		}, var520 = function(var521, var522, var523) {
-			for (; var521.msgQueue.length > 0;) {
-				fn30(var523, {
-					event: var521.msgQueue.pop(),
+		}, var515 = function(var516, var517, var518) {
+			for (; var516.msgQueue.length > 0;) {
+				fn30(var518, {
+					event: var516.msgQueue.pop(),
 					source: str1,
-					widgetId: var522
-				}, var521.iframeOrigin);
+					widgetId: var517
+				}, var516.iframeOrigin);
 			}
-		}, var524 = function(var525, var526) {
-			if (var526) {
+		}, var519 = function(var520, var521) {
+			if (var521) {
 				var arr10 = [
 					"retry-interval",
 					"retry",
@@ -1528,220 +1506,220 @@
 					"appearance",
 					"sitekey",
 					"feedback-enabled"
-				], var527 = Object.prototype.hasOwnProperty, arr11 = [], flag22 = true, flag23 = false, var528 = undefined;
+				], var522 = Object.prototype.hasOwnProperty, arr11 = [], flag20 = true, flag21 = false, var523 = undefined;
 				try {
-					for (var var529 = arr10[Symbol.iterator](), var530; !(flag22 = (var530 = var529.next()).done); flag22 = true) {
-						var var531 = var530.value;
-						var527.call(var526, var531) && var526[var531] !== undefined && var526[var531] !== var525.params[var531] && arr11.push(var531);
+					for (var var524 = arr10[Symbol.iterator](), var525; !(flag20 = (var525 = var524.next()).done); flag20 = true) {
+						var var526 = var525.value;
+						var522.call(var521, var526) && var521[var526] !== undefined && var521[var526] !== var520.params[var526] && arr11.push(var526);
 					}
-				} catch (var532) {
-					flag23 = true;
-					var528 = var532;
+				} catch (var527) {
+					flag21 = true;
+					var523 = var527;
 				} finally {
 					try {
-						!flag22 && var529.return != null && var529.return();
+						!flag20 && var524.return != null && var524.return();
 					} finally {
-						if (flag23) throw var528;
+						if (flag21) throw var523;
 					}
 				}
 				arr11.length > 0 && fn23("The parameters ".concat(arr10.join(","), " is/are not allowed be changed between the calls of render() and execute() of a widget.\n    Consider rendering a new widget if you want to change the following parameters ").concat(arr11.join(",")), 3618);
-				var526.action && (pick13(var526.action) || fn23("Invalid input for optional parameter \"action\", got \"".concat(var526.action, "\""), 3604), var525.action = var526.action);
-				var526.cData && (pick14(var526.cData) || fn23("Invalid input for optional parameter \"cData\", got \"".concat(var526.cData, "\""), 3605), var525.cData = var526.cData);
-				var526["after-interactive-callback"] && (var525.cbAfterInteractive = var526["after-interactive-callback"]);
-				var526["before-interactive-callback"] && (var525.cbBeforeInteractive = var526["before-interactive-callback"]);
-				var526.callback && (var525.cbSuccess = var526.callback);
-				var526["expired-callback"] && (var525.cbExpired = var526["expired-callback"]);
-				var526["timeout-callback"] && (var525.cbTimeout = var526["timeout-callback"]);
-				var526["error-callback"] && (var525.cbError = var526["error-callback"]);
-				var526["unsupported-callback"] && (var525.cbUnsupported = var526["unsupported-callback"]);
-				var526.chlPageData && (var525.chlPageData = var526.chlPageData);
+				var521.action && (pick13(var521.action) || fn23("Invalid input for optional parameter \"action\", got \"".concat(var521.action, "\""), 3604), var520.action = var521.action);
+				var521.cData && (pick14(var521.cData) || fn23("Invalid input for optional parameter \"cData\", got \"".concat(var521.cData, "\""), 3605), var520.cData = var521.cData);
+				var521["after-interactive-callback"] && (var520.cbAfterInteractive = var521["after-interactive-callback"]);
+				var521["before-interactive-callback"] && (var520.cbBeforeInteractive = var521["before-interactive-callback"]);
+				var521.callback && (var520.cbSuccess = var521.callback);
+				var521["expired-callback"] && (var520.cbExpired = var521["expired-callback"]);
+				var521["timeout-callback"] && (var520.cbTimeout = var521["timeout-callback"]);
+				var521["error-callback"] && (var520.cbError = var521["error-callback"]);
+				var521["unsupported-callback"] && (var520.cbUnsupported = var521["unsupported-callback"]);
+				var521.chlPageData && (var520.chlPageData = var521.chlPageData);
 			}
-		}, var533 = function(var534, var535, var536) {
-			var534 === "explicit" && var535 && var524(var535, var536);
-			fn24(pick15(var534));
-		}, var537 = function(var538) {
-			var539(var80.Api, var538);
-		}, var539 = function(var540, var541) {
-			var var542 = pick20(var541);
-			var542 || fn23("Nothing to reset found for provided container", 3329);
-			var var543 = obj9.widgetMap.get(var542);
-			if (var543) {
-				var var544, var545, var546 = var543.isExecuted;
-				var543.isResetting = true;
-				var543.response = undefined;
-				var543.mode = undefined;
-				var543.msgQueue = [];
-				var543.isComplete = false;
-				var543.isExecuted = false;
-				var543.isExecuting = false;
-				var543.isExpired = false;
-				var543.isFailed = false;
-				var543.isInitialized = false;
-				var543.isStale = false;
-				var543.isOverrunning = false;
-				var543.cfChlOut = undefined;
-				var543.cfChlOutS = undefined;
-				var543.errorCode = undefined;
-				var543.frMd = undefined;
-				var543.autoFeedbackSent = false;
-				var543.watchcat.overrunBeginSeq = 0;
-				var543.watchcat.lastAckedSeq = 0;
-				var543.watchcat.seq = 0;
-				pick19(var543, var540, var546) && (var543.msgQueue.push(var78.Execute), var543.isExecuted = true, var543.isExecuting = true);
-				var var547 = call8(var542), elem14 = var543.shadow.querySelector("#".concat(var547));
-				(!var547 || !elem14) && fn23("Widget ".concat(var542, " to reset was not found."), 3330);
-				(var543.params.appearance === var74.InteractionOnly || var543.params.appearance === var74.Execute) && fn61(elem14);
-				var543.params.sitekey === null && fn23("Unexpected Error: Sitekey is null", 3347);
-				var var548 = elem14.cloneNode(), var549 = call(var542, var543.params.sitekey, var543.params, (var544 = var543.rcV) !== null && var544 !== undefined ? var544 : str9, false, "b", var540, obj9.scriptUrlParsed, fn17(var543));
-				var548.src = var549;
-				fn57(var548, var543);
-				var543.iframeOrigin = fn28(var549);
-				(var545 = elem14.parentNode) === null || var545 === undefined || var545.replaceChild(var548, elem14);
-				fn55(var543, var547);
-				var543.retryTimeout && window.clearTimeout(var543.retryTimeout);
-			} else fn23("Widget ".concat(var542, " to reset was not found."), 3331);
-		}, var550 = function(var551, var552) {
-			var var553 = call8(var551);
-			if (var553) {
+		}, var528 = function(var529, var530, var531) {
+			var529 === "explicit" && var530 && var519(var530, var531);
+			fn24(pick15(var529));
+		}, var532 = function(var533) {
+			var534(var80.Api, var533);
+		}, var534 = function(var535, var536) {
+			var var537 = pick20(var536);
+			var537 || fn23("Nothing to reset found for provided container", 3329);
+			var var538 = obj9.widgetMap.get(var537);
+			if (var538) {
+				var var539, var540, var541 = var538.isExecuted;
+				var538.isResetting = true;
+				var538.response = undefined;
+				var538.mode = undefined;
+				var538.msgQueue = [];
+				var538.isComplete = false;
+				var538.isExecuted = false;
+				var538.isExecuting = false;
+				var538.isExpired = false;
+				var538.isFailed = false;
+				var538.isInitialized = false;
+				var538.isStale = false;
+				var538.isOverrunning = false;
+				var538.cfChlOut = undefined;
+				var538.cfChlOutS = undefined;
+				var538.errorCode = undefined;
+				var538.frMd = undefined;
+				var538.autoFeedbackSent = false;
+				var538.watchcat.overrunBeginSeq = 0;
+				var538.watchcat.lastAckedSeq = 0;
+				var538.watchcat.seq = 0;
+				pick19(var538, var535, var541) && (var538.msgQueue.push(var78.Execute), var538.isExecuted = true, var538.isExecuting = true);
+				var var542 = call8(var537), elem14 = var538.shadow.querySelector("#".concat(var542));
+				(!var542 || !elem14) && fn23("Widget ".concat(var537, " to reset was not found."), 3330);
+				(var538.params.appearance === var74.InteractionOnly || var538.params.appearance === var74.Execute) && fn60(elem14);
+				var538.params.sitekey === null && fn23("Unexpected Error: Sitekey is null", 3347);
+				var var543 = elem14.cloneNode(), var544 = call(var537, var538.params.sitekey, var538.params, (var539 = var538.rcV) !== null && var539 !== undefined ? var539 : str9, false, "b", var535, obj9.scriptUrlParsed, fn17(var538));
+				var543.src = var544;
+				fn56(var543, var538);
+				var538.iframeOrigin = fn28(var544);
+				(var540 = elem14.parentNode) === null || var540 === undefined || var540.replaceChild(var543, elem14);
+				fn54(var538, var542);
+				var538.retryTimeout && window.clearTimeout(var538.retryTimeout);
+			} else fn23("Widget ".concat(var537, " to reset was not found."), 3331);
+		}, var545 = function(var546, var547) {
+			var var548 = call8(var546);
+			if (var548) {
 				var arr12 = [
-					"input#".concat(var553, "_response"),
-					"input#".concat(var553, "_legacy_response"),
-					"input#".concat(var553, "_g_response")
+					"input#".concat(var548, "_response"),
+					"input#".concat(var548, "_legacy_response"),
+					"input#".concat(var548, "_g_response")
 				];
-				document.querySelectorAll(arr12.join(", ")).forEach(function(var554) {
-					return var554.remove();
+				document.querySelectorAll(arr12.join(", ")).forEach(function(var549) {
+					return var549.remove();
 				});
-				var552.shadow.querySelectorAll(arr12.join(", ")).forEach(function(var555) {
-					return var555.remove();
+				var547.shadow.querySelectorAll(arr12.join(", ")).forEach(function(var550) {
+					return var550.remove();
 				});
-				var246(var553);
-				var200(var552);
+				var246(var548);
+				var200(var547);
 			}
-			var552.wrapper.remove();
-			var552.retryTimeout && window.clearTimeout(var552.retryTimeout);
-			obj9.widgetMap.delete(var551);
+			var547.wrapper.remove();
+			var547.retryTimeout && window.clearTimeout(var547.retryTimeout);
+			obj9.widgetMap.delete(var546);
 			fn38(obj9);
-		}, var556 = function(var557) {
-			var var558 = pick20(var557), var559 = var558 ? obj9.widgetMap.get(var558) : undefined;
-			if (!var558 || !var559) {
+		}, var551 = function(var552) {
+			var var553 = pick20(var552), var554 = var553 ? obj9.widgetMap.get(var553) : undefined;
+			if (!var553 || !var554) {
 				fn24("Nothing to remove found for the provided container.");
 				return;
 			}
-			var550(var558, var559);
-		}, var560 = function() {
-			var var561 = Array.from(obj9.widgetMap.keys()), flag24 = true, flag25 = false, var562 = undefined;
+			var545(var553, var554);
+		}, var555 = function() {
+			var var556 = Array.from(obj9.widgetMap.keys()), flag22 = true, flag23 = false, var557 = undefined;
 			try {
-				for (var var563 = var561[Symbol.iterator](), var564; !(flag24 = (var564 = var563.next()).done); flag24 = true) {
-					var var565 = var564.value, var566 = obj9.widgetMap.get(var565), var567 = call8(var565);
-					!var567 || !var566 || (var246(var567), var200(var566), var539(var80.UpgradeReload, var567));
+				for (var var558 = var556[Symbol.iterator](), var559; !(flag22 = (var559 = var558.next()).done); flag22 = true) {
+					var var560 = var559.value, var561 = obj9.widgetMap.get(var560), var562 = call8(var560);
+					!var562 || !var561 || (var246(var562), var200(var561), var534(var80.UpgradeReload, var562));
 				}
-			} catch (var568) {
-				flag25 = true;
-				var562 = var568;
+			} catch (var563) {
+				flag23 = true;
+				var557 = var563;
 			} finally {
 				try {
-					!flag24 && var563.return != null && var563.return();
+					!flag22 && var558.return != null && var558.return();
 				} finally {
-					if (flag25) throw var562;
+					if (flag23) throw var557;
 				}
 			}
-		}, var569 = function(var570, var571, var572) {
-			var var573, var574, var575, var576, var577, var578, var579, var580, var581, var582, var583, var584, var585, var586, var587;
-			if (typeof var570 == "string") {
-				var var588 = call17(var570);
-				if (var588) {
-					var var589, var590 = obj9.widgetMap.get(var588), var591 = (var589 = var590 == null ? undefined : var590.wrapper.parentElement) !== null && var589 !== undefined ? var589 : null;
-					if (var591 && and4(var572, var590)) {
-						var586 = var591;
-						var587 = {
-							widget: var590,
-							widgetId: var588
+		}, var564 = function(var565, var566, var567) {
+			var var568, var569, var570, var571, var572, var573, var574, var575, var576, var577, var578, var579, var580, var581, var582;
+			if (typeof var565 == "string") {
+				var var583 = call17(var565);
+				if (var583) {
+					var var584, var585 = obj9.widgetMap.get(var583), var586 = (var584 = var585 == null ? undefined : var585.wrapper.parentElement) !== null && var584 !== undefined ? var584 : null;
+					if (var586 && and4(var567, var585)) {
+						var581 = var586;
+						var582 = {
+							widget: var585,
+							widgetId: var583
 						};
-					} else return var533(var572, var590, var571), call8(var588);
+					} else return var528(var567, var585, var566), call8(var583);
 				} else {
-					var var592;
+					var var587;
 					try {
-						var592 = document.querySelector(var570);
-					} catch (var593) {
-						fn23("Invalid type for \"container\", expected \"selector\" or an implementation of \"HTMLElement\", got \"".concat(var570, "\""), 3586);
+						var587 = document.querySelector(var565);
+					} catch (var588) {
+						fn23("Invalid type for \"container\", expected \"selector\" or an implementation of \"HTMLElement\", got \"".concat(var565, "\""), 3586);
 					}
-					var592 || fn23("Unable to find a container for \"".concat(var570, "\""), 3585);
-					var586 = var592;
+					var587 || fn23("Unable to find a container for \"".concat(var565, "\""), 3585);
+					var581 = var587;
 				}
-			} else instanceOf(var570, HTMLElement) ? var586 = var570 : fn23("Invalid type for parameter \"container\", expected \"string\" or an implementation of \"HTMLElement\"", 3587);
-			if (!var587) {
-				var var594 = call17(var586);
-				if (var594) {
-					var var595 = obj9.widgetMap.get(var594);
-					if (var595 && and4(var572, var595) && var595.wrapper.parentElement === var586) var587 = {
-						widget: var595,
-						widgetId: var594
+			} else instanceOf(var565, HTMLElement) ? var581 = var565 : fn23("Invalid type for parameter \"container\", expected \"string\" or an implementation of \"HTMLElement\"", 3587);
+			if (!var582) {
+				var var589 = call17(var581);
+				if (var589) {
+					var var590 = obj9.widgetMap.get(var589);
+					if (var590 && and4(var567, var590) && var590.wrapper.parentElement === var581) var582 = {
+						widget: var590,
+						widgetId: var589
 					};
-					else return var533(var572, var595, var571), call8(var594);
+					else return var528(var567, var590, var566), call8(var589);
 				}
 			}
-			var var596 = call19();
-			if (!var596) return fn23("Turnstile cannot determine its page location", 3607);
-			var var597 = fn66(var586);
-			if (var597) {
-				var var598 = Object.assign(var597, var571), var599 = var598.action, var600 = var598.cData, var601 = var598.chlPageData, var602 = var598.sitekey;
-				var598.theme = (var573 = var598.theme) !== null && var573 !== undefined ? var573 : var64.Auto;
-				var598.retry = (var574 = var598.retry) !== null && var574 !== undefined ? var574 : var68.Auto;
-				var598.execution = (var575 = var598.execution) !== null && var575 !== undefined ? var575 : var76.Render;
-				var598.appearance = (var576 = var598.appearance) !== null && var576 !== undefined ? var576 : var74.Always;
-				var598["retry-interval"] = Number((var577 = var598["retry-interval"]) !== null && var577 !== undefined ? var577 : num12);
-				var598["expiry-interval"] = Number((var578 = var598["expiry-interval"]) !== null && var578 !== undefined ? var578 : (num2 - num3) * 1e3);
-				var598.size = (var579 = var598.size) !== null && var579 !== undefined ? var579 : var62.Normal;
-				var var603 = var598.callback, var604 = var598["expired-callback"], var605 = var598["timeout-callback"], var606 = var598["after-interactive-callback"], var607 = var598["before-interactive-callback"], var608 = var598["error-callback"], var609 = var598["unsupported-callback"];
-				typeof var602 != "string" && fn23("Invalid or missing type for parameter \"sitekey\", expected \"string\", got \"".concat(typeof var602 == "undefined" ? "undefined" : typeOf(var602), "\""), 3588);
-				call16(var602) || fn23("Invalid input for parameter \"sitekey\", got \"".concat(var602, "\""), 3589);
-				notEqual3(var598.size) || fn23("Invalid type for parameter \"size\", expected normal|compact, got \"".concat(var598.size, "\" ").concat(typeOf(var598.size)), 3590);
-				notEqual1(var598.theme) || fn23("Invalid type for parameter \"theme\", expected dark|light|auto, got \"".concat(var598.theme, "\" ").concat(typeOf(var598.theme)), 3591);
-				notEqual2(var598.retry) || fn23("Invalid type for parameter \"retry\", expected never|auto, got \"".concat(var598.retry, "\" ").concat(typeOf(var598.retry)), 3592);
-				var598.language || (var598.language = "auto");
-				or2(var598.language) || (fn24("Invalid language value: \"".concat(var598.language, ", expected either: auto, or an ISO 639-1 two-letter language code (e.g. en) or language and country code (e.g. en-US).")), var598.language = "auto");
-				notEqual6(var598.appearance) || fn23("Unknown appearance value: \"".concat(var598.appearance, ", expected either: 'always', 'execute', or 'interaction-only'."), 3600);
-				notEqual8(var598.execution) || fn23("Unknown execution value: \"".concat(var598.execution, ", expected either: 'render' or 'execute'."), 3601);
-				and1(var598["retry-interval"]) || fn23("Invalid retry-interval value: \"".concat(var598["retry-interval"], ", expected an integer value > 0 and < 900000\""), 3602);
-				and2(var598["expiry-interval"]) || fn23("Invalid expiry-interval value: \"".concat(var598["expiry-interval"], ", expected an integer value > 0 and < 360000\""), 3602);
-				var var610 = (var580 = var598["refresh-expired"]) !== null && var580 !== undefined ? var580 : var70.Auto;
-				notEqual4(var610) ? var598["refresh-expired"] = var610 : fn23("Invalid type for parameter \"refresh-expired\", expected never|manual|auto, got \"".concat(var610, "\" ").concat(typeof var610 == "undefined" ? "undefined" : typeOf(var610)), 3603);
-				var var611 = (var581 = var598["refresh-timeout"]) !== null && var581 !== undefined ? var581 : var72.Auto;
-				notEqual5(var611) ? var598["refresh-timeout"] = var611 : fn23("Invalid type for parameter \"refresh-timeout\", expected never|manual|auto, got \"".concat(var611, "\" ").concat(typeof var611 == "undefined" ? "undefined" : typeOf(var611)), 3603);
-				pick13(var599) || fn23("Invalid input for optional parameter \"action\", got \"".concat(var599, "\""), 3604);
-				pick14(var600) || fn23("Invalid input for optional parameter \"cData\", got \"".concat(var600, "\""), 3605);
-				var elem15 = document.createElement("iframe"), elem16 = document.createElement("div"), var612 = elem16.attachShadow({ mode: "closed" }), var613 = var518(), var614 = call8(var613);
-				if (!(!var613 || !var614)) {
-					var arr13 = [], var615 = var598.execution === var76.Render;
-					var615 && arr13.push(var78.Execute);
+			var var591 = call19();
+			if (!var591) return fn23("Turnstile cannot determine its page location", 3607);
+			var var592 = fn65(var581);
+			if (var592) {
+				var var593 = Object.assign(var592, var566), var594 = var593.action, var595 = var593.cData, var596 = var593.chlPageData, var597 = var593.sitekey;
+				var593.theme = (var568 = var593.theme) !== null && var568 !== undefined ? var568 : var64.Auto;
+				var593.retry = (var569 = var593.retry) !== null && var569 !== undefined ? var569 : var68.Auto;
+				var593.execution = (var570 = var593.execution) !== null && var570 !== undefined ? var570 : var76.Render;
+				var593.appearance = (var571 = var593.appearance) !== null && var571 !== undefined ? var571 : var74.Always;
+				var593["retry-interval"] = Number((var572 = var593["retry-interval"]) !== null && var572 !== undefined ? var572 : num12);
+				var593["expiry-interval"] = Number((var573 = var593["expiry-interval"]) !== null && var573 !== undefined ? var573 : (num2 - num3) * 1e3);
+				var593.size = (var574 = var593.size) !== null && var574 !== undefined ? var574 : var62.Normal;
+				var var598 = var593.callback, var599 = var593["expired-callback"], var600 = var593["timeout-callback"], var601 = var593["after-interactive-callback"], var602 = var593["before-interactive-callback"], var603 = var593["error-callback"], var604 = var593["unsupported-callback"];
+				typeof var597 != "string" && fn23("Invalid or missing type for parameter \"sitekey\", expected \"string\", got \"".concat(typeof var597 == "undefined" ? "undefined" : typeOf(var597), "\""), 3588);
+				call16(var597) || fn23("Invalid input for parameter \"sitekey\", got \"".concat(var597, "\""), 3589);
+				notEqual3(var593.size) || fn23("Invalid type for parameter \"size\", expected normal|compact, got \"".concat(var593.size, "\" ").concat(typeOf(var593.size)), 3590);
+				notEqual1(var593.theme) || fn23("Invalid type for parameter \"theme\", expected dark|light|auto, got \"".concat(var593.theme, "\" ").concat(typeOf(var593.theme)), 3591);
+				notEqual2(var593.retry) || fn23("Invalid type for parameter \"retry\", expected never|auto, got \"".concat(var593.retry, "\" ").concat(typeOf(var593.retry)), 3592);
+				var593.language || (var593.language = "auto");
+				or2(var593.language) || (fn24("Invalid language value: \"".concat(var593.language, ", expected either: auto, or an ISO 639-1 two-letter language code (e.g. en) or language and country code (e.g. en-US).")), var593.language = "auto");
+				notEqual6(var593.appearance) || fn23("Unknown appearance value: \"".concat(var593.appearance, ", expected either: 'always', 'execute', or 'interaction-only'."), 3600);
+				notEqual8(var593.execution) || fn23("Unknown execution value: \"".concat(var593.execution, ", expected either: 'render' or 'execute'."), 3601);
+				and1(var593["retry-interval"]) || fn23("Invalid retry-interval value: \"".concat(var593["retry-interval"], ", expected an integer value > 0 and < 900000\""), 3602);
+				and2(var593["expiry-interval"]) || fn23("Invalid expiry-interval value: \"".concat(var593["expiry-interval"], ", expected an integer value > 0 and < 360000\""), 3602);
+				var var605 = (var575 = var593["refresh-expired"]) !== null && var575 !== undefined ? var575 : var70.Auto;
+				notEqual4(var605) ? var593["refresh-expired"] = var605 : fn23("Invalid type for parameter \"refresh-expired\", expected never|manual|auto, got \"".concat(var605, "\" ").concat(typeof var605 == "undefined" ? "undefined" : typeOf(var605)), 3603);
+				var var606 = (var576 = var593["refresh-timeout"]) !== null && var576 !== undefined ? var576 : var72.Auto;
+				notEqual5(var606) ? var593["refresh-timeout"] = var606 : fn23("Invalid type for parameter \"refresh-timeout\", expected never|manual|auto, got \"".concat(var606, "\" ").concat(typeof var606 == "undefined" ? "undefined" : typeOf(var606)), 3603);
+				pick13(var594) || fn23("Invalid input for optional parameter \"action\", got \"".concat(var594, "\""), 3604);
+				pick14(var595) || fn23("Invalid input for optional parameter \"cData\", got \"".concat(var595, "\""), 3605);
+				var elem15 = document.createElement("iframe"), elem16 = document.createElement("div"), var607 = elem16.attachShadow({ mode: "closed" }), var608 = var513(), var609 = call8(var608);
+				if (!(!var608 || !var609)) {
+					var arr13 = [], var610 = var593.execution === var76.Render;
+					var610 && arr13.push(var78.Execute);
 					obj9.lastWidgetIdx++;
 					var obj11 = {};
-					obj9.widgetMap.set(var613, fn8(fn6({
-						action: var599,
-						assetCtxCallback: var598._acCb,
+					obj9.widgetMap.set(var608, fn8(fn6({
+						action: var594,
+						assetCtxCallback: var593._acCb,
 						autoFeedbackSent: false,
-						cbAfterInteractive: var606,
-						cbBeforeInteractive: var607,
-						cbError: var608,
-						cbExpired: var604,
-						cbSuccess: var603,
-						cbTimeout: var605,
-						cbUnsupported: var609,
-						cData: var600,
-						chlPageData: var601,
+						cbAfterInteractive: var601,
+						cbBeforeInteractive: var602,
+						cbError: var603,
+						cbExpired: var599,
+						cbSuccess: var598,
+						cbTimeout: var600,
+						cbUnsupported: var604,
+						cData: var595,
+						chlPageData: var596,
 						idx: obj9.lastWidgetIdx,
 						isComplete: false,
-						isExecuted: var615,
-						isExecuting: var615,
+						isExecuted: var610,
+						isExecuting: var610,
 						isExpired: false,
 						isFailed: false,
 						isInitialized: false,
 						isResetting: false,
 						isStale: false,
 						msgQueue: arr13,
-						params: var598,
+						params: var593,
 						rcV: str9,
-						renderSource: var572,
+						renderSource: var567,
 						responseElementsBuilt: false,
 						watchcat: {
 							lastAckedSeq: 0,
@@ -1751,7 +1729,7 @@
 						}
 					}, obj11), {
 						isOverrunning: false,
-						shadow: var612,
+						shadow: var607,
 						widgetInitStartTimeTsMs: 0,
 						widgetParamsStartTimeTsMs: 0,
 						widgetRenderEndTimeTsMs: 0,
@@ -1759,16 +1737,16 @@
 						wrapper: elem16
 					}));
 					fn37(obj9);
-					var var616 = obj9.widgetMap.get(var613);
-					var616 || fn23("Turnstile Initialization Error ", 3606);
-					var616.chlPageData && fn47();
+					var var611 = obj9.widgetMap.get(var608);
+					var611 || fn23("Turnstile Initialization Error ", 3606);
+					var611.chlPageData && fn47();
 					elem15.style.display = "none";
 					elem15.style.border = "none";
 					elem15.style.overflow = "hidden";
-					var var617 = call(var613, var602, var598, str9, false, "b", var80.New, obj9.scriptUrlParsed, fn17(var616));
-					var616.iframeOrigin = fn28(var617);
-					elem15.setAttribute("src", var617);
-					fn57(elem15, var616);
+					var var612 = call(var608, var597, var593, str9, false, "b", var80.New, obj9.scriptUrlParsed, fn17(var611));
+					var611.iframeOrigin = fn28(var612);
+					elem15.setAttribute("src", var612);
+					fn56(elem15, var611);
 					var arr14 = [
 						"cross-origin-isolated",
 						"fullscreen",
@@ -1777,523 +1755,519 @@
 						"gamepad",
 						"xr-spatial-tracking"
 					];
-					((var582 = (var585 = document.featurePolicy) === null || var585 === undefined || (var584 = var585.features) === null || var584 === undefined ? undefined : var584.call(var585)) !== null && var582 !== undefined ? var582 : []).indexOf(str8) !== -1 && arr14.push(str8);
+					((var577 = (var580 = document.featurePolicy) === null || var580 === undefined || (var579 = var580.features) === null || var579 === undefined ? undefined : var579.call(var580)) !== null && var577 !== undefined ? var577 : []).indexOf(str8) !== -1 && arr14.push(str8);
 					elem15.setAttribute("allow", arr14.join("; "));
 					elem15.setAttribute("sandbox", "allow-same-origin allow-scripts allow-popups");
-					elem15.id = var614;
-					elem15.tabIndex = (var583 = var598.tabindex) !== null && var583 !== undefined ? var583 : 0;
+					elem15.id = var609;
+					elem15.tabIndex = (var578 = var593.tabindex) !== null && var578 !== undefined ? var578 : 0;
 					elem15.title = "Widget containing a Cloudflare security challenge";
-					var612.appendChild(elem15);
-					fn58(var616, var614);
-					var587 && var550(var587.widgetId, var587.widget);
-					var586.appendChild(elem16);
-					var616.widgetRenderEndTimeTsMs = 0;
-					return var614;
+					var607.appendChild(elem15);
+					fn57(var611, var609);
+					var582 && var545(var582.widgetId, var582.widget);
+					var581.appendChild(elem16);
+					var611.widgetRenderEndTimeTsMs = 0;
+					return var609;
 				}
 			}
-		}, call21 = function(var618, var619) {
-			return var569(var618, var619, "explicit");
-		}, var620 = function() {
+		}, call21 = function(var613, var614) {
+			return var564(var613, var614, "explicit");
+		}, var615 = function() {
 			var arr15 = [str2, str3];
 			obj9.isRecaptchaCompatibilityMode && arr15.push(str4);
-			document.querySelectorAll(arr15.join(", ")).forEach(function(var621) {
-				var569(var621, undefined, "implicit");
+			document.querySelectorAll(arr15.join(", ")).forEach(function(var616) {
+				var564(var616, undefined, "implicit");
 			});
-		}, var622 = function() {
-			var var623, var624 = -1, flag26 = true, flag27 = false, var625 = undefined;
+		}, var617 = function() {
+			var var618, var619 = -1, flag24 = true, flag25 = false, var620 = undefined;
 			try {
-				for (var var626 = obj9.widgetMap[Symbol.iterator](), var627; !(flag26 = (var627 = var626.next()).done); flag26 = true) {
-					var var628 = or1(var627.value, 2), var629 = var628[0], var630 = var628[1];
-					var624 < var630.idx && (var623 = var629, var624 = var630.idx);
+				for (var var621 = obj9.widgetMap[Symbol.iterator](), var622; !(flag24 = (var622 = var621.next()).done); flag24 = true) {
+					var var623 = or1(var622.value, 2), var624 = var623[0], var625 = var623[1];
+					var619 < var625.idx && (var618 = var624, var619 = var625.idx);
 				}
-			} catch (var631) {
-				flag27 = true;
-				var625 = var631;
+			} catch (var626) {
+				flag25 = true;
+				var620 = var626;
 			} finally {
 				try {
-					!flag26 && var626.return != null && var626.return();
+					!flag24 && var621.return != null && var621.return();
 				} finally {
-					if (flag27) throw var625;
+					if (flag25) throw var620;
 				}
 			}
-			var624 === -1 && fn23("Could not find widget", 43778);
-			return var623;
-		}, var632 = fn65(), var633 = function(var634) {
-			if (var634.source === str1 && !(!var634.widgetId || !obj9.widgetMap.has(var634.widgetId))) {
-				var var635 = call8(var634.widgetId), var636 = obj9.widgetMap.get(var634.widgetId);
-				if (!(!var635 || !var636)) switch (var634.event) {
+			var619 === -1 && fn23("Could not find widget", 43778);
+			return var618;
+		}, var627 = fn64(), var628 = function(var629) {
+			if (var629.source === str1 && !(!var629.widgetId || !obj9.widgetMap.has(var629.widgetId))) {
+				var var630 = call8(var629.widgetId), var631 = obj9.widgetMap.get(var629.widgetId);
+				if (!(!var630 || !var631)) switch (var629.event) {
 					case "init": {
-						var636.widgetInitStartTimeTsMs = 0;
-						var636.kills = var634.kills;
-						var elem17 = var636.shadow.getElementById(var635);
-						elem17 || fn23("Cannot initialize Widget, Element not found (#".concat(var635, ")."), 3074);
-						var636.mode = var634.mode;
-						var636.nextRcV = var634.nextRcV;
-						var636.mode === var60.Invisible && var636.params["refresh-expired"] === var70.Manual && fn24("refresh-expired=manual is impossible in invisible mode, consider using '".concat(var70.Auto, "' or '").concat(var70.Never, ".'"));
-						var636.mode !== var60.Managed && var636.params["refresh-timeout"] !== var72.Auto && fn24("setting refresh-timeout has no effect on an invisible/non-interactive widget and will be ignored.");
-						var636.params.appearance === var74.Always || var636.isExecuting && var636.params.appearance === var74.Execute ? fn60(elem17, var636) : fn61(elem17);
+						var631.widgetInitStartTimeTsMs = 0;
+						var631.kills = var629.kills;
+						var elem17 = var631.shadow.getElementById(var630);
+						elem17 || fn23("Cannot initialize Widget, Element not found (#".concat(var630, ")."), 3074);
+						var631.mode = var629.mode;
+						var631.nextRcV = var629.nextRcV;
+						var631.mode === var60.Invisible && var631.params["refresh-expired"] === var70.Manual && fn24("refresh-expired=manual is impossible in invisible mode, consider using '".concat(var70.Auto, "' or '").concat(var70.Never, ".'"));
+						var631.mode !== var60.Managed && var631.params["refresh-timeout"] !== var72.Auto && fn24("setting refresh-timeout has no effect on an invisible/non-interactive widget and will be ignored.");
+						var631.params.appearance === var74.Always || var631.isExecuting && var631.params.appearance === var74.Execute ? fn59(elem17, var631) : fn60(elem17);
 						elem17.style.display = "";
-						var elem18 = var636.shadow.querySelector("#".concat(var635));
-						elem18 || fn23("Received state for an unknown widget: ".concat(var634.widgetId), 3078);
+						var elem18 = var631.shadow.querySelector("#".concat(var630));
+						elem18 || fn23("Received state for an unknown widget: ".concat(var629.widgetId), 3078);
 						fn30(elem18, {
 							event: "init",
 							source: str1,
-							widgetId: var634.widgetId
-						}, var636.iframeOrigin);
+							widgetId: var629.widgetId
+						}, var631.iframeOrigin);
 						break;
 					}
 					case "translationInit": {
-						var elem19 = var636.shadow.getElementById(var635);
-						elem19 || fn23("Cannot initialize Widget, Element not found (#".concat(var635, ")."), 3074);
+						var elem19 = var631.shadow.getElementById(var630);
+						elem19 || fn23("Cannot initialize Widget, Element not found (#".concat(var630, ")."), 3074);
 						var map = new Map();
-						var636.displayLanguage = var634.displayLanguage;
-						var636.displayRtl = var634.displayRtl;
-						Object.keys(var634.translationData).forEach(function(var637) {
-							map.set(var637, var634.translationData[var637]);
+						var631.displayLanguage = var629.displayLanguage;
+						var631.displayRtl = var629.displayRtl;
+						Object.keys(var629.translationData).forEach(function(var632) {
+							map.set(var632, var629.translationData[var632]);
 						});
-						fn62(elem19, map);
+						fn61(elem19, map);
 						break;
 					}
 					case "languageUnsupported": {
-						fn24("Language ".concat(var636.params.language, " is not supported, falling back to: ").concat(var634.fallback, "."));
-						var636.displayLanguage = var634.fallback;
+						fn24("Language ".concat(var631.params.language, " is not supported, falling back to: ").concat(var629.fallback, "."));
+						var631.displayLanguage = var629.fallback;
 						break;
 					}
 					case "reject": {
-						var elem20 = var636.shadow.getElementById(var635);
-						if (var636.isExecuting = false, elem20 || fn23("Cannot initialize Widget, Element not found (#".concat(var635, ")."), 3075), var634.reason === "unsupported_browser") {
-							var var638;
-							(var638 = var636.cbUnsupported) === null || var638 === undefined || var638.call(var636);
+						var elem20 = var631.shadow.getElementById(var630);
+						if (var631.isExecuting = false, elem20 || fn23("Cannot initialize Widget, Element not found (#".concat(var630, ")."), 3075), var629.reason === "unsupported_browser") {
+							var var633;
+							(var633 = var631.cbUnsupported) === null || var633 === undefined || var633.call(var631);
 						}
 						break;
 					}
 					case "food": {
-						var636.watchcat && var634.seq > var636.watchcat.lastAckedSeq && (var636.watchcat.lastAckedSeq = var634.seq);
+						var631.watchcat && var629.seq > var631.watchcat.lastAckedSeq && (var631.watchcat.lastAckedSeq = var629.seq);
 						break;
 					}
 					case "overrunBegin": {
-						var636.isOverrunning = true;
-						var636.watchcat && (var636.watchcat.overrunBeginSeq = var636.watchcat.lastAckedSeq);
+						var631.isOverrunning = true;
+						var631.watchcat && (var631.watchcat.overrunBeginSeq = var631.watchcat.lastAckedSeq);
 						break;
 					}
 					case "overrunEnd": {
-						var636.isOverrunning = false;
+						var631.isOverrunning = false;
 						break;
 					}
 					case "complete": {
-						if (var513(var636, str9, var634.widgetId), var636.response = var634.token, var634.aC) {
-							var var639;
-							(var639 = var636.assetCtxCallback) === null || var639 === undefined || var639.call(var636, var634.aC);
+						if (var508(var631, str9, var629.widgetId), var631.response = var629.token, var629.aC) {
+							var var634;
+							(var634 = var631.assetCtxCallback) === null || var634 === undefined || var634.call(var631, var629.aC);
 						}
-						if (var634.scs && !negate("scs", var636) && (var636.scs = var634.scs, var636.params["session-continuity-persist"] && !negate("scs_persist", var636))) {
-							var var640 = var636.params.sitekey;
-							if (var640) {
-								var var641 = "".concat(str10).concat(var640);
+						if (var629.scs && !negate("scs", var631) && (var631.scs = var629.scs, var631.params["session-continuity-persist"] && !negate("scs_persist", var631))) {
+							var var635 = var631.params.sitekey;
+							if (var635) {
+								var var636 = "".concat(str10).concat(var635);
 								try {
-									localStorage.setItem(var641, var634.scs);
-								} catch (var642) {}
+									localStorage.setItem(var636, var629.scs);
+								} catch (var637) {}
 							}
 						}
-						var634.sToken ? call20(var636, var634.widgetId, var635, var634.token, var634.sToken, var634.chlId) : var504(var636, var635, false);
+						var629.sToken ? call20(var631, var629.widgetId, var630, var629.token, var629.sToken, var629.chlId) : var499(var631, var630, false);
 						break;
 					}
 					case "fail": {
-						if (var634.rcV && var513(var636, var634.rcV, var634.widgetId), var634.cfChlOut && (var636.cfChlOut = var634.cfChlOut), var634.cfChlOutS && (var636.cfChlOutS = var634.cfChlOutS), var634.code && (var636.errorCode = var634.code), var634.aC) {
-							var var643;
-							(var643 = var636.assetCtxCallback) === null || var643 === undefined || var643.call(var636, var634.aC);
+						if (var629.rcV && var508(var631, var629.rcV, var629.widgetId), var629.cfChlOut && (var631.cfChlOut = var629.cfChlOut), var629.cfChlOutS && (var631.cfChlOutS = var629.cfChlOutS), var629.code && (var631.errorCode = var629.code), var629.aC) {
+							var var638;
+							(var638 = var631.assetCtxCallback) === null || var638 === undefined || var638.call(var631, var629.aC);
 						}
-						var636.isExecuting = false;
-						var636.isFailed = true;
-						var636.isInitialized = true;
-						var634.frMd && (var636.frMd = var634.frMd);
-						fn55(var636, var635);
-						var var644 = var636.cbError, var645 = var634.code === num7 || var634.code === num8, var646 = var634.code !== num4;
-						if (var645) {
-							var elem21 = var636.shadow.querySelector("#".concat(var635));
+						var631.isExecuting = false;
+						var631.isFailed = true;
+						var631.isInitialized = true;
+						var629.frMd && (var631.frMd = var629.frMd);
+						fn54(var631, var630);
+						var var639 = var631.cbError, var640 = var629.code === num7 || var629.code === num8, var641 = var629.code !== num4;
+						if (var640) {
+							var elem21 = var631.shadow.querySelector("#".concat(var630));
 							elem21 && fn30(elem21, {
 								event: "forceFail",
 								source: str1,
-								widgetId: var634.widgetId
-							}, var636.iframeOrigin);
+								widgetId: var629.widgetId
+							}, var631.iframeOrigin);
 						}
-						if (var644) {
-							var var647;
-							var644(String((var647 = var634.code) !== null && var647 !== undefined ? var647 : num6)) ? var646 && var636.params.retry === var68.Auto && !var636.isResetting && var496(var636, var635, var645) : (var634.code && fn24("Error: ".concat(var634.code, ".")), var646 && var496(var636, var635, var645));
-						} else var634.code ? (var646 && var496(var636, var635, var645), fn23("Error: ".concat(var634.code), 3076)) : var496(var636, var635, false);
+						if (var639) {
+							var var642;
+							var639(String((var642 = var629.code) !== null && var642 !== undefined ? var642 : num6)) ? var641 && var631.params.retry === var68.Auto && !var631.isResetting && var491(var631, var630, var640) : (var629.code && fn24("Error: ".concat(var629.code, ".")), var641 && var491(var631, var630, var640));
+						} else var629.code ? (var641 && var491(var631, var630, var640), fn23("Error: ".concat(var629.code), 3076)) : var491(var631, var630, false);
 						break;
 					}
 					case "feedbackInit": {
-						var var648 = fn63(var636, var635).targetWindow;
-						if (var648) {
+						var var643 = fn62(var631, var630).targetWindow;
+						if (var643) {
 							fn24("A feedback report form is already opened for this widget.");
 							return;
 						}
-						if (!var636.autoFeedbackSent && !negate("feedback-report-auto-submit", var636)) {
-							var var649 = var181(var636, var634.feedbackOrigin, var634.rayId, var636.frMd, obj9.scriptUrlParsed);
-							var649 && (var636.autoFeedbackSent = true);
+						if (!var631.autoFeedbackSent && !negate("feedback-report-auto-submit", var631)) {
+							var var644 = var181(var631, var629.feedbackOrigin, var629.rayId, var631.frMd, obj9.scriptUrlParsed);
+							var644 && (var631.autoFeedbackSent = true);
 						}
-						var224(var635, var636, var634.feedbackOrigin, obj9.scriptUrlParsed);
+						var224(var630, var631, var629.feedbackOrigin, obj9.scriptUrlParsed);
 						break;
 					}
 					case "requestFeedbackData": {
-						var elem22 = var636.shadow.querySelector("#".concat(var635));
-						elem22 || fn23("Received state for an unknown widget: #".concat(var635, " / ").concat(var634.widgetId), 3078);
+						var elem22 = var631.shadow.querySelector("#".concat(var630));
+						elem22 || fn23("Received state for an unknown widget: #".concat(var630, " / ").concat(var629.widgetId), 3078);
 						fn30(elem22, {
 							event: "requestTurnstileResults",
 							source: str1,
-							widgetId: var634.widgetId
-						}, var636.iframeOrigin);
+							widgetId: var629.widgetId
+						}, var631.iframeOrigin);
 						break;
 					}
 					case "turnstileResults": {
-						var var650, var651, var652, var653 = fn63(var636, var635), var654 = var653.targetOrigin, var655 = var653.targetWindow;
-						if (!var655) break;
-						fn29(var655, {
-							cfChlOut: (var650 = var636.cfChlOut) !== null && var650 !== undefined ? var650 : var634.cfChlOut,
-							cfChlOutS: (var651 = var636.cfChlOutS) !== null && var651 !== undefined ? var651 : var634.cfChlOutS,
-							errorCode: var636.errorCode,
+						var var645, var646, var647, var648 = fn62(var631, var630), var649 = var648.targetOrigin, var650 = var648.targetWindow;
+						if (!var650) break;
+						fn29(var650, {
+							cfChlOut: (var645 = var631.cfChlOut) !== null && var645 !== undefined ? var645 : var629.cfChlOut,
+							cfChlOutS: (var646 = var631.cfChlOutS) !== null && var646 !== undefined ? var646 : var629.cfChlOutS,
+							errorCode: var631.errorCode,
 							event: "feedbackData",
-							frMd: (var652 = var636.frMd) !== null && var652 !== undefined ? var652 : var634.frMd,
-							mode: var634.mode,
-							rayId: var634.rayId,
-							rcV: var634.rcV,
-							sitekey: var634.sitekey,
+							frMd: (var647 = var631.frMd) !== null && var647 !== undefined ? var647 : var629.frMd,
+							mode: var629.mode,
+							rayId: var629.rayId,
+							rcV: var629.rcV,
+							sitekey: var629.sitekey,
 							source: str1,
-							widgetId: var634.widgetId
-						}, var654);
+							widgetId: var629.widgetId
+						}, var649);
 						break;
 					}
 					case "closeFeedbackReportIframe": {
-						var var656 = fn63(var636, var635).targetWindow;
-						var656 || fn23("Received state for an unknown widget: ".concat(var634.widgetId), 3078);
-						var246(var635);
-						var200(var636);
+						var var651 = fn62(var631, var630).targetWindow;
+						var651 || fn23("Received state for an unknown widget: ".concat(var629.widgetId), 3078);
+						var246(var630);
+						var200(var631);
 						break;
 					}
 					case "tokenExpired": {
-						var var657, var658 = var634.token;
-						var636.isExpired = true;
-						(var657 = var636.cbExpired) === null || var657 === undefined || var657.call(var636, var658);
-						var636.params["refresh-expired"] === var70.Auto && !var636.isResetting && var539(var80.AutoExpire, var635);
+						var var652, var653 = var629.token;
+						var631.isExpired = true;
+						(var652 = var631.cbExpired) === null || var652 === undefined || var652.call(var631, var653);
+						var631.params["refresh-expired"] === var70.Auto && !var631.isResetting && var534(var80.AutoExpire, var630);
 						break;
 					}
 					case "interactiveTimeout": {
-						var513(var636, str9, var634.widgetId);
-						fn55(var636, var635);
-						var var659 = var636.cbTimeout;
-						if (var659 ? var659() : var636.params["refresh-timeout"] === var72.Never && !var636.isResetting && fn24("The widget encountered an interactive timeout and is set to never refresh. Consider defining a timeout handler and resetting the widget upon timeout as solving a widget in a timed-out state is going to fail."), var636.params["refresh-timeout"] === var72.Auto && !var636.isResetting) {
-							var var660 = var636.cbAfterInteractive;
-							var660 == null || var660();
-							var539(var80.AutoTimeout, var635);
+						var508(var631, str9, var629.widgetId);
+						fn54(var631, var630);
+						var var654 = var631.cbTimeout;
+						if (var654 ? var654() : var631.params["refresh-timeout"] === var72.Never && !var631.isResetting && fn24("The widget encountered an interactive timeout and is set to never refresh. Consider defining a timeout handler and resetting the widget upon timeout as solving a widget in a timed-out state is going to fail."), var631.params["refresh-timeout"] === var72.Auto && !var631.isResetting) {
+							var var655 = var631.cbAfterInteractive;
+							var655 == null || var655();
+							var534(var80.AutoTimeout, var630);
 						}
 						break;
 					}
 					case "refreshRequest": {
-						var513(var636, str9, var634.widgetId);
-						var246(var635);
-						var200(var636);
-						var539(var80.ManualRefresh, var635);
+						var508(var631, str9, var629.widgetId);
+						var246(var630);
+						var200(var631);
+						var534(var80.ManualRefresh, var630);
 						break;
 					}
 					case "reloadRequest": {
-						var513(var636, var634.nextRcV, var634.widgetId);
-						var539(var634.trigger, var635);
+						var508(var631, var629.nextRcV, var629.widgetId);
+						var534(var629.trigger, var630);
 						break;
 					}
 					case "reloadApiJsRequest": {
-						if (negate("reload", var636)) {
-							fn49(var634.widgetId);
+						if (negate("reload", var631)) {
+							fn48(var629.widgetId);
 							break;
 						}
 						if (var373 !== undefined) {
-							fn49(var634.widgetId);
+							fn48(var629.widgetId);
 							break;
 						}
-						if (lessThan()) {
-							fn49(var634.widgetId);
-							break;
-						}
-						pick22() ? (obj9.apiJsMismatchReloadAttempts++, fn52(), fn53(var634.widgetId)) : fn49(var634.widgetId);
+						pick22() ? (obj9.apiJsMismatchReloadAttempts++, fn51(), fn52(var629.widgetId)) : fn48(var629.widgetId);
 						break;
 					}
 					case "interactiveBegin": {
-						var var661, elem23 = var636.shadow.getElementById(var635);
-						elem23 || fn23("Cannot layout widget, Element not found (#".concat(var635, ")."), 3076);
-						(var661 = var636.cbBeforeInteractive) === null || var661 === undefined || var661.call(var636);
-						var636.params.appearance === var74.InteractionOnly && fn60(elem23, var636);
+						var var656, elem23 = var631.shadow.getElementById(var630);
+						elem23 || fn23("Cannot layout widget, Element not found (#".concat(var630, ")."), 3076);
+						(var656 = var631.cbBeforeInteractive) === null || var656 === undefined || var656.call(var631);
+						var631.params.appearance === var74.InteractionOnly && fn59(elem23, var631);
 						break;
 					}
 					case "interactiveEnd": {
-						var var662;
-						(var662 = var636.cbAfterInteractive) === null || var662 === undefined || var662.call(var636);
+						var var657;
+						(var657 = var631.cbAfterInteractive) === null || var657 === undefined || var657.call(var631);
 						break;
 					}
 					case "widgetStale": {
-						var636.isStale = true;
+						var631.isStale = true;
 						break;
 					}
 					case "requestExtraParams": {
-						var636.widgetParamsStartTimeTsMs = 0;
-						var elem24 = var636.shadow.querySelector("#".concat(var635));
-						elem24 || fn23("Received state for an unknown widget: ".concat(var634.widgetId), 3078);
-						var636.isResetting = false;
+						var631.widgetParamsStartTimeTsMs = 0;
+						var elem24 = var631.shadow.querySelector("#".concat(var630));
+						elem24 || fn23("Received state for an unknown widget: ".concat(var629.widgetId), 3078);
+						var631.isResetting = false;
 						var obj12 = {}, num31 = 0, obj13 = {
-							"d.cT": var512(),
-							"ht.atrs": var509(document.body.parentNode),
+							"d.cT": var507(),
+							"ht.atrs": var504(document.body.parentNode),
 							"pg.ref": document.referrer,
 							pi: {
-								ffp: call14(var636.wrapper),
+								ffp: call14(var631.wrapper),
 								ii: window.self !== window.top,
 								lH: window.location.href,
 								mL: document.getElementsByTagName("meta").length,
 								pfp: call15(document, num14, num15),
 								sL: document.scripts.length,
-								sR: var636.wrapper.shadowRoot === null,
+								sR: var631.wrapper.shadowRoot === null,
 								ssL: document.styleSheets.length,
 								t: "".concat(document.title.length, "|").concat(shiftRightU(document.title)),
 								tL: document.getElementsByTagName("*").length,
-								wp: call13(var636.wrapper),
-								xp: call11(var636.wrapper).slice(0, num16)
+								wp: call13(var631.wrapper),
+								xp: call11(var631.wrapper).slice(0, num16)
 							},
 							"w.iW": window.innerWidth
-						}, list8 = var636.scs;
-						if (!list8 && var636.params["session-continuity-persist"] && !negate("scs_persist", var636)) {
-							var var663 = var636.params.sitekey;
-							if (var663) {
-								var var664 = "".concat(str10).concat(var663);
+						}, list8 = var631.scs;
+						if (!list8 && var631.params["session-continuity-persist"] && !negate("scs_persist", var631)) {
+							var var658 = var631.params.sitekey;
+							if (var658) {
+								var var659 = "".concat(str10).concat(var658);
 								try {
-									var var665;
-									list8 = (var665 = localStorage.getItem(var664)) !== null && var665 !== undefined ? var665 : undefined;
-								} catch (var666) {}
+									var var660;
+									list8 = (var660 = localStorage.getItem(var659)) !== null && var660 !== undefined ? var660 : undefined;
+								} catch (var661) {}
 							}
 						}
 						list8 && list8.length > num17 && (list8 = undefined);
 						fn30(elem24, fn6({
-							action: var636.action,
+							action: var631.action,
 							apiJsMismatchReloadAttempts: obj9.apiJsMismatchReloadAttempts,
 							apiJsMismatchReloadCompletedCount: obj9.apiJsMismatchReloadCompletedCount,
-							apiJsResourceTiming: var632 ? JSON.parse(JSON.stringify(var632)) : undefined,
-							appearance: var636.params.appearance,
+							apiJsResourceTiming: var627 ? JSON.parse(JSON.stringify(var627)) : undefined,
+							appearance: var631.params.appearance,
 							au: obj9.scriptUrl,
-							cData: var636.cData,
+							cData: var631.cData,
 							ch: "1eec422858ff",
-							chlPageData: var636.chlPageData,
+							chlPageData: var631.chlPageData,
 							event: "extraParams",
-							execution: var636.params.execution,
-							"expiry-interval": var636.params["expiry-interval"],
-							language: var636.params.language,
-							rcV: var636.rcV,
-							"refresh-expired": var636.params["refresh-expired"],
-							"refresh-timeout": var636.params["refresh-timeout"],
-							retry: var636.params.retry,
-							"retry-interval": var636.params["retry-interval"],
+							execution: var631.params.execution,
+							"expiry-interval": var631.params["expiry-interval"],
+							language: var631.params.language,
+							rcV: var631.rcV,
+							"refresh-expired": var631.params["refresh-expired"],
+							"refresh-timeout": var631.params["refresh-timeout"],
+							retry: var631.params.retry,
+							"retry-interval": var631.params["retry-interval"],
 							scs: list8,
 							source: str1,
-							timeExtraParamsMs: 0 - var636.widgetRenderStartTimeTsMs,
-							timeInitMs: var636.widgetInitStartTimeTsMs - var636.widgetRenderEndTimeTsMs,
+							timeExtraParamsMs: 0 - var631.widgetRenderStartTimeTsMs,
+							timeInitMs: var631.widgetInitStartTimeTsMs - var631.widgetRenderEndTimeTsMs,
 							timeLoadInitMs: 0 - obj9.turnstileLoadInitTimeTsMs,
-							timeParamsMs: var636.widgetParamsStartTimeTsMs - var636.widgetInitStartTimeTsMs,
-							timeRenderMs: var636.widgetRenderEndTimeTsMs - var636.widgetRenderStartTimeTsMs,
+							timeParamsMs: var631.widgetParamsStartTimeTsMs - var631.widgetInitStartTimeTsMs,
+							timeRenderMs: var631.widgetRenderEndTimeTsMs - var631.widgetRenderStartTimeTsMs,
 							timeTiefMs: 0 - num31,
 							upgradeAttempts: obj9.upgradeAttempts,
 							upgradeCompletedCount: obj9.upgradeCompletedCount,
 							url: call19(),
-							widgetId: var634.widgetId,
+							widgetId: var629.widgetId,
 							wPr: obj13
-						}, obj12), var636.iframeOrigin);
-						var520(var636, var634.widgetId, elem24);
-						var636.isInitialized = true;
+						}, obj12), var631.iframeOrigin);
+						var515(var631, var629.widgetId, elem24);
+						var631.isInitialized = true;
 						break;
 					}
 					default: break;
 				}
 			}
-		}, var667 = function(var668) {
-			if (and6(var668)) {
-				var var669 = var668.data;
-				if (!call18(var668)) {
-					fn24("Ignored message from wrong origin: ".concat(var668.origin, "."));
+		}, var662 = function(var663) {
+			if (and6(var663)) {
+				var var664 = var663.data;
+				if (!call18(var663)) {
+					fn24("Ignored message from wrong origin: ".concat(var663.origin, "."));
 					return;
 				}
-				if (!(!var669.widgetId || !obj9.widgetMap.has(var669.widgetId))) {
-					var var670 = call8(var669.widgetId), var671 = obj9.widgetMap.get(var669.widgetId);
-					if (!(!var670 || !var671)) {
-						if (!fn64(var668, var671, var670)) {
-							fn24("Ignored message from unexpected source for event: ".concat(var669.event, "."));
+				if (!(!var664.widgetId || !obj9.widgetMap.has(var664.widgetId))) {
+					var var665 = call8(var664.widgetId), var666 = obj9.widgetMap.get(var664.widgetId);
+					if (!(!var665 || !var666)) {
+						if (!fn63(var663, var666, var665)) {
+							fn24("Ignored message from unexpected source for event: ".concat(var664.event, "."));
 							return;
 						}
-						var633(var669);
+						var628(var664);
 					}
 				}
 			}
 		};
-		obj9.msgHandler = var667;
-		obj9.internalMsgHandler = var633;
-		window.addEventListener("message", var667);
-		function pick20(var672) {
-			var var673;
-			if (typeof var672 == "string") {
-				var var674 = call17(var672);
-				if (var674) return var674;
+		obj9.msgHandler = var662;
+		obj9.internalMsgHandler = var628;
+		window.addEventListener("message", var662);
+		function pick20(var667) {
+			var var668;
+			if (typeof var667 == "string") {
+				var var669 = call17(var667);
+				if (var669) return var669;
 				try {
-					var elem25 = document.querySelector(var672);
+					var elem25 = document.querySelector(var667);
 					return elem25 ? pick20(elem25) : null;
-				} catch (var675) {
+				} catch (var670) {
 					return null;
 				}
 			}
-			return instanceOf(var672, Element) ? call17(var672) : var672 || obj9.widgetMap.size === 0 ? null : (var673 = var622()) !== null && var673 !== undefined ? var673 : null;
+			return instanceOf(var667, Element) ? call17(var667) : var667 || obj9.widgetMap.size === 0 ? null : (var668 = var617()) !== null && var668 !== undefined ? var668 : null;
 		}
-		var obj14 = {}, obj15 = { showFeedback: function(var676) {
-			var var677 = pick20(var676);
-			if (var677) {
-				var var678 = call8(var677);
-				if (var678) {
-					var var679 = obj9.widgetMap.get(var677);
-					var679 && var224(var678, var679, var253.Custom, obj9.scriptUrlParsed);
+		var obj14 = {}, obj15 = { showFeedback: function(var671) {
+			var var672 = pick20(var671);
+			if (var672) {
+				var var673 = call8(var672);
+				if (var673) {
+					var var674 = obj9.widgetMap.get(var672);
+					var674 && var224(var673, var674, var253.Custom, obj9.scriptUrlParsed);
 				}
 			}
-		} }, var680 = fn8(fn6({}, obj14), {
+		} }, var675 = fn8(fn6({}, obj14), {
 			_private: obj15,
-			execute: function(var681, var682) {
-				var var683 = pick20(var681);
-				if (!var683) {
-					var var684;
-					var682 === undefined && fn23("Please provide 2 parameters to execute: container and parameters", 43521);
-					var var685 = call21(var681, var682);
-					var685 || fn23("Failed to render widget", 43522);
-					var683 = (var684 = pick3(var685)) !== null && var684 !== undefined ? var684 : pick20(var681);
-					var683 || fn23("Failed to render widget", 43522);
+			execute: function(var676, var677) {
+				var var678 = pick20(var676);
+				if (!var678) {
+					var var679;
+					var677 === undefined && fn23("Please provide 2 parameters to execute: container and parameters", 43521);
+					var var680 = call21(var676, var677);
+					var680 || fn23("Failed to render widget", 43522);
+					var678 = (var679 = pick3(var680)) !== null && var679 !== undefined ? var679 : pick20(var676);
+					var678 || fn23("Failed to render widget", 43522);
 				}
-				var var686 = obj9.widgetMap.get(var683);
-				if (var686) {
-					var524(var686, var682);
-					var var687 = call8(var683);
-					if (var687 || (var686.isExecuting = false, fn23("Widget ".concat(var683, " to execute was not found"), 43522)), var686.isExecuting) {
-						fn24("Call to execute() on a widget that is already executing (".concat(var687, "), consider using reset() before execute()."));
+				var var681 = obj9.widgetMap.get(var678);
+				if (var681) {
+					var519(var681, var677);
+					var var682 = call8(var678);
+					if (var682 || (var681.isExecuting = false, fn23("Widget ".concat(var678, " to execute was not found"), 43522)), var681.isExecuting) {
+						fn24("Call to execute() on a widget that is already executing (".concat(var682, "), consider using reset() before execute()."));
 						return;
 					}
-					if (var686.isExecuting = true, var686.response) {
-						var var688;
-						var686.isExecuting = false;
-						fn24("Call to execute() on a widget that was already executed (".concat(var687, "), execute() will return the previous token obtained. Consider using reset() before execute() to obtain a fresh token."));
-						(var688 = var686.cbSuccess) === null || var688 === undefined || var688.call(var686, var686.response, false);
+					if (var681.isExecuting = true, var681.response) {
+						var var683;
+						var681.isExecuting = false;
+						fn24("Call to execute() on a widget that was already executed (".concat(var682, "), execute() will return the previous token obtained. Consider using reset() before execute() to obtain a fresh token."));
+						(var683 = var681.cbSuccess) === null || var683 === undefined || var683.call(var681, var681.response, false);
 						return;
 					}
-					var686.isExpired && fn24("Call to execute on a expired-widget (".concat(var687, "), consider using reset() before."));
-					var686.isStale && (var539(var80.StaleExecute, var687), var686.isExecuting = true);
-					(var686.isResetting || !var686.isInitialized) && var686.msgQueue.push(var78.Execute);
-					var686.isExecuted = true;
-					var elem26 = var686.shadow.querySelector("#".concat(var687));
-					if (elem26 || (var686.isExecuting = false, fn23("Widget ".concat(var687, " to execute was not found"), 43522)), var686.isResetting || !var686.isInitialized) return;
-					if (var686.isInitialized && var686.msgQueue.length > 0) {
-						var520(var686, var683, elem26);
-						var686.params.appearance === var74.Execute && fn60(elem26, var686);
+					var681.isExpired && fn24("Call to execute on a expired-widget (".concat(var682, "), consider using reset() before."));
+					var681.isStale && (var534(var80.StaleExecute, var682), var681.isExecuting = true);
+					(var681.isResetting || !var681.isInitialized) && var681.msgQueue.push(var78.Execute);
+					var681.isExecuted = true;
+					var elem26 = var681.shadow.querySelector("#".concat(var682));
+					if (elem26 || (var681.isExecuting = false, fn23("Widget ".concat(var682, " to execute was not found"), 43522)), var681.isResetting || !var681.isInitialized) return;
+					if (var681.isInitialized && var681.msgQueue.length > 0) {
+						var515(var681, var678, elem26);
+						var681.params.appearance === var74.Execute && fn59(elem26, var681);
 						return;
 					}
-					var686.isInitialized && var686.params.appearance === var74.Execute && fn60(elem26, var686);
-					var686.isExecuting && fn30(elem26, {
+					var681.isInitialized && var681.params.appearance === var74.Execute && fn59(elem26, var681);
+					var681.isExecuting && fn30(elem26, {
 						event: "execute",
 						source: str1,
-						widgetId: var683
-					}, var686.iframeOrigin);
+						widgetId: var678
+					}, var681.iframeOrigin);
 				}
 			},
-			getResponse: function(var689) {
-				var var690;
+			getResponse: function(var684) {
+				var var685;
+				if (typeof var684 == "undefined") {
+					var var686 = var617();
+					if (var686) {
+						var var687 = obj9.widgetMap.get(var686);
+						var687 != null && var687.isExpired && fn24("Call to getResponse on a widget that expired, consider refreshing the widget.");
+						return var687 == null ? undefined : var687.response;
+					}
+					fn23("Could not find a widget", 43794);
+				}
+				var var688 = pick20(var684);
+				var688 || fn23("Could not find widget for provided container", 43778);
+				return (var685 = obj9.widgetMap.get(var688)) === null || var685 === undefined ? undefined : var685.response;
+			},
+			isExpired: function(var689) {
+				var var690, var691;
 				if (typeof var689 == "undefined") {
-					var var691 = var622();
-					if (var691) {
-						var var692 = obj9.widgetMap.get(var691);
-						var692 != null && var692.isExpired && fn24("Call to getResponse on a widget that expired, consider refreshing the widget.");
-						return var692 == null ? undefined : var692.response;
+					var var692 = var617();
+					if (var692) {
+						var var693, var694;
+						return (var693 = (var694 = obj9.widgetMap.get(var692)) === null || var694 === undefined ? undefined : var694.isExpired) !== null && var693 !== undefined ? var693 : false;
 					}
 					fn23("Could not find a widget", 43794);
 				}
-				var var693 = pick20(var689);
-				var693 || fn23("Could not find widget for provided container", 43778);
-				return (var690 = obj9.widgetMap.get(var693)) === null || var690 === undefined ? undefined : var690.response;
+				var var695 = pick20(var689);
+				var695 || fn23("Could not find widget for provided container", 43778);
+				return (var690 = (var691 = obj9.widgetMap.get(var695)) === null || var691 === undefined ? undefined : var691.isExpired) !== null && var690 !== undefined ? var690 : false;
 			},
-			isExpired: function(var694) {
-				var var695, var696;
-				if (typeof var694 == "undefined") {
-					var var697 = var622();
-					if (var697) {
-						var var698, var699;
-						return (var698 = (var699 = obj9.widgetMap.get(var697)) === null || var699 === undefined ? undefined : var699.isExpired) !== null && var698 !== undefined ? var698 : false;
-					}
-					fn23("Could not find a widget", 43794);
-				}
-				var var700 = pick20(var694);
-				var700 || fn23("Could not find widget for provided container", 43778);
-				return (var695 = (var696 = obj9.widgetMap.get(var700)) === null || var696 === undefined ? undefined : var696.isExpired) !== null && var695 !== undefined ? var695 : false;
-			},
-			ready: function(var701) {
-				if (obj9.scriptWasLoadedAsync && (fn24("turnstile.ready() would break if called *before* the Turnstile api.js script is loaded by visitors."), fn23("Remove async/defer from the Turnstile api.js script tag before using turnstile.ready().", 3857)), typeof var701 != "function" && fn23("turnstile.ready() expected a \"function\" argument, got \"".concat(typeof var701 == "undefined" ? "undefined" : typeOf(var701), "\""), 3841), obj9.isReady) {
-					var701();
+			ready: function(var696) {
+				if (obj9.scriptWasLoadedAsync && (fn24("turnstile.ready() would break if called *before* the Turnstile api.js script is loaded by visitors."), fn23("Remove async/defer from the Turnstile api.js script tag before using turnstile.ready().", 3857)), typeof var696 != "function" && fn23("turnstile.ready() expected a \"function\" argument, got \"".concat(typeof var696 == "undefined" ? "undefined" : typeOf(var696), "\""), 3841), obj9.isReady) {
+					var696();
 					return;
 				}
-				arr7.push(var701);
+				arr7.push(var696);
 			},
-			remove: var556,
+			remove: var551,
 			render: call21,
-			reset: var537
+			reset: var532
 		});
-		Object.defineProperty(var680, var365, {
+		Object.defineProperty(var675, var365, {
 			configurable: true,
 			enumerable: false,
 			value: {
 				clearPendingApiJsReloadRequest: function() {
-					fn50();
+					fn49();
 				},
 				rearmTimedUpgrade: function() {
-					fn54();
+					fn53();
 				},
 				rejectPendingApiJsReloadRequest: function() {
-					fn51();
+					fn50();
 				},
 				reloadAfterUpgrade: function() {
-					var560();
+					var555();
 				}
 			}
 		});
 		return {
-			runImplicitRender: var620,
-			turnstile: var680
+			runImplicitRender: var615,
+			turnstile: var675
 		};
-	})(), var702 = var475.runImplicitRender, var703 = var475.turnstile;
-	function fn66(var704) {
-		var var705, var706, obj16 = { sitekey: var704.getAttribute("data-sitekey") }, var707 = var704.getAttribute("data-tabindex");
-		var707 && (obj16.tabindex = Number.parseInt(var707, 10));
-		var var708 = var704.getAttribute("data-theme");
-		var708 && (notEqual1(var708) ? obj16.theme = var708 : fn24("Unknown data-theme value: \"".concat(var708, "\".")));
-		var var709 = var704.getAttribute("data-size");
-		if (var709 && (notEqual3(var709) ? obj16.size = var709 : fn24("Unknown data-size value: \"".concat(var709, "\"."))), 0) var var710;
-		var var711 = var704.getAttribute("data-action");
-		typeof var711 == "string" && (obj16.action = var711);
-		var var712 = var704.getAttribute("data-cdata");
-		typeof var712 == "string" && (obj16.cData = var712);
-		var var713 = var704.getAttribute("data-retry");
-		var713 && (notEqual2(var713) ? obj16.retry = var713 : fn24("Invalid data-retry value: \"".concat(var713, ", expected either 'never' or 'auto'\".")));
-		var var714 = var704.getAttribute("data-retry-interval");
-		if (var714) {
-			var var715 = Number.parseInt(var714, 10);
-			var715 > 0 && var715 < 9e5 ? obj16["retry-interval"] = var715 : fn24("Invalid data-retry-interval value: \"".concat(var714, ", expected an integer value > 0 and < 900000\"."));
+	})(), var697 = var470.runImplicitRender, var698 = var470.turnstile;
+	function fn65(var699) {
+		var var700, var701, obj16 = { sitekey: var699.getAttribute("data-sitekey") }, var702 = var699.getAttribute("data-tabindex");
+		var702 && (obj16.tabindex = Number.parseInt(var702, 10));
+		var var703 = var699.getAttribute("data-theme");
+		var703 && (notEqual1(var703) ? obj16.theme = var703 : fn24("Unknown data-theme value: \"".concat(var703, "\".")));
+		var var704 = var699.getAttribute("data-size");
+		if (var704 && (notEqual3(var704) ? obj16.size = var704 : fn24("Unknown data-size value: \"".concat(var704, "\"."))), 0) var var705;
+		var var706 = var699.getAttribute("data-action");
+		typeof var706 == "string" && (obj16.action = var706);
+		var var707 = var699.getAttribute("data-cdata");
+		typeof var707 == "string" && (obj16.cData = var707);
+		var var708 = var699.getAttribute("data-retry");
+		var708 && (notEqual2(var708) ? obj16.retry = var708 : fn24("Invalid data-retry value: \"".concat(var708, ", expected either 'never' or 'auto'\".")));
+		var var709 = var699.getAttribute("data-retry-interval");
+		if (var709) {
+			var var710 = Number.parseInt(var709, 10);
+			var710 > 0 && var710 < 9e5 ? obj16["retry-interval"] = var710 : fn24("Invalid data-retry-interval value: \"".concat(var709, ", expected an integer value > 0 and < 900000\"."));
 		}
-		var var716 = var704.getAttribute("data-expiry-interval");
-		if (var716) {
-			var var717 = Number.parseInt(var716, 10);
-			var717 > 0 && var717 < 36e4 ? obj16["expiry-interval"] = var717 : fn24("Invalid data-expiry-interval value: \"".concat(var717, ", expected an integer value > 0 and < 360000\"."));
+		var var711 = var699.getAttribute("data-expiry-interval");
+		if (var711) {
+			var var712 = Number.parseInt(var711, 10);
+			var712 > 0 && var712 < 36e4 ? obj16["expiry-interval"] = var712 : fn24("Invalid data-expiry-interval value: \"".concat(var712, ", expected an integer value > 0 and < 360000\"."));
 		}
-		var var718 = var704.getAttribute("data-refresh-expired");
-		var718 && (notEqual4(var718) ? obj16["refresh-expired"] = var718 : fn24("Unknown data-refresh-expired value: \"".concat(var718, ", expected either: 'never', 'auto' or 'manual'.")));
-		var var719 = var704.getAttribute("data-refresh-timeout");
-		var719 && (notEqual5(var719) ? obj16["refresh-timeout"] = var719 : fn24("Unknown data-refresh-timeout value: \"".concat(var719, ", expected either: 'never', 'auto' or 'manual'.")));
-		var var720 = var704.getAttribute("data-language");
-		var720 && (or2(var720) ? obj16.language = var720 : fn24("Invalid data-language value: \"".concat(var720, ", expected either: auto, or an ISO 639-1 two-letter language code (e.g. en) or language and country code (e.g. en-US).")));
-		function pick21(var721) {
-			var var722 = var704.getAttribute(var721), var723 = var722 ? win[var722] : undefined;
-			return typeof var723 == "function" ? var723 : undefined;
+		var var713 = var699.getAttribute("data-refresh-expired");
+		var713 && (notEqual4(var713) ? obj16["refresh-expired"] = var713 : fn24("Unknown data-refresh-expired value: \"".concat(var713, ", expected either: 'never', 'auto' or 'manual'.")));
+		var var714 = var699.getAttribute("data-refresh-timeout");
+		var714 && (notEqual5(var714) ? obj16["refresh-timeout"] = var714 : fn24("Unknown data-refresh-timeout value: \"".concat(var714, ", expected either: 'never', 'auto' or 'manual'.")));
+		var var715 = var699.getAttribute("data-language");
+		var715 && (or2(var715) ? obj16.language = var715 : fn24("Invalid data-language value: \"".concat(var715, ", expected either: auto, or an ISO 639-1 two-letter language code (e.g. en) or language and country code (e.g. en-US).")));
+		function pick21(var716) {
+			var var717 = var699.getAttribute(var716), var718 = var717 ? win[var717] : undefined;
+			return typeof var718 == "function" ? var718 : undefined;
 		}
 		[
 			"error-callback",
@@ -2303,41 +2277,41 @@
 			"timeout-callback",
 			"after-interactive-callback",
 			"before-interactive-callback"
-		].forEach(function(var724) {
-			Object.assign(obj16, fn5({}, var724, pick21("data-".concat(var724))));
+		].forEach(function(var719) {
+			Object.assign(obj16, fn5({}, var719, pick21("data-".concat(var719))));
 		});
-		obj16["feedback-enabled"] = (var705 = pick18(var704.getAttribute("data-feedback-enabled"), true, function(var725) {
-			return "Invalid data-feedback-enabled value: \"".concat(var725, "\", expected either: 'true' or 'false'. Value is ignored.");
-		})) !== null && var705 !== undefined ? var705 : true;
-		obj16["response-field"] = (var706 = pick18(var704.getAttribute("data-response-field"), true, function(var726) {
-			return "Invalid data-response-field value: \"".concat(var726, "\", expected either: 'true' or 'false'. Value is ignored.");
-		})) !== null && var706 !== undefined ? var706 : true;
-		var var727 = var704.getAttribute("data-response-field-name");
-		var727 && (obj16["response-field-name"] = var727);
-		var var728 = var704.getAttribute("data-execution");
-		var728 && (notEqual8(var728) ? obj16.execution = var728 : fn24("Unknown data-execution value: \"".concat(var728, ", expected either: 'render' or 'execute'.")));
-		var var729 = var704.getAttribute("data-appearance");
-		var729 && (notEqual6(var729) ? obj16.appearance = var729 : fn24("Unknown data-appearance value: \"".concat(var729, ", expected either: 'always', 'execute', or 'interaction-only'.")));
-		var var730 = pick18(var704.getAttribute("data-offlabel-show-privacy"), undefined, function(var731) {
-			return "Invalid data-offlabel-show-privacy value: \"".concat(var731, "\", expected \"true\" or \"false\".");
+		obj16["feedback-enabled"] = (var700 = pick18(var699.getAttribute("data-feedback-enabled"), true, function(var720) {
+			return "Invalid data-feedback-enabled value: \"".concat(var720, "\", expected either: 'true' or 'false'. Value is ignored.");
+		})) !== null && var700 !== undefined ? var700 : true;
+		obj16["response-field"] = (var701 = pick18(var699.getAttribute("data-response-field"), true, function(var721) {
+			return "Invalid data-response-field value: \"".concat(var721, "\", expected either: 'true' or 'false'. Value is ignored.");
+		})) !== null && var701 !== undefined ? var701 : true;
+		var var722 = var699.getAttribute("data-response-field-name");
+		var722 && (obj16["response-field-name"] = var722);
+		var var723 = var699.getAttribute("data-execution");
+		var723 && (notEqual8(var723) ? obj16.execution = var723 : fn24("Unknown data-execution value: \"".concat(var723, ", expected either: 'render' or 'execute'.")));
+		var var724 = var699.getAttribute("data-appearance");
+		var724 && (notEqual6(var724) ? obj16.appearance = var724 : fn24("Unknown data-appearance value: \"".concat(var724, ", expected either: 'always', 'execute', or 'interaction-only'.")));
+		var var725 = pick18(var699.getAttribute("data-offlabel-show-privacy"), undefined, function(var726) {
+			return "Invalid data-offlabel-show-privacy value: \"".concat(var726, "\", expected \"true\" or \"false\".");
 		});
-		typeof var730 == "boolean" && (obj16["offlabel-show-privacy"] = var730);
-		var var732 = pick18(var704.getAttribute("data-offlabel-show-help"), undefined, function(var733) {
-			return "Invalid data-offlabel-show-help value: \"".concat(var733, "\", expected \"true\" or \"false\".");
+		typeof var725 == "boolean" && (obj16["offlabel-show-privacy"] = var725);
+		var var727 = pick18(var699.getAttribute("data-offlabel-show-help"), undefined, function(var728) {
+			return "Invalid data-offlabel-show-help value: \"".concat(var728, "\", expected \"true\" or \"false\".");
 		});
-		typeof var732 == "boolean" && (obj16["offlabel-show-help"] = var732);
+		typeof var727 == "boolean" && (obj16["offlabel-show-help"] = var727);
 		return obj16;
 	}
 	function pick22() {
-		if (fn47(), fn48()) return false;
-		return fn42(window.turnstile, obj9) ? true : (fn54(), false);
+		if (fn47(), false) return false;
+		return fn42(window.turnstile, obj9) ? true : (fn53(), false);
 	}
-	var739 = false;
-	var740 = fn27();
-	obj9.scriptWasLoadedAsync = (var737 = var740 == null ? undefined : var740.loadedAsync) !== null && var737 !== undefined ? var737 : false;
-	obj9.scriptUrl = (var738 = var740 == null ? undefined : var740.src) !== null && var738 !== undefined ? var738 : "undefined";
-	obj9.scriptUrlParsed = var740 == null ? undefined : var740.url;
-	var740 != null && var740.params && (var741 = var740.params.get("compat"), (var741 == null ? undefined : var741.toLowerCase()) === "recaptcha" ? window.grecaptcha ? fn24("grecaptcha is already defined. The compatibility layer will not be enabled.") : (fn24("Compatibility layer enabled."), obj9.isRecaptchaCompatibilityMode = true, window.grecaptcha = var703) : var741 !== null && fn24("Unknown value for api.js?compat: \"".concat(var741, "\", ignoring.")), var740.params.forEach(function(var734, var735) {
+	var734 = false;
+	var735 = fn27();
+	obj9.scriptWasLoadedAsync = (var732 = var735 == null ? undefined : var735.loadedAsync) !== null && var732 !== undefined ? var732 : false;
+	obj9.scriptUrl = (var733 = var735 == null ? undefined : var735.src) !== null && var733 !== undefined ? var733 : "undefined";
+	obj9.scriptUrlParsed = var735 == null ? undefined : var735.url;
+	var735 != null && var735.params && (var736 = var735.params.get("compat"), (var736 == null ? undefined : var736.toLowerCase()) === "recaptcha" ? window.grecaptcha ? fn24("grecaptcha is already defined. The compatibility layer will not be enabled.") : (fn24("Compatibility layer enabled."), obj9.isRecaptchaCompatibilityMode = true, window.grecaptcha = var698) : var736 !== null && fn24("Unknown value for api.js?compat: \"".concat(var736, "\", ignoring.")), var735.params.forEach(function(var729, var730) {
 		[
 			"onload",
 			"compat",
@@ -2345,21 +2319,21 @@
 			"_upgrade",
 			"_reload",
 			"render"
-		].indexOf(var735) !== -1 || fn24("Unknown parameter passed to api.js: \"?".concat(var735, "=...\", ignoring."));
-	}), var739 = var740.params.get("_upgrade") === "true", var742 = var740.params.get("onload"), var742 && !var739 && setTimeout(function() {
-		typeof win[var742] == "function" ? win[var742]() : (fn24("Unable to find onload callback '".concat(var742, "' immediately after loading, expected 'function', got '").concat(typeOf(win[var742]), "'.")), setTimeout(function() {
-			typeof win[var742] == "function" ? win[var742]() : fn24("Unable to find onload callback '".concat(var742, "' after 1 second, expected 'function', got '").concat(typeOf(win[var742]), "'."));
+		].indexOf(var730) !== -1 || fn24("Unknown parameter passed to api.js: \"?".concat(var730, "=...\", ignoring."));
+	}), var734 = var735.params.get("_upgrade") === "true", var737 = var735.params.get("onload"), var737 && !var734 && setTimeout(function() {
+		typeof win[var737] == "function" ? win[var737]() : (fn24("Unable to find onload callback '".concat(var737, "' immediately after loading, expected 'function', got '").concat(typeOf(win[var737]), "'.")), setTimeout(function() {
+			typeof win[var737] == "function" ? win[var737]() : fn24("Unable to find onload callback '".concat(var737, "' after 1 second, expected 'function', got '").concat(typeOf(win[var737]), "'."));
 		}, 1e3));
 	}, 0));
-	var743 = "turnstile" in window;
-	var744 = var743 ? fn45(window.turnstile) : undefined;
-	var745 = var743 && var739 ? fn43(window.turnstile, obj9, function() {
-		var var736;
-		window.turnstile = var703;
-		(var736 = fn45(var703)) === null || var736 === undefined || var736.reloadAfterUpgrade();
+	var738 = "turnstile" in window;
+	var739 = var738 ? fn45(window.turnstile) : undefined;
+	var740 = var738 && var734 ? fn43(window.turnstile, obj9, function() {
+		var var731;
+		window.turnstile = var698;
+		(var731 = fn45(var698)) === null || var731 === undefined || var731.reloadAfterUpgrade();
 		fn37(obj9);
 	}) : false;
-	var745 && (var744 == null || var744.clearPendingApiJsReloadRequest());
-	var743 && var739 && !var745 ? (fn24("Turnstile upgrade state was missing. Keeping the existing Turnstile instance."), var744 == null || var744.rejectPendingApiJsReloadRequest(), var744 == null || var744.rearmTimedUpgrade()) : var743 && !var739 ? fn24("Turnstile already has been loaded. Was Turnstile imported multiple times?") : (var745 || (window.turnstile = var703), var739 || ((var740 == null || (var746 = var740.params) === null || var746 === undefined ? undefined : var746.get("render")) !== "explicit" && arr7.push(var702), document.readyState === "complete" || document.readyState === "interactive" ? setTimeout(fn56, 0) : window.addEventListener("DOMContentLoaded", fn56)), fn54());
-	var var737, var738, var739, var740, var741, var742, var743, var744, var745, var746;
+	var740 && (var739 == null || var739.clearPendingApiJsReloadRequest());
+	var738 && var734 && !var740 ? (fn24("Turnstile upgrade state was missing. Keeping the existing Turnstile instance."), var739 == null || var739.rejectPendingApiJsReloadRequest(), var739 == null || var739.rearmTimedUpgrade()) : var738 && !var734 ? fn24("Turnstile already has been loaded. Was Turnstile imported multiple times?") : (var740 || (window.turnstile = var698), var734 || ((var735 == null || (var741 = var735.params) === null || var741 === undefined ? undefined : var741.get("render")) !== "explicit" && arr7.push(var697), document.readyState === "complete" || document.readyState === "interactive" ? setTimeout(fn55, 0) : window.addEventListener("DOMContentLoaded", fn55)), fn53());
+	var var732, var733, var734, var735, var736, var737, var738, var739, var740, var741;
 })();

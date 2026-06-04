@@ -39,7 +39,25 @@ const SANDBOX_PRELUDE: &str = r#"
   // constant instead corrupts seed/charset setup in legitimate string decoders,
   // mass-declining sound lifts (observed: ~+10% bloat on sample_11). Freezing a
   // clock read is independently unsound; this only makes the tool deterministic.
-  if (typeof g.Date === "function") { g.Date.now = function(){ return 0; }; }
+  //
+  // Freeze *every* wall-clock reader, not just `Date.now()`. The double-eval guard
+  // misses `new Date()` / `+new Date()` / `.getTime()` because two reads in the
+  // same millisecond agree (sample_7 leaked a `+new Date()` token timestamp into a
+  // lifted value). Pin `Date.now()` and the no-arg `new Date()` (and `Date()` as a
+  // function) to the epoch, while leaving `new Date(explicitArg)` exact so a real
+  // decoder's date math still works.
+  if (typeof g.Date === "function") {
+    var _RealDate = g.Date;
+    var FrozenDate = function(){
+      if (!(this instanceof FrozenDate)) return new _RealDate(0).toString();
+      return arguments.length === 0 ? new _RealDate(0) : new _RealDate(...arguments);
+    };
+    FrozenDate.prototype = _RealDate.prototype;
+    FrozenDate.now = function(){ return 0; };
+    FrozenDate.parse = _RealDate.parse;
+    FrozenDate.UTC = _RealDate.UTC;
+    g.Date = FrozenDate;
+  }
 
   var B="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   if (typeof g.atob === "undefined") {
@@ -177,6 +195,20 @@ impl Sandbox {
         *self.deadline.lock().unwrap() = None;
         result
     }
+
+    /// Evaluate `code` with `Math.random` pinned to the constant `seed` for the
+    /// duration of this call. Used by the lifter's *differential-seed* guard: a
+    /// decode whose result depends on RNG (`Math.floor(100*Math.random())`)
+    /// produces a different value under two different seeds and is refused, while
+    /// a decode independent of RNG (the common case — RNG, if used at all, only
+    /// shuffled a charset at setup time) yields the same value under any seed and
+    /// lifts. This catches the low-entropy collision a plain double-eval misses
+    /// (two real `Math.random()` draws over a small range agree ~1% of the time),
+    /// *without* freezing RNG during setup (which corrupts legitimate decoders).
+    pub fn eval_to_value_seeded(&self, code: &str, seed: f64) -> Option<EvalValue> {
+        let seeded = format!("Math.random = function () {{ return {seed}; }};\n{code}");
+        self.eval_to_value(&seeded)
+    }
 }
 
 /// Hard cap on the number of array elements (across all nesting) any single
@@ -301,7 +333,18 @@ const HARNESS_PRELUDE: &str = r#"
   // values). Unlike the partial-evaluation sandbox, here we DO freeze
   // Math.random — we are comparing two whole-program runs, not lifting a value,
   // so a stable RNG is exactly what we want.
-  if (typeof g.Date === "function") { g.Date.now = function(){ return 0; }; }
+  if (typeof g.Date === "function") {
+    var _RealDate = g.Date;
+    var FrozenDate = function(){
+      if (!(this instanceof FrozenDate)) return new _RealDate(0).toString();
+      return arguments.length === 0 ? new _RealDate(0) : new _RealDate(...arguments);
+    };
+    FrozenDate.prototype = _RealDate.prototype;
+    FrozenDate.now = function(){ return 0; };
+    FrozenDate.parse = _RealDate.parse;
+    FrozenDate.UTC = _RealDate.UTC;
+    g.Date = FrozenDate;
+  }
   g.Math.random = function(){ return 0.5; };
 
   // Console capture. Every variant funnels into one recorder that stringifies
