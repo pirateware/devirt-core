@@ -4,19 +4,20 @@
 - **Impact:** ~~Low (partial)~~ **Net-negative on its only target** · **Effort:** Medium · **Risk:** Low
 - **Pass:** `src/sandbox.rs` (`EvalValue` `:33-37`), `src/passes/decoder_lift.rs` (splice `:1821-1830`)
 
-> **STATUS (2026-06): DEFERRED — would bloat sample_9, the only beneficiary.** The
-> diagnosis is correct (the `var1` unpacker is pure and blocked only by scalar-only
-> `EvalValue`), but materializing the result is **net-negative**: `list2` is the
-> VM's bytecode table, decoded from a **~131 KB** packed string into tens of
-> thousands of integers. As an array literal `[8,12,5,…]` that is comparable-to-
-> larger than the packed string, so the output **grows**, and the VM still
-> interprets it (full lift stays out of scope). Replacing a compact packed string
-> with a giant int-array literal is not a readability or size win. No other current
-> sample has an array-returning decoder that would benefit. Adding an `EvalValue`
-> variant + array-splice path also widens the sandbox/equivalence-test surface for
-> zero positive payoff today. Revisit only if a future sample has a *small*
-> array-returning decoder, and gate any array splice on a tight size limit so it
-> can never bloat.
+> **STATUS (2026-06): IMPLEMENTED with a tight size cap (B3.1, branch
+> `ws-c-decoders`).** `EvalValue::Arr(Vec<EvalValue>)` added to `src/sandbox.rs`;
+> `eval_to_value` converts a flat primitive array element-wise, gated by
+> `MAX_ARRAY_ELEMS = 64` across all nesting. `decoder_lift` splices via a new
+> `eval_value_to_expr` helper that builds the array literal (declining on
+> NaN/Infinity, which have no literal form). `pure_eval` declines arrays.
+>
+> The cap is what makes this safe on sample_9: its `list2` bytecode array
+> (tens of thousands of ints) **exceeds the cap**, so it is never materialized —
+> sample_9 stays byte-identical (the original deferral concern). The win lands on
+> *small* array-returning decoders elsewhere: **sample_1 −6564 bytes**,
+> **sample_11 −4**. Tests: `lifts_small_array_returning_decoder` (should-fire),
+> `does_not_materialize_huge_array` (cap must-NOT-fire). Full suite green
+> (incl. the 80 equivalence cases); all samples converge + idempotent.
 
 ## Symptom
 

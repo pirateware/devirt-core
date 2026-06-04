@@ -69,15 +69,21 @@ pub struct Sandbox {
     _rt: Runtime,
 }
 
-/// A primitive decoder result, tagged by JS type so the lifter can splice the
-/// *correct* literal kind. Coercing a numeric result to a string literal (the
-/// old `eval_to_string`-only path) silently changed semantics: `dec(x) + 1`
-/// would go from numeric `262` to string `"2611"`.
+/// A decoder result, tagged by JS type so the lifter can splice the *correct*
+/// literal kind. Coercing a numeric result to a string literal (the old
+/// `eval_to_string`-only path) silently changed semantics: `dec(x) + 1` would go
+/// from numeric `262` to string `"2611"`.
+///
+/// `Arr` carries a flat array of primitives (no nesting, no holes) so an
+/// array-returning decoder can be materialized as an array literal. It is
+/// deliberately shallow: the splice path caps the element count so a huge bytecode
+/// table is never expanded (net-negative — see `issues/09`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum EvalValue {
     Str(String),
     Num(f64),
     Bool(bool),
+    Arr(Vec<EvalValue>),
 }
 
 impl Sandbox {
@@ -148,17 +154,47 @@ impl Sandbox {
         *self.deadline.lock().unwrap() = Some(Instant::now() + EVAL_BUDGET);
         let result = self.ctx.with(|ctx| {
             let v: rquickjs::Value = ctx.eval(code).ok()?;
-            if v.is_string() {
-                v.get::<String>().ok().map(EvalValue::Str)
-            } else if v.is_number() {
-                v.as_number().map(EvalValue::Num)
-            } else if v.is_bool() {
-                v.as_bool().map(EvalValue::Bool)
-            } else {
-                None
-            }
+            let mut budget = MAX_ARRAY_ELEMS;
+            value_to_eval(&v, &mut budget)
         });
         *self.deadline.lock().unwrap() = None;
         result
     }
+}
+
+/// Hard cap on the number of array elements (across all nesting) any single
+/// `eval_to_value` result may materialize. This keeps the array-splice from ever
+/// expanding a large packed table (e.g. a VM bytecode array) into a giant literal,
+/// which would bloat output for no readability win (`issues/09`).
+const MAX_ARRAY_ELEMS: usize = 64;
+
+/// Convert a QuickJS value to an [`EvalValue`], counting array elements against
+/// `budget`. Returns `None` for any non-primitive/non-flat-array value, a hole, or
+/// when the element budget is exhausted — those are not safe/desirable to splice.
+fn value_to_eval(v: &rquickjs::Value<'_>, budget: &mut usize) -> Option<EvalValue> {
+    if v.is_string() {
+        return v.get::<String>().ok().map(EvalValue::Str);
+    }
+    if v.is_number() {
+        return v.as_number().map(EvalValue::Num);
+    }
+    if v.is_bool() {
+        return v.as_bool().map(EvalValue::Bool);
+    }
+    if let Some(arr) = v.as_array() {
+        let len = arr.len();
+        if len > *budget {
+            return None; // would exceed the materialization cap
+        }
+        *budget -= len;
+        let mut out = Vec::with_capacity(len);
+        for i in 0..len {
+            // A hole or a non-convertible element disqualifies the whole array:
+            // splicing it would change semantics or require a non-literal form.
+            let elem: rquickjs::Value = arr.get(i).ok()?;
+            out.push(value_to_eval(&elem, budget)?);
+        }
+        return Some(EvalValue::Arr(out));
+    }
+    None
 }

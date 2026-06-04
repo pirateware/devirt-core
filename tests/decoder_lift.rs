@@ -236,6 +236,181 @@ fn does_not_lift_memo_decoder_with_observed_cache() {
 }
 
 #[test]
+fn lifts_through_bind_accessor_alias() {
+    // C3: a decoder aliased through `.bind()` (`g = dec.bind(null)`). `dec` is a
+    // pure, `this`-free decoder, so `g(i)` is observationally `dec(i)` and the call
+    // through the bound alias must lift to the decoded literal.
+    let src = r#"
+        (function () {
+            var tbl = ["alpha", "beta", "gamma"];
+            function dec(i) { return tbl[i]; }
+            var g = dec.bind(null);
+            sink(g(0), g(2));
+        })();
+    "#;
+    let out = deobfuscate(src, "t.js").code;
+    assert!(
+        out.contains("\"alpha\"") && out.contains("\"gamma\""),
+        "bound accessor-alias decode not lifted: {out}"
+    );
+    assert!(!out.contains("g("), "bound alias call survived: {out}");
+}
+
+#[test]
+fn does_not_lift_reassigned_bind_alias() {
+    // Adversarial: the bound alias `g` is reassigned to something else, so a baked
+    // `g = dec.bind(null)` would be stale at the call site. The `unstable` gate must
+    // drop it and leave the calls in place.
+    let src = r#"
+        (function () {
+            var tbl = ["alpha", "beta", "gamma"];
+            function dec(i) { return tbl[i]; }
+            var g = dec.bind(null);
+            g = other;
+            sink(g(0), g(2));
+        })();
+    "#;
+    let out = deobfuscate(src, "t.js").code;
+    // The alias is reassigned, so it must not be lifted: the calls must NOT be
+    // decoded into `sink("alpha", "gamma")`, and the reassignment must survive.
+    assert!(
+        !out.contains(r#"sink("alpha", "gamma")"#),
+        "reassigned bound alias must not be lifted: {out}"
+    );
+    assert!(out.contains("other"), "reassignment lost: {out}");
+}
+
+#[test]
+fn removes_nested_spent_rotation_iife() {
+    // C4: the Cloudflare shape — the array rotation IIFE is *nested* inside a larger
+    // wrapper IIFE, and the rotated table holder (`hold`) is read ONLY by the
+    // rotation (every decode site was already lifted). The rotation is then
+    // unobservable and must be removed; the next DCE round drops `hold`/`arr`.
+    let src = r#"
+        (function () {
+            var arr = ["log", "Hello", "warn"];
+            function hold() { var a = arr; hold = function () { return a; }; return hold(); }
+            (function (wrap) {
+                (function (get, k, list) {
+                    for (list = get(); true;) {
+                        if (k === 0) break;
+                        list.push(list.shift());
+                    }
+                })(hold, 0);
+                console[d(0)](d(1));
+            })();
+            function d(i) { return arr[i]; }
+        })();
+    "#;
+    let out = deobfuscate(src, "t.js").code;
+    // The decode resolves and the nested rotation (push/shift) must be gone.
+    assert!(
+        out.contains("console.log(\"Hello\")"),
+        "decode not lifted: {out}"
+    );
+    assert!(
+        !out.contains("push(") && !out.contains("shift("),
+        "nested spent rotation IIFE was not removed: {out}"
+    );
+}
+
+#[test]
+fn keeps_rotation_when_table_still_read() {
+    // Adversarial: the table holder is still read by live application code
+    // (`escape(hold)`), so the rotation is observable and MUST be kept — removing it
+    // would change the rotated array the live read observes.
+    let src = r#"
+        (function () {
+            var arr = ["log", "Hello", "warn"];
+            function hold() { return arr; }
+            (function (wrap) {
+                (function (get, k, list) {
+                    for (list = get(); true;) {
+                        if (k === 0) break;
+                        list.push(list.shift());
+                    }
+                })(hold, 0);
+                window.leak = hold;
+            })();
+        })();
+    "#;
+    let out = deobfuscate(src, "t.js").code;
+    // `hold` escapes to the host, so the rotation that mutates its array is
+    // observable and must survive.
+    assert!(
+        out.contains("push(") && out.contains("shift("),
+        "rotation over a still-read table must be kept: {out}"
+    );
+}
+
+#[test]
+fn lifts_small_array_returning_decoder() {
+    // B3: a pure decoder that returns a small literal array materializes to an
+    // array literal (the EvalValue::Arr splice). `unpack` builds `[1,2,3]` from a
+    // packed string; the call must become `[1, 2, 3]`.
+    let src = r#"
+        (function () {
+            function unpack(s) { return s.split(",").map(function (x) { return +x; }); }
+            sink(unpack("1,2,3"));
+        })();
+    "#;
+    let out = deobfuscate(src, "t.js").code;
+    assert!(
+        out.contains("[1, 2, 3]") || out.contains("[\n\t\t1,"),
+        "small array decoder not materialized: {out}"
+    );
+    assert!(
+        !out.contains("unpack("),
+        "array decoder call survived: {out}"
+    );
+}
+
+#[test]
+fn does_not_materialize_huge_array() {
+    // B3 bloat cap: a pure decoder returning a large array must NOT be expanded
+    // (materializing thousands of ints as a literal is net-negative — issues/09).
+    // The call must survive rather than splice a giant array literal.
+    let src = r#"
+        (function () {
+            function build(n) { var a = []; for (var i = 0; i < n; i++) a.push(i); return a; }
+            sink(build(500));
+        })();
+    "#;
+    let out = deobfuscate(src, "t.js").code;
+    assert!(
+        out.contains("build(500)"),
+        "huge array must not be materialized (cap): {out}"
+    );
+}
+
+#[test]
+fn does_not_lift_decoder_through_this_global_detection() {
+    // B3/C2 sound decline: the sample_7 Base91 chain bottoms out in a global-object
+    // detector that uses `this` and `new Function("return this")()`. Until a sound
+    // pure-call value-binding preamble + a narrowly-scoped global-idiom relaxation
+    // exist, such a decoder must NOT be lifted — `this`/`Function` poison the static
+    // purity gate, and that is the safe outcome (no transform). This locks in the
+    // decline so a future relaxation can't silently start lifting it unchecked.
+    let src = r#"
+        (function () {
+            function glob() { try { return new Function("return this")(); } catch (e) {} return this; }
+            var g = glob() || {};
+            var dec = g.TextDecoder;
+            var tbl = ["AAAA", "BBBB"];
+            function pick(i) { return dec ? new dec().decode(tbl[i]) : tbl[i]; }
+            sink(pick(0), pick(1));
+        })();
+    "#;
+    let out = deobfuscate(src, "t.js").code;
+    // The decoder chain must survive unresolved (the `this`/Function detector keeps
+    // it static-impure); no decode literal may replace the calls.
+    assert!(
+        out.contains("pick(0)") && out.contains("pick(1)"),
+        "this/Function-rooted decoder must be left in place: {out}"
+    );
+}
+
+#[test]
 fn lifts_object_keyed_arguments() {
     // Argument is a member of a pure object literal — still fully evaluable.
     let src = r#"

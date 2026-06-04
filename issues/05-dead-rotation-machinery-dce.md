@@ -4,7 +4,25 @@
 - **Impact:** ~~High~~ **Modest** · **Effort:** Medium · **Risk:** **Medium (soundness)**
 - **Pass:** `src/passes/decoder_lift.rs`, `src/passes/dce.rs`, `src/passes/dead_store.rs`
 
-> **STATUS (2026-06): DEFERRED — soundness risk outweighs the payoff.** Findings:
+> **STATUS UPDATE (2026-06, branch `ws-c-decoders`): the nested spent-rotation
+> removal landed (C4).** `decoder_lift`'s cleanup now (a) recognizes *self-caching
+> table providers* (`function call1(p){ p=<lit>.split(";"); call1=()=>p; return
+> call1() }`) whose ONLY external references are rotation-IIFE arguments — the array
+> escapes only via the provider's return, so if no live code calls it, it reaches
+> nothing; and (b) descends through transparent IIFE/block/try wrappers for both the
+> liveness scan and the removal, so the *nested* rotation (Cloudflare wraps it inside
+> the anti-bot init IIFE) is found and dropped. LivenessScan treats scaffolding
+> function declarations as dependency edges, not liveness, and excludes a provider's
+> own self-references — so the table is pinned live only by a non-scaffolding call.
+> Tests: `removes_nested_spent_rotation_iife`, `keeps_rotation_when_table_still_read`
+> (table escapes to host → kept). **Result: sample_6 −237 bytes** (rotation dropped;
+> the now self-referential `call1` + its table are left to a future nested-DCE pass).
+> sample_5 stays blocked by `fn12` (issue 06's declined case keeps the table live);
+> sample_8's `call1` is genuinely-live app code (`getElementById`-style), correctly
+> untouched. No regression; the must-NOT-fire test guards the escape case.
+>
+> **ORIGINAL STATUS (2026-06): DEFERRED — soundness risk outweighs the payoff.**
+> Findings:
 > - **sample_5 cannot be cleaned** — the rotation accessor (`var1 = get1`) is still
 >   read by `fn12` (the 22 unlifted calls of issue 06), so the cluster is live.
 >   Coupled to issue 06 (skipped).
