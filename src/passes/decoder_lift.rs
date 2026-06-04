@@ -258,6 +258,14 @@ impl Pass for DecoderLift {
         scaffolding.extend(data_names.iter().cloned());
         scaffolding.extend(aliases.keys().cloned());
         scaffolding.extend(private_caches.iter().cloned());
+        // Self-caching table *providers* (`function f(p){ p=<lit>.split(); f=()=>p;
+        // return f() }`) whose array reaches no live code — every reference to `f`
+        // outside its own body is a rotation-IIFE argument. These hold the spent
+        // string table behind a memo closure the name-based scaffolding model can't
+        // otherwise see; recognizing them lets the rotation (and then `f`) be
+        // dropped. Sound by construction: if any *other* reference to `f` exists, it
+        // is not added, so a still-called provider is always kept.
+        scaffolding.extend(collect_spent_providers(program));
         if self.cleanup_spent_rotations(program, &scaffolding) {
             self.changed = true;
         }
@@ -267,50 +275,41 @@ impl Pass for DecoderLift {
 }
 
 impl DecoderLift {
-    /// Remove top-level string-array *rotation* IIFEs that are now dead. A bare
+    /// Remove string-array *rotation* IIFEs that are now dead. A bare
     /// `(function(arr,n){ … arr.push(arr.shift()) … })(table, k);` statement only
     /// mutates the decoder `table`; once no live code reads that table (all decode
-    /// sites lifted), the rotation is unobservable and safe to drop. We remove
-    /// only the rotation statement — the now-unreferenced table/decoder bindings
-    /// fall to DCE on the next round.
+    /// sites lifted), the rotation is unobservable and safe to drop. We remove only
+    /// the rotation statement — the now-unreferenced table/decoder bindings fall to
+    /// DCE on the next round.
+    ///
+    /// The rotation may be *nested* one or more transparent wrappers deep (the
+    /// Cloudflare family wraps it inside the anti-bot init IIFE), so both the
+    /// liveness scan and the removal descend through wrapping IIFE / block / try
+    /// bodies — never into a real function/loop/branch (those are live logic).
     ///
     /// Liveness is name-based (like the rest of this pass): a scaffolding name is
-    /// *live* if a non-scaffolding statement references it, closed under the
-    /// scaffolding declarations' own dependencies. A rotation IIFE is removable
-    /// iff it touches no live scaffolding name.
+    /// *live* if any non-rotation code reads it, closed under the scaffolding
+    /// declarations' own dependencies. Reads that occur *inside* a recognized
+    /// rotation IIFE are deliberately excluded — they are exactly the reads the
+    /// rotation would shed. A rotation IIFE is removable iff every scaffolding name
+    /// it touches is dead under this closure.
     fn cleanup_spent_rotations(
         &self,
         program: &mut Program<'_>,
         scaffolding: &HashSet<String>,
     ) -> bool {
-        // Classify each top-level statement and gather the scaffolding names it
-        // references (identifier reads only).
-        let mut decl_deps: HashMap<String, HashSet<String>> = HashMap::new(); // name -> scaffolding refs in its init
-        let mut rotation_idx: Vec<(usize, HashSet<String>)> = Vec::new(); // (stmt index, touched scaffolding names)
-        let mut live: HashSet<String> = HashSet::new();
+        // Phase 1 — whole-program liveness, skipping rotation-IIFE subtrees.
+        let mut scan = LivenessScan {
+            scaffolding,
+            live: HashSet::new(),
+            decl_deps: HashMap::new(),
+        };
+        scan.visit_program(program);
+        let mut live = scan.live;
+        let decl_deps = scan.decl_deps;
 
-        for (i, stmt) in program.body.iter().enumerate() {
-            if let Some(names) = scaffold_decl_names(stmt, scaffolding) {
-                let refs = stmt_scaffold_refs(stmt, scaffolding);
-                for n in &names {
-                    decl_deps.insert(n.clone(), refs.clone());
-                }
-                continue;
-            }
-            if let Some(touched) = rotation_iife_touches(stmt, scaffolding) {
-                rotation_idx.push((i, touched));
-                continue;
-            }
-            // Real statement: every scaffolding name it reads is live.
-            live.extend(stmt_scaffold_refs(stmt, scaffolding));
-        }
-
-        if rotation_idx.is_empty() {
-            return false;
-        }
-
-        // Close `live` under declaration dependencies: if a live name is defined
-        // by a scaffolding decl, that decl's own scaffolding references are live.
+        // Close `live` under declaration dependencies: if a live name is defined by
+        // a scaffolding decl, that decl's own scaffolding references are live too.
         loop {
             let mut added = false;
             for (name, deps) in &decl_deps {
@@ -327,23 +326,255 @@ impl DecoderLift {
             }
         }
 
-        // Remove rotation IIFEs that touch only dead scaffolding.
-        let dead: HashSet<usize> = rotation_idx
-            .iter()
-            .filter(|(_, touched)| touched.is_disjoint(&live))
-            .map(|(i, _)| *i)
-            .collect();
-        if dead.is_empty() {
-            return false;
-        }
-        let mut idx = 0usize;
-        program.body.retain(|_| {
-            let keep = !dead.contains(&idx);
-            idx += 1;
-            keep
-        });
-        true
+        // Phase 2 — remove dead rotation statements at any transparent depth.
+        remove_dead_rotations(&mut program.body, scaffolding, &live)
     }
+}
+
+/// Remove rotation-IIFE expression statements (whose touched scaffolding is all
+/// dead) from `body` and from any transparent wrapper bodies it contains. Returns
+/// whether anything was removed.
+fn remove_dead_rotations<'a>(
+    body: &mut ArenaVec<'a, Statement<'a>>,
+    scaffolding: &HashSet<String>,
+    live: &HashSet<String>,
+) -> bool {
+    let mut changed = false;
+    // Recurse first so nested wrappers are cleaned regardless of the outer keep.
+    for stmt in body.iter_mut() {
+        if let Some(inner) = iife_body_mut(stmt) {
+            changed |= remove_dead_rotations(inner, scaffolding, live);
+        }
+        match stmt {
+            Statement::TryStatement(t) => {
+                changed |= remove_dead_rotations(&mut t.block.body, scaffolding, live);
+            }
+            Statement::BlockStatement(b) => {
+                changed |= remove_dead_rotations(&mut b.body, scaffolding, live);
+            }
+            _ => {}
+        }
+    }
+    let before = body.len();
+    body.retain(|stmt| match rotation_iife_touches(stmt, scaffolding) {
+        Some(touched) => !touched.is_disjoint(live), // keep iff it touches a live name
+        None => true,
+    });
+    changed || body.len() != before
+}
+
+/// Mutable counterpart of [`iife_body`]: the statement list of a transparent
+/// wrapping IIFE expression statement, if `stmt` is one.
+fn iife_body_mut<'b, 'a>(
+    stmt: &'b mut Statement<'a>,
+) -> Option<&'b mut ArenaVec<'a, Statement<'a>>> {
+    let Statement::ExpressionStatement(es) = stmt else {
+        return None;
+    };
+    let mut expr = &mut es.expression;
+    while let Expression::UnaryExpression(u) = expr {
+        expr = &mut u.argument;
+    }
+    let Expression::CallExpression(call) = expr else {
+        return None;
+    };
+    match &mut call.callee {
+        Expression::FunctionExpression(f) => f.body.as_mut().map(|b| &mut b.statements),
+        Expression::ArrowFunctionExpression(f) => Some(&mut f.body.statements),
+        _ => None,
+    }
+}
+
+/// Whole-program scan of scaffolding liveness that *excludes* reads inside a
+/// recognized rotation IIFE. It records, per scaffolding declaration, the
+/// scaffolding names its initializer references (the dependency edges the closure
+/// follows), and the set of scaffolding names read by any non-rotation code.
+struct LivenessScan<'r> {
+    scaffolding: &'r HashSet<String>,
+    live: HashSet<String>,
+    decl_deps: HashMap<String, HashSet<String>>,
+}
+
+impl<'a, 'r> Visit<'a> for LivenessScan<'r> {
+    fn visit_statement(&mut self, stmt: &Statement<'a>) {
+        // A scaffolding *var* declaration contributes dependency edges, not liveness.
+        if let Some(names) = scaffold_decl_names(stmt, self.scaffolding) {
+            let refs = stmt_scaffold_refs(stmt, self.scaffolding);
+            for n in &names {
+                self.decl_deps.insert(n.clone(), refs.clone());
+            }
+            return;
+        }
+        // A scaffolding *function* declaration (`function dec(){…}` / a spent
+        // provider) likewise contributes only dependency edges: the table reads in
+        // its body must not pin the table live — only a call from *non-scaffolding*
+        // code does. Self-references inside the body are dropped (a provider's own
+        // `return f()`/`f = …` is not external liveness).
+        if let Statement::FunctionDeclaration(func) = stmt {
+            if let Some(id) = &func.id {
+                if self.scaffolding.contains(id.name.as_str()) {
+                    let mut refs = stmt_scaffold_refs(stmt, self.scaffolding);
+                    refs.remove(id.name.as_str());
+                    self.decl_deps.insert(id.name.to_string(), refs);
+                    return;
+                }
+            }
+        }
+        oxc_ast_visit::walk::walk_statement(self, stmt);
+    }
+
+    fn visit_expression(&mut self, expr: &Expression<'a>) {
+        // Do not descend into a rotation IIFE: the scaffolding it reads is exactly
+        // what the rotation would shed, so those reads must not pin liveness.
+        if is_rotation_iife_expr(expr, self.scaffolding) {
+            return;
+        }
+        oxc_ast_visit::walk::walk_expression(self, expr);
+    }
+
+    fn visit_identifier_reference(&mut self, it: &oxc_ast::ast::IdentifierReference<'a>) {
+        if self.scaffolding.contains(it.name.as_str()) {
+            self.live.insert(it.name.to_string());
+        }
+    }
+}
+
+/// Find *self-caching table providers*: function declarations `f` whose body
+/// reassigns `f` to a closure returning a locally-built array (the `function
+/// f(p){ p = <lit>.split(...); f = function(){ return p }; return f() }` idiom),
+/// and whose only references *outside its own declaration* are arguments to a
+/// rotation IIFE. Such an `f` encapsulates a spent string table that reaches no
+/// live code, so the rotation that pumps it — and then `f` itself — is droppable.
+///
+/// Soundness: the array escapes only through `f()`'s return value, so if every
+/// outside reference is a rotation argument (which never lets the result escape:
+/// the rotation only push/shifts the array in place), no live code can observe it.
+/// Any other outside reference (a real call, an alias, a property access) leaves
+/// `f` out of the set, so a still-used provider is never touched.
+fn collect_spent_providers(program: &Program<'_>) -> HashSet<String> {
+    let mut scan = ProviderScan::default();
+    scan.visit_program(program);
+    scan.candidates
+        .iter()
+        .filter(|name| {
+            // Every reference outside the provider's own body must be a rotation
+            // argument. `inside_refs` are references within `f`'s own declaration
+            // (its self-assignment / self-call); `outside_refs` everything else.
+            let outside = scan.outside_refs.get(*name).copied().unwrap_or(0);
+            let rot = scan.rotation_arg_refs.get(*name).copied().unwrap_or(0);
+            outside > 0 && outside == rot
+        })
+        .cloned()
+        .collect()
+}
+
+#[derive(Default)]
+struct ProviderScan {
+    candidates: HashSet<String>,          // names with the self-caching shape
+    outside_refs: HashMap<String, usize>, // references outside the provider's body
+    rotation_arg_refs: HashMap<String, usize>, // those that are rotation IIFE args
+    /// Stack of provider names whose body we are currently inside (to exclude the
+    /// self-assignment / self-call from the "outside" reference count).
+    body_stack: Vec<String>,
+}
+
+impl<'a> Visit<'a> for ProviderScan {
+    fn visit_function(&mut self, func: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
+        let provider_name = func.id.as_ref().and_then(|id| {
+            is_self_caching_provider(func, id.name.as_str()).then(|| id.name.to_string())
+        });
+        if let Some(name) = &provider_name {
+            self.candidates.insert(name.clone());
+            self.body_stack.push(name.clone());
+        }
+        oxc_ast_visit::walk::walk_function(self, func, flags);
+        if provider_name.is_some() {
+            self.body_stack.pop();
+        }
+    }
+
+    fn visit_call_expression(&mut self, node: &oxc_ast::ast::CallExpression<'a>) {
+        // A rotation IIFE call: count any bare-identifier argument as a rotation-arg
+        // reference (the table provider is passed positionally, e.g. `(call1, k)`).
+        if matches!(
+            &node.callee,
+            Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_)
+        ) {
+            for a in &node.arguments {
+                if let Some(Expression::Identifier(id)) = a.as_expression() {
+                    *self
+                        .rotation_arg_refs
+                        .entry(id.name.to_string())
+                        .or_default() += 1;
+                }
+            }
+        }
+        oxc_ast_visit::walk::walk_call_expression(self, node);
+    }
+
+    fn visit_identifier_reference(&mut self, it: &oxc_ast::ast::IdentifierReference<'a>) {
+        // Count every reference that is not lexically inside the provider's own body.
+        if !self.body_stack.iter().any(|n| n == it.name.as_str()) {
+            *self.outside_refs.entry(it.name.to_string()).or_default() += 1;
+        }
+    }
+}
+
+/// Recognize the self-caching provider body for a function named `name`:
+/// somewhere in its body it reassigns `name = function(){ … }` (memoizing the
+/// table behind a fresh closure). The reassignment is the load-bearing signal: a
+/// plain decoder never overwrites its own binding.
+fn is_self_caching_provider(func: &oxc_ast::ast::Function<'_>, name: &str) -> bool {
+    struct SelfAssignScan<'n> {
+        name: &'n str,
+        found: bool,
+    }
+    impl<'a, 'n> Visit<'a> for SelfAssignScan<'n> {
+        fn visit_assignment_expression(&mut self, node: &oxc_ast::ast::AssignmentExpression<'a>) {
+            if let oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(t) = &node.left {
+                if t.name == self.name
+                    && matches!(
+                        &node.right,
+                        Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_)
+                    )
+                {
+                    self.found = true;
+                }
+            }
+            oxc_ast_visit::walk::walk_assignment_expression(self, node);
+        }
+    }
+    let Some(body) = &func.body else {
+        return false;
+    };
+    let mut s = SelfAssignScan { name, found: false };
+    for stmt in &body.statements {
+        s.visit_statement(stmt);
+    }
+    s.found
+}
+
+/// True if `expr` is a (unary-wrapped) rotation IIFE call: an IIFE that is pure
+/// modulo mutating scaffolding tables and touches at least one scaffolding name.
+fn is_rotation_iife_expr(expr: &Expression<'_>, scaffolding: &HashSet<String>) -> bool {
+    let mut e = expr;
+    while let Expression::UnaryExpression(u) = e {
+        e = &u.argument;
+    }
+    let Expression::CallExpression(call) = e else {
+        return false;
+    };
+    if !matches!(
+        &call.callee,
+        Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_)
+    ) {
+        return false;
+    }
+    let fv = freevars_of_expr(e);
+    if !fv.all_allowed(scaffolding, None, &HashSet::new()) {
+        return false;
+    }
+    fv.free().iter().any(|n| scaffolding.contains(n))
 }
 
 /// If `stmt` is a `var`/`let`/`const` declaration binding only scaffolding names

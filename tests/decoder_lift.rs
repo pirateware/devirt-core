@@ -281,6 +281,69 @@ fn does_not_lift_reassigned_bind_alias() {
 }
 
 #[test]
+fn removes_nested_spent_rotation_iife() {
+    // C4: the Cloudflare shape — the array rotation IIFE is *nested* inside a larger
+    // wrapper IIFE, and the rotated table holder (`hold`) is read ONLY by the
+    // rotation (every decode site was already lifted). The rotation is then
+    // unobservable and must be removed; the next DCE round drops `hold`/`arr`.
+    let src = r#"
+        (function () {
+            var arr = ["log", "Hello", "warn"];
+            function hold() { var a = arr; hold = function () { return a; }; return hold(); }
+            (function (wrap) {
+                (function (get, k, list) {
+                    for (list = get(); true;) {
+                        if (k === 0) break;
+                        list.push(list.shift());
+                    }
+                })(hold, 0);
+                console[d(0)](d(1));
+            })();
+            function d(i) { return arr[i]; }
+        })();
+    "#;
+    let out = deobfuscate(src, "t.js").code;
+    // The decode resolves and the nested rotation (push/shift) must be gone.
+    assert!(
+        out.contains("console.log(\"Hello\")"),
+        "decode not lifted: {out}"
+    );
+    assert!(
+        !out.contains("push(") && !out.contains("shift("),
+        "nested spent rotation IIFE was not removed: {out}"
+    );
+}
+
+#[test]
+fn keeps_rotation_when_table_still_read() {
+    // Adversarial: the table holder is still read by live application code
+    // (`escape(hold)`), so the rotation is observable and MUST be kept — removing it
+    // would change the rotated array the live read observes.
+    let src = r#"
+        (function () {
+            var arr = ["log", "Hello", "warn"];
+            function hold() { return arr; }
+            (function (wrap) {
+                (function (get, k, list) {
+                    for (list = get(); true;) {
+                        if (k === 0) break;
+                        list.push(list.shift());
+                    }
+                })(hold, 0);
+                window.leak = hold;
+            })();
+        })();
+    "#;
+    let out = deobfuscate(src, "t.js").code;
+    // `hold` escapes to the host, so the rotation that mutates its array is
+    // observable and must survive.
+    assert!(
+        out.contains("push(") && out.contains("shift("),
+        "rotation over a still-read table must be kept: {out}"
+    );
+}
+
+#[test]
 fn lifts_object_keyed_arguments() {
     // Argument is a member of a pure object literal — still fully evaluable.
     let src = r#"
