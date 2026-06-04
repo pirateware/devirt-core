@@ -1626,6 +1626,26 @@ fn pure_expression_resolution_preserves_value() {
 }
 
 #[test]
+fn conditional_nested_region_init_is_not_inlined() {
+    // B1 wall (sample_1's shape): a constant written by an init function that runs
+    // only inside a *conditionally-reached nested dispatcher case* must NOT be
+    // inlined cross-function — a read can observe the pre-init `undefined` (here,
+    // `case 1` reads L before `case 2`'s init writes it). The pipeline must leave
+    // the write and the symbolic reads in place; equivalence is the safety net.
+    assert_equivalent(
+        "__r = (function(){ \
+           var L; var out = []; \
+           function disp(s){ \
+             while (s) { switch (s) { \
+               case 1: out.push('' + L); s = 2; break; \
+               case 2: init(); s = 3; break; \
+               case 3: out.push('' + L); s = 0; break; } } \
+             function init(){ L = 9; } } \
+           disp(1); return out.join(','); })();",
+    );
+}
+
+#[test]
 fn nondeterministic_and_nonpure_writes_are_not_resolved() {
     // B4 adversarial: an RHS over an impure call (`Date.now()`) or a non-write-once
     // operand must be left alone. Equivalence is the safety net — the value must

@@ -183,6 +183,31 @@ fn member_written_table_labels_stay_symbolic() {
 }
 
 #[test]
+fn conditional_nested_init_constant_stays_symbolic() {
+    // B1 wall (sample_1): a label constant written by an init function that runs
+    // inside a conditionally-reached nested dispatcher case is NOT setup-complete
+    // (the dispatcher's state-reachability is not statically proven), so it must
+    // stay symbolic. Inlining it would be unsound — a read on an earlier case can
+    // observe the pre-init `undefined`.
+    let out = deob(
+        "(function(){ \
+           var L; var out = []; \
+           function disp(s){ \
+             while (s) { switch (s) { \
+               case 1: out.push('' + L); s = 2; break; \
+               case 2: init(); s = 3; break; \
+               case 3: out.push('' + L); s = 0; break; } } \
+             function init(){ L = 9; } } \
+           disp(1); sink(out.join(',')); })();",
+    );
+    // The init write survives (constant not inlined / write not DCE'd).
+    assert!(
+        out.contains("= 9"),
+        "conditional nested-init constant was unsoundly inlined: {out}"
+    );
+}
+
+#[test]
 fn idempotent_on_nested_obfuscation() {
     let src = "function f(){ var a = 1, b = 2; if (!!1) return a + b; }";
     let once = deobfuscate(src, "t.js").code;

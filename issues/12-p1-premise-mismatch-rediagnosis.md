@@ -53,3 +53,50 @@ Effort routed to where sound, equivalence-validated progress is reachable:
   by the differential equivalence battery on synthetic branch/loop/nested
   dispatchers — a new capability that does not depend on the headline-sample
   const-resolution above.
+
+## STATUS (ws-b-resolution / B1) — wall confirmed precisely; sound DECLINE shipped
+
+Refined diagnosis of s1's label-init ordering. The real shape is:
+
+```text
+// deep inside a top-level flattened dispatcher var3=fn37(...), in `case 772:`
+var2574 = (function FTQAbjUkpF() {
+   fn22(); fn31(); fn19();              // fn19() writes the labels var43x..var47x
+   var var431..var476;                  // the label bindings
+   var dispatch = function(...) { ... switch(s){ case var475: ... } };  // reads
+   ...
+   return SomeCtor;
+})();                                    // IIFE, but NESTED ~6 levels, in a case
+```
+
+So `var2574 = (IIFE)()` *is* an IIFE-init, but the IIFE is **not a top-level
+statement** — it lives inside `case 772:` of an outer flattened dispatcher. The
+`OrderingOracle` only registers regions for the program body and *top-level* IIFE
+statements (`iife_region` scans `program.body`), so `fn19();` is never found as a
+bare init-call in a recognized region → `writes_before_all_reads` returns false
+(verified by instrumentation: every per-symbol gate passes — single write,
+unconditional, writer called once, 6 reads — only the region/ordering proof
+declines). That is the entire reason GCI reports `inlined=0` of `1083` on that
+round.
+
+**Why a sound widening is not landed.** Registering the nested IIFE as a setup
+region would require proving the IIFE *runs unconditionally* — but it runs only
+when the outer dispatcher's state reaches `772`, a fact that depends on the outer
+state machine's reachability, which is exactly the kind of conditional ordering we
+cannot statically prove without risking an unsound inline (a label read on a
+sibling case can execute before `fn19()` writes it). Per the task's hard
+invariant, B1 ships a **sound DECLINE** rather than an unsound inline.
+
+**Adversarial tests locking in the sound decline** (a constant written by an init
+that runs inside a conditionally-reached nested dispatcher case must stay symbolic
+— a read on an earlier case observes the pre-init `undefined`):
+- `conditional_nested_init_constant_stays_symbolic` (`tests/phase1.rs`)
+- `conditional_nested_region_init_is_not_inlined` (`tests/equivalence.rs`)
+
+**To actually resolve s1 (future work):** a constructor/nested-setup
+happens-before proof that (a) recognizes a nested IIFE/ctor region reached
+*unconditionally* from a proven-setup parent and (b) proves no label-reading
+function is reachable before the nested init completes — i.e. model the outer
+flattened dispatcher's guaranteed execution order. This is the novel,
+soundness-delicate mechanism issue 12 flagged as out of scope for a bounded sound
+widening, and it remains so.
