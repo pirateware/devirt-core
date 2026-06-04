@@ -4,7 +4,7 @@
 - **Samples (quarantined in `KNOWN_BUGS`):** `seed_09_base64__{controlflow,deadcode,numbers_keys,strong}`,
   `seed_13_try_catch__{deadcode,strong}`.
 - **Impact:** **Soundness** (wrong output) · **Effort:** Medium-High
-- **Status:** PARTIALLY FIXED — simple shapes fixed; obscured shapes open.
+- **Status:** ✅ FIXED — all six quarantined cases pass; `KNOWN_BUGS` is now empty.
 
 ## Symptom
 
@@ -33,30 +33,44 @@ This fixed `seed_09` under `minimal` / `strarr_base64` / `strarr_rc4` and made s
 *real* samples slightly larger (previously-unsound folds now declined, behavior
 preserved — verified by the equivalence harness).
 
-## What remains (this issue)
+## Root cause (the obscured shapes) and the fix
 
-Under **control-flow flattening / dead-code injection**, the same fold still
-happens. On the clean repro (`b64encode` obfuscated with the `controlflow`
-profile, then deobfuscated) the folding pass is **not** `ssa-opt` or
-`global-const-inline` (both report 0 changes and correctly exclude the array).
-The passes that *do* change are `const-fold`, `inline-single-use`, `decoder-lift`,
-`member-normalize`, `dce`. So in a round *before* the mutation is statically
-visible (CFF has scattered `a.push` across switch-dispatched blocks, or the
-property is still a string-array index), one of these substitutes `[]` for `a`
-into a `.length` / `a[i]` read, then `const-fold` reduces `[].length`→0 /
-`[][i]`→undefined.
+A per-round AST bisect pinned **`decoder-lift`** as the folder in both remaining
+shapes — it bakes a binding's initial `[]`/`{}` into the sandbox preamble and
+then evaluates reads of it (`t.length`, `t[i]`) to the empty-literal value. Two
+distinct gates let a *mutated* aggregate through:
 
-### Next step
+1. **`seed_09` (function-local `bytes`)** — the SSA escape query
+   `mutable_aggregate_tables` (`src/ir/analysis.rs`) failed to disqualify a
+   receiver mutated through an **opaque computed-method call**
+   (`bytes[_dec("push")](b)`, before the string decode lands). Its
+   `visit_call_expression` only treated a *string-literal* computed key as a
+   possible mutator and fell through (`_ => None`, a clean read) for a decoder-
+   call key — the inverse of conservative. Fixed by assuming an opaque computed
+   method name **may** mutate (matching the already-correct logic in
+   `src/ir/consts.rs`).
 
-Per-round AST bisect on the clean `controlflow` repro to pin the exact pass and
-round, then give that pass the same mutator-aware escape gate (or make the
-empty-array-literal substitution refuse a binding that is mutated anywhere in the
-program — the `mutable_aggregate_tables` query already computes exactly this set
-and could be consulted by the inliner / const-fold member rule).
+2. **`seed_13` (top-level `const log = []`, pushed to in a `finally`)** —
+   `decoder-lift`'s `classify` seeds its pure-data set from top-level
+   `is_pure_data` initializers, gated only by `scan_unstable` (bare reassigns /
+   `++`). That scan is blind to `.push`/member mutation, so `log` entered the
+   pure set, was baked as `[]`, and `log.length` folded to 0. Fixed with a new
+   `scan_live_mutated` query (`src/passes/decoder_lift.rs`) that flags an
+   aggregate mutated by anything **other than** the canonical length-preserving
+   rotation `t.push(t.shift())` / `t.unshift(t.pop())`. A rotation-only table
+   stays bakeable (the rotation IIFE is replayed verbatim in the preamble); a
+   table the live program grows/edits is excluded.
 
-## Why quarantined, not reverted
+`scan_live_mutated` is the decoder-lift-specific complement to
+`mutable_aggregate_tables`: the latter (correctly) rejects *every* mutated
+aggregate and so cannot be used here — it would also drop the rotated string-array
+decoder tables this pass exists to lift.
 
-The partial fix is sound and a net improvement (it fixes the common shapes and
-tightens real-sample folding). The residual obscured shapes are a pre-existing
-latent bug the new corpus surfaced; they are quarantined (loudly, in `KNOWN_BUGS`)
-so the suite stays green while the remaining fold path is tracked here.
+## Verification
+
+All six formerly-quarantined cases now reproduce their expected program output
+byte-for-byte; `KNOWN_BUGS` in `tests/generated_corpus.rs` is empty. The
+behavior-equivalence and determinism harnesses pass. Two real samples re-blessed
+(`sample_7`, `sample_14_recaptcha`): both changes are in the **conservative**
+direction (a declined fold, plus an incidental deterministic preamble-layout
+shift in a baked stack-trace line number) — never a changed behavior.

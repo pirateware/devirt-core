@@ -36,22 +36,14 @@ fn generated_dir() -> PathBuf {
 /// assertion but reported loudly every run so they are never silently forgotten.
 /// See `issues/13-mutated-array-length-fold.md`.
 ///
-/// One bug class: a mutated array's `.length` / element read folds to its *empty
-/// literal* value (`a.length`→0, `a[i]`→undefined) when aggressive obfuscation
-/// (control-flow flattening, dead-code injection) obscures the mutation enough
-/// that an inlining/folding pass substitutes `[]` for the binding in a round
-/// before the mutation is visible. The simple shapes are fixed (the escape
-/// analyses now exclude mutator-method receivers); these obscured shapes remain.
-const KNOWN_BUGS: &[&str] = &[
-    // base64 codec (`const bytes=[]; bytes.push(…); … bytes.length`/`bytes[i]`):
-    "seed_09_base64__controlflow.js",
-    "seed_09_base64__deadcode.js",
-    "seed_09_base64__numbers_keys.js",
-    "seed_09_base64__strong.js",
-    // closure-captured `const log=[]` mutated in a `finally`:
-    "seed_13_try_catch__deadcode.js",
-    "seed_13_try_catch__strong.js",
-];
+/// Empty: the mutated-array `.length`/element fold (`a.length`→0, `a[i]`→undefined
+/// for a `const a=[]` that is later `a.push(…)`-ed) is now fully fixed under every
+/// obfuscation profile. The remaining hole was decoder-lift baking a mutated
+/// aggregate into the sandbox preamble as its empty literal: closed by excluding
+/// `mutable_aggregate_tables` from the pure-data seed and by treating an opaque
+/// computed-method call (`a[_dec("push")](x)`) as a possible mutator in the SSA
+/// escape scan. Keep this list as the quarantine hook for any future regression.
+const KNOWN_BUGS: &[&str] = &[];
 
 struct Case {
     name: String,

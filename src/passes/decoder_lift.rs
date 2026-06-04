@@ -196,9 +196,22 @@ impl Pass for DecoderLift {
         // proven pure and lifted. See `collect_value_bindings`.
         let value_bindings = collect_value_bindings(program, &unstable, allocator);
 
+        // Aggregates mutated by *non-rotation* code (`t.push(value)`, `t[i]=x`,
+        // `delete t[k]`, …). A pure-data table that is only ever *rotated*
+        // (`t.push(t.shift())`) stays bakeable — the rotation IIFE is replayed in
+        // the sandbox preamble, so the baked table matches runtime and the rotation
+        // is length-preserving. But a table the *live* program mutates (a base64
+        // `bytes.push(b)` accumulator, a `log.push(msg)` sink) is NOT reproduced in
+        // the preamble: baking its `[]` and folding `t.length`→0 / `t[i]`→undefined
+        // is the soundness bug in issues/13. `mutable_aggregate_tables` (used for the
+        // SSA-grade `local_data` gate) cannot be used here because it also rejects
+        // the legitimately-rotated decoder tables this pass exists to lift.
+        let live_mutated = scan_live_mutated(program);
+
         let analysis = classify(
             &tops,
             &unstable,
+            &live_mutated,
             &data_names,
             scoped_funcs,
             &value_bindings,
@@ -1122,6 +1135,7 @@ struct Pending {
 fn classify(
     tops: &[&Statement<'_>],
     unstable: &HashSet<String>,
+    live_mutated: &HashSet<String>,
     seed_pure: &HashSet<String>,
     scoped_funcs: Vec<Pending>,
     value_bindings: &[ValueBinding],
@@ -1152,6 +1166,17 @@ fn classify(
                 };
                 let Some(init) = &d.init else { continue };
                 if unstable.contains(id.name.as_str()) {
+                    continue;
+                }
+                // A pure-data aggregate the *live* program mutates by anything other
+                // than a rotation (`bytes.push(b)`, `log.push(msg)`, `t[i]=x`) is not
+                // a stable immutable table: baking its initial `[]`/`{}` into the
+                // sandbox preamble would fold reads like `t.length`→0 / `t[i]`→
+                // undefined against a value the live mutation has since changed
+                // (issues/13). `unstable` (bare reassigns/updates only) is blind to
+                // method/member mutation, so this closes that hole — while still
+                // admitting a table that is *only* rotated (replayed in the preamble).
+                if live_mutated.contains(id.name.as_str()) {
                     continue;
                 }
                 if is_pure_data(init) {
@@ -1545,6 +1570,143 @@ fn scan_unstable(program: &Program<'_>) -> HashSet<String> {
         }
     }
     out
+}
+
+/// Names mutated by *non-rotation* code: a member write (`t[k]=x`, `t.p=x`), a
+/// member update (`t[k]++`), `delete t[k]`, or a mutator-method call (`t.push(v)`,
+/// `t.splice(…)`) that is **not** the canonical length-preserving rotation
+/// `t.push(t.shift())` / `t.unshift(t.pop())`.
+///
+/// This is the decoder-lift-specific complement to `mutable_aggregate_tables`: it
+/// deliberately *keeps* a table that is only ever rotated (the rotation IIFE is
+/// replayed verbatim in the sandbox preamble, so the baked table matches runtime),
+/// while rejecting a table the live program grows/edits — whose `[]`/`{}` start
+/// state, baked into the preamble, would mis-fold `t.length`/`t[i]` reads.
+fn scan_live_mutated(program: &Program<'_>) -> HashSet<String> {
+    let mut s = LiveMutScan::default();
+    s.visit_program(program);
+    s.mutated
+}
+
+#[derive(Default)]
+struct LiveMutScan {
+    mutated: HashSet<String>,
+}
+
+impl LiveMutScan {
+    fn flag(&mut self, name: Option<String>) {
+        if let Some(n) = name {
+            self.mutated.insert(n);
+        }
+    }
+}
+
+/// Is `call` the canonical self-rotation `base.push(base.shift())` /
+/// `base.unshift(base.pop())` — a length-preserving reorder reproduced faithfully
+/// in the sandbox preamble — on the receiver whose base name is `base`?
+fn is_rotation_call(call: &oxc_ast::ast::CallExpression<'_>, base: &Option<String>) -> bool {
+    let Some(base) = base else { return false };
+    let outer = match &call.callee {
+        Expression::StaticMemberExpression(m) => m.property.name.as_str(),
+        Expression::ComputedMemberExpression(m) => match &m.expression {
+            Expression::StringLiteral(s) => s.value.as_str(),
+            _ => return false,
+        },
+        _ => return false,
+    };
+    let inner_method = match outer {
+        "push" => "shift",
+        "unshift" => "pop",
+        _ => return false,
+    };
+    if call.arguments.len() != 1 {
+        return false;
+    }
+    let Some(Expression::CallExpression(inner)) = call.arguments[0].as_expression() else {
+        return false;
+    };
+    let (m_name, m_obj) = match &inner.callee {
+        Expression::StaticMemberExpression(m) => (m.property.name.as_str(), &m.object),
+        Expression::ComputedMemberExpression(m) => match &m.expression {
+            Expression::StringLiteral(s) => (s.value.as_str(), &m.object),
+            _ => return false,
+        },
+        _ => return false,
+    };
+    m_name == inner_method
+        && inner.arguments.is_empty()
+        && member_base(m_obj).as_deref() == Some(base.as_str())
+}
+
+impl<'a> Visit<'a> for LiveMutScan {
+    fn visit_assignment_expression(&mut self, node: &oxc_ast::ast::AssignmentExpression<'a>) {
+        use oxc_ast::ast::AssignmentTarget as T;
+        // Only member-target writes mutate an aggregate's contents; a bare
+        // reassignment (`t = …`) is already covered by `unstable`.
+        if matches!(
+            &node.left,
+            T::StaticMemberExpression(_)
+                | T::ComputedMemberExpression(_)
+                | T::PrivateFieldExpression(_)
+        ) {
+            let base = assign_target_base(&node.left);
+            self.flag(base);
+        }
+        oxc_ast_visit::walk::walk_assignment_expression(self, node);
+    }
+
+    fn visit_update_expression(&mut self, node: &oxc_ast::ast::UpdateExpression<'a>) {
+        use oxc_ast::ast::SimpleAssignmentTarget as S;
+        if matches!(
+            &node.argument,
+            S::StaticMemberExpression(_) | S::ComputedMemberExpression(_)
+        ) {
+            let base = simple_target_base(&node.argument);
+            self.flag(base);
+        }
+        oxc_ast_visit::walk::walk_update_expression(self, node);
+    }
+
+    fn visit_unary_expression(&mut self, node: &oxc_ast::ast::UnaryExpression<'a>) {
+        if matches!(node.operator, oxc_syntax::operator::UnaryOperator::Delete) {
+            let base = match &node.argument {
+                Expression::StaticMemberExpression(m) => member_base(&m.object),
+                Expression::ComputedMemberExpression(m) => member_base(&m.object),
+                _ => None,
+            };
+            self.flag(base);
+        }
+        oxc_ast_visit::walk::walk_unary_expression(self, node);
+    }
+
+    fn visit_call_expression(&mut self, node: &oxc_ast::ast::CallExpression<'a>) {
+        let recv = match &node.callee {
+            Expression::StaticMemberExpression(m) => Some((m.property.name.as_str(), &m.object)),
+            Expression::ComputedMemberExpression(m) => match &m.expression {
+                Expression::StringLiteral(s) => Some((s.value.as_str(), &m.object)),
+                // An opaque computed method name (`t[_dec("push")](x)`) could be a
+                // mutator we can't see — conservatively flag it (it is, by
+                // construction, not the literal `t.push(t.shift())` rotation shape).
+                _ => Some(("", &m.object)),
+            },
+            _ => None,
+        };
+        if let Some((name, obj)) = recv {
+            let base = member_base(obj);
+            if is_rotation_call(node, &base) {
+                // `t.push(t.shift())`: a self-contained, length-preserving rotation
+                // reproduced verbatim in the preamble. Do NOT descend — the inner
+                // `t.shift()` is itself a mutator call that would otherwise be
+                // (spuriously) flagged as a live mutation of `t`.
+                return;
+            }
+            let mutates = name.is_empty() || MUTATOR_METHODS.contains(&name);
+            if mutates {
+                self.flag(base);
+            }
+        }
+        oxc_ast_visit::walk::walk_call_expression(self, node);
+    }
 }
 
 #[derive(Default)]

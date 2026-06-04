@@ -252,20 +252,30 @@ impl<'a, 's> Visit<'a> for TableScan<'s> {
     }
 
     fn visit_call_expression(&mut self, node: &CallExpression<'a>) {
-        // A mutator method on a candidate (`t.push(x)`) mutates the table.
-        let recv = match &node.callee {
-            Expression::StaticMemberExpression(m) => Some((m.property.name.as_str(), &m.object)),
-            Expression::ComputedMemberExpression(m) => match &m.expression {
-                Expression::StringLiteral(s) => Some((s.value.as_str(), &m.object)),
-                _ => None,
-            },
+        // A method call on a candidate (`t.push(x)`) may mutate the table. We
+        // disqualify the receiver when the method *might* be a mutator:
+        //   * a static / string-literal method name in `MUTATOR_METHODS`;
+        //   * an **opaque** computed method name (`t[_dec("push")](x)` before the
+        //     string decode lands, `t[k](x)`, …) — we cannot prove it is a pure
+        //     read, so conservatively assume it mutates. Treating this as a clean
+        //     read is the soundness hole that let a mutated `[]` keep its
+        //     empty-literal identity and fold `t.length`→0 / `t[i]`→undefined.
+        let maybe_mutator = match &node.callee {
+            Expression::StaticMemberExpression(m) => {
+                Some((MUTATOR_METHODS.contains(&m.property.name.as_str()), &m.object))
+            }
+            Expression::ComputedMemberExpression(m) => {
+                let mutating = match &m.expression {
+                    Expression::StringLiteral(s) => MUTATOR_METHODS.contains(&s.value.as_str()),
+                    _ => true, // opaque method name — conservatively a possible mutator
+                };
+                Some((mutating, &m.object))
+            }
             _ => None,
         };
-        if let Some((name, obj)) = recv {
-            if MUTATOR_METHODS.contains(&name) {
-                if let Some(sym) = self.obj_sym(obj) {
-                    self.disqualified.insert(sym);
-                }
+        if let Some((true, obj)) = maybe_mutator {
+            if let Some(sym) = self.obj_sym(obj) {
+                self.disqualified.insert(sym);
             }
         }
         walk::walk_call_expression(self, node);
