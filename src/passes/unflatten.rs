@@ -370,6 +370,11 @@ enum CaseEnd {
     Step(Trans),
     /// `return`/`throw`: the machine stops here.
     Terminal,
+    /// No `break`/terminator: control falls through into the *textually next*
+    /// case's body. The payload is that successor case's (integer) state label, so
+    /// the simulator continues there. A case that falls off the end of the switch
+    /// (no successor) is not modelled — `parse_cases` declines.
+    FallThrough(i64),
 }
 
 pub(crate) struct ParsedCase<'b, 'a> {
@@ -384,16 +389,51 @@ pub(crate) fn parse_cases<'b, 'a>(
     s: &str,
 ) -> Option<HashMap<i64, ParsedCase<'b, 'a>>> {
     let mut out = HashMap::new();
+    // Each case's integer label, in textual order, so a fall-through case (no
+    // `break`) can name its successor's state. Computed up front; a non-integer
+    // label anywhere makes the whole switch unmodellable.
+    let mut labels: Vec<i64> = Vec::with_capacity(switch.cases.len());
     for case in &switch.cases {
-        let state = int_literal(case.test.as_ref()?)?;
+        labels.push(int_literal(case.test.as_ref()?)?);
+    }
+    for (ci, case) in switch.cases.iter().enumerate() {
+        let state = labels[ci];
         // Obfuscators wrap each case body in a block (`case X: { … } break;`). Inline
         // transparent blocks (no block-scoped declarations) so the transition and
         // terminator become visible at the case's top level.
         let mut flat: Vec<&Statement> = Vec::new();
         flatten_case(&case.consequent, &mut flat);
         // The first top-level terminator decides the case end; anything after it is
-        // dead (e.g. a `break` after a `return`).
-        let term_idx = flat.iter().position(|st| is_top_level_control(st))?;
+        // dead (e.g. a `break` after a `return`). A case with *no* top-level control
+        // statement falls through into the textually-next case's body.
+        let Some(term_idx) = flat.iter().position(|st| is_top_level_control(st)) else {
+            // Fall-through: emit this case's body, then continue at the next case.
+            let Some(&next_state) = labels.get(ci + 1) else {
+                return None; // falls off the end of the switch — unmodelled
+            };
+            // The body must be dispatch-clean (no mention of `s`): there is no
+            // transition to drop here, so any reference/write to `s` is unmodelled.
+            let mut emit = Vec::new();
+            for &st in &flat {
+                if mentions(st, s) {
+                    return None;
+                }
+                emit.push(st);
+            }
+            if out
+                .insert(
+                    state,
+                    ParsedCase {
+                        emit,
+                        end: CaseEnd::FallThrough(next_state),
+                    },
+                )
+                .is_some()
+            {
+                return None; // duplicate case label
+            }
+            continue;
+        };
         let (end, upto, terminal_incl) = match flat[term_idx] {
             Statement::BreakStatement(b) if b.label.is_none() => {
                 let next = sole_transition(&flat[..term_idx], s)?;
@@ -548,15 +588,37 @@ pub(crate) fn simulate<'a>(
         if !visited.insert(state) {
             return None; // revisited state → real loop, not a linear chain
         }
-        let case = cases.get(&state)?; // no matching case + no default → unmodeled
-        for st in &case.emit {
-            // Deep-clone each emitted statement into the arena so it survives the
-            // splice that replaces the original dispatcher.
-            seq.push((*st).clone_in(alloc));
-        }
-        match case.end {
-            CaseEnd::Step(t) => state = t.apply(state),
-            CaseEnd::Terminal => return Some((seq, ExitMode::Terminal)),
+        // Run the case at `state`, following any `break`-less fall-through into the
+        // textually-next case *within the same switch iteration* (the loop test is
+        // NOT re-checked between fall-through cases — control never returns to the
+        // dispatcher until a `break`/terminator). A fall-through chain is bounded by
+        // the distinct case labels; a step/terminal/cycle ends it.
+        let mut ft_seen: HashSet<i64> = HashSet::new();
+        loop {
+            if !ft_seen.insert(state) {
+                return None; // fall-through revisiting a label → not a linear chain
+            }
+            let case = cases.get(&state)?; // no matching case + no default → unmodeled
+            for st in &case.emit {
+                // Deep-clone each emitted statement into the arena so it survives the
+                // splice that replaces the original dispatcher.
+                seq.push((*st).clone_in(alloc));
+            }
+            match case.end {
+                CaseEnd::Step(t) => {
+                    state = t.apply(state);
+                    break;
+                }
+                CaseEnd::Terminal => return Some((seq, ExitMode::Terminal)),
+                CaseEnd::FallThrough(next) => {
+                    // Continue into the successor case body; mark it visited at the
+                    // outer level too so a later `break` back to it is still a cycle.
+                    if !visited.insert(next) {
+                        return None;
+                    }
+                    state = next;
+                }
+            }
         }
         // `do…while`: the body has run; the test now decides whether to continue.
         if kind == LoopKind::DoWhile && !test.continues(state) {

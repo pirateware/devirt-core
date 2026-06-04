@@ -150,6 +150,51 @@ fn symbolic_const_labels_collapse() {
 }
 
 #[test]
+fn fall_through_case_collapses() {
+    // Case 1 has no `break`/transition: control falls through into case 2's body
+    // (textual successor), so the run order is a(), b(). Then 2 -> 0 exits.
+    let out = deob(
+        "var s = 1; while (s) { switch (s) { \
+         case 1: a(); case 2: b(); s = 0; break; } }",
+    );
+    assert!(
+        !out.contains("switch") && !out.contains("while"),
+        "fall-through not unflattened: {out}"
+    );
+    let (ia, ib) = (out.find("a()").unwrap(), out.find("b()").unwrap());
+    assert!(ia < ib, "fall-through order wrong: {out}");
+}
+
+#[test]
+fn fall_through_chain_to_jump_target_collapses() {
+    // Jump into a fall-through group: 1 -> a(); jump to 2. 2 falls into 3.
+    // Order: a(), then (entering at 2) b(), c().
+    let out = deob(
+        "var s = 1; while (s) { switch (s) { \
+         case 1: a(); s = 2; break; case 2: b(); case 3: c(); s = 0; break; } }",
+    );
+    assert!(!out.contains("switch"), "not unflattened: {out}");
+    let ia = out.find("a()").unwrap();
+    let ib = out.find("b()").unwrap();
+    let ic = out.find("c()").unwrap();
+    assert!(ia < ib && ib < ic, "order wrong: {out}");
+}
+
+#[test]
+fn fall_through_off_end_is_kept() {
+    // The last case falls through with no textual successor: falling off the end
+    // of the switch is not a state transition we can follow — must decline.
+    let out = deob(
+        "var s = 1; while (s) { switch (s) { \
+         case 1: a(); s = 2; break; case 2: b(); } }",
+    );
+    assert!(
+        out.contains("switch"),
+        "fall-off-end wrongly unflattened: {out}"
+    );
+}
+
+#[test]
 fn real_do_while_loop_is_kept() {
     // A genuine loop (revisits state 1) must NOT be linearized.
     let out = deob(

@@ -1197,6 +1197,54 @@ fn unflatten_dispatcher_preserves_value() {
 }
 
 #[test]
+fn unflatten_mul_and_fallthrough_preserve_value() {
+    // Multiplicative transition: 1 -> 3 -> 12 (exit). acc = 10 + 20.
+    assert_equivalent(
+        r#"
+        var acc = 0;
+        var s = 1;
+        while (s != 12) {
+            switch (s) {
+                case 1: acc += 10; s *= 3; break;
+                case 3: acc += 20; s *= 4; break;
+            }
+        }
+        __r = acc;
+        "#,
+    );
+    // Fall-through: case 1 has no break, control flows into case 2's body.
+    // Run order is acc += 10 then acc += 20 -> acc = 30.
+    assert_equivalent(
+        r#"
+        var acc = 0;
+        var s = 1;
+        while (s) {
+            switch (s) {
+                case 1: acc += 10;
+                case 2: acc += 20; s = 0; break;
+            }
+        }
+        __r = acc;
+        "#,
+    );
+    // Jump into a fall-through group: 1 -> 2, then 2 falls into 3.
+    assert_equivalent(
+        r#"
+        var acc = 0;
+        var s = 1;
+        while (s) {
+            switch (s) {
+                case 1: acc += 1; s = 2; break;
+                case 2: acc += 2;
+                case 3: acc += 4; s = 0; break;
+            }
+        }
+        __r = acc;
+        "#,
+    );
+}
+
+#[test]
 fn unflatten_declines_unsound_shapes() {
     // Conditional transition (real loop): `s` is written inside an `if`, so the
     // machine is cyclic, not a linear chain. Must NOT be unflattened; value (n=3)
