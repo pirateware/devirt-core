@@ -107,6 +107,34 @@ fn compound_transition_collapses() {
 }
 
 #[test]
+fn mul_transition_collapses() {
+    // Multiplicative transition: s *= K (1 -> 3 -> 12, exit at 12).
+    let out = deob(
+        "var s = 1; while (s != 12) { switch (s) { \
+         case 1: a(); s *= 3; break; case 3: b(); s *= 4; break; } }",
+    );
+    assert!(
+        !out.contains("switch"),
+        "mul-transition not unflattened: {out}"
+    );
+    let (ia, ib) = (out.find("a()").unwrap(), out.find("b()").unwrap());
+    assert!(ia < ib, "order wrong: {out}");
+}
+
+#[test]
+fn cyclic_mul_transition_is_kept() {
+    // `s *= 1` revisits the same state forever — a real loop, must NOT linearize.
+    let out = deob(
+        "var s = 1; while (s) { switch (s) { \
+         case 1: a(); s *= 1; break; } }",
+    );
+    assert!(
+        out.contains("switch"),
+        "cyclic mul-transition wrongly unflattened: {out}"
+    );
+}
+
+#[test]
 fn symbolic_const_labels_collapse() {
     // Write-once integer constants used as labels/transitions/init resolve.
     let out = deob(
@@ -122,6 +150,51 @@ fn symbolic_const_labels_collapse() {
 }
 
 #[test]
+fn fall_through_case_collapses() {
+    // Case 1 has no `break`/transition: control falls through into case 2's body
+    // (textual successor), so the run order is a(), b(). Then 2 -> 0 exits.
+    let out = deob(
+        "var s = 1; while (s) { switch (s) { \
+         case 1: a(); case 2: b(); s = 0; break; } }",
+    );
+    assert!(
+        !out.contains("switch") && !out.contains("while"),
+        "fall-through not unflattened: {out}"
+    );
+    let (ia, ib) = (out.find("a()").unwrap(), out.find("b()").unwrap());
+    assert!(ia < ib, "fall-through order wrong: {out}");
+}
+
+#[test]
+fn fall_through_chain_to_jump_target_collapses() {
+    // Jump into a fall-through group: 1 -> a(); jump to 2. 2 falls into 3.
+    // Order: a(), then (entering at 2) b(), c().
+    let out = deob(
+        "var s = 1; while (s) { switch (s) { \
+         case 1: a(); s = 2; break; case 2: b(); case 3: c(); s = 0; break; } }",
+    );
+    assert!(!out.contains("switch"), "not unflattened: {out}");
+    let ia = out.find("a()").unwrap();
+    let ib = out.find("b()").unwrap();
+    let ic = out.find("c()").unwrap();
+    assert!(ia < ib && ib < ic, "order wrong: {out}");
+}
+
+#[test]
+fn fall_through_off_end_is_kept() {
+    // The last case falls through with no textual successor: falling off the end
+    // of the switch is not a state transition we can follow — must decline.
+    let out = deob(
+        "var s = 1; while (s) { switch (s) { \
+         case 1: a(); s = 2; break; case 2: b(); } }",
+    );
+    assert!(
+        out.contains("switch"),
+        "fall-off-end wrongly unflattened: {out}"
+    );
+}
+
+#[test]
 fn real_do_while_loop_is_kept() {
     // A genuine loop (revisits state 1) must NOT be linearized.
     let out = deob(
@@ -131,6 +204,88 @@ fn real_do_while_loop_is_kept() {
     assert!(
         out.contains("switch"),
         "cyclic do-while wrongly unflattened: {out}"
+    );
+}
+
+#[test]
+fn string_state_dispatcher_collapses() {
+    // The dispatch state is a string; transitions are `s = "label"`. Run order
+    // "a" -> "b" -> exit.
+    let out = deob(
+        "var s = \"a\"; while (s) { switch (s) { \
+         case \"a\": a(); s = \"b\"; break; case \"b\": b(); s = \"\"; break; } }",
+    );
+    assert!(
+        !out.contains("switch") && !out.contains("while"),
+        "string-state machine not unflattened: {out}"
+    );
+    let (ia, ib) = (out.find("a()").unwrap(), out.find("b()").unwrap());
+    assert!(ia < ib, "order wrong: {out}");
+}
+
+#[test]
+fn string_state_neq_terminal_collapses() {
+    // Non-falsy string exit: `while (s != "done")`.
+    let out = deob(
+        "var s = \"x\"; while (s != \"done\") { switch (s) { \
+         case \"x\": a(); s = \"y\"; break; case \"y\": b(); s = \"done\"; break; } }",
+    );
+    assert!(!out.contains("switch"), "not unflattened: {out}");
+    let (ia, ib) = (out.find("a()").unwrap(), out.find("b()").unwrap());
+    assert!(ia < ib, "order wrong: {out}");
+}
+
+#[test]
+fn boolean_state_dispatcher_collapses() {
+    // Boolean state: start true, case true does work and flips to false; exit on
+    // `while (s)` going false.
+    let out = deob(
+        "var s = true; while (s) { switch (s) { \
+         case true: a(); s = false; break; } }",
+    );
+    assert!(
+        !out.contains("switch"),
+        "boolean-state not unflattened: {out}"
+    );
+    assert!(out.contains("a()"), "body lost: {out}");
+}
+
+#[test]
+fn cyclic_string_state_is_kept() {
+    // A string-state machine that revisits "a" is a real loop — must NOT linearize.
+    let out = deob(
+        "var s = \"a\"; while (s) { switch (s) { \
+         case \"a\": a(); s = \"b\"; break; case \"b\": b(); s = \"a\"; break; } }",
+    );
+    assert!(
+        out.contains("switch"),
+        "cyclic string-state wrongly unflattened: {out}"
+    );
+}
+
+#[test]
+fn string_state_external_use_is_kept() {
+    // `s` (string) is read after the loop — not a private dispatch var, keep it.
+    let out = deob(
+        "var s = \"a\"; while (s) { switch (s) { case \"a\": a(); s = \"\"; break; } } sink(s);",
+    );
+    assert!(
+        out.contains("switch"),
+        "string dispatcher wrongly removed: {out}"
+    );
+}
+
+#[test]
+fn semantic_string_switch_is_kept() {
+    // A real (non-CFF) switch on an externally-supplied string: the discriminant
+    // is a parameter, not a dispatch-only local with literal transitions. Must NOT
+    // be touched.
+    let out = deob(
+        "function f(ev) { switch (ev) { case \"open\": a(); break; case \"close\": b(); break; } } f(x);",
+    );
+    assert!(
+        out.contains("switch"),
+        "semantic string switch wrongly unflattened: {out}"
     );
 }
 
