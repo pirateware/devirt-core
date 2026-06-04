@@ -6,8 +6,15 @@
 //!  1. **Single value-establishing write.** Exactly one declarator-init or bare
 //!     `X = <expr>` assignment program-wide; no compound/update/delete/
 //!     destructuring/for-head write anywhere.
-//!  2. **The write's RHS is an inlineable literal.**
-//!  3. **Every read happens-after the write** — proven by [`OrderingOracle`].
+//!  2. **The write's RHS is constant.** Either an inlineable literal, *or* a
+//!     **pure integer expression** over already-resolved symbols (`var b = a + 1`
+//!     once `a` resolves). The pure-expression case is evaluated in a **bounded
+//!     fixpoint** entirely in Rust over integer operands — deterministic by
+//!     construction (no host state, no impure calls), so no sandbox/nondeterminism
+//!     guard is needed. An impure / non-integer / not-yet-resolved RHS declines.
+//!  3. **Every read happens-after the write** — proven by [`OrderingOracle`]. For a
+//!     pure-expression `X` whose RHS reads `a`, that read is itself one of `a`'s
+//!     reads, so `a`'s own happens-before proof already covers it.
 //!
 //! (Value-can't-be-mutated-through-an-alias is automatic here: the resolved value
 //! is always an immutable scalar literal, so aliasing is moot — that condition
@@ -129,6 +136,142 @@ fn expr_to_int(expr: &Expression<'_>) -> Option<i64> {
 }
 
 // ---------------------------------------------------------------------------
+// Pure integer expression classification + evaluation (B4)
+// ---------------------------------------------------------------------------
+
+/// Operators on integers that produce a deterministic integer and never call user
+/// code or observe host state. (`/` is excluded — non-integer / NaN / Infinity
+/// results are not inlineable integers; `**` likewise can overflow to non-integer.)
+fn pure_int_binop(op: oxc_syntax::operator::BinaryOperator) -> bool {
+    use oxc_syntax::operator::BinaryOperator::*;
+    matches!(
+        op,
+        Addition
+            | Subtraction
+            | Multiplication
+            | Remainder
+            | BitwiseAnd
+            | BitwiseOR
+            | BitwiseXOR
+            | ShiftLeft
+            | ShiftRight
+            | ShiftRightZeroFill
+            | Equality
+            | StrictEquality
+            | Inequality
+            | StrictInequality
+            | LessThan
+            | LessEqualThan
+            | GreaterThan
+            | GreaterEqualThan
+    )
+}
+
+/// Whether `expr` is a **pure integer expression**: built only from numeric
+/// literals, parentheses, the unary operators `-`/`~`/`+`, the binary operators in
+/// [`pure_int_binop`], and **bare identifier reads** (whose symbols this resolver
+/// may later prove constant). No calls, member access, strings, objects, logical
+/// short-circuits, or host references — so evaluation is total and deterministic.
+///
+/// A bare identifier with no resolvable symbol (a free/global like `undefined`) is
+/// rejected: we can only evaluate it if it resolves to a tracked integer.
+fn is_pure_int_expr(expr: &Expression<'_>, scoping: &Scoping) -> bool {
+    match expr {
+        Expression::NumericLiteral(n) => n.value.fract() == 0.0 && n.value.is_finite(),
+        Expression::ParenthesizedExpression(p) => is_pure_int_expr(&p.expression, scoping),
+        Expression::Identifier(id) => id
+            .reference_id
+            .get()
+            .and_then(|rid| scoping.get_reference(rid).symbol_id())
+            .is_some(),
+        Expression::UnaryExpression(u) => {
+            use oxc_syntax::operator::UnaryOperator::*;
+            matches!(u.operator, UnaryNegation | UnaryPlus | BitwiseNot)
+                && is_pure_int_expr(&u.argument, scoping)
+        }
+        Expression::BinaryExpression(b) => {
+            pure_int_binop(b.operator)
+                && is_pure_int_expr(&b.left, scoping)
+                && is_pure_int_expr(&b.right, scoping)
+        }
+        _ => false,
+    }
+}
+
+/// Evaluate a pure integer expression, resolving each bare identifier through
+/// `env` (the already-resolved symbol → integer map). Returns `None` if any
+/// operand is unresolved or any sub-result is not a finite integer. Arithmetic
+/// uses JS `f64` semantics then requires an integer result, so e.g. `5 % 2 == 1`
+/// but a fractional/NaN/Infinity intermediate declines the whole expression.
+fn eval_pure_int(
+    expr: &Expression<'_>,
+    scoping: &Scoping,
+    env: &HashMap<SymbolId, i64>,
+) -> Option<i64> {
+    use oxc_syntax::operator::{BinaryOperator as B, UnaryOperator as U};
+    match expr {
+        Expression::NumericLiteral(n) if n.value.fract() == 0.0 && n.value.is_finite() => {
+            Some(n.value as i64)
+        }
+        Expression::ParenthesizedExpression(p) => eval_pure_int(&p.expression, scoping, env),
+        Expression::Identifier(id) => {
+            let sym = id
+                .reference_id
+                .get()
+                .and_then(|rid| scoping.get_reference(rid).symbol_id())?;
+            env.get(&sym).copied()
+        }
+        Expression::UnaryExpression(u) => {
+            let v = eval_pure_int(&u.argument, scoping, env)?;
+            match u.operator {
+                U::UnaryNegation => Some(-v),
+                U::UnaryPlus => Some(v),
+                U::BitwiseNot => Some(!(v as i32) as i64),
+                _ => None,
+            }
+        }
+        Expression::BinaryExpression(b) => {
+            let l = eval_pure_int(&b.left, scoping, env)?;
+            let r = eval_pure_int(&b.right, scoping, env)?;
+            let bool_to_int = |x: bool| Some(x as i64);
+            match b.operator {
+                // Arithmetic uses f64 then re-checks integrality (JS semantics).
+                B::Addition => f64_int(l as f64 + r as f64),
+                B::Subtraction => f64_int(l as f64 - r as f64),
+                B::Multiplication => f64_int(l as f64 * r as f64),
+                B::Remainder => {
+                    if r == 0 {
+                        None // `x % 0` is NaN
+                    } else {
+                        f64_int((l as f64) % (r as f64))
+                    }
+                }
+                // Bitwise/shift coerce to int32 in JS; mirror that exactly.
+                B::BitwiseAnd => Some(((l as i32) & (r as i32)) as i64),
+                B::BitwiseOR => Some(((l as i32) | (r as i32)) as i64),
+                B::BitwiseXOR => Some(((l as i32) ^ (r as i32)) as i64),
+                B::ShiftLeft => Some(((l as i32).wrapping_shl((r as u32) & 31)) as i64),
+                B::ShiftRight => Some(((l as i32).wrapping_shr((r as u32) & 31)) as i64),
+                B::ShiftRightZeroFill => Some(((l as u32).wrapping_shr((r as u32) & 31)) as i64),
+                B::Equality | B::StrictEquality => bool_to_int(l == r),
+                B::Inequality | B::StrictInequality => bool_to_int(l != r),
+                B::LessThan => bool_to_int(l < r),
+                B::LessEqualThan => bool_to_int(l <= r),
+                B::GreaterThan => bool_to_int(l > r),
+                B::GreaterEqualThan => bool_to_int(l >= r),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Accept an `f64` arithmetic result only if it is a finite integer.
+fn f64_int(v: f64) -> Option<i64> {
+    (v.fract() == 0.0 && v.is_finite()).then_some(v as i64)
+}
+
+// ---------------------------------------------------------------------------
 // Census (read-only)
 // ---------------------------------------------------------------------------
 
@@ -140,6 +283,10 @@ struct Census<'a, 's> {
 
     value_writes: HashMap<SymbolId, usize>,
     literal: HashMap<SymbolId, Expression<'a>>,
+    /// Symbol → its single write's RHS, when that RHS is a *pure integer
+    /// expression* (not itself an inlineable literal). Resolved in a fixpoint once
+    /// the symbols it reads resolve. The expression is stored cloned.
+    pure_rhs: HashMap<SymbolId, Expression<'a>>,
     disqualified: HashSet<SymbolId>,
     /// Symbol → the function scope of its single *unconditional* literal write.
     write_fn: HashMap<SymbolId, ScopeId>,
@@ -161,6 +308,7 @@ impl<'a, 's> Census<'a, 's> {
             cond_depth: 0,
             value_writes: HashMap::new(),
             literal: HashMap::new(),
+            pure_rhs: HashMap::new(),
             disqualified: HashSet::new(),
             write_fn: HashMap::new(),
             reads: HashMap::new(),
@@ -179,19 +327,24 @@ impl<'a, 's> Census<'a, 's> {
         self.scoping.get_reference(rid).symbol_id()
     }
 
-    fn record_value_write(&mut self, sym: SymbolId, literal_rhs: Option<&Expression<'a>>) {
+    fn record_value_write(&mut self, sym: SymbolId, rhs: &Expression<'a>) {
         *self.value_writes.entry(sym).or_default() += 1;
-        match literal_rhs {
-            Some(rhs) => {
-                self.literal.insert(sym, rhs.clone_in(self.allocator));
-                if self.cond_depth == 0 {
-                    self.write_fn.insert(sym, self.cur_fn());
-                }
+        if is_inlineable_literal(rhs) {
+            self.literal.insert(sym, rhs.clone_in(self.allocator));
+            if self.cond_depth == 0 {
+                self.write_fn.insert(sym, self.cur_fn());
             }
-            // A non-literal value write leaves nothing to inline.
-            None => {
-                self.disqualified.insert(sym);
+        } else if is_pure_int_expr(rhs, self.scoping) {
+            // A pure integer expression over literals / identifier reads. Kept for
+            // the resolution fixpoint; the same ordering proof as a literal write
+            // applies (the write must happen-before every read of `sym`).
+            self.pure_rhs.insert(sym, rhs.clone_in(self.allocator));
+            if self.cond_depth == 0 {
+                self.write_fn.insert(sym, self.cur_fn());
             }
+        } else {
+            // A value write we can neither inline nor evaluate — nothing to do.
+            self.disqualified.insert(sym);
         }
     }
 
@@ -254,8 +407,7 @@ impl<'a, 's> Visit<'a> for Census<'a, 's> {
                         }
                         _ => {}
                     }
-                    let lit = is_inlineable_literal(init).then_some(init);
-                    self.record_value_write(sym, lit);
+                    self.record_value_write(sym, init);
                 }
             }
             other => collect_pattern_symbols(other, &mut self.disqualified),
@@ -269,8 +421,7 @@ impl<'a, 's> Visit<'a> for Census<'a, 's> {
             AssignmentTarget::AssignmentTargetIdentifier(id) => {
                 if let Some(sym) = self.ref_sym(id) {
                     if node.operator == AssignmentOperator::Assign {
-                        let lit = is_inlineable_literal(&node.right).then_some(&node.right);
-                        self.record_value_write(sym, lit);
+                        self.record_value_write(sym, &node.right);
                     } else {
                         self.disqualified.insert(sym);
                     }
@@ -448,30 +599,86 @@ fn analyze<'a>(
     let oracle =
         OrderingOracle::build(program, scoping, &census.fn_scope_symbol, &census.raw_calls);
 
-    let mut accepted: HashMap<SymbolId, Expression<'a>> = HashMap::new();
-
-    for (&sym, &writes) in &census.value_writes {
-        if writes != 1 || census.disqualified.contains(&sym) || !census.literal.contains_key(&sym) {
-            continue;
+    // The shared per-symbol gate: a single write provably happening-before every
+    // read. Identical for a literal write and a pure-expression write — the only
+    // difference is *what value* the write establishes.
+    let ordered_ok = |sym: SymbolId| -> bool {
+        if census.value_writes.get(&sym).copied() != Some(1) || census.disqualified.contains(&sym) {
+            return false;
         }
         let Some(&wf) = census.write_fn.get(&sym) else {
-            continue; // write was conditional or not in a function
+            return false; // write was conditional or not in a function
         };
-        // The writer function must be called exactly once, unconditionally, as a
-        // direct child of a region.
         let Some(&wf_sym) = census.fn_scope_symbol.get(&wf) else {
-            continue; // anonymous writer fn → no name to call by
+            return false; // anonymous writer fn → no name to call by
         };
         if census.call_count.get(&wf_sym).copied() != Some(1) {
-            continue;
+            return false;
         }
-
-        // Every read must happen-after the write (the ordering proof).
         let reads = census.reads.get(&sym).map(Vec::as_slice).unwrap_or(&[]);
-        if oracle.writes_before_all_reads(scoping, wf_sym, reads) {
-            accepted.insert(sym, census.literal[&sym].clone_in(allocator));
+        oracle.writes_before_all_reads(scoping, wf_sym, reads)
+    };
+
+    let mut accepted: HashMap<SymbolId, Expression<'a>> = HashMap::new();
+    // Integer view of resolved symbols, the environment the pure-expr fixpoint
+    // evaluates against (only integer-valued resolutions participate).
+    let mut env: HashMap<SymbolId, i64> = HashMap::new();
+
+    // Base case: literal writes (the original, narrow rule).
+    for (&sym, lit) in &census.literal {
+        if ordered_ok(sym) {
+            accepted.insert(sym, lit.clone_in(allocator));
+            if let Some(v) = expr_to_int(lit) {
+                env.insert(sym, v);
+            }
+        }
+    }
+
+    // Fixpoint: a pure-integer-expression write resolves once every symbol it reads
+    // is already resolved to an integer. Bounded by the number of pending symbols
+    // (each pass resolves ≥1 or terminates), so it cannot loop. Soundness: the RHS
+    // is total/deterministic (`is_pure_int_expr`), and `ordered_ok` proves the
+    // write happens-before all reads of `sym`; the reads it performs of its operand
+    // symbols are themselves covered by those operands' own happens-before proofs
+    // (they only entered `env` via this same gate).
+    let ast = oxc_ast::AstBuilder::new(allocator);
+    let max_passes = census.pure_rhs.len() + 1;
+    for _ in 0..max_passes {
+        let mut changed = false;
+        for (&sym, rhs) in &census.pure_rhs {
+            if env.contains_key(&sym) {
+                continue; // already resolved
+            }
+            if !ordered_ok(sym) {
+                continue;
+            }
+            if let Some(v) = eval_pure_int(rhs, scoping, &env) {
+                env.insert(sym, v);
+                accepted.insert(sym, int_lit(v, ast));
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
         }
     }
 
     accepted
+}
+
+/// Build a numeric-literal expression for an integer (negative values become a
+/// `-` unary over a non-negative literal, the canonical AST shape).
+fn int_lit<'a>(v: i64, ast: oxc_ast::AstBuilder<'a>) -> Expression<'a> {
+    use oxc_syntax::number::NumberBase;
+    if v < 0 {
+        let inner =
+            ast.expression_numeric_literal(Span::default(), (-v) as f64, None, NumberBase::Decimal);
+        ast.expression_unary(
+            Span::default(),
+            oxc_syntax::operator::UnaryOperator::UnaryNegation,
+            inner,
+        )
+    } else {
+        ast.expression_numeric_literal(Span::default(), v as f64, None, NumberBase::Decimal)
+    }
 }

@@ -138,6 +138,76 @@ fn ambiguous_reassignment_not_folded() {
 }
 
 #[test]
+fn nested_const_array_2d_resolves_to_literals() {
+    // B2: a provably-immutable 2-D const array read `T[i][j]`, including the
+    // cross-function aliased shape (`T = base[k]`), resolves the labels to
+    // literals so the dispatcher becomes a plain numeric switch.
+    let out = deob(
+        "(function(){ \
+           var base = [[[1, 2], [3, 4]], [[5, 6], [7, 8]]]; \
+           var T = base[1]; \
+           function run(s){ var acc = 0; while (s != 0) { switch (s) { \
+             case T[0][0]: acc += 1; s = T[0][1]; break; \
+             case T[1][1]: acc += 4; s = 0; break; } } return acc; } \
+           sink(run); })();",
+    );
+    assert!(
+        out.contains("case 5") && out.contains("case 8"),
+        "nested/aliased const-array labels not resolved: {out}"
+    );
+}
+
+#[test]
+fn member_written_table_labels_stay_symbolic() {
+    // B2 adversarial sibling (sample_11's table shape): the table is built by
+    // member writes (`base[i][j] = …`) — i.e. *mutable* — so its element reads
+    // must NOT be resolved to literals. `mutable_aggregate_tables` is the gate.
+    let out = deob(
+        "(function(){ \
+           var base = []; \
+           for (var i = 0; i < 2; i++) base[i] = new Array(2); \
+           base[0][0] = 5; base[0][1] = 6; \
+           var T = base[0]; \
+           function run(s){ var acc = 0; while (s != 0) { switch (s) { \
+             case T[0]: acc += 1; s = T[1]; break; \
+             case T[1]: acc += 2; s = 0; break; } } return acc; } \
+           sink(run); })();",
+    );
+    // The mutable table's element reads survive as member accesses; no numeric
+    // `case 5`/`case 6` literal appears (that would be an unsound static read of a
+    // member-written table).
+    assert!(
+        !out.contains("case 5") && !out.contains("case 6"),
+        "member-written table was unsoundly resolved: {out}"
+    );
+}
+
+#[test]
+fn conditional_nested_init_constant_stays_symbolic() {
+    // B1 wall (sample_1): a label constant written by an init function that runs
+    // inside a conditionally-reached nested dispatcher case is NOT setup-complete
+    // (the dispatcher's state-reachability is not statically proven), so it must
+    // stay symbolic. Inlining it would be unsound — a read on an earlier case can
+    // observe the pre-init `undefined`.
+    let out = deob(
+        "(function(){ \
+           var L; var out = []; \
+           function disp(s){ \
+             while (s) { switch (s) { \
+               case 1: out.push('' + L); s = 2; break; \
+               case 2: init(); s = 3; break; \
+               case 3: out.push('' + L); s = 0; break; } } \
+             function init(){ L = 9; } } \
+           disp(1); sink(out.join(',')); })();",
+    );
+    // The init write survives (constant not inlined / write not DCE'd).
+    assert!(
+        out.contains("= 9"),
+        "conditional nested-init constant was unsoundly inlined: {out}"
+    );
+}
+
+#[test]
 fn idempotent_on_nested_obfuscation() {
     let src = "function f(){ var a = 1, b = 2; if (!!1) return a + b; }";
     let once = deobfuscate(src, "t.js").code;

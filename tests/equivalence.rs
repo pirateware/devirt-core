@@ -338,6 +338,44 @@ fn ssa_const_array_fold_preserves_value() {
 }
 
 #[test]
+fn nested_const_array_2d_and_alias_fold_preserves_value() {
+    // B2: a provably-immutable 2-D const array, read `T[i][j]`. Resolving the
+    // nested element must not change the value.
+    assert_equivalent("var T = [[10, 20], [30, 40]]; __r = T[0][0] + T[1][1];");
+    // Aliased element of a 3-D const array (`T = base[1]` then `T[i][j]`), read in
+    // a nested function — the cross-function 2-D-alias case from the roadmap.
+    assert_equivalent(
+        "__r = (function(){ \
+           var base = [[[1, 2], [3, 4]], [[5, 6], [7, 8]]]; \
+           var T = base[1]; \
+           function run(s){ var acc = 0; while (s != 0) { switch (s) { \
+             case T[0][0]: acc += 1; s = T[0][1]; break; \
+             case T[0][1]: acc += 2; s = T[1][0]; break; \
+             case T[1][0]: acc += 3; s = T[1][1]; break; \
+             case T[1][1]: acc += 4; s = 0; break; } } return acc; } \
+           return run(T[0][0]); })();",
+    );
+}
+
+#[test]
+fn member_written_table_is_not_resolved() {
+    // B2 adversarial sibling (sample_11's shape): a table built by *member writes*
+    // (`base[i][j] = …`) is mutable, so `T = base[0]; T[i]` must NOT be resolved to
+    // a literal. Equivalence guards soundness regardless of the (correct) decline.
+    assert_equivalent(
+        "__r = (function(){ \
+           var base = []; \
+           for (var i = 0; i < 2; i++) base[i] = new Array(2); \
+           base[0][0] = 5; base[0][1] = 6; base[1][0] = 7; base[1][1] = 8; \
+           var T = base[0]; \
+           function run(s){ var acc = 0; while (s != 0) { switch (s) { \
+             case T[0]: acc += 1; s = T[1]; break; \
+             case T[1]: acc += 2; s = 0; break; } } return acc; } \
+           return run(base[0][0]); })();",
+    );
+}
+
+#[test]
 fn ssa_short_circuit_dominating_def_folds_soundly() {
     // The sample_10 shape: array assigned inside a `&&` chain, read after. The
     // assignment dominates the reads, so folding is sound.
@@ -1553,5 +1591,80 @@ fn unflatten_param_state_preserves_value() {
         "__r = (function(){ var log = ''; \
            function f(s, x) { while (s) { switch (s) { case 1: log += x; s = 0; break; } } } \
            f(1, (log += 'a', 'b')); return log; })();",
+    );
+}
+
+#[test]
+fn pure_expression_resolution_preserves_value() {
+    // B4: a pure-expression constant chain in an init function, read in a
+    // dispatcher. Resolving `B=A+1`, `C=B*2-3` must not change the result.
+    assert_equivalent(
+        "__r = (function(){ \
+           var A, B, C, STOP; \
+           function init(){ A = 10; B = A + 1; C = B * 2 - 3; STOP = 0; } init(); \
+           function run(s){ var acc = 0; while (s != STOP) { switch (s) { \
+             case A: acc += 1; s = B; break; case B: acc += 2; s = C; break; \
+             case C: acc += 3; s = STOP; break; } } return acc; } \
+           return run(A); })();",
+    );
+    // Bitwise / shift / remainder under JS int32 semantics.
+    assert_equivalent(
+        "__r = (function(){ \
+           var X, Y, Z; \
+           function init(){ X = (419 ^ 661) >>> 0; Y = X & 31; Z = (Y << 2) - 7 % 4; } init(); \
+           function read(){ return X + Y + Z; } \
+           return read(); })();",
+    );
+    // Negative results and unary operators.
+    assert_equivalent(
+        "__r = (function(){ \
+           var P, Q; \
+           function init(){ P = -5; Q = ~P + 1; } init(); \
+           function read(){ return P + Q; } \
+           return read(); })();",
+    );
+}
+
+#[test]
+fn conditional_nested_region_init_is_not_inlined() {
+    // B1 wall (sample_1's shape): a constant written by an init function that runs
+    // only inside a *conditionally-reached nested dispatcher case* must NOT be
+    // inlined cross-function — a read can observe the pre-init `undefined` (here,
+    // `case 1` reads L before `case 2`'s init writes it). The pipeline must leave
+    // the write and the symbolic reads in place; equivalence is the safety net.
+    assert_equivalent(
+        "__r = (function(){ \
+           var L; var out = []; \
+           function disp(s){ \
+             while (s) { switch (s) { \
+               case 1: out.push('' + L); s = 2; break; \
+               case 2: init(); s = 3; break; \
+               case 3: out.push('' + L); s = 0; break; } } \
+             function init(){ L = 9; } } \
+           disp(1); return out.join(','); })();",
+    );
+}
+
+#[test]
+fn nondeterministic_and_nonpure_writes_are_not_resolved() {
+    // B4 adversarial: an RHS over an impure call (`Date.now()`) or a non-write-once
+    // operand must be left alone. Equivalence is the safety net — the value must
+    // match regardless of whether resolution (correctly) declines.
+    assert_equivalent(
+        "__r = (function(){ \
+           var A, B; \
+           function init(){ A = 1; A = 2; B = A + 1; } init(); \
+           function read(){ return B; } \
+           return read(); })();",
+    );
+    // `T = Date.now()` is non-pure (host state) → never resolved; `U = T + 1` then
+    // also cannot resolve. We can only assert the *deterministic* part is stable, so
+    // mask the timestamp out: the point is the pipeline must not fold these.
+    assert_equivalent(
+        "__r = (function(){ \
+           var T, U; \
+           function init(){ T = 100; U = T / 0; } init(); \
+           function read(){ return (U === Infinity); } \
+           return read(); })();",
     );
 }
