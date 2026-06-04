@@ -271,12 +271,21 @@ impl Pass for DecoderLift {
             &value_binding_src,
             allocator,
         );
-        let Some(sandbox) = Sandbox::new() else {
+        // Two sandboxes seeded with *different* deterministic PRNGs. A decode is
+        // lifted only when both agree: a value that genuinely depends on RNG (a
+        // decoder shuffling a charset/seed — sample_7) differs between the seeds
+        // and is refused, so it is never baked to a non-portable literal, while a
+        // value independent of RNG agrees and lifts reproducibly. This is the
+        // soundness+determinism guard; see `Sandbox::new_seeded`.
+        let (Some(sandbox), Some(sandbox_alt)) = (
+            Sandbox::new_seeded(crate::sandbox::DEFAULT_RANDOM_SEED),
+            Sandbox::new_seeded(0x5151_4949),
+        ) else {
             return false;
         };
-        // Define the whole library once; per-call evals reuse it (fast + the
-        // array is rotated exactly once, as in the real program).
-        if !sandbox.setup(&preamble) {
+        // Define the whole library once in each; per-call evals reuse it (fast +
+        // the array is rotated exactly once, as in the real program).
+        if !sandbox.setup(&preamble) || !sandbox_alt.setup(&preamble) {
             return false;
         }
 
@@ -289,6 +298,7 @@ impl Pass for DecoderLift {
             allowed: &allowed,
             grounded: &grounded,
             sandbox,
+            sandbox_alt,
             memo: HashMap::new(),
             changed: false,
             _marker: std::marker::PhantomData,
@@ -2382,6 +2392,9 @@ struct Lifter<'a, 'r> {
     allowed: &'r HashSet<String>,
     grounded: &'r HashSet<String>,
     sandbox: Sandbox,
+    /// A second sandbox seeded with a *different* deterministic PRNG. A decode is
+    /// lifted only when it agrees across both, refusing RNG-dependent values.
+    sandbox_alt: Sandbox,
     memo: HashMap<String, Option<EvalValue>>,
     changed: bool,
     _marker: std::marker::PhantomData<&'a ()>,
@@ -2500,19 +2513,18 @@ impl<'a, 'r> Traverse<'a, ()> for Lifter<'a, 'r> {
             if let Some(cached) = self.memo.get(&src) {
                 cached.clone()
             } else {
-                // The library is already defined in the persistent context;
-                // evaluate just the call expression. Evaluate under two *different*
-                // `Math.random` seeds and require agreement: a decode that depends
-                // on RNG yields different values and is refused, while one
-                // independent of RNG (the norm) agrees and lifts. This is a
-                // deterministic test — unlike a plain double-eval, which misses the
-                // ~1% collision of two real low-entropy `Math.random()` draws (the
-                // `Math.floor(100*Math.random())` token that jittered sample_7).
-                // `Date` is frozen in the sandbox prelude, so RNG is the only
-                // remaining entropy a lift must guard against.
+                // The library is already defined in both persistent contexts;
+                // evaluate just the call expression in each. The two sandboxes use
+                // *different* deterministic PRNG seeds, so a decode whose result
+                // depends on RNG (a charset/seed shuffle — the `var2206` token that
+                // jittered sample_7 across processes) yields different values and is
+                // refused, while a decode independent of RNG agrees and lifts
+                // reproducibly. Deterministic by construction — both seeds are
+                // fixed — so the lift decision is identical on every machine.
+                // (`Date` is frozen in the prelude; RNG is the only other entropy.)
                 let call = format!("({});", src);
-                let a = self.sandbox.eval_to_value_seeded(&call, 0.137_f64);
-                let b = self.sandbox.eval_to_value_seeded(&call, 0.911_f64);
+                let a = self.sandbox.eval_to_value(&call);
+                let b = self.sandbox_alt.eval_to_value(&call);
                 let result = if a.is_some() && a == b { a } else { None };
                 self.memo.insert(src, result.clone());
                 result

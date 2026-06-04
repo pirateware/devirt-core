@@ -34,11 +34,12 @@ const SANDBOX_PRELUDE: &str = r#"
   // reader), leaving the `Date` constructor and instance methods intact so
   // feature-detection and `new Date(x)` inside a real decoder keep working.
   //
-  // `Math.random` is deliberately NOT frozen: the double-eval guard already
-  // catches RNG-dependent values (two reads disagree), and pinning it to a
-  // constant instead corrupts seed/charset setup in legitimate string decoders,
-  // mass-declining sound lifts (observed: ~+10% bloat on sample_11). Freezing a
-  // clock read is independently unsound; this only makes the tool deterministic.
+  // `Math.random` is handled OUTSIDE this prelude: `new_seeded` installs a
+  // deterministic, seeded PRNG (see `seeded_random_js`) — a real varied sequence,
+  // not a frozen constant (a constant degenerates charset shuffles and
+  // mass-declines decoders, ~+10% bloat on sample_11). The lifter runs two
+  // sandboxes with different seeds and refuses any value that disagrees, so a
+  // genuinely RNG-dependent decode is never baked.
   //
   // Freeze *every* wall-clock reader, not just `Date.now()`. The double-eval guard
   // misses `new Date()` / `+new Date()` / `.getTime()` because two reads in the
@@ -121,8 +122,44 @@ pub enum EvalValue {
     Arr(Vec<EvalValue>),
 }
 
+/// Default `Math.random` seed for the partial-evaluation sandbox. QuickJS seeds
+/// `Math.random` *non-deterministically per context*, so a decoder that shuffles
+/// a charset/seed with it (sample_7) decodes to a different value every process —
+/// jitter that leaks into a lifted literal. We install a *deterministic, seeded*
+/// PRNG instead. Crucially it is a real (varied) sequence, **not** a frozen
+/// constant: a constant `Math.random` degenerates Fisher-Yates shuffles and
+/// mass-declines legitimate decoders (~+10% bloat on sample_11), whereas a seeded
+/// PRNG shuffles correctly *and* reproducibly. Soundness against decoders whose
+/// *result* truly depends on RNG is handled separately by the lifter's two-seed
+/// differential (it refuses any value that changes between two seeds).
+pub const DEFAULT_RANDOM_SEED: u32 = 0x9E37_79B9;
+
+/// Install a deterministic mulberry32 PRNG as `Math.random`, seeded by `seed`.
+/// Deterministic + well-distributed, so charset shuffles work and are reproducible.
+fn seeded_random_js(seed: u32) -> String {
+    format!(
+        r#"(function(g){{
+          var s = {seed} >>> 0;
+          g.Math.random = function(){{
+            s = (s + 0x6D2B79F5) | 0;
+            var t = Math.imul(s ^ (s >>> 15), 1 | s);
+            t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+          }};
+        }})(typeof globalThis !== "undefined" ? globalThis : this);"#
+    )
+}
+
 impl Sandbox {
     pub fn new() -> Option<Sandbox> {
+        Self::new_seeded(DEFAULT_RANDOM_SEED)
+    }
+
+    /// A sandbox whose `Math.random` is a deterministic PRNG seeded by `seed`.
+    /// The lifter builds two with *different* seeds and lifts a decode only when
+    /// both agree — so a value that genuinely depends on RNG (non-reproducible at
+    /// runtime) is refused, while one independent of RNG lifts reproducibly.
+    pub fn new_seeded(seed: u32) -> Option<Sandbox> {
         let rt = Runtime::new().ok()?;
         rt.set_memory_limit(128 * 1024 * 1024);
         rt.set_max_stack_size(2 * 1024 * 1024);
@@ -134,8 +171,14 @@ impl Sandbox {
         )));
 
         let ctx = Context::full(&rt).ok()?;
-        // Install the base64 polyfills once in the persistent context.
-        if !ctx.with(|ctx| ctx.eval::<rquickjs::Value, _>(SANDBOX_PRELUDE).is_ok()) {
+        // Install the base64 polyfills + Date freeze, then the seeded PRNG.
+        let ok = ctx.with(|ctx| {
+            ctx.eval::<rquickjs::Value, _>(SANDBOX_PRELUDE).is_ok()
+                && ctx
+                    .eval::<rquickjs::Value, _>(seeded_random_js(seed))
+                    .is_ok()
+        });
+        if !ok {
             return None;
         }
         Some(Sandbox {
@@ -194,20 +237,6 @@ impl Sandbox {
         });
         *self.deadline.lock().unwrap() = None;
         result
-    }
-
-    /// Evaluate `code` with `Math.random` pinned to the constant `seed` for the
-    /// duration of this call. Used by the lifter's *differential-seed* guard: a
-    /// decode whose result depends on RNG (`Math.floor(100*Math.random())`)
-    /// produces a different value under two different seeds and is refused, while
-    /// a decode independent of RNG (the common case — RNG, if used at all, only
-    /// shuffled a charset at setup time) yields the same value under any seed and
-    /// lifts. This catches the low-entropy collision a plain double-eval misses
-    /// (two real `Math.random()` draws over a small range agree ~1% of the time),
-    /// *without* freezing RNG during setup (which corrupts legitimate decoders).
-    pub fn eval_to_value_seeded(&self, code: &str, seed: f64) -> Option<EvalValue> {
-        let seeded = format!("Math.random = function () {{ return {seed}; }};\n{code}");
-        self.eval_to_value(&seeded)
     }
 }
 
