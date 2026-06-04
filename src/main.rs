@@ -30,6 +30,9 @@ fn main() {
     for e in &report.parse_errors {
         eprintln!("parse: {e}");
     }
+    if let Some(err) = &report.error {
+        eprintln!("[deob] {err}");
+    }
     print!("{}", report.code);
 
     eprintln!(
