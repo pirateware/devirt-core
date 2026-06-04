@@ -4,9 +4,23 @@
 - **Impact:** ~~Medium~~ **Low** · **Effort:** ~~Medium~~ **High (fiddly)** · **Risk:** Medium
 - **Pass:** `src/passes/decoder_lift.rs` (supported by `assigned_once`/`inline_single_use`)
 
-> **STATUS (2026-06): SKIPPED — not worth the risk/payoff.** Inspecting the real
-> `fn12` shows the alias is **not** the simple `var442 = var1` the doc assumed. It
-> is:
+> **STATUS UPDATE (2026-06, branch `ws-c-decoders`): the general `.bind()`
+> accessor-alias follow landed (C3); the s5 `fn12` sequence/param-table case stays
+> declined.** `collect_aliases` now recognizes `var g = dec.bind(<pure-args>)` (and
+> the assignment form) and lifts calls through the bound alias of a classified-pure,
+> `this`-free decoder — the bind receiver/leading args are pure-data-gated so the
+> sandbox reproduces the alias exactly, only the first chain edge may carry a
+> `.bind`, and the emit is rebuilt against the resolved pure-func name. Tests:
+> `lifts_through_bind_accessor_alias`, `does_not_lift_reassigned_bind_alias`. No
+> current sample's surviving decoder uses that exact bound-alias form, so sample
+> bytes are unchanged — it is a correctness widening for inputs that do.
+>
+> The specific s5 `fn12` case below remains **declined** (sequence-expr alias +
+> param-as-table), unchanged from the original analysis:
+>
+> **ORIGINAL STATUS (2026-06): SKIPPED — not worth the risk/payoff.** Inspecting the
+> real `fn12` shows the alias is **not** the simple `var442 = var1` the doc assumed.
+> It is:
 > ```js
 > function fn12(var438, var439, var440, var441, var442, …) {  // var441,var442 are PARAMS
 >   var442 = (var441 = { g:…, z:…, K:… }, var1);              // RHS is a SequenceExpression

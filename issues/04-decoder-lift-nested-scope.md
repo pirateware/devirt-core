@@ -21,6 +21,13 @@
 > (`call3("InnerErr: " + e.message)`) — correctly left. Full test suite green
 > (equivalence + idempotency). Byte size barely moves (decoded names ≈ same length
 > as `call3(N)`); the win is **readability**. `fn40` has 4 dynamic-arg survivors.
+>
+> **C1 RE-VERIFICATION (2026-06, branch `ws-c-decoders`):** confirmed sample_11
+> nested-scope lifting is **complete** — there are **zero literal-arg survivors**
+> for `call3`/`fn40`/`fn55`; every remaining survivor (13 `call3` + 4 `fn40` +
+> 1 `fn55`) has a *dynamic runtime argument* and is a true encoder, correctly
+> preserved. The s7 secondary target is host-coupled (`this`/`Function` global
+> detector) and is a documented sound decline — see issue 03's STATUS UPDATE.
 
 ## Symptom
 
