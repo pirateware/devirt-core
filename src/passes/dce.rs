@@ -76,10 +76,10 @@ fn keep_statement(s: &Statement<'_>, scoping: &Scoping) -> bool {
     match s {
         Statement::EmptyStatement(_) => false,
         Statement::VariableDeclaration(vd) => !vd.declarations.is_empty(),
-        Statement::FunctionDeclaration(f) => f
-            .id
-            .as_ref()
-            .is_none_or(|id| !fn_decl_is_dead(id.symbol_id(), f, scoping)),
+        Statement::FunctionDeclaration(f) => {
+            f.id.as_ref()
+                .is_none_or(|id| !fn_decl_is_dead(id.symbol_id(), f, scoping))
+        }
         // A bare literal statement (`80214130;`, `true;`, `null;`) computes a
         // value that is immediately discarded with no side effect — pure
         // obfuscation noise (often a spent opaque-predicate constant). Drop it.

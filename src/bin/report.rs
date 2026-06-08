@@ -108,7 +108,16 @@ fn report_generated_corpus() {
     println!("\nobfuscator.io corpus (samples/generated/) — aggregated by profile");
     println!(
         "{:<13} {:>5} {:>9} {:>9} {:>6}  {:>8} {:>8}  {:>8}  {:>6}  {:>5}",
-        "profile", "files", "in_bytes", "out_bytes", "kept%", "brackets", "opaque%", "hexrefs", "rounds", "conv"
+        "profile",
+        "files",
+        "in_bytes",
+        "out_bytes",
+        "kept%",
+        "brackets",
+        "opaque%",
+        "hexrefs",
+        "rounds",
+        "conv"
     );
 
     let mut profiles: Vec<String> = by_profile.keys().cloned().collect();
@@ -163,7 +172,16 @@ fn print_agg_row(label: &str, a: &ProfileAgg) {
     };
     println!(
         "{:<13} {:>5} {:>9} {:>9} {:>5}% {:>8} {:>7}% {:>8}  {:>6}  {:>5}",
-        label, a.files, a.in_bytes, a.out_bytes, kept, a.brackets, opaque, a.hexrefs, a.rounds_max, conv
+        label,
+        a.files,
+        a.in_bytes,
+        a.out_bytes,
+        kept,
+        a.brackets,
+        opaque,
+        a.hexrefs,
+        a.rounds_max,
+        conv
     );
 }
 
@@ -176,8 +194,20 @@ fn profile_of(name: &str) -> Option<String> {
 }
 
 fn count_bracket_access(s: &str) -> usize {
-    // crude: count `["` occurrences (string-keyed member access)
-    s.matches("[\"").count()
+    // Count `["` only where it is a string-keyed *member access* (`obj["x"]`),
+    // not an array/object literal (`= ["x"]`, `, ["x"]`). The discriminator is
+    // the byte immediately before `[`: a member access follows an expression
+    // (identifier char, `)`, `]`, or a closing quote) with no space, whereas a
+    // literal follows an operator/punctuator/space. Excludes the array-literal
+    // false positives that dominate the raw `["` count.
+    let b = s.as_bytes();
+    (1..b.len().saturating_sub(1))
+        .filter(|&i| b[i] == b'[' && b[i + 1] == b'"' && is_member_lhs(b[i - 1]))
+        .count()
+}
+
+fn is_member_lhs(p: u8) -> bool {
+    p.is_ascii_alphanumeric() || matches!(p, b'_' | b'$' | b')' | b']' | b'"' | b'\'')
 }
 
 /// Raw (non-distinct) occurrence count of `_0x…`-style hex-named identifiers

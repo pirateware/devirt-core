@@ -226,7 +226,8 @@ fn render_generated_corpus(s: &mut String) {
             continue;
         }
         let name = p.file_name().unwrap().to_string_lossy().into_owned();
-        let Some((_, profile)) = name.strip_suffix(".js").and_then(|st| st.rsplit_once("__")) else {
+        let Some((_, profile)) = name.strip_suffix(".js").and_then(|st| st.rsplit_once("__"))
+        else {
             continue;
         };
         let src = fs::read_to_string(&p).unwrap();
@@ -326,7 +327,20 @@ fn push_agg_row(s: &mut String, label: &str, a: &ProfileAgg) {
 }
 
 fn count_bracket_access(s: &str) -> usize {
-    s.matches("[\"").count()
+    // Count `["` only where it is a string-keyed *member access* (`obj["x"]`),
+    // not an array/object literal — the byte before `[` is part of the object
+    // expression (identifier char, `)`, `]`, or a closing quote) with no space.
+    // Mirrors `src/bin/report.rs`. Excludes the array-literal false positives
+    // that dominate the raw `["` count.
+    let b = s.as_bytes();
+    (1..b.len().saturating_sub(1))
+        .filter(|&i| {
+            b[i] == b'['
+                && b[i + 1] == b'"'
+                && (b[i - 1].is_ascii_alphanumeric()
+                    || matches!(b[i - 1], b'_' | b'$' | b')' | b']' | b'"' | b'\''))
+        })
+        .count()
 }
 
 /// Fraction (%) of distinct identifier-ish tokens that look obfuscated: length
