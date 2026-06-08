@@ -226,7 +226,8 @@ fn render_generated_corpus(s: &mut String) {
             continue;
         }
         let name = p.file_name().unwrap().to_string_lossy().into_owned();
-        let Some((_, profile)) = name.strip_suffix(".js").and_then(|st| st.rsplit_once("__")) else {
+        let Some((_, profile)) = name.strip_suffix(".js").and_then(|st| st.rsplit_once("__"))
+        else {
             continue;
         };
         let src = fs::read_to_string(&p).unwrap();

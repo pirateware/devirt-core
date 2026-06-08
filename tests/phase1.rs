@@ -28,7 +28,10 @@ fn member_normalization_optional_chain() {
     // `a?.["foo"]` parses as a ChainElement, not an Expression, so it needs a
     // dedicated hook. The object is an opaque param so the access survives.
     let out = deob(r#"function f(a){ return a?.["foo"]?.["1bad"]; } sink(f);"#);
-    assert!(out.contains("?.foo"), "optional chain not normalized: {out}");
+    assert!(
+        out.contains("?.foo"),
+        "optional chain not normalized: {out}"
+    );
     // non-identifier key stays bracketed
     assert!(
         out.contains(r#"?.["1bad"]"#),
@@ -242,8 +245,9 @@ fn object_reconstruction_folds_split_writes() {
 fn object_reconstruction_exposes_proxy_table() {
     // An operator-proxy table built in split-write form is invisible to
     // proxy-inline until reconstructed; once folded, the call inlines and folds.
-    let out =
-        deob(r#"function f(){ var t = {}; t.sum = function(a,b){ return a + b; }; return t.sum(2,3); } sink(f);"#);
+    let out = deob(
+        r#"function f(){ var t = {}; t.sum = function(a,b){ return a + b; }; return t.sum(2,3); } sink(f);"#,
+    );
     assert!(out.contains('5'), "proxy table not inlined+folded: {out}");
     assert!(!out.contains("t.sum"), "proxy survived: {out}");
 }

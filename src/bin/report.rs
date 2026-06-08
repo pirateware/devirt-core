@@ -108,7 +108,16 @@ fn report_generated_corpus() {
     println!("\nobfuscator.io corpus (samples/generated/) — aggregated by profile");
     println!(
         "{:<13} {:>5} {:>9} {:>9} {:>6}  {:>8} {:>8}  {:>8}  {:>6}  {:>5}",
-        "profile", "files", "in_bytes", "out_bytes", "kept%", "brackets", "opaque%", "hexrefs", "rounds", "conv"
+        "profile",
+        "files",
+        "in_bytes",
+        "out_bytes",
+        "kept%",
+        "brackets",
+        "opaque%",
+        "hexrefs",
+        "rounds",
+        "conv"
     );
 
     let mut profiles: Vec<String> = by_profile.keys().cloned().collect();
@@ -163,7 +172,16 @@ fn print_agg_row(label: &str, a: &ProfileAgg) {
     };
     println!(
         "{:<13} {:>5} {:>9} {:>9} {:>5}% {:>8} {:>7}% {:>8}  {:>6}  {:>5}",
-        label, a.files, a.in_bytes, a.out_bytes, kept, a.brackets, opaque, a.hexrefs, a.rounds_max, conv
+        label,
+        a.files,
+        a.in_bytes,
+        a.out_bytes,
+        kept,
+        a.brackets,
+        opaque,
+        a.hexrefs,
+        a.rounds_max,
+        conv
     );
 }
 

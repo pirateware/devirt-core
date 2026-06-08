@@ -150,8 +150,10 @@ impl<'a> Traverse<'a, ()> for ReconstructObject {
         }
 
         let n = stmts.len();
-        let mut old: Vec<Option<Statement<'a>>> =
-            std::mem::replace(stmts, ctx.ast.vec()).into_iter().map(Some).collect();
+        let mut old: Vec<Option<Statement<'a>>> = std::mem::replace(stmts, ctx.ast.vec())
+            .into_iter()
+            .map(Some)
+            .collect();
 
         let mut i = 0;
         while i < n {
@@ -191,7 +193,8 @@ impl<'a> Traverse<'a, ()> for ReconstructObject {
                     }
                     let mut seed_stmt = old[i].take().unwrap();
                     if let Statement::VariableDeclaration(vd) = &mut seed_stmt {
-                        if let Some(Expression::ObjectExpression(obj)) = &mut vd.declarations[0].init
+                        if let Some(Expression::ObjectExpression(obj)) =
+                            &mut vd.declarations[0].init
                         {
                             obj.properties = props;
                         }
@@ -235,5 +238,13 @@ fn take_member_property<'a>(stmt: Statement<'a>, ast: AstBuilder<'a>) -> ObjectP
     let m = m.unbox();
     let span = m.span;
     let key = ast.property_key_static_identifier(span, m.property.name);
-    ast.object_property_kind_object_property(span, PropertyKind::Init, key, a.right, false, false, false)
+    ast.object_property_kind_object_property(
+        span,
+        PropertyKind::Init,
+        key,
+        a.right,
+        false,
+        false,
+        false,
+    )
 }

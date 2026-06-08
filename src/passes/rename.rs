@@ -194,8 +194,8 @@ fn callback_param_roles(method: &str) -> Option<&'static [&'static str]> {
         // (accumulator, currentValue, index, array)
         "reduce" | "reduceRight" => &["acc", "value", "index", "arr"],
         // (element, index, array)
-        "map" | "forEach" | "filter" | "find" | "findIndex" | "findLast"
-        | "findLastIndex" | "some" | "every" | "flatMap" => &["item", "index", "arr"],
+        "map" | "forEach" | "filter" | "find" | "findIndex" | "findLast" | "findLastIndex"
+        | "some" | "every" | "flatMap" => &["item", "index", "arr"],
         // (a, b) comparator
         "sort" => &["left", "right"],
         _ => return None,
