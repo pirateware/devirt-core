@@ -3957,13 +3957,6 @@
 					}
 				}
 			}
-			function call35(var983, var984) {
-				call35 = Object.setPrototypeOf ? Object.setPrototypeOf.bind() : function(var985, var986) {
-					var985.__proto__ = var986;
-					return var985;
-				};
-				return call35(var983, var984);
-			}
 			function fn182(var987, var988, var989) {
 				return Reflect.construct.apply(null, arguments);
 				var arr70 = [null];
