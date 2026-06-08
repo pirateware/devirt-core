@@ -22,7 +22,7 @@ use oxc_allocator::{Allocator, Vec as ArenaVec};
 use oxc_ast::ast::{Expression, Program, Statement};
 use oxc_ast::AstBuilder;
 
-use super::unflatten::{detect_loop, mentions, state_init};
+use super::unflatten::{detect_loop, int_state_candidates, mentions, splice_remove_state};
 use crate::ir::cff;
 use crate::pass::Pass;
 
@@ -61,52 +61,58 @@ impl<'a> Walker<'a> {
     }
 
     fn try_recover(&mut self, stmts: &mut ArenaVec<'a, Statement<'a>>) {
-        let mut hit: Option<(usize, usize, Vec<Statement<'a>>)> = None;
-        for i in 0..stmts.len() {
-            let Some((s_name, entry)) = state_init(&stmts[i]) else {
-                continue;
-            };
-            // Dispatch-only: `s` referenced in exactly one OTHER statement (the loop).
-            let others: Vec<usize> = (0..stmts.len())
-                .filter(|&k| k != i && mentions(&stmts[k], &s_name))
-                .collect();
-            if others.len() != 1 {
-                continue;
+        let mut hit: Option<(usize, usize, String, Vec<Statement<'a>>)> = None;
+        'outer: for i in 0..stmts.len() {
+            // A single statement can offer several state candidates (a multi-
+            // declarator `var s = 1, acc = 0, …`, the common real-world shape), so
+            // try each. The dispatch-only gate below keeps every one sound.
+            for (s_name, entry) in int_state_candidates(&stmts[i]) {
+                // Dispatch-only: `s` referenced in exactly one OTHER statement (the loop).
+                let others: Vec<usize> = (0..stmts.len())
+                    .filter(|&k| k != i && mentions(&stmts[k], &s_name))
+                    .collect();
+                if others.len() != 1 {
+                    continue;
+                }
+                let j = others[0];
+                if j <= i {
+                    continue;
+                }
+                let Some((switch, _kind, test)) = detect_loop(&stmts[j], &s_name) else {
+                    continue;
+                };
+                // Recover the state graph, using the loop test to classify exits.
+                let continues = |state: i64| test.continues(state);
+                let Some(cfg) = cff::build(switch, &s_name, entry, &continues) else {
+                    continue;
+                };
+                // Try the specialized self-loop → do/while first (it reads nicest), then
+                // fall back to the general relooper for arbitrary reducible branch/loop
+                // graphs the linear form declined on. Either declines soundly (→ leave
+                // the dispatcher) on shapes it cannot place.
+                let seq = cff::structure(switch, &s_name, &cfg, self.ast)
+                    .or_else(|| cff::structure_general(switch, &s_name, &cfg, self.ast));
+                let Some(seq) = seq else {
+                    continue;
+                };
+                hit = Some((i, j, s_name, seq));
+                break 'outer;
             }
-            let j = others[0];
-            if j <= i {
-                continue;
-            }
-            let Some((switch, _kind, test)) = detect_loop(&stmts[j], &s_name) else {
-                continue;
-            };
-            // Recover the state graph, using the loop test to classify exits.
-            let continues = |state: i64| test.continues(state);
-            let Some(cfg) = cff::build(switch, &s_name, entry, &continues) else {
-                continue;
-            };
-            // Try the specialized self-loop → do/while first (it reads nicest), then
-            // fall back to the general relooper for arbitrary reducible branch/loop
-            // graphs the linear form declined on. Either declines soundly (→ leave
-            // the dispatcher) on shapes it cannot place.
-            let seq = cff::structure(switch, &s_name, &cfg, self.ast)
-                .or_else(|| cff::structure_general(switch, &s_name, &cfg, self.ast));
-            let Some(seq) = seq else {
-                continue;
-            };
-            hit = Some((i, j, seq));
-            break;
         }
 
-        let Some((i, j, seq)) = hit else {
+        let Some((i, j, s_name, seq)) = hit else {
             return;
         };
-        // Splice: drop the state initializer (i) and replace the dispatcher (j)
-        // with the structured sequence; keep everything else in order.
+        // Splice: remove the state binding from the initializer (i) and replace the
+        // dispatcher (j) with the structured sequence; keep everything else in order.
+        // A multi-declarator `var` keeps its other declarators in place.
         let old = std::mem::replace(stmts, self.ast.vec());
         let mut seq = Some(seq);
         for (k, s) in old.into_iter().enumerate() {
             if k == i {
+                if let Some(kept) = splice_remove_state(&s, &s_name, self.ast) {
+                    stmts.push(kept);
+                }
                 continue;
             }
             if k == j {
