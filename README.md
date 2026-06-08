@@ -57,13 +57,16 @@ optional dashboard — not part of the test gate.
 The obfuscated-JS corpus lives **outside this repo**, in a Hugging Face dataset
 ([`devirt-dev/devirt-corpus`](https://huggingface.co/datasets/devirt-dev/devirt-corpus)).
 HF datasets are plain git repos, so no extra tooling is needed. `./samples` is
-gitignored.
+gitignored. Live scores + a browsable input→output table are published on the
+[dataset page](https://huggingface.co/datasets/devirt-dev/devirt-corpus).
 
 ```sh
 scripts/pull-corpus.sh                  # clone/update ./samples from the dataset
 CORPUS_REV=<sha> scripts/pull-corpus.sh # pin a revision for reproducible scores
 cargo run --release --bin report        # per-source readability scoreboard
 cargo run --release --bin report --files  # …plus every sample listed
+cargo run --release --bin report -- --json samples/metrics.jsonl --markdown
+                                        # per-sample JSONL (HF viewer) + markdown card
 ```
 
 The report groups samples by source (`generated`, `real/npm`, `real/tranco`,

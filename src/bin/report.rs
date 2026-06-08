@@ -13,9 +13,16 @@
 //!   kept%   — output bytes / input bytes (less dead weight => lower)
 //!   opaque% — mean fraction of identifiers that are hex (`_0x..`) or 1-2 chars
 //!             (more meaningful names => lower)
+//!
+//! Publishing flags drive the Hugging Face dataset page:
+//!   --json <path>   write per-sample rows (incl. input/output code) as JSONL,
+//!                   which the HF Dataset Viewer renders as a browsable table
+//!   --markdown      print the aggregate scoreboard as a GitHub table (for the
+//!                   dataset card / README), instead of the fixed-width table
 use devirt_core::deobfuscate;
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Default)]
@@ -30,9 +37,12 @@ struct Agg {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let show_files = args.iter().any(|a| a == "--files");
+    let markdown = args.iter().any(|a| a == "--markdown");
+    let json_path = flag_value(&args, "--json");
     let root = args
         .iter()
         .find(|a| !a.starts_with("--"))
+        .filter(|a| Some(a.as_str()) != json_path.as_deref())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("samples"));
 
@@ -48,6 +58,12 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Optional per-sample JSONL for the HF Dataset Viewer.
+    let mut json = json_path.as_ref().map(|p| {
+        let w = BufWriter::new(File::create(p).expect("create --json file"));
+        w
+    });
+
     let mut groups: BTreeMap<String, Agg> = BTreeMap::new();
     let mut total = Agg::default();
     if show_files {
@@ -60,8 +76,10 @@ fn main() {
         let opaque_in = opaque_ratio(&src);
         let r = deobfuscate(&src, &name);
         let opaque_out = opaque_ratio(&r.code);
+        let rel_path = rel(&root, p);
+        let source = group_of(&root, p);
 
-        let g = groups.entry(group_of(&root, p)).or_default();
+        let g = groups.entry(source.clone()).or_default();
         g.files += 1;
         g.in_bytes += src.len();
         g.out_bytes += r.code.len();
@@ -73,10 +91,14 @@ fn main() {
         total.opaque_in_sum += opaque_in;
         total.opaque_out_sum += opaque_out;
 
+        if let Some(w) = json.as_mut() {
+            write_json_row(w, &rel_path, &source, &src, &r.code, opaque_in, opaque_out);
+        }
+
         if show_files {
             println!(
                 "{:<52} {:>9} {:>9} {:>5}% {:>6.1}%→{:>5.1}%",
-                trunc(&rel(&root, p), 52),
+                trunc(&rel_path, 52),
                 src.len(),
                 r.code.len(),
                 pct(r.code.len(), src.len()),
@@ -86,17 +108,30 @@ fn main() {
         }
     }
 
+    if let Some(w) = json.as_mut() {
+        w.flush().expect("flush --json file");
+        eprintln!("wrote {} rows to {}", total.files, json_path.unwrap());
+    }
+
     if show_files {
         println!();
     }
-    println!(
-        "{:<24} {:>7} {:>11} {:>11} {:>6} {:>16}",
-        "source", "files", "in", "out", "kept%", "opaque% in→out"
-    );
-    for (name, a) in &groups {
-        print_row(name, a);
+    if markdown {
+        print_markdown(&groups, &total);
+    } else {
+        println!(
+            "{:<24} {:>7} {:>11} {:>11} {:>6} {:>16}",
+            "source", "files", "in", "out", "kept%", "opaque% in→out"
+        );
+        for (name, a) in &groups {
+            print_row(name, a);
+        }
+        print_row("TOTAL", &total);
     }
-    print_row("TOTAL", &total);
+}
+
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned()
 }
 
 fn print_row(name: &str, a: &Agg) {
@@ -111,6 +146,66 @@ fn print_row(name: &str, a: &Agg) {
         a.opaque_in_sum / n,
         a.opaque_out_sum / n,
     );
+}
+
+/// GitHub-flavored markdown table for the dataset card.
+fn print_markdown(groups: &BTreeMap<String, Agg>, total: &Agg) {
+    println!("| source | files | in bytes | out bytes | kept% | opaque% in→out |");
+    println!("|---|--:|--:|--:|--:|--:|");
+    let row = |name: &str, a: &Agg| {
+        let n = a.files.max(1) as f64;
+        println!(
+            "| `{}` | {} | {} | {} | {}% | {:.1}% → {:.1}% |",
+            name, a.files, a.in_bytes, a.out_bytes, pct(a.out_bytes, a.in_bytes),
+            a.opaque_in_sum / n, a.opaque_out_sum / n,
+        );
+    };
+    for (name, a) in groups {
+        row(name, a);
+    }
+    row("TOTAL", total);
+}
+
+/// One JSONL row per sample. Hand-rolled JSON (no serde dep) — only strings need
+/// escaping, and `js_escape` covers the JSON string grammar.
+fn write_json_row(
+    w: &mut impl Write,
+    path: &str,
+    source: &str,
+    input: &str,
+    output: &str,
+    opaque_in: f64,
+    opaque_out: f64,
+) {
+    let _ = writeln!(
+        w,
+        "{{\"path\":\"{}\",\"source\":\"{}\",\"in_bytes\":{},\"out_bytes\":{},\"kept_pct\":{},\"opaque_in\":{:.1},\"opaque_out\":{:.1},\"input\":\"{}\",\"output\":\"{}\"}}",
+        json_escape(path),
+        json_escape(source),
+        input.len(),
+        output.len(),
+        pct(output.len(), input.len()),
+        opaque_in,
+        opaque_out,
+        json_escape(input),
+        json_escape(output),
+    );
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 16);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
