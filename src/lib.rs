@@ -15,18 +15,6 @@ use oxc_parser::{ParseOptions, Parser};
 use oxc_span::SourceType;
 use std::path::Path;
 
-/// WASM/JS entry point (browser, Cloudflare Workers, Node). Deobfuscates
-/// `source` and returns the transformed code. `filename` only steers source-type
-/// inference (module vs script, jsx, ts) — pass e.g. `"input.js"`. On an internal
-/// pipeline panic it returns the input cleanly reformatted, the same graceful
-/// fallback as the native [`deobfuscate`] API (callers never see a trap on the
-/// normal error paths; see the crate's WASM notes for the one engine edge case).
-#[cfg(target_arch = "wasm32")]
-#[wasm_bindgen::prelude::wasm_bindgen]
-pub fn deobfuscate_js(source: &str, filename: &str) -> String {
-    deobfuscate(source, filename).code
-}
-
 pub struct Report {
     pub code: String,
     pub parse_errors: Vec<String>,

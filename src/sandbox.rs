@@ -393,12 +393,12 @@ pub fn behavior_signature(source: &str, budget: Duration) -> BehaviorSignature {
     };
     // Boa's recursive-descent parser, bytecompiler, and tree-walking VM lean on
     // the native Rust stack far more than QuickJS's bytecode VM did, so a large
-    // obfuscated program can overflow a default (~2–8 MiB) test/server stack.
-    // `run_isolated` gives it a big dedicated stack on native (a stack overflow
-    // aborts and is *not* catchable, so it must be prevented, not contained); on
-    // wasm it runs inline against the linked stack size. The whole-program run is
-    // also panic-contained on native: a Boa internal panic (e.g. its `%` overflow
-    // bug) collapses to the same comparable `HarnessError`, never a host crash.
+    // obfuscated program can overflow a default (~2-8 MiB) test/server stack.
+    // `run_isolated` gives it a big dedicated stack (a stack overflow aborts and
+    // is *not* catchable, so it must be prevented, not contained). The
+    // whole-program run is also panic-contained: a Boa internal panic (e.g. its
+    // `%` overflow bug) collapses to the same comparable `HarnessError`, never a
+    // host crash.
     const HARNESS_STACK: usize = 256 * 1024 * 1024;
     crate::util::run_isolated("behavior-signature", HARNESS_STACK, || {
         catch(|| behavior_signature_impl(source, budget))
