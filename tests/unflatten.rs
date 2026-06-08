@@ -466,3 +466,20 @@ fn multi_declarator_state_two_state_loop_recovers() {
 // `multi_declarator_sibling_reads_state_preserves_value` in tests/equivalence.rs;
 // a pipeline-level "is kept" assertion would be wrong, since once const-fold
 // rewrites `mirror = s` to `mirror = 1` the dispatcher legitimately recovers.
+
+// ---------------------------------------------------------------------------
+// Trailing `default:` clause — the handler for any state with no explicit case.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn default_clause_dispatcher_linearizes() {
+    // State 2 has no explicit case; the trailing `default:` is its handler. The
+    // chain 1 -> 2(default) -> exit must linearize away the dispatcher.
+    let out = deob(
+        "var s = 1, acc = 0; while (s) { switch (s) { \
+         case 1: acc += 1; s = 2; break; \
+         default: acc += 2; s = 0; break; } } sink(acc);",
+    );
+    assert!(!out.contains("switch"), "default-clause dispatcher survived: {out}");
+    assert!(!out.contains("while"), "loop survived: {out}");
+}
