@@ -1,6 +1,7 @@
 //! Pass registry. Add new passes here and to `default_pipeline()`.
 
 mod assigned_once;
+mod block_flatten;
 mod computed_state;
 mod const_fold;
 mod dce;
@@ -23,6 +24,7 @@ mod unflatten_param;
 mod unflatten_string_order;
 
 pub use assigned_once::AssignedOnceInline;
+pub use block_flatten::BlockFlatten;
 pub use computed_state::ComputedState;
 pub use const_fold::ConstantFold;
 pub use dce::Dce;
@@ -132,6 +134,11 @@ pub fn default_pipeline() -> Vec<Box<dyn Pass>> {
         // literals) and before DCE (so spent assignments become dead and get
         // removed). See `src/ir/`.
         Box::new(crate::ir::SsaOpt),
+        // Dissolve transparent bare blocks (debris from collapsing a constant-
+        // condition `if` to its taken branch) into the parent list. Runs right
+        // before DCE so an unwrapped `{ return x; }` exposes its terminator and
+        // DCE's unreachable-tail removal drops what followed in the same round.
+        Box::new(BlockFlatten::default()),
         Box::new(Dce::default()),
         // Remove pure stores to variables that are now read-never (spent
         // decoder-index arithmetic chains).

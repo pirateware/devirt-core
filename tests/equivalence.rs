@@ -2188,3 +2188,29 @@ fn multi_declarator_sibling_reads_state_preserves_value() {
          __r = String(mirror);",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Transparent bare-block flattening (src/passes/block_flatten.rs). A `var`-only
+// or declaration-free block dissolves into its parent; a `let`/`const`/`class`
+// block must NOT (it would change scoping or collide). The differential net
+// confirms the value is preserved across both the flatten and the decline.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn block_flatten_preserves_value() {
+    // A constant-condition guard collapses; the residual block dissolves and the
+    // dead branch is dropped. Value must be the live branch's.
+    assert_equivalent(
+        "function g(n){ var a = 7; if ((a * a - 49) === 0) { return n * 2; } \
+         else { return 999; } } __r = g(5);",
+    );
+    // A bare `var` block flattens (var hoists regardless), value preserved.
+    assert_equivalent("{ var a = 5; } __r = a + 1;");
+}
+
+#[test]
+fn block_flatten_respects_lexical_scope() {
+    // A `let` shadow inside a block must not be merged into the outer scope: the
+    // outer read must still observe the outer binding (1), not the shadow (2).
+    assert_equivalent("var out; { let a = 2; out = a; } var a = 1; __r = out + ':' + a;");
+}
