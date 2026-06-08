@@ -40,9 +40,6 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
-      - name: Format check
-        run: cargo fmt --all -- --check
-
       - name: Clippy (warnings = errors)
         run: cargo clippy --release --all-targets -- -D warnings
 

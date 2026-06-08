@@ -59,10 +59,9 @@ fn main() {
     }
 
     // Optional per-sample JSONL for the HF Dataset Viewer.
-    let mut json = json_path.as_ref().map(|p| {
-        let w = BufWriter::new(File::create(p).expect("create --json file"));
-        w
-    });
+    let mut json = json_path
+        .as_ref()
+        .map(|p| BufWriter::new(File::create(p).expect("create --json file")));
 
     let mut groups: BTreeMap<String, Agg> = BTreeMap::new();
     let mut total = Agg::default();
