@@ -163,25 +163,29 @@ fn render_scoreboard() -> String {
          Tracks the pipeline's effect per sample; `kept%` is output/input bytes \
          (lower = more dead weight removed), `brackets` counts `[\"…\"]` string \
          member access (lower = more `.x`), `opaque%` is the fraction of \
-         identifiers that are ≤2 chars or `_0x…` (lower = more meaningful names).\n\n",
+         identifiers that are ≤2 chars or `_0x…` (lower = more meaningful names), \
+         `hexrefs` is the raw (non-distinct) occurrence count of `_0x…`-style \
+         identifiers (lower = less decoder residue; ~0 means the string-array \
+         decoder was fully lifted).\n\n",
     );
     s.push_str(
-        "| sample | in_bytes | out_bytes | kept% | brackets | opaque% | rounds | converged |\n",
+        "| sample | in_bytes | out_bytes | kept% | brackets | opaque% | hexrefs | rounds | converged |\n",
     );
     s.push_str(
-        "|--------|---------:|----------:|------:|---------:|--------:|-------:|:---------:|\n",
+        "|--------|---------:|----------:|------:|---------:|--------:|--------:|-------:|:---------:|\n",
     );
     for (name, src) in sorted_samples() {
         let r = deobfuscate(&src, &name);
         let kept = r.code.len() * 100 / src.len().max(1);
         s.push_str(&format!(
-            "| {} | {} | {} | {}% | {} | {}% | {} | {} |\n",
+            "| {} | {} | {} | {}% | {} | {}% | {} | {} | {} |\n",
             name,
             src.len(),
             r.code.len(),
             kept,
             count_bracket_access(&r.code),
             opaque_name_ratio(&r.code),
+            count_hex_refs(&r.code),
             r.rounds,
             if r.converged { "yes" } else { "**no**" },
         ));
@@ -206,7 +210,8 @@ const PROFILE_ORDER: &[&str] = &[
 /// These are synthetic but obfuscator.io-faithful, and they gate correctness via
 /// `manifest.json`; aggregating them here makes them count toward readability too,
 /// per technique. `kept%` is byte-weighted (Σout/Σin); `opaque%` is the mean of
-/// per-file ratios; `rounds` is the worst case; `converged` flags any non-fixpoint.
+/// per-file ratios; `hexrefs` is the total across all files in the profile;
+/// `rounds` is the worst case; `converged` flags any non-fixpoint.
 fn render_generated_corpus(s: &mut String) {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("samples")
@@ -232,6 +237,7 @@ fn render_generated_corpus(s: &mut String) {
         a.out_bytes += r.code.len();
         a.brackets += count_bracket_access(&r.code);
         a.opaque_sum += opaque_name_ratio(&r.code);
+        a.hexrefs += count_hex_refs(&r.code);
         a.rounds_max = a.rounds_max.max(r.rounds);
         if !r.converged {
             a.not_converged += 1;
@@ -253,14 +259,16 @@ fn render_generated_corpus(s: &mut String) {
     s.push_str(
         "Synthetic javascript-obfuscator fixtures (one row per technique, \
          aggregated over all seeds). `kept%` is byte-weighted Σout/Σin; \
-         `opaque%` is the mean per-file ratio; `rounds` is the worst case; \
+         `opaque%` is the mean per-file ratio; `hexrefs` is the total \
+         `_0x…`-style identifier occurrences (non-distinct) across all files — \
+         ~0 means the decoder was lifted everywhere; `rounds` is the worst case; \
          `converged` is `yes` only if every file reached a fixpoint.\n\n",
     );
     s.push_str(
-        "| profile | files | in_bytes | out_bytes | kept% | brackets | opaque% | rounds | converged |\n",
+        "| profile | files | in_bytes | out_bytes | kept% | brackets | opaque% | hexrefs | rounds | converged |\n",
     );
     s.push_str(
-        "|---------|------:|---------:|----------:|------:|---------:|--------:|-------:|:---------:|\n",
+        "|---------|------:|---------:|----------:|------:|---------:|--------:|--------:|-------:|:---------:|\n",
     );
     let mut total = ProfileAgg::default();
     for profile in &profiles {
@@ -277,6 +285,7 @@ struct ProfileAgg {
     out_bytes: usize,
     brackets: usize,
     opaque_sum: usize,
+    hexrefs: usize,
     rounds_max: usize,
     not_converged: usize,
 }
@@ -288,6 +297,7 @@ impl ProfileAgg {
         self.out_bytes += o.out_bytes;
         self.brackets += o.brackets;
         self.opaque_sum += o.opaque_sum;
+        self.hexrefs += o.hexrefs;
         self.rounds_max = self.rounds_max.max(o.rounds_max);
         self.not_converged += o.not_converged;
     }
@@ -297,7 +307,7 @@ fn push_agg_row(s: &mut String, label: &str, a: &ProfileAgg) {
     let kept = a.out_bytes * 100 / a.in_bytes.max(1);
     let opaque = a.opaque_sum / a.files.max(1);
     s.push_str(&format!(
-        "| {} | {} | {} | {} | {}% | {} | {}% | {} | {} |\n",
+        "| {} | {} | {} | {} | {}% | {} | {}% | {} | {} | {} |\n",
         label,
         a.files,
         a.in_bytes,
@@ -305,6 +315,7 @@ fn push_agg_row(s: &mut String, label: &str, a: &ProfileAgg) {
         kept,
         a.brackets,
         opaque,
+        a.hexrefs,
         a.rounds_max,
         if a.not_converged == 0 {
             "yes".to_string()
@@ -351,4 +362,29 @@ fn opaque_name_ratio(s: &str) -> usize {
     } else {
         opaque.len() * 100 / all.len()
     }
+}
+
+/// Raw (non-distinct) occurrence count of `_0x…`-style hex-named identifiers.
+/// Counts every token starting with `_0x` followed by at least one hex character,
+/// regardless of how many times the same name appears. Mirrors `src/bin/report.rs`.
+/// Lower is better; ~0 means no decoder residue remains. Spikes on profiles where
+/// the string-array decoder survives (strarr_base64, strarr_rc4, numbers_keys,
+/// strong) and drops to ~0 once the decoder is fully lifted.
+fn count_hex_refs(s: &str) -> usize {
+    let mut count = 0usize;
+    let mut cur = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' {
+            cur.push(ch);
+        } else {
+            if cur.starts_with("_0x") && cur.len() > 3 {
+                count += 1;
+            }
+            cur.clear();
+        }
+    }
+    if cur.starts_with("_0x") && cur.len() > 3 {
+        count += 1;
+    }
+    count
 }
