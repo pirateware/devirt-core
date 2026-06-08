@@ -31,6 +31,10 @@ rustc-ice-*.txt
 /in.js
 /out.js
 
+# Obfuscated-JS corpus — pulled from the Hugging Face dataset, never vendored here
+# (scripts/pull-corpus.sh). Generate into it with scripts/gen-corpus.mjs.
+/samples/
+
 # Node deps used only for local obfuscation tooling — never part of the crate
 /node_modules/
 /package.json

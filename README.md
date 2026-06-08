@@ -34,7 +34,7 @@ cargo build --release
 ```sh
 cargo run --release --bin deob -- <file.js>          # deobfuscate, print to stdout
 cargo run --release --bin deob -- --format <file.js> # reprint with no transforms ("before" side of a diff)
-cargo run --release --bin report                     # readability metrics across the sample corpus
+cargo run --release --bin report                     # readability metrics over ./samples (pull it first)
 ```
 
 `--format` shares the deobfuscator's exact formatter, so a diff against normal
@@ -43,27 +43,32 @@ output shows only real deobfuscation changes, not formatting noise.
 ## Testing
 
 ```sh
-cargo test                                  # fast unit tests
-cargo test --release --features slow-tests  # full net: goldens, equivalence, idempotency, determinism
-./scripts/run-samples.sh                    # write in/out pairs to out/ for diffing
-./scripts/run-samples.sh sample_5           # side-by-side diff for one sample
-./scripts/bless.sh                          # re-bless golden snapshots after an intended change
+cargo nextest run --release   # full suite (CI runs this)
+cargo test --release          # same, without nextest
 ```
 
-The regression net (see `tests/README.md`) pins every sample's output
-byte-for-byte (`tests/snapshots/`) and proves the whole pipeline preserves
-observable behavior on the real corpus (`tests/sample_equivalence.rs`), so no pass
-change can silently move output. `tests/snapshots/SCOREBOARD.md` tracks readability
-metrics over time. Slow tests are gated behind the `slow-tests` feature so local
-iteration stays fast; CI runs them.
+The suite (see `tests/README.md`) is self-contained: every fixture is an inline
+JS snippet embedded in the Rust tests, so there is no on-disk corpus to pull and
+the suite covers correctness only. The readability corpus below is a separate,
+optional dashboard — not part of the test gate.
 
-## Samples
+## Corpus
 
-Real-world obfuscated scripts live in `samples/sample_*.js`, alongside a generated
-synthetic corpus (`samples/generated/`, built from `samples/seeds/` via
-`scripts/gen-samples.js`). The real samples are sourced from public anti-bot and
-challenge scripts, including DataDome, reCAPTCHA, hCaptcha, Cloudflare Turnstile,
-PerimeterX, and GoDaddy.
+The obfuscated-JS corpus lives **outside this repo**, in a Hugging Face dataset
+([`devirt-dev/devirt-corpus`](https://huggingface.co/datasets/devirt-dev/devirt-corpus)).
+HF datasets are plain git repos, so no extra tooling is needed. `./samples` is
+gitignored.
+
+```sh
+scripts/pull-corpus.sh                  # clone/update ./samples from the dataset
+CORPUS_REV=<sha> scripts/pull-corpus.sh # pin a revision for reproducible scores
+node scripts/gen-corpus.mjs             # (re)generate samples/generated/ from samples/seeds/
+cargo run --release --bin report        # readability metrics over ./samples
+```
+
+Generating the corpus needs `javascript-obfuscator` locally (`npm i
+javascript-obfuscator`); it is local tooling only and never part of the crate.
+After generating, push `./samples` back to the dataset to publish.
 
 ## Library
 

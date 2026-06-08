@@ -7,6 +7,10 @@ edition = "2021"
 name = "deob"
 path = "src/main.rs"
 
+[[bin]]
+name = "report"
+path = "src/bin/report.rs"
+
 [dependencies]
 oxc_allocator = "0.134.0"
 oxc_parser    = "0.134.0"
