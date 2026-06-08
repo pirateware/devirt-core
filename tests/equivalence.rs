@@ -2214,3 +2214,30 @@ fn block_flatten_respects_lexical_scope() {
     // outer read must still observe the outer binding (1), not the shadow (2).
     assert_equivalent("var out; { let a = 2; out = a; } var a = 1; __r = out + ':' + a;");
 }
+
+// ---------------------------------------------------------------------------
+// Pure method-call evaluation (src/passes/pure_eval.rs). A method call on a
+// constant receiver whose free names are all side-effect-free globals collapses
+// to its primitive value; a call with an impure/unknown receiver must not. The
+// differential net confirms value (and side-effect) preservation either way.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pure_method_call_preserves_value() {
+    assert_equivalent("__r = ['a','b','c'].join('-');");
+    assert_equivalent("__r = 'Hello'.toUpperCase() + 'x'.repeat(3);");
+    // Single-use receiver inlined then folded; numeric result stays numeric.
+    assert_equivalent("var s = 'abcde'; __r = s.length + 1;");
+    // The classic type trap: a join result is a string, not a number.
+    assert_equivalent("__r = [1, 0, 0].join('');");
+}
+
+#[test]
+fn impure_receiver_method_call_keeps_effect() {
+    // The method receiver has an observable side effect; folding the call away
+    // would drop it. The gate (free name `f`) declines, preserving the effect.
+    assert_equivalent(
+        "var log = ''; function f(){ log += 'x'; return ['a','b']; } \
+         var r = f().join(''); __r = r + ':' + log;",
+    );
+}
