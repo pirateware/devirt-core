@@ -186,7 +186,132 @@ fn render_scoreboard() -> String {
             if r.converged { "yes" } else { "**no**" },
         ));
     }
+    render_generated_corpus(&mut s);
     s
+}
+
+/// Profile order mirrors `scripts/gen-samples.js` — each is one
+/// javascript-obfuscator (obfuscator.io) technique. Unknown profiles append last.
+const PROFILE_ORDER: &[&str] = &[
+    "minimal",
+    "strarr_base64",
+    "strarr_rc4",
+    "controlflow",
+    "deadcode",
+    "numbers_keys",
+    "strong",
+];
+
+/// Append a per-profile rollup of the obfuscator.io corpus (`samples/generated/`).
+/// These are synthetic but obfuscator.io-faithful, and they gate correctness via
+/// `manifest.json`; aggregating them here makes them count toward readability too,
+/// per technique. `kept%` is byte-weighted (Σout/Σin); `opaque%` is the mean of
+/// per-file ratios; `rounds` is the worst case; `converged` flags any non-fixpoint.
+fn render_generated_corpus(s: &mut String) {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("samples")
+        .join("generated");
+    let mut by_profile: std::collections::BTreeMap<String, ProfileAgg> = Default::default();
+    let Ok(rd) = fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("js") {
+            continue;
+        }
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        let Some((_, profile)) = name.strip_suffix(".js").and_then(|st| st.rsplit_once("__")) else {
+            continue;
+        };
+        let src = fs::read_to_string(&p).unwrap();
+        let r = deobfuscate(&src, &name);
+        let a = by_profile.entry(profile.to_string()).or_default();
+        a.files += 1;
+        a.in_bytes += src.len();
+        a.out_bytes += r.code.len();
+        a.brackets += count_bracket_access(&r.code);
+        a.opaque_sum += opaque_name_ratio(&r.code);
+        a.rounds_max = a.rounds_max.max(r.rounds);
+        if !r.converged {
+            a.not_converged += 1;
+        }
+    }
+    if by_profile.is_empty() {
+        return;
+    }
+
+    let mut profiles: Vec<String> = by_profile.keys().cloned().collect();
+    profiles.sort_by_key(|p| {
+        PROFILE_ORDER
+            .iter()
+            .position(|x| x == p)
+            .unwrap_or(PROFILE_ORDER.len())
+    });
+
+    s.push_str("\n## obfuscator.io corpus (`samples/generated/`), by profile\n\n");
+    s.push_str(
+        "Synthetic javascript-obfuscator fixtures (one row per technique, \
+         aggregated over all seeds). `kept%` is byte-weighted Σout/Σin; \
+         `opaque%` is the mean per-file ratio; `rounds` is the worst case; \
+         `converged` is `yes` only if every file reached a fixpoint.\n\n",
+    );
+    s.push_str(
+        "| profile | files | in_bytes | out_bytes | kept% | brackets | opaque% | rounds | converged |\n",
+    );
+    s.push_str(
+        "|---------|------:|---------:|----------:|------:|---------:|--------:|-------:|:---------:|\n",
+    );
+    let mut total = ProfileAgg::default();
+    for profile in &profiles {
+        push_agg_row(s, profile, &by_profile[profile]);
+        total.merge(&by_profile[profile]);
+    }
+    push_agg_row(s, "**all**", &total);
+}
+
+#[derive(Default)]
+struct ProfileAgg {
+    files: usize,
+    in_bytes: usize,
+    out_bytes: usize,
+    brackets: usize,
+    opaque_sum: usize,
+    rounds_max: usize,
+    not_converged: usize,
+}
+
+impl ProfileAgg {
+    fn merge(&mut self, o: &ProfileAgg) {
+        self.files += o.files;
+        self.in_bytes += o.in_bytes;
+        self.out_bytes += o.out_bytes;
+        self.brackets += o.brackets;
+        self.opaque_sum += o.opaque_sum;
+        self.rounds_max = self.rounds_max.max(o.rounds_max);
+        self.not_converged += o.not_converged;
+    }
+}
+
+fn push_agg_row(s: &mut String, label: &str, a: &ProfileAgg) {
+    let kept = a.out_bytes * 100 / a.in_bytes.max(1);
+    let opaque = a.opaque_sum / a.files.max(1);
+    s.push_str(&format!(
+        "| {} | {} | {} | {} | {}% | {} | {}% | {} | {} |\n",
+        label,
+        a.files,
+        a.in_bytes,
+        a.out_bytes,
+        kept,
+        a.brackets,
+        opaque,
+        a.rounds_max,
+        if a.not_converged == 0 {
+            "yes".to_string()
+        } else {
+            format!("**{} no**", a.not_converged)
+        },
+    ));
 }
 
 fn count_bracket_access(s: &str) -> usize {
