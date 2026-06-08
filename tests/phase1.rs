@@ -2,7 +2,7 @@
 //! These assert on *behavior shape*, never on a specific sample — the pipeline
 //! must stay sample-agnostic.
 
-use js_deobfuscator::deobfuscate;
+use devirt_core::deobfuscate;
 
 fn deob(src: &str) -> String {
     let r = deobfuscate(src, "t.js");

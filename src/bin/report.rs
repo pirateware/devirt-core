@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
-use js_deobfuscator::deobfuscate;
+use devirt_core::deobfuscate;
 
 fn main() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("samples");

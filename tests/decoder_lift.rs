@@ -1,6 +1,6 @@
 //! Decoder-lifting tests. Structural patterns only — never a specific sample.
 
-use js_deobfuscator::deobfuscate;
+use devirt_core::deobfuscate;
 
 #[test]
 fn lifts_string_array_decoder_with_rotation() {

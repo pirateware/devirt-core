@@ -1,6 +1,6 @@
 //! Dead-code-elimination tests. Structural patterns only — never a specific sample.
 
-use js_deobfuscator::deobfuscate;
+use devirt_core::deobfuscate;
 
 /// A function declaration whose only remaining reference is the self-memoizing
 /// write inside its own body (the obfuscator string-array accessor, after every

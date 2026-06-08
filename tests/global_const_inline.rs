@@ -1,6 +1,6 @@
 //! Cross-function write-once constant inlining tests. Structural patterns only.
 
-use js_deobfuscator::deobfuscate;
+use devirt_core::deobfuscate;
 
 #[test]
 fn inlines_constant_written_in_init_function() {

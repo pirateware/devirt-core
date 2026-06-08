@@ -1,4 +1,4 @@
-# js-deobfuscator
+# devirt-core
 
 A generic, sample-agnostic JavaScript deobfuscator built as a compiler. It parses
 input with [oxc](https://github.com/oxc-project/oxc), runs a fixpoint of
@@ -71,7 +71,7 @@ The crate exposes the deobfuscator as a normal Rust API for embedding in other
 tools:
 
 ```rust
-use js_deobfuscator::{deobfuscate, format_only};
+use devirt_core::{deobfuscate, format_only};
 
 let report = deobfuscate(source, "input.js"); // filename only steers source-type inference
 println!("{}", report.code);

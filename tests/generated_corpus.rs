@@ -23,8 +23,8 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use js_deobfuscator::deobfuscate;
-use js_deobfuscator::sandbox::{behavior_signature, RunOutcome};
+use devirt_core::deobfuscate;
+use devirt_core::sandbox::{behavior_signature, RunOutcome};
 
 fn generated_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

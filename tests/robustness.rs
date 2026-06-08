@@ -7,7 +7,7 @@
 //! half-transformed program). The actual panic-containment unit lives in the lib
 //! crate; here we assert the end-to-end guarantee on adversarial input.
 
-use js_deobfuscator::{deobfuscate, format_only};
+use devirt_core::{deobfuscate, format_only};
 
 /// Every input must be handled without a panic and must yield re-parseable output.
 fn assert_survives(src: &str) {

@@ -1,6 +1,6 @@
 //! Constant-selector de-multiplexer tests. Structural patterns only.
 
-use js_deobfuscator::deobfuscate;
+use devirt_core::deobfuscate;
 
 #[test]
 fn specializes_constant_selector_multiplexer() {

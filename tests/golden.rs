@@ -23,7 +23,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
-use js_deobfuscator::deobfuscate;
+use devirt_core::deobfuscate;
 
 fn blessing() -> bool {
     std::env::var("UPDATE_SNAPSHOTS").is_ok_and(|v| v == "1" || v == "true")

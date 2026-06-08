@@ -2,7 +2,7 @@
 //! sample. The identities used (`(a^b)+2*(a&b) == a+b`, `a+~b+1 == a-b`) are real
 //! integer identities, so a correct fingerprint must recover the operator.
 
-use js_deobfuscator::deobfuscate;
+use devirt_core::deobfuscate;
 
 fn deob(src: &str) -> String {
     let r = deobfuscate(src, "t.js");

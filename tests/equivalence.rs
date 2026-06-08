@@ -7,8 +7,8 @@
 //! every value-changing pass (const-fold, void/string folding, sequence split,
 //! dead-literal DCE, decoder lift): a pass that alters behavior fails here.
 
-use js_deobfuscator::deobfuscate;
-use js_deobfuscator::sandbox::{EvalValue, Sandbox};
+use devirt_core::deobfuscate;
+use devirt_core::sandbox::{EvalValue, Sandbox};
 
 /// Evaluate `program` (an expression-returning IIFE body wrapper) and return its
 /// primitive result. Each call uses a fresh sandbox for isolation.
@@ -1766,7 +1766,7 @@ fn pure_expression_resolution_preserves_value() {
 /// firing: the proof that we structured, not just stayed equivalent by declining.
 fn assert_structured(src: &str) {
     assert_equivalent(src);
-    let deob = js_deobfuscator::deobfuscate(src, "t.js");
+    let deob = devirt_core::deobfuscate(src, "t.js");
     assert!(
         !deob.code.contains("switch"),
         "expected the dispatcher to be structured away, but a switch remains:\n{}",
@@ -1778,7 +1778,7 @@ fn assert_structured(src: &str) {
 /// remains) — the adversarial / unsupported sibling. Value still preserved.
 fn assert_declined(src: &str) {
     assert_equivalent(src);
-    let deob = js_deobfuscator::deobfuscate(src, "t.js");
+    let deob = devirt_core::deobfuscate(src, "t.js");
     assert!(
         deob.code.contains("switch"),
         "expected the dispatcher to be left intact (declined), but it was structured:\n{}",

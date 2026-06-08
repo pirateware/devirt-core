@@ -3,7 +3,7 @@
 //! Structural shape + decline behavior. Value-preservation (the real soundness
 //! net) lives in tests/equivalence.rs (`string_order_*`).
 
-use js_deobfuscator::deobfuscate;
+use devirt_core::deobfuscate;
 
 fn deob(src: &str) -> String {
     let r = deobfuscate(src, "t.js");

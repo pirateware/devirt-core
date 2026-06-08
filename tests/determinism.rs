@@ -17,7 +17,7 @@
 //! Mid-size real samples (sample_3, sample_11) are the historical jitter sources,
 //! so they are the headline fixtures here alongside a couple of smaller ones.
 
-use js_deobfuscator::deobfuscate;
+use devirt_core::deobfuscate;
 
 /// Deobfuscate `name` (from the `samples/` dir) `n` times in this process and
 /// assert every run is byte-identical to the first.

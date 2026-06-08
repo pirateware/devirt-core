@@ -1,7 +1,7 @@
 //! Control-flow unflattening tests. Structural shape only; soundness (value
 //! preservation, decline-to-transform) lives in tests/equivalence.rs.
 
-use js_deobfuscator::deobfuscate;
+use devirt_core::deobfuscate;
 
 fn deob(src: &str) -> String {
     let r = deobfuscate(src, "t.js");

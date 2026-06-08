@@ -1,6 +1,6 @@
 //! else-after-terminator flattening tests.
 
-use js_deobfuscator::deobfuscate;
+use devirt_core::deobfuscate;
 
 fn deob(src: &str) -> String {
     let r = deobfuscate(src, "t.js");

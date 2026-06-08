@@ -1,4 +1,4 @@
-use js_deobfuscator::{deobfuscate, run_pass};
+use devirt_core::{deobfuscate, run_pass};
 
 #[test]
 fn renames_opaque_bindings_and_all_references() {

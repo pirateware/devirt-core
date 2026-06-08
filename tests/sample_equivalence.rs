@@ -26,8 +26,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use js_deobfuscator::deobfuscate;
-use js_deobfuscator::sandbox::{behavior_signature, BehaviorSignature, RunOutcome};
+use devirt_core::deobfuscate;
+use devirt_core::sandbox::{behavior_signature, BehaviorSignature, RunOutcome};
 
 /// Per-sample wall-clock budget for one program run under the shim. Overridable
 /// (`DEOB_EQUIV_BUDGET_MS`) so a slow CI box can loosen it without a code change.

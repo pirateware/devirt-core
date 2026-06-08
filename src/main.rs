@@ -3,7 +3,7 @@
 //! Flags:
 //!   --format   re-print with NO transforms (the "before" side of a diff).
 
-use js_deobfuscator::{deobfuscate, format_only};
+use devirt_core::{deobfuscate, format_only};
 
 struct Args {
     format: bool,

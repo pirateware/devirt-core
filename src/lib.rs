@@ -1,4 +1,4 @@
-//! js-deobfuscator: a generic, sample-agnostic JS deobfuscator built as a
+//! devirt-core: a generic, sample-agnostic JS deobfuscator built as a
 //! fixpoint of semantics-preserving AST rewrites over oxc.
 
 mod driver;

@@ -1,4 +1,4 @@
-use js_deobfuscator::sandbox::Sandbox;
+use devirt_core::sandbox::Sandbox;
 
 #[test]
 fn evaluates_a_real_base91_style_decoder() {
