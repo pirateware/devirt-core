@@ -1,23 +1,38 @@
-//! `report` — a small readability dashboard over the local corpus (`samples/`).
+//! `report` — a readability dashboard over the local corpus (`samples/`).
 //!
 //! Not a test; a quick way to see the pipeline's effect on real input. Pull the
 //! corpus first (`scripts/pull-corpus.sh`), then:
 //!
-//!   cargo run --release --bin report            # scores ./samples
-//!   cargo run --release --bin report <dir>      # scores another directory
+//!   cargo run --release --bin report            # per-source aggregates over ./samples
+//!   cargo run --release --bin report --files    # also list every sample
+//!   cargo run --release --bin report <dir>      # score another directory
 //!
-//! For each *.js found, run the deobfuscator and print two size-normalized
-//! proxies for "how readable is the output":
+//! Samples are grouped by their source directory (e.g. `generated`, `real/npm`,
+//! `real/tranco`, `real/httparchive`) so each source's scores are visible
+//! separately. Two size-normalized proxies for "how readable is the output":
 //!   kept%   — output bytes / input bytes (less dead weight => lower)
-//!   opaque% — fraction of identifiers that are hex (`_0x..`) or 1-2 chars
+//!   opaque% — mean fraction of identifiers that are hex (`_0x..`) or 1-2 chars
 //!             (more meaningful names => lower)
 use devirt_core::deobfuscate;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[derive(Default)]
+struct Agg {
+    files: usize,
+    in_bytes: usize,
+    out_bytes: usize,
+    opaque_in_sum: f64,
+    opaque_out_sum: f64,
+}
+
 fn main() {
-    let root = std::env::args()
-        .nth(1)
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let show_files = args.iter().any(|a| a == "--files");
+    let root = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("samples"));
 
@@ -33,34 +48,68 @@ fn main() {
         std::process::exit(1);
     }
 
-    println!(
-        "{:<44} {:>9} {:>9} {:>6} {:>8}",
-        "sample", "in", "out", "kept%", "opaque%"
-    );
-    let (mut in_sum, mut out_sum) = (0usize, 0usize);
+    let mut groups: BTreeMap<String, Agg> = BTreeMap::new();
+    let mut total = Agg::default();
+    if show_files {
+        println!("{:<52} {:>9} {:>9} {:>6} {:>8}", "sample", "in", "out", "kept%", "opaque%");
+    }
+
     for p in &files {
-        let Ok(src) = fs::read_to_string(p) else {
-            continue;
-        };
+        let Ok(src) = fs::read_to_string(p) else { continue };
         let name = p.file_name().unwrap().to_string_lossy();
+        let opaque_in = opaque_ratio(&src);
         let r = deobfuscate(&src, &name);
-        in_sum += src.len();
-        out_sum += r.code.len();
-        println!(
-            "{:<44} {:>9} {:>9} {:>5}% {:>7.1}%",
-            trunc(&rel(&root, p), 44),
-            src.len(),
-            r.code.len(),
-            pct(r.code.len(), src.len()),
-            opaque_ratio(&r.code),
-        );
+        let opaque_out = opaque_ratio(&r.code);
+
+        let g = groups.entry(group_of(&root, p)).or_default();
+        g.files += 1;
+        g.in_bytes += src.len();
+        g.out_bytes += r.code.len();
+        g.opaque_in_sum += opaque_in;
+        g.opaque_out_sum += opaque_out;
+        total.files += 1;
+        total.in_bytes += src.len();
+        total.out_bytes += r.code.len();
+        total.opaque_in_sum += opaque_in;
+        total.opaque_out_sum += opaque_out;
+
+        if show_files {
+            println!(
+                "{:<52} {:>9} {:>9} {:>5}% {:>6.1}%→{:>5.1}%",
+                trunc(&rel(&root, p), 52),
+                src.len(),
+                r.code.len(),
+                pct(r.code.len(), src.len()),
+                opaque_in,
+                opaque_out,
+            );
+        }
+    }
+
+    if show_files {
+        println!();
     }
     println!(
-        "{:<44} {:>9} {:>9} {:>5}%",
-        format!("TOTAL ({} files)", files.len()),
-        in_sum,
-        out_sum,
-        pct(out_sum, in_sum),
+        "{:<24} {:>7} {:>11} {:>11} {:>6} {:>16}",
+        "source", "files", "in", "out", "kept%", "opaque% in→out"
+    );
+    for (name, a) in &groups {
+        print_row(name, a);
+    }
+    print_row("TOTAL", &total);
+}
+
+fn print_row(name: &str, a: &Agg) {
+    let n = a.files.max(1) as f64;
+    println!(
+        "{:<24} {:>7} {:>11} {:>11} {:>5}% {:>6.1}%→{:>5.1}%",
+        trunc(name, 24),
+        a.files,
+        a.in_bytes,
+        a.out_bytes,
+        pct(a.out_bytes, a.in_bytes),
+        a.opaque_in_sum / n,
+        a.opaque_out_sum / n,
     );
 }
 
@@ -70,10 +119,7 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
         let p = e.path();
         if p.is_dir() {
             // Skip git internals and the plain seeds (inputs, not obfuscated samples).
-            if p.file_name()
-                .map(|n| n == ".git" || n == "seeds")
-                .unwrap_or(false)
-            {
+            if p.file_name().map(|n| n == ".git" || n == "seeds").unwrap_or(false) {
                 continue;
             }
             collect(&p, out);
@@ -83,22 +129,29 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Source group = the sample's directory relative to root (e.g. `real/npm`).
+fn group_of(root: &Path, p: &Path) -> String {
+    p.parent()
+        .and_then(|d| d.strip_prefix(root).ok())
+        .map(|d| d.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| ".".into())
+}
+
 fn pct(part: usize, whole: usize) -> usize {
     part * 100 / whole.max(1)
 }
 
 fn rel(root: &Path, p: &Path) -> String {
-    p.strip_prefix(root)
-        .unwrap_or(p)
-        .to_string_lossy()
-        .into_owned()
+    p.strip_prefix(root).unwrap_or(p).to_string_lossy().into_owned()
 }
 
 fn trunc(s: &str, n: usize) -> String {
-    if s.len() <= n {
+    if s.chars().count() <= n {
         s.to_string()
     } else {
-        format!("…{}", &s[s.len() - (n - 1)..])
+        let tail: String = s.chars().rev().take(n - 1).collect::<Vec<_>>().into_iter().rev().collect();
+        format!("…{}", tail)
     }
 }
 

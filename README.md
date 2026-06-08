@@ -62,13 +62,30 @@ gitignored.
 ```sh
 scripts/pull-corpus.sh                  # clone/update ./samples from the dataset
 CORPUS_REV=<sha> scripts/pull-corpus.sh # pin a revision for reproducible scores
-node scripts/gen-corpus.mjs             # (re)generate samples/generated/ from samples/seeds/
-cargo run --release --bin report        # readability metrics over ./samples
+cargo run --release --bin report        # per-source readability scoreboard
+cargo run --release --bin report --files  # …plus every sample listed
 ```
 
-Generating the corpus needs `javascript-obfuscator` locally (`npm i
-javascript-obfuscator`); it is local tooling only and never part of the crate.
-After generating, push `./samples` back to the dataset to publish.
+The report groups samples by source (`generated`, `real/npm`, `real/tranco`,
+`real/httparchive`) and shows `kept%` plus **opaque% in→out** — the fraction of
+machine-looking identifiers before vs. after. Note `kept%` exceeds 100% on real
+*minified* input because the engine reformats/expands it; the readability story
+is the opaque-% drop, not byte count.
+
+### Growing the corpus
+
+```sh
+node scripts/make-seeds.mjs --count 200   # generate varied plain seeds
+node scripts/gen-corpus.mjs               # obfuscate them under ~21 profiles
+node scripts/gen-corpus.mjs --profiles strong,controlflow   # …or a subset
+```
+
+Real-world samples come from three sources (npm / Tranco crawl / HTTP Archive),
+each filtered + deduped the same way — see [`scripts/real/README.md`](scripts/real/README.md).
+
+Generating needs `javascript-obfuscator` locally (`npm i javascript-obfuscator`);
+it is local tooling only, never part of the crate. After generating/fetching,
+push `./samples` back to the dataset to publish.
 
 ## Library
 

@@ -20,23 +20,61 @@ import JsObf from "javascript-obfuscator";
 const SEEDS = "samples/seeds";
 const OUT = "samples/generated";
 
+// A matrix of named profiles spanning javascript-obfuscator's technique space.
+// Each isolates or combines transforms a deobfuscator must see through; the
+// names become the `__<profile>` suffix so `report` can aggregate per technique.
+const SA = (enc, extra = {}) => ({
+  stringArray: true,
+  stringArrayEncoding: [enc],
+  stringArrayThreshold: 1,
+  ...extra,
+});
 const PROFILES = {
   minimal: {},
-  strings_b64: { stringArray: true, stringArrayEncoding: ["base64"], stringArrayThreshold: 1 },
-  strings_rc4: { stringArray: true, stringArrayEncoding: ["rc4"], stringArrayThreshold: 1 },
+  strings_none: SA("none"),
+  strings_b64: SA("base64"),
+  strings_rc4: SA("rc4"),
+  strings_rotate: SA("base64", { stringArrayRotate: true, stringArrayShuffle: true }),
+  strings_wrappers: SA("rc4", { stringArrayWrappersCount: 3, stringArrayWrappersType: "function" }),
+  strings_indexshift: SA("rc4", { stringArrayIndexShift: true, stringArrayWrappersCount: 2 }),
+  splitstrings: { splitStrings: true, splitStringsChunkLength: 4 },
+  numbers: { numbersToExpressions: true },
+  objectkeys: { transformObjectKeys: true },
+  names_hex: { identifierNamesGenerator: "hexadecimal", renameGlobals: true },
+  names_mangled: { identifierNamesGenerator: "mangled", renameGlobals: true },
   controlflow: { controlFlowFlattening: true, controlFlowFlatteningThreshold: 1 },
+  controlflow_half: { controlFlowFlattening: true, controlFlowFlatteningThreshold: 0.5 },
   deadcode: { deadCodeInjection: true, deadCodeInjectionThreshold: 1 },
-  strong: {
-    stringArray: true,
-    stringArrayEncoding: ["rc4"],
-    stringArrayThreshold: 1,
+  cf_dead: {
+    controlFlowFlattening: true,
+    controlFlowFlatteningThreshold: 1,
+    deadCodeInjection: true,
+    deadCodeInjectionThreshold: 1,
+  },
+  sa_cf: SA("rc4", { controlFlowFlattening: true, controlFlowFlatteningThreshold: 1 }),
+  sa_numbers: SA("base64", { numbersToExpressions: true }),
+  strong: SA("rc4", {
+    stringArrayRotate: true,
+    stringArrayShuffle: true,
+    stringArrayWrappersCount: 2,
     controlFlowFlattening: true,
     controlFlowFlatteningThreshold: 1,
     deadCodeInjection: true,
     numbersToExpressions: true,
+    transformObjectKeys: true,
+    splitStrings: true,
+    splitStringsChunkLength: 5,
     simplify: true,
-  },
+  }),
 };
+
+// Profiles deliberately exclude self-defending / debug-protection / console
+// suppression — anti-tamper that breaks plain execution.
+const selected = (() => {
+  const i = process.argv.indexOf("--profiles");
+  if (i < 0) return Object.keys(PROFILES);
+  return process.argv[i + 1].split(",").filter((p) => PROFILES[p]);
+})();
 
 mkdirSync(OUT, { recursive: true });
 const seeds = readdirSync(SEEDS).filter((f) => f.endsWith(".js"));
@@ -45,14 +83,22 @@ if (seeds.length === 0) {
   process.exit(1);
 }
 
-let n = 0;
+let n = 0, failed = 0;
 for (const f of seeds) {
   const code = readFileSync(join(SEEDS, f), "utf8");
   const stem = basename(f, ".js");
-  for (const [name, opts] of Object.entries(PROFILES)) {
-    const out = JsObf.obfuscate(code, { seed: 1337, ...opts }).getObfuscatedCode();
-    writeFileSync(join(OUT, `${stem}__${name}.js`), out);
-    n++;
+  for (const name of selected) {
+    try {
+      const out = JsObf.obfuscate(code, { seed: 1337, ...PROFILES[name] }).getObfuscatedCode();
+      writeFileSync(join(OUT, `${stem}__${name}.js`), out);
+      n++;
+    } catch {
+      failed++; // a profile/seed combo the obfuscator rejects — skip, don't abort
+    }
   }
+  if (n % 500 === 0 && n) process.stdout.write(`\rgenerated ${n} files...   `);
 }
-console.log(`Generated ${n} files (${seeds.length} seeds x ${Object.keys(PROFILES).length} profiles) into ${OUT}/`);
+console.log(
+  `\nGenerated ${n} files (${seeds.length} seeds x ${selected.length} profiles) into ${OUT}/` +
+    (failed ? ` (${failed} combos skipped)` : "")
+);
