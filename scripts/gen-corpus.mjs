@@ -77,12 +77,15 @@ const selected = (() => {
 })();
 
 mkdirSync(OUT, { recursive: true });
+for (const name of selected) mkdirSync(join(OUT, name), { recursive: true });
 const seeds = readdirSync(SEEDS).filter((f) => f.endsWith(".js"));
 if (seeds.length === 0) {
   console.error(`no seeds in ${SEEDS}/ — pull the corpus first (scripts/pull-corpus.sh)`);
   process.exit(1);
 }
 
+// Shard by profile (samples/generated/<profile>/<seed>.js) so 10k+ files don't
+// land in one directory and `report` shows a per-technique row.
 let n = 0, failed = 0;
 for (const f of seeds) {
   const code = readFileSync(join(SEEDS, f), "utf8");
@@ -90,13 +93,13 @@ for (const f of seeds) {
   for (const name of selected) {
     try {
       const out = JsObf.obfuscate(code, { seed: 1337, ...PROFILES[name] }).getObfuscatedCode();
-      writeFileSync(join(OUT, `${stem}__${name}.js`), out);
+      writeFileSync(join(OUT, name, `${stem}.js`), out);
       n++;
     } catch {
       failed++; // a profile/seed combo the obfuscator rejects — skip, don't abort
     }
   }
-  if (n % 500 === 0 && n) process.stdout.write(`\rgenerated ${n} files...   `);
+  if (n % 1000 === 0 && n) process.stdout.write(`\rgenerated ${n} files...   `);
 }
 console.log(
   `\nGenerated ${n} files (${seeds.length} seeds x ${selected.length} profiles) into ${OUT}/` +
