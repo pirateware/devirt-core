@@ -1,0 +1,66 @@
+name: Score corpus
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: score-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  score:
+    name: score + publish metrics
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build report
+        run: cargo build --release --bin report
+
+      - name: Pull corpus
+        run: scripts/pull-corpus.sh
+
+      - name: Score
+        run: |
+          cargo run --release --bin report -- --json samples/metrics.jsonl --markdown \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Shard metrics (<10MB per file, no LFS)
+        run: |
+          rm -rf samples/metrics
+          mkdir -p samples/metrics
+          split -C 9000000 -d --additional-suffix=.jsonl \
+            samples/metrics.jsonl samples/metrics/part-
+          rm samples/metrics.jsonl
+
+      - name: Publish to Hugging Face dataset
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          cd samples
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin \
+            "https://github-actions:${HF_TOKEN}@huggingface.co/datasets/devirt-dev/devirt-corpus"
+          git add -A metrics
+          if git diff --cached --quiet; then
+            echo "metrics unchanged for ${GITHUB_REF_NAME}; nothing to publish"
+          else
+            git commit -m "ci: refresh metrics for ${GITHUB_REF_NAME}"
+            git push origin HEAD:main
+          fi
