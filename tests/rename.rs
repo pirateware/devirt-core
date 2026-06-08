@@ -112,7 +112,9 @@ fn emitted_names_are_unique_and_collision_free() {
 #[test]
 fn does_not_touch_property_names() {
     // `WL` here is a property key, not a reference to a binding — must survive.
-    let out = deobfuscate("var ab = {}; ab.WL = 1; foo(ab.WL);", "t.js").code;
+    // `ab` aliases `window` so the object can't be reconstructed/folded away,
+    // keeping the `.WL` property access in the output for rename to leave alone.
+    let out = deobfuscate("var ab = window; ab.WL = 1; foo(ab.WL);", "t.js").code;
     assert!(
         out.contains(".WL"),
         "property name was wrongly renamed: {out}"
