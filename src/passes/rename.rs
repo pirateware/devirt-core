@@ -24,8 +24,9 @@
 use std::collections::{HashMap, HashSet};
 
 use oxc_ast::ast::{
-    BindingIdentifier, BindingPattern, Expression, Function, FunctionBody, IdentifierReference,
-    Program, Statement, StaticMemberExpression, VariableDeclarator,
+    BindingIdentifier, BindingPattern, CallExpression, CatchClause, Expression, ForStatement,
+    FormalParameters, Function, FunctionBody, IdentifierReference, Program, Statement,
+    StaticMemberExpression, VariableDeclarator,
 };
 use oxc_syntax::operator::BinaryOperator;
 use oxc_syntax::symbol::{SymbolFlags, SymbolId};
@@ -162,6 +163,43 @@ impl Collector {
     fn record_hint(&mut self, sym: SymbolId, name: &str) {
         self.hints.entry(sym).or_insert_with(|| name.to_string());
     }
+
+    /// Apply positional callback role names to a parameter list. `roles[i]` is the
+    /// conventional name for the i-th param; extra params get no hint (fall through
+    /// to the generic fallback). Only plain-identifier params are nameable.
+    fn name_callback_params(&mut self, params: &FormalParameters<'_>, roles: &[&str]) {
+        for (i, param) in params.items.iter().enumerate() {
+            let Some(&role) = roles.get(i) else { break };
+            if let Some(sym) = binding_symbol(&param.pattern) {
+                self.record_hint(sym, role);
+            }
+        }
+    }
+}
+
+/// The `SymbolId` of a binding pattern, when it is a plain identifier (`x`, not a
+/// destructuring pattern — those have their own already-meaningful names).
+fn binding_symbol(pat: &BindingPattern<'_>) -> Option<SymbolId> {
+    match pat {
+        BindingPattern::BindingIdentifier(bid) => bid.symbol_id.get(),
+        _ => None,
+    }
+}
+
+/// Conventional parameter roles for an array-iteration callback, by method name.
+/// Returns `None` for methods whose callback params have no strong convention.
+/// All names are ≥ 3 non-`_$` chars so they survive `is_opaque` (idempotence).
+fn callback_param_roles(method: &str) -> Option<&'static [&'static str]> {
+    Some(match method {
+        // (accumulator, currentValue, index, array)
+        "reduce" | "reduceRight" => &["acc", "value", "index", "arr"],
+        // (element, index, array)
+        "map" | "forEach" | "filter" | "find" | "findIndex" | "findLast"
+        | "findLastIndex" | "some" | "every" | "flatMap" => &["item", "index", "arr"],
+        // (a, b) comparator
+        "sort" => &["left", "right"],
+        _ => return None,
+    })
 }
 
 impl<'a> Traverse<'a, ()> for Collector {
@@ -203,6 +241,63 @@ impl<'a> Traverse<'a, ()> for Collector {
         }
     }
 
+    /// A `catch (e) {}` binding is, by overwhelming convention, an error — name it
+    /// `error`. (`err` is 3 chars but reads slightly less clearly; both are fine
+    /// against `is_opaque`. We use `error`.)
+    fn enter_catch_clause(&mut self, node: &mut CatchClause<'a>, _ctx: &mut TraverseCtx<'a, ()>) {
+        if let Some(param) = &node.param {
+            if let Some(sym) = binding_symbol(&param.pattern) {
+                self.record_hint(sym, "error");
+            }
+        }
+    }
+
+    /// A C-style loop counter `for (let i = 0; i < n; i++)` is, by convention, an
+    /// index. We give the *first* such counter in a function `index`, deeper nests
+    /// `index2`, … via the global de-duplicator. The counter is identified as the
+    /// `init` declarator whose binding drives the `update` (`i++` / `++i` / `i +=`).
+    fn enter_for_statement(&mut self, node: &mut ForStatement<'a>, ctx: &mut TraverseCtx<'a, ()>) {
+        if let Some(sym) = for_counter_symbol(node, ctx) {
+            self.record_hint(sym, "index");
+        }
+    }
+
+    /// Array-iteration callbacks carry strong conventional param roles. When a call
+    /// is `<obj>.<method>(<callback>, …)` for a known iteration method, name the
+    /// callback's params from their role (`reduce` → accumulator + element, `map` →
+    /// element + index, …). This is the single biggest source of leftover `varN`.
+    fn enter_call_expression(
+        &mut self,
+        node: &mut CallExpression<'a>,
+        _ctx: &mut TraverseCtx<'a, ()>,
+    ) {
+        // The method name may be a static member (`xs.reduce`) or a string-keyed
+        // computed member (`xs["reduce"]`) left by partial string-array recovery.
+        let method = match &node.callee {
+            Expression::StaticMemberExpression(m) => m.property.name.as_str(),
+            Expression::ComputedMemberExpression(m) => match &m.expression {
+                Expression::StringLiteral(s) => s.value.as_str(),
+                _ => return,
+            },
+            _ => return,
+        };
+        let roles = match callback_param_roles(method) {
+            Some(r) => r,
+            None => return,
+        };
+        // The callback is the relevant positional argument (1st for most, but
+        // `reduce`/`reduceRight` also take an optional seed *after* it).
+        let Some(cb_arg) = node.arguments.first() else {
+            return;
+        };
+        let params = match cb_arg.as_expression() {
+            Some(Expression::ArrowFunctionExpression(f)) => &f.params,
+            Some(Expression::FunctionExpression(f)) => &f.params,
+            _ => return,
+        };
+        self.name_callback_params(params, roles);
+    }
+
     fn enter_static_member_expression(
         &mut self,
         node: &mut StaticMemberExpression<'a>,
@@ -220,6 +315,46 @@ impl<'a> Traverse<'a, ()> for Collector {
                 .or_default()
                 .push(node.property.name.to_string());
         }
+    }
+}
+
+/// The loop-counter symbol of a C-style `for (init; test; update)`, when it has the
+/// canonical shape: an `init` that declares a single identifier, and an `update`
+/// that mutates *that same* identifier (`i++`, `++i`, `i += k`). Returns its
+/// `SymbolId` so the rename pass can hint it as an index. We resolve the update's
+/// target identifier back to a symbol and require it to match the declared one, so
+/// we never mis-hint a loop whose counter is updated indirectly.
+fn for_counter_symbol(node: &ForStatement<'_>, ctx: &TraverseCtx<'_, ()>) -> Option<SymbolId> {
+    use oxc_ast::ast::{ForStatementInit, SimpleAssignmentTarget};
+
+    // The declared counter symbol from `init` (`let i = 0`).
+    let ForStatementInit::VariableDeclaration(decl) = node.init.as_ref()? else {
+        return None;
+    };
+    if decl.declarations.len() != 1 {
+        return None;
+    }
+    let decl_sym = binding_symbol(&decl.declarations[0].id)?;
+
+    // The identifier mutated by `update` must resolve to that same symbol.
+    let update = node.update.as_ref()?;
+    let target_ref = match update {
+        Expression::UpdateExpression(u) => match &u.argument {
+            SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => id,
+            _ => return None,
+        },
+        Expression::AssignmentExpression(a) => match &a.left {
+            oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(id) => id,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let rid = target_ref.reference_id.get()?;
+    let update_sym = ctx.scoping().get_reference(rid).symbol_id()?;
+    if update_sym == decl_sym {
+        Some(decl_sym)
+    } else {
+        None
     }
 }
 

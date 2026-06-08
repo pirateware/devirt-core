@@ -24,6 +24,19 @@ fn member_normalization() {
 }
 
 #[test]
+fn member_normalization_optional_chain() {
+    // `a?.["foo"]` parses as a ChainElement, not an Expression, so it needs a
+    // dedicated hook. The object is an opaque param so the access survives.
+    let out = deob(r#"function f(a){ return a?.["foo"]?.["1bad"]; } sink(f);"#);
+    assert!(out.contains("?.foo"), "optional chain not normalized: {out}");
+    // non-identifier key stays bracketed
+    assert!(
+        out.contains(r#"?.["1bad"]"#),
+        "invalid-ident optional key wrongly converted: {out}"
+    );
+}
+
+#[test]
 fn member_normalization_on_assignment_target() {
     // The LHS of an assignment is a SimpleAssignmentTarget, not an Expression;
     // it must normalize just like read-position member access.

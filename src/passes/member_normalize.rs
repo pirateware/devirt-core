@@ -7,7 +7,8 @@
 
 use oxc_allocator::{Allocator, TakeIn};
 use oxc_ast::ast::{
-    ComputedMemberExpression, Expression, Program, SimpleAssignmentTarget, StaticMemberExpression,
+    ChainElement, ComputedMemberExpression, Expression, Program, SimpleAssignmentTarget,
+    StaticMemberExpression,
 };
 use oxc_traverse::{traverse_mut, Traverse, TraverseCtx};
 
@@ -85,6 +86,25 @@ impl<'a> Traverse<'a, ()> for MemberNormalize {
         };
         if let Some(member) = try_static(computed, ctx) {
             *target = SimpleAssignmentTarget::StaticMemberExpression(member);
+            self.changed = true;
+        }
+    }
+
+    /// Inside an optional chain (`a?.["x"]`), the computed member is a
+    /// `ChainElement::ComputedMemberExpression`, *not* an
+    /// `Expression::ComputedMemberExpression`, so `enter_expression` never sees
+    /// it. Normalize it here too so `a?.["x"]` becomes `a?.x` (and the trailing
+    /// member of `a["x"]?.["y"]`, which is also a chain element).
+    fn enter_chain_element(
+        &mut self,
+        element: &mut ChainElement<'a>,
+        ctx: &mut TraverseCtx<'a, ()>,
+    ) {
+        let ChainElement::ComputedMemberExpression(computed) = element else {
+            return;
+        };
+        if let Some(member) = try_static(computed, ctx) {
+            *element = ChainElement::StaticMemberExpression(member);
             self.changed = true;
         }
     }

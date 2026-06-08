@@ -9,6 +9,7 @@
 
 use oxc_allocator::{Allocator, Vec as ArenaVec};
 use oxc_ast::ast::{BindingPattern, Program, Statement, VariableDeclarator};
+use oxc_ast_visit::Visit;
 use oxc_semantic::Scoping;
 use oxc_traverse::{traverse_mut, Traverse, TraverseCtx};
 
@@ -75,10 +76,10 @@ fn keep_statement(s: &Statement<'_>, scoping: &Scoping) -> bool {
     match s {
         Statement::EmptyStatement(_) => false,
         Statement::VariableDeclaration(vd) => !vd.declarations.is_empty(),
-        Statement::FunctionDeclaration(f) => {
-            f.id.as_ref()
-                .is_none_or(|id| !fn_decl_is_dead(id.symbol_id(), scoping))
-        }
+        Statement::FunctionDeclaration(f) => f
+            .id
+            .as_ref()
+            .is_none_or(|id| !fn_decl_is_dead(id.symbol_id(), f, scoping)),
         // A bare literal statement (`80214130;`, `true;`, `null;`) computes a
         // value that is immediately discarded with no side effect — pure
         // obfuscation noise (often a spent opaque-predicate constant). Drop it.
@@ -111,20 +112,76 @@ fn is_removable_symbol(symbol: oxc_syntax::symbol::SymbolId, scoping: &Scoping) 
     scoping.symbol_is_unused(symbol)
 }
 
-/// A function declaration is dead if its name is never *read* anywhere — i.e. it
-/// is never called or otherwise observed. Defining a function declaration has no
-/// side effect, so when nothing reads the binding, neither its body nor any
-/// self-reassignment inside it can ever run, and the whole statement is inert.
+/// A function declaration is dead if its name is never *read* from outside its
+/// own body — i.e. no live code calls or otherwise observes it. Defining a
+/// function declaration has no side effect, so when nothing external reads the
+/// binding, the whole statement is inert: its body only runs when called, and a
+/// call can only come through an external read.
 ///
-/// This is strictly broader than `symbol_is_unused`, which counts a *write* as a
-/// use. The obfuscator string-array accessor relies on that gap: after every
-/// call site is inlined away, all that remains is the self-memoizing write inside
-/// its own body —
-///   `function f(){ const a=[…]; f = function(){ return a; }; return […]; }`
-/// — a lone write reference that pins the function alive even though it is dead.
-/// Keying on read references instead lets it be collected.
-fn fn_decl_is_dead(symbol: oxc_syntax::symbol::SymbolId, scoping: &Scoping) -> bool {
-    !scoping.get_resolved_references(symbol).any(|r| r.is_read())
+/// Two gaps over plain `symbol_is_unused` (which counts *any* reference — read or
+/// write — as a use) are closed here, both exploited by obfuscator string-array
+/// accessors left dead after every call site is inlined:
+///
+///   * **Self-reassignment.** `function f(){ … f = function(){ return a; } … }`
+///     leaves a lone *write* reference that `symbol_is_unused` treats as live.
+///     Keying on *reads* drops it.
+///   * **Self-reads.** The javascript-obfuscator base64/RC4 accessor memoizes
+///     through its own name: `function f(i){ … if (f.X === undefined){ f.Y = …;
+///     f.Z = {}; f.X = true; } … f.Z[k] … }`. Every surviving reference is a
+///     *read* of `f`, but all are lexically inside `f`'s own body, so they only
+///     execute if `f` is called from outside — which never happens once the call
+///     sites are lifted. Excluding self-body reads lets it be collected.
+///
+/// Self-body reads are identified by counting, inside the function's own body,
+/// the read references that resolve to its symbol, and comparing against the
+/// symbol's *total* resolved read count. When they match, every read is in-body
+/// and the declaration is dead; an external read makes the in-body count smaller
+/// and keeps it live.
+fn fn_decl_is_dead(
+    symbol: oxc_syntax::symbol::SymbolId,
+    func: &oxc_ast::ast::Function<'_>,
+    scoping: &Scoping,
+) -> bool {
+    let total_reads = scoping
+        .get_resolved_references(symbol)
+        .filter(|r| r.is_read())
+        .count();
+    if total_reads == 0 {
+        return true;
+    }
+    // Count the read references to `symbol` that occur within the function's own
+    // body (its self-memoizing `f.cache`/`f = …` references). Resolution is by
+    // `reference_id`, so a parameter or local that shadows the name is *not*
+    // miscounted — only references that actually bind to `symbol` are tallied.
+    let mut scan = SelfReadScan {
+        symbol,
+        scoping,
+        in_body_reads: 0,
+    };
+    if let Some(body) = &func.body {
+        for stmt in &body.statements {
+            scan.visit_statement(stmt);
+        }
+    }
+    total_reads == scan.in_body_reads
+}
+
+/// Counts read references resolving to `symbol` within the subtree it visits.
+struct SelfReadScan<'r> {
+    symbol: oxc_syntax::symbol::SymbolId,
+    scoping: &'r Scoping,
+    in_body_reads: usize,
+}
+
+impl<'a, 'r> Visit<'a> for SelfReadScan<'r> {
+    fn visit_identifier_reference(&mut self, it: &oxc_ast::ast::IdentifierReference<'a>) {
+        if let Some(rid) = it.reference_id.get() {
+            let r = self.scoping.get_reference(rid);
+            if r.symbol_id() == Some(self.symbol) && r.is_read() {
+                self.in_body_reads += 1;
+            }
+        }
+    }
 }
 
 fn is_terminator(s: &Statement<'_>) -> bool {
