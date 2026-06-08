@@ -227,3 +227,23 @@ fn idempotent_on_nested_obfuscation() {
     let twice = deobfuscate(&once, "t.js").code;
     assert_eq!(once, twice, "pipeline is not idempotent");
 }
+
+#[test]
+fn object_reconstruction_folds_split_writes() {
+    // `transformObjectKeys` lowers `{a,b}` into `o = {}; o.a = …; o.b = …`.
+    // Reconstruction folds the contiguous writes back into the literal.
+    let out = deob(r#"function f(){ var o = {}; o.a = "x"; o.b = "y"; return o; } sink(f);"#);
+    assert!(out.contains(r#"a: "x""#), "not reconstructed: {out}");
+    assert!(out.contains(r#"b: "y""#), "not reconstructed: {out}");
+    assert!(!out.contains(".a ="), "split write survived: {out}");
+}
+
+#[test]
+fn object_reconstruction_exposes_proxy_table() {
+    // An operator-proxy table built in split-write form is invisible to
+    // proxy-inline until reconstructed; once folded, the call inlines and folds.
+    let out =
+        deob(r#"function f(){ var t = {}; t.sum = function(a,b){ return a + b; }; return t.sum(2,3); } sink(f);"#);
+    assert!(out.contains('5'), "proxy table not inlined+folded: {out}");
+    assert!(!out.contains("t.sum"), "proxy survived: {out}");
+}

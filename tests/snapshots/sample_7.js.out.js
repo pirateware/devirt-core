@@ -12184,8 +12184,7 @@
 							function fn718(var2968) {
 								return function(var2969, var2970, var2971) {
 									var2970 = (function(var2972, var2973) {
-										var obj104 = {};
-										obj104.f0x70a39114 = var2972;
+										var obj104 = { f0x70a39114: var2972 };
 										var2973 && (obj104.f0x24f7cb1 = var2973);
 										return obj104;
 									})(var2970, var2971);
@@ -12986,8 +12985,7 @@
 							};
 							function fn756(var3226, var3227) {
 								fn677("f0x6acb38");
-								var obj130 = {};
-								obj130.f0x1bfb0c97 = !(!var3226[1] || !var3226[1].withCredentials);
+								var obj130 = { f0x1bfb0c97: !(!var3226[1] || !var3226[1].withCredentials) };
 								var3227 = Object.assign({ g: var3226[0] }, var3227);
 								var3218(var3217, obj130, var3227);
 								fn678("f0x6acb38");
@@ -15829,14 +15827,15 @@
 			}
 			function fn845(var3961) {
 				try {
-					var obj184 = {};
-					obj184.vid = (var3961.match(new RegExp("window\\._pxVid\\s*=\\s*([\"'])([\\w-]{36})\\1\\s*;", "")) || [])[2] || fn37();
-					obj184.uuid = (var3961.match(new RegExp("window\\._pxUuid\\s*=\\s*([\"'])([\\w-]{36}(:true)?)\\1\\s*;", "")) || [])[2] || or4();
-					obj184.appId = (var3961.match(new RegExp("window\\._pxAppId\\s*=\\s*(['\"])(PX\\w{4,8})\\1\\s*;", "")) || [])[2] || fn35();
-					obj184.blockScript = (var3961.match(new RegExp("(?:\\.src|pxCaptchaSrc)\\s*=\\s*([\"'])((?:(?!\\1).)*captcha\\.js(?:(?!\\1).)*)\\1\\s*;", "")) || [])[2] || call97();
-					obj184.hostUrl = (var3961.match(new RegExp("window\\._pxHostUrl\\s*=\\s*([\"'])((?:(?!\\1).)*)\\1\\s*;", "")) || [])[2];
-					obj184.jsClientSrc = (var3961.match(new RegExp("window\\._pxJsClientSrc\\s*=\\s*([\"'])((?:(?!\\1).)*)\\1\\s*;", "")) || [])[2];
-					obj184.firstPartyEnabled = (var3961.match(new RegExp("window\\._pxFirstPartyEnabled\\s*=\\s*(true|false)\\s*;", "")) || [])[1];
+					var obj184 = {
+						vid: (var3961.match(new RegExp("window\\._pxVid\\s*=\\s*([\"'])([\\w-]{36})\\1\\s*;", "")) || [])[2] || fn37(),
+						uuid: (var3961.match(new RegExp("window\\._pxUuid\\s*=\\s*([\"'])([\\w-]{36}(:true)?)\\1\\s*;", "")) || [])[2] || or4(),
+						appId: (var3961.match(new RegExp("window\\._pxAppId\\s*=\\s*(['\"])(PX\\w{4,8})\\1\\s*;", "")) || [])[2] || fn35(),
+						blockScript: (var3961.match(new RegExp("(?:\\.src|pxCaptchaSrc)\\s*=\\s*([\"'])((?:(?!\\1).)*captcha\\.js(?:(?!\\1).)*)\\1\\s*;", "")) || [])[2] || call97(),
+						hostUrl: (var3961.match(new RegExp("window\\._pxHostUrl\\s*=\\s*([\"'])((?:(?!\\1).)*)\\1\\s*;", "")) || [])[2],
+						jsClientSrc: (var3961.match(new RegExp("window\\._pxJsClientSrc\\s*=\\s*([\"'])((?:(?!\\1).)*)\\1\\s*;", "")) || [])[2],
+						firstPartyEnabled: (var3961.match(new RegExp("window\\._pxFirstPartyEnabled\\s*=\\s*(true|false)\\s*;", "")) || [])[1]
+					};
 					return obj184;
 				} catch (error440) {}
 			}

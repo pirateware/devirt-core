@@ -176,8 +176,20 @@ fn profile_of(name: &str) -> Option<String> {
 }
 
 fn count_bracket_access(s: &str) -> usize {
-    // crude: count `["` occurrences (string-keyed member access)
-    s.matches("[\"").count()
+    // Count `["` only where it is a string-keyed *member access* (`obj["x"]`),
+    // not an array/object literal (`= ["x"]`, `, ["x"]`). The discriminator is
+    // the byte immediately before `[`: a member access follows an expression
+    // (identifier char, `)`, `]`, or a closing quote) with no space, whereas a
+    // literal follows an operator/punctuator/space. Excludes the array-literal
+    // false positives that dominate the raw `["` count.
+    let b = s.as_bytes();
+    (1..b.len().saturating_sub(1))
+        .filter(|&i| b[i] == b'[' && b[i + 1] == b'"' && is_member_lhs(b[i - 1]))
+        .count()
+}
+
+fn is_member_lhs(p: u8) -> bool {
+    p.is_ascii_alphanumeric() || matches!(p, b'_' | b'$' | b')' | b']' | b'"' | b'\'')
 }
 
 /// Raw (non-distinct) occurrence count of `_0x…`-style hex-named identifiers

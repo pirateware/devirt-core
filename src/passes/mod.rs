@@ -14,6 +14,7 @@ mod math_fingerprint;
 mod member_normalize;
 mod proxy_inline;
 mod pure_eval;
+mod reconstruct_object;
 mod rename;
 mod sequence_split;
 mod unflatten;
@@ -35,6 +36,7 @@ pub use math_fingerprint::MathFingerprint;
 pub use member_normalize::MemberNormalize;
 pub use proxy_inline::ProxyInline;
 pub use pure_eval::PureEval;
+pub use reconstruct_object::ReconstructObject;
 pub use rename::RenameByRole;
 pub use sequence_split::SequenceSplit;
 pub use unflatten::Unflatten;
@@ -102,6 +104,11 @@ pub fn default_pipeline() -> Vec<Box<dyn Pass>> {
         // lift, and the const folds below reach further. Runs before them so the
         // exposed work is picked up in the same round. See `src/ir/inline.rs`.
         Box::new(crate::ir::InlineSingleUse),
+        // Fold `X = {}; X.a = …; X.b = …;` runs back into the object literal
+        // they were lowered from (transformObjectKeys). Runs before ProxyInline
+        // so operator-proxy *tables* built in this split form are reconstituted
+        // into the `{ m: function… }` literal ProxyInline can recognize.
+        Box::new(ReconstructObject::default()),
         // Collapse operator-proxy wrappers (a OP b) before lifting, so decoder
         // calls hidden inside proxy expansions become visible.
         Box::new(ProxyInline::default()),

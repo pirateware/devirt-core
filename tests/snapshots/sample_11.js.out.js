@@ -2434,8 +2434,7 @@ var DataDomeJsTag = (() => {
 									},
 									function(var442, var443, var444) {
 										function fn29(var445, var446) {
-											var obj19 = {};
-											obj19.name = var445;
+											var obj19 = { name: var445 };
 											win.navigator.permissions.query(obj19).then(function(var447) {
 												"denied" != var447.state || var358[15][161] == var358[99][105] ? var446() : var442("emd", "denied");
 											}).catch(function() {
