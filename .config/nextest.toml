@@ -1,9 +1,8 @@
 # nextest configuration.
 #
 # nextest runs every test across all test binaries in one global thread pool, so
-# the heavy whole-corpus tests (golden / sample_equivalence / samples) overlap
-# instead of running binary-by-binary like `cargo test`. On a multi-core box this
-# is the bulk of the suite's wall-clock win.
+# tests overlap instead of running binary-by-binary like `cargo test`. On a
+# multi-core box this is the bulk of the suite's wall-clock win.
 
 [profile.default]
 # Don't stop at the first failure — we want the full red/green picture in one run.
@@ -12,9 +11,7 @@ fail-fast = false
 # loop the sandbox never breaks) instead of stalling the whole run forever.
 slow-timeout = { period = "30s", terminate-after = 4 }
 
-# Used by CI (`--profile ci`), which also passes `--features slow-tests` so the
-# full real-sample net runs. Looser timeout for the multi-megabyte samples on
-# slower shared runners.
+# Used by CI (`--profile ci`). Looser timeout for slower shared runners.
 [profile.ci]
 fail-fast = false
 slow-timeout = { period = "120s", terminate-after = 3 }

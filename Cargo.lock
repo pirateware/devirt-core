@@ -285,7 +285,6 @@ dependencies = [
  "oxc_span",
  "oxc_syntax",
  "oxc_traverse",
- "serde_json",
 ]
 
 [[package]]

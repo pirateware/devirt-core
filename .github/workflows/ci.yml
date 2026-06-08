@@ -49,14 +49,9 @@ jobs:
       - name: Build
         run: cargo build --release
 
-      # The full suite gates every change. Beyond the per-pass units it includes
-      # the differential snippet-equivalence harness, the robustness /
-      # panic-containment battery, and the regression net: byte-exact golden
-      # snapshots of every sample (`tests/golden.rs`) plus whole-pipeline
-      # behavior-equivalence on the real corpus (`tests/sample_equivalence.rs`).
-      # A snapshot mismatch fails here with a re-bless hint; see tests/README.md.
-      #
-      # `--features slow-tests` runs the slow real-sample tests that are skipped by
-      # default for fast local iteration; nextest runs all binaries concurrently.
+      # The functionality suite gates every change: the per-pass units, the
+      # differential snippet-equivalence harness (`tests/equivalence.rs`), and the
+      # robustness / panic-containment battery. All fixtures are inline; nextest
+      # runs every binary concurrently. See tests/README.md.
       - name: Test
-        run: cargo nextest run --release --features slow-tests --profile ci
+        run: cargo nextest run --release --profile ci

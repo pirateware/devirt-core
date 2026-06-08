@@ -20,16 +20,5 @@ oxc_ecmascript = "0.134.0"
 boa_engine = "0.21.1"
 oxc_ast_visit = "0.134.0"
 
-[dev-dependencies]
-# Parses the generated-corpus manifest in tests/generated_corpus.rs.
-serde_json = "1"
-
-[features]
-# Enables the slow real-sample regression tests (golden snapshots, whole-corpus
-# behavior-equivalence, idempotency, large-sample determinism). Off by default so
-# `cargo test` / `cargo nextest run` stay fast for local iteration; CI builds with
-# `--features slow-tests` to run the full net. See tests/README.md.
-slow-tests = []
-
 [profile.release]
 opt-level = 3
