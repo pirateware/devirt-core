@@ -2132,3 +2132,59 @@ fn string_order_nonconstant_array_decline_preserves_value() {
          })();",
     );
 }
+
+// ---------------------------------------------------------------------------
+// State variable declared in a multi-declarator `var` (`var s = 1, acc = 0, …`,
+// the common real-world shape). Recovery must remove only the state declarator and
+// keep its siblings (and their initializer effects) in place and in order. Each
+// "recovers" case is paired with a sibling shape where removing the declarator
+// would be unsound; the differential net catches any error by value mismatch.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn multi_declarator_linear_dispatcher_preserves_value() {
+    assert_equivalent(
+        "var s = 1, acc = 0; \
+         while (s) { switch (s) { \
+           case 1: acc += 10; s = 2; break; \
+           case 2: acc += 20; s = 0; break; } } \
+         __r = acc;",
+    );
+}
+
+#[test]
+fn multi_declarator_looping_dispatcher_preserves_value() {
+    // A two-state loop with the state declared alongside `acc`/`i`. Whether the
+    // relooper recovers it or declines, the accumulated value must be identical.
+    assert_equivalent(
+        "function f(n) { var s = 1, acc = 0, i = 0; \
+           while (s) { switch (s) { \
+             case 1: if (i < n) { s = 2; } else { s = 0; } break; \
+             case 2: acc += i; i = i + 1; s = 1; break; } } return acc; } \
+         __r = f(4);",
+    );
+}
+
+#[test]
+fn multi_declarator_sibling_side_effect_survives() {
+    // A sibling declarator in the same `var` has an effectful initializer. Removing
+    // the state declarator must not drop or reorder it.
+    assert_equivalent(
+        "var log = 0; \
+         var s = 1, tick = (log = 5); \
+         while (s) { switch (s) { case 1: s = 0; break; } } \
+         __r = log;",
+    );
+}
+
+#[test]
+fn multi_declarator_sibling_reads_state_preserves_value() {
+    // A sibling reads the state var in its own initializer (`mirror = s`). The
+    // candidate must be declined (removing `s` would strand `mirror`); the
+    // dispatcher is left intact and the value is preserved either way.
+    assert_equivalent(
+        "var s = 1, mirror = s; \
+         while (s) { switch (s) { case 1: s = 0; break; } } \
+         __r = String(mirror);",
+    );
+}

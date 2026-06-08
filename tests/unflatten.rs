@@ -419,3 +419,50 @@ fn lookup_table_out_of_range_is_kept() {
         "out-of-range lookup wrongly unflattened: {out}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// State variable declared in a multi-declarator `var` (the common real-world
+// shape, e.g. `var s = 1, acc = 0, i = 0;`). Recovery must find the dispatch
+// state among the siblings, remove only its declarator, and keep the rest.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn multi_declarator_state_linear_chain_collapses() {
+    // `s` shares its declaration with `acc`. The linear chain must still collapse,
+    // and the sibling `acc` declaration must survive.
+    let out = deob(
+        "var s = 1, acc = 0; while (s) { switch (s) { \
+         case 1: acc = 1; s = 2; break; \
+         case 2: acc = 2; s = 0; break; } } sink(acc);",
+    );
+    assert!(
+        !out.contains("while") && !out.contains("switch"),
+        "dispatcher survived multi-declarator init: {out}"
+    );
+    assert!(out.contains("acc"), "sibling declarator lost: {out}");
+}
+
+#[test]
+fn multi_declarator_state_two_state_loop_recovers() {
+    // The textbook two-state loop with `s` declared alongside `acc`/`i`. The
+    // relooper recovers it into a `while` loop; the dispatcher must be gone.
+    let out = deob(
+        "function f(n) { var s = 1, acc = 0, i = 0; \
+         while (s) { switch (s) { \
+           case 1: if (i < n) { s = 2; } else { s = 0; } break; \
+           case 2: acc += i; i = i + 1; s = 1; break; } } return acc; } f(input());",
+    );
+    assert!(
+        !out.contains("switch"),
+        "two-state dispatcher survived multi-declarator init: {out}"
+    );
+    assert!(out.contains("while"), "loop not recovered: {out}");
+}
+
+// NB: the unsound-splice guard (declining a candidate whose sibling declarator
+// reads the state var) is load-bearing within a single fixpoint round — Unflatten
+// runs before ConstantFold, so an un-gated removal would strand the sibling's read
+// before folding could resolve it. Its end-to-end soundness is covered by
+// `multi_declarator_sibling_reads_state_preserves_value` in tests/equivalence.rs;
+// a pipeline-level "is kept" assertion would be wrong, since once const-fold
+// rewrites `mirror = s` to `mirror = 1` the dispatcher legitimately recovers.

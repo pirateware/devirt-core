@@ -53,10 +53,12 @@ use oxc_allocator::{Allocator, CloneIn, Vec as ArenaVec};
 use oxc_ast::ast::VariableDeclarationKind;
 use oxc_ast::ast::{
     AssignmentTarget, BindingPattern, BlockStatement, Expression, Program, SimpleAssignmentTarget,
-    Statement, SwitchStatement,
+    Statement, SwitchStatement, VariableDeclaration,
 };
+use oxc_ast::AstBuilder;
 use oxc_ast_visit::Visit;
 use oxc_semantic::Scoping;
+use oxc_span::SPAN;
 use oxc_syntax::operator::{AssignmentOperator, BinaryOperator};
 use oxc_traverse::{traverse_mut, Traverse, TraverseCtx};
 
@@ -172,52 +174,57 @@ impl<'a> Traverse<'a, ()> for Unflatten {
         // is what keeps the relaxation sound: statements between the init and the
         // loop cannot observe or alter `s`, so the simulated state still holds when
         // the loop is entered, and they stay in place before the linear sequence.
-        let mut hit: Option<(usize, usize, Vec<Statement<'a>>)> = None;
-        for i in 0..stmts.len() {
+        let mut hit: Option<(usize, usize, String, Vec<Statement<'a>>)> = None;
+        'outer: for i in 0..stmts.len() {
             // The state initializer may be an integer (the primary engine) or a
-            // string/boolean literal (`sval`). Both share the dispatch-only gate.
-            let s_name = match init_state_name(&stmts[i]) {
-                Some(n) => n,
-                None => continue,
-            };
-            // `s` must appear in exactly one OTHER statement — the dispatcher.
-            let others: Vec<usize> = (0..stmts.len())
-                .filter(|&k| k != i && mentions(&stmts[k], &s_name))
-                .collect();
-            if others.len() != 1 {
-                continue;
+            // string/boolean literal (`sval`). Both share the dispatch-only gate. A
+            // single statement can offer several candidates (a multi-declarator
+            // `var s = 1, acc = 0, …` — the common real-world shape), so try each.
+            for s_name in state_init_names(&stmts[i]) {
+                // `s` must appear in exactly one OTHER statement — the dispatcher.
+                let others: Vec<usize> = (0..stmts.len())
+                    .filter(|&k| k != i && mentions(&stmts[k], &s_name))
+                    .collect();
+                if others.len() != 1 {
+                    continue;
+                }
+                let j = others[0];
+                if j <= i {
+                    continue; // the loop must run after the initializer
+                }
+                // Try the integer engine first; fall back to the string/boolean engine.
+                let seq = simulate_int_at(
+                    &stmts[i],
+                    &stmts[j],
+                    &s_name,
+                    &self.tables,
+                    ctx.ast.allocator,
+                )
+                .or_else(|| simulate_sval_at(&stmts[i], &stmts[j], &s_name, ctx.ast.allocator));
+                let Some(seq) = seq else {
+                    continue;
+                };
+                hit = Some((i, j, s_name, seq));
+                break 'outer;
             }
-            let j = others[0];
-            if j <= i {
-                continue; // the loop must run after the initializer
-            }
-            // Try the integer engine first; fall back to the string/boolean engine.
-            let seq = simulate_int_at(
-                &stmts[i],
-                &stmts[j],
-                &s_name,
-                &self.tables,
-                ctx.ast.allocator,
-            )
-            .or_else(|| simulate_sval_at(&stmts[i], &stmts[j], &s_name, ctx.ast.allocator));
-            let Some(seq) = seq else {
-                continue;
-            };
-            hit = Some((i, j, seq));
-            break;
         }
 
-        let Some((i, j, seq)) = hit else {
+        let Some((i, j, s_name, seq)) = hit else {
             return;
         };
-        // Splice: drop the state initializer (i) and replace the dispatcher loop
-        // (j) with the linear sequence. Statements between i and j (and elsewhere)
-        // are preserved in order. `seq` already holds arena clones.
+        // Splice: remove the state binding from the initializer (i) and replace the
+        // dispatcher loop (j) with the linear sequence. Statements between i and j
+        // (and elsewhere) are preserved in order. When the initializer is a
+        // multi-declarator `var`, only the state declarator is dropped; its siblings
+        // stay in place. `seq` already holds arena clones.
         let old = std::mem::replace(stmts, ctx.ast.vec());
         let mut seq = Some(seq);
         for (k, s) in old.into_iter().enumerate() {
             if k == i {
-                continue; // drop the state initializer
+                if let Some(kept) = splice_remove_state(&s, &s_name, ctx.ast) {
+                    stmts.push(kept);
+                }
+                continue; // drop (or trim) the state initializer
             }
             if k == j {
                 for st in seq.take().unwrap() {
@@ -231,14 +238,18 @@ impl<'a> Traverse<'a, ()> for Unflatten {
     }
 }
 
-/// The dispatch-state variable name if `stmt` initializes one to an integer,
-/// string, or boolean literal. Used to find dispatch candidates before deciding
-/// which engine (integer vs. string/boolean) applies.
-fn init_state_name(stmt: &Statement<'_>) -> Option<String> {
-    if let Some((name, _)) = state_init(stmt) {
-        return Some(name);
+/// Every dispatch-state candidate name `stmt` initializes to an integer, string,
+/// or boolean literal — including each qualifying declarator of a multi-declarator
+/// `var`. Used to find dispatch candidates before deciding which engine (integer
+/// vs. string/boolean) applies.
+fn state_init_names(stmt: &Statement<'_>) -> Vec<String> {
+    let mut names = candidate_names(stmt, &|e| int_literal(e).is_some());
+    for n in candidate_names(stmt, &|e| sval_literal(e).is_some()) {
+        if !names.contains(&n) {
+            names.push(n);
+        }
     }
-    sval_init(stmt).map(|(name, _)| name)
+    names
 }
 
 /// Run the integer engine on the (init, dispatcher) statement pair, returning the
@@ -250,7 +261,7 @@ fn simulate_int_at<'a>(
     tables: &LookupTables,
     alloc: &'a Allocator,
 ) -> Option<Vec<Statement<'a>>> {
-    let (_, init) = state_init(init_stmt)?;
+    let init = state_init_value(init_stmt, s_name)?;
     let (switch, kind, test) = detect_loop(loop_stmt, s_name)?;
     let cases = parse_cases(switch, s_name, tables)?;
     // The local form replaces only the dispatcher; statements after it stay in the
@@ -259,32 +270,144 @@ fn simulate_int_at<'a>(
     Some(seq)
 }
 
-/// `var s = <int>;` (single declarator) or `s = <int>;` → `(name, value)`.
-pub(crate) fn state_init(stmt: &Statement<'_>) -> Option<(String, i64)> {
+/// Every integer dispatch-state candidate in `stmt`: `(name, entry value)`. Covers
+/// the standalone `var s = K;` / `s = K;` forms and each qualifying declarator of a
+/// multi-declarator `var`. Used by the CFG recovery pass (`unflatten_cfg`).
+pub(crate) fn int_state_candidates(stmt: &Statement<'_>) -> Vec<(String, i64)> {
+    candidate_names(stmt, &|e| int_literal(e).is_some())
+        .into_iter()
+        .filter_map(|name| state_init_value(stmt, &name).map(|v| (name, v)))
+        .collect()
+}
+
+/// Clean dispatch-state candidate names in `stmt` whose initializer satisfies
+/// `lit`. Accepts the standalone `var x = LIT;` / `x = LIT;` forms and a single
+/// declarator inside a *multi*-declarator `var` — but, for the latter, only when
+/// removing that declarator is provably sound: its binding is a plain identifier,
+/// its initializer is the literal (pure, so dropping it reorders nothing), and no
+/// *sibling* declarator's initializer reads the name (so dropping it cannot strand
+/// a sibling that depends on its value). This is what lets recovery fire when an
+/// obfuscator declares the state alongside other locals — `var s = 1, acc = 0, …`.
+fn candidate_names(stmt: &Statement<'_>, lit: &dyn Fn(&Expression<'_>) -> bool) -> Vec<String> {
     match stmt {
-        Statement::VariableDeclaration(vd) if vd.declarations.len() == 1 => {
-            let d = &vd.declarations[0];
+        Statement::VariableDeclaration(vd) => {
+            let mut out = Vec::new();
+            for (idx, d) in vd.declarations.iter().enumerate() {
+                let BindingPattern::BindingIdentifier(id) = &d.id else {
+                    continue;
+                };
+                let Some(init) = d.init.as_ref() else { continue };
+                if !lit(init) || sibling_reads(vd, idx, &id.name) {
+                    continue;
+                }
+                out.push(id.name.to_string());
+            }
+            out
+        }
+        Statement::ExpressionStatement(es) => {
+            let Expression::AssignmentExpression(a) = &es.expression else {
+                return Vec::new();
+            };
+            if a.operator != AssignmentOperator::Assign {
+                return Vec::new();
+            }
+            let AssignmentTarget::AssignmentTargetIdentifier(id) = &a.left else {
+                return Vec::new();
+            };
+            if !lit(&a.right) {
+                return Vec::new();
+            }
+            vec![id.name.to_string()]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Does any declarator of `vd` *other than* `keep` read `name` in its initializer?
+/// If so, the `keep` declarator cannot be removed without stranding that sibling.
+fn sibling_reads(vd: &VariableDeclaration<'_>, keep: usize, name: &str) -> bool {
+    vd.declarations.iter().enumerate().any(|(k, d)| {
+        k != keep
+            && d.init.as_ref().is_some_and(|e| {
+                let mut s = NameScan {
+                    name,
+                    reads_or_writes: false,
+                    writes: false,
+                };
+                s.visit_expression(e);
+                s.reads_or_writes
+            })
+    })
+}
+
+/// The integer value the state candidate `name` is initialized to in `stmt`.
+fn state_init_value(stmt: &Statement<'_>, name: &str) -> Option<i64> {
+    init_value(stmt, name, &int_literal)
+}
+
+/// The string/boolean value the state candidate `name` is initialized to in `stmt`.
+fn sval_init_value(stmt: &Statement<'_>, name: &str) -> Option<StateVal> {
+    init_value(stmt, name, &sval_literal)
+}
+
+/// Resolve the initializer of the declarator/assignment binding `name` in `stmt`
+/// through `lit`. Mirrors `candidate_names`' accepted shapes by name.
+fn init_value<T>(
+    stmt: &Statement<'_>,
+    name: &str,
+    lit: &dyn Fn(&Expression<'_>) -> Option<T>,
+) -> Option<T> {
+    match stmt {
+        Statement::VariableDeclaration(vd) => vd.declarations.iter().find_map(|d| {
             let BindingPattern::BindingIdentifier(id) = &d.id else {
                 return None;
             };
-            let v = int_literal(d.init.as_ref()?)?;
-            Some((id.name.to_string(), v))
-        }
+            (id.name == name).then(|| lit(d.init.as_ref()?)).flatten()
+        }),
         Statement::ExpressionStatement(es) => {
             let Expression::AssignmentExpression(a) = &es.expression else {
                 return None;
             };
-            if !matches!(a.operator, oxc_syntax::operator::AssignmentOperator::Assign) {
+            if a.operator != AssignmentOperator::Assign {
                 return None;
             }
             let AssignmentTarget::AssignmentTargetIdentifier(id) = &a.left else {
                 return None;
             };
-            let v = int_literal(&a.right)?;
-            Some((id.name.to_string(), v))
+            (id.name == name).then(|| lit(&a.right)).flatten()
         }
         _ => None,
     }
+}
+
+/// Remove the dispatch-state binding `name` from the recovered initializer `stmt`.
+/// Returns `Some(modified)` when the statement must stay — a multi-declarator `var`
+/// keeps its remaining declarators in place and in order — or `None` to drop the
+/// whole statement (a standalone `var s = K;` / `s = K;`, the legacy behavior).
+pub(crate) fn splice_remove_state<'a>(
+    stmt: &Statement<'a>,
+    name: &str,
+    ast: AstBuilder<'a>,
+) -> Option<Statement<'a>> {
+    let Statement::VariableDeclaration(vd) = stmt else {
+        return None;
+    };
+    if vd.declarations.len() <= 1 {
+        return None; // standalone declaration → drop it entirely
+    }
+    let mut kept = ast.vec();
+    for d in &vd.declarations {
+        if matches!(&d.id, BindingPattern::BindingIdentifier(id) if id.name == name) {
+            continue;
+        }
+        kept.push(d.clone_in(ast.allocator));
+    }
+    if kept.is_empty() {
+        return None;
+    }
+    Some(Statement::VariableDeclaration(ast.alloc(
+        ast.variable_declaration(SPAN, vd.kind, kept, vd.declare),
+    )))
 }
 
 /// A non-negative or negative integer-valued numeric literal (`5`, `-1`).
@@ -949,33 +1072,6 @@ fn sval_literal(expr: &Expression<'_>) -> Option<StateVal> {
     }
 }
 
-/// `var s = <str|bool>;` (single declarator) or `s = <str|bool>;` → `(name, val)`.
-fn sval_init(stmt: &Statement<'_>) -> Option<(String, StateVal)> {
-    match stmt {
-        Statement::VariableDeclaration(vd) if vd.declarations.len() == 1 => {
-            let d = &vd.declarations[0];
-            let BindingPattern::BindingIdentifier(id) = &d.id else {
-                return None;
-            };
-            let v = sval_literal(d.init.as_ref()?)?;
-            Some((id.name.to_string(), v))
-        }
-        Statement::ExpressionStatement(es) => {
-            let Expression::AssignmentExpression(a) = &es.expression else {
-                return None;
-            };
-            if !matches!(a.operator, AssignmentOperator::Assign) {
-                return None;
-            }
-            let AssignmentTarget::AssignmentTargetIdentifier(id) = &a.left else {
-                return None;
-            };
-            let v = sval_literal(&a.right)?;
-            Some((id.name.to_string(), v))
-        }
-        _ => None,
-    }
-}
 
 /// The loop continue-condition over a string/boolean state.
 enum SvalTest {
@@ -1182,7 +1278,7 @@ fn simulate_sval_at<'a>(
     s_name: &str,
     alloc: &'a Allocator,
 ) -> Option<Vec<Statement<'a>>> {
-    let (_, init) = sval_init(init_stmt)?;
+    let init = sval_init_value(init_stmt, s_name)?;
     // Reuse the integer `detect_loop` only for its structural shape extraction
     // (while/do/for + single switch + no-default + discriminant is `s`); but the
     // test must be parsed over `StateVal`, so re-derive it here from the loop node.
