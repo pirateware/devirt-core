@@ -1,10 +1,13 @@
-//! Whole-expression constant evaluation of self-contained pure IIFEs.
+//! Whole-expression constant evaluation of self-contained pure calls.
 //!
-//! Generalizes decoder-lift's "run it in the sandbox" idea from decoder *calls*
-//! to an entire immediately-invoked function expression that is a closed,
-//! side-effect-free computation: `var VM = (function(){ … })();`. Obfuscated
-//! bytecode VMs and similar "compute a constant the hard way" blobs collapse to
-//! the value they produce.
+//! Generalizes decoder-lift's "run it in the sandbox" idea from decoder *calls* to
+//! any closed, side-effect-free call that produces a primitive:
+//!   * an immediately-invoked function expression — `var VM = (function(){ … })();`
+//!     (obfuscated bytecode VMs and "compute a constant the hard way" blobs); and
+//!   * a **pure method call** on a constant receiver — `['a','b'].join('')`,
+//!     `"x".toUpperCase()` — the pure built-ins const-fold cannot reach. Single-use
+//!     inlining feeds these literal receivers (`var s = "abc"; s.toUpperCase()` →
+//!     `"abc".toUpperCase()`), which then collapse to their value here.
 //!
 //! Soundness — we only evaluate an IIFE whose evaluation has no observable effect
 //! beyond producing its value, and whose value is a primitive we can splice as a
@@ -63,27 +66,40 @@ struct Evaluator {
     changed: bool,
 }
 
-/// Is `expr` an immediately-invoked function expression — `(function(){…})(…)`
-/// or `(()=>…)(…)` (the callee is a closed function scope)?
-fn is_iife(expr: &Expression<'_>) -> bool {
+/// Is `expr` a call we should try to constant-evaluate in the sandbox? Two shapes
+/// qualify; the closed-and-pure gate in `enter_expression` then proves each one is
+/// safe to fold (any free name outside the allowed pure globals rejects it):
+///   * an **IIFE** — `(function(){…})(…)` / `(()=>…)(…)` (a closed function scope);
+///   * a **method call** — `recv.m(…)` / `recv[k](…)`, which covers the pure
+///     built-ins const-fold cannot reach (`['a','b'].join('')`, `"x".toUpperCase()`,
+///     `[…].concat(…)`). A user method like `obj.m()` has `obj` as a free name and
+///     is rejected by the gate; a literal/`Math`/`String` receiver passes.
+///
+/// Bare global calls (`parseInt(…)`, `Math.max(…)`) are intentionally excluded —
+/// const-fold/oxc already evaluate those, so adding them here would only duplicate
+/// work and run `freevars` over every plain `foo()` call site.
+fn is_foldable_call(expr: &Expression<'_>) -> bool {
     let Expression::CallExpression(call) = expr else {
         return false;
     };
     matches!(
         &call.callee,
-        Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_)
+        Expression::FunctionExpression(_)
+            | Expression::ArrowFunctionExpression(_)
+            | Expression::StaticMemberExpression(_)
+            | Expression::ComputedMemberExpression(_)
     )
 }
 
 impl<'a> Traverse<'a, ()> for Evaluator {
     fn enter_expression(&mut self, expr: &mut Expression<'a>, ctx: &mut TraverseCtx<'a, ()>) {
-        if !is_iife(expr) {
+        if !is_foldable_call(expr) {
             return;
         }
-        // Only fold an IIFE whose *result is consumed* (an initializer, argument,
-        // or subexpression). A bare-statement IIFE `(function(){…})();` discards
-        // its value, so collapsing it to a literal would just produce dead code
-        // for DCE — but a *pure* bare IIFE is exactly the scope wrapper that
+        // Only fold a call whose *result is consumed* (an initializer, argument, or
+        // subexpression). A bare-statement IIFE `(function(){…})();` discards its
+        // value, so collapsing it to a literal would just produce dead code for DCE
+        // — but a *pure* bare IIFE is exactly the scope wrapper that
         // dead-object-prop / SSA fold from the inside, a strictly more informative
         // result. Leave those to them; our value-add is the consumed case.
         if ctx.parent().is_expression_statement() {
