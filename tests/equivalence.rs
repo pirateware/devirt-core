@@ -2241,3 +2241,43 @@ fn impure_receiver_method_call_keeps_effect() {
          var r = f().join(''); __r = r + ':' + log;",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Trailing `default:` clause in an integer-state dispatcher (the body for any
+// unlisted state). The linear engine routes a missing state to the default; a
+// non-trailing default declines. The differential net confirms either way.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn default_clause_dispatcher_preserves_value() {
+    // The default is the handler for the unlisted state 2.
+    assert_equivalent(
+        "var s = 1, acc = 0; while (s) { switch (s) { \
+         case 1: acc += 10; s = 2; break; \
+         default: acc += 100; s = 0; break; } } __r = acc;",
+    );
+    // A dead default (every reached state is explicit) is correctly ignored.
+    assert_equivalent(
+        "var s = 1, acc = 0; while (s) { switch (s) { \
+         case 1: acc += 1; s = 3; break; \
+         case 3: acc += 2; s = 0; break; \
+         default: acc += 999; s = 0; break; } } __r = acc;",
+    );
+    // Type preserved through a default-routed body (stays a string).
+    assert_equivalent(
+        "var s = 1, out = ''; while (s) { switch (s) { \
+         case 1: out += 'a'; s = 9; break; \
+         default: out += 'b'; s = 0; break; } } __r = out;",
+    );
+}
+
+#[test]
+fn non_trailing_default_is_declined() {
+    // A default that is not the last case would tangle fall-through order, so the
+    // engine declines and leaves the dispatcher intact — value preserved as written.
+    assert_equivalent(
+        "var s = 1, acc = 0; while (s) { switch (s) { \
+         default: acc += 5; s = 0; break; \
+         case 1: acc += 1; s = 2; break; } } __r = acc;",
+    );
+}

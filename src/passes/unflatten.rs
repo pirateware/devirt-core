@@ -263,10 +263,10 @@ fn simulate_int_at<'a>(
 ) -> Option<Vec<Statement<'a>>> {
     let init = state_init_value(init_stmt, s_name)?;
     let (switch, kind, test) = detect_loop(loop_stmt, s_name)?;
-    let cases = parse_cases(switch, s_name, tables)?;
+    let (cases, default) = parse_cases(switch, s_name, tables)?;
     // The local form replaces only the dispatcher; statements after it stay in the
     // list, so the exit mode is irrelevant here.
-    let (seq, _exit) = simulate(init, &cases, &test, kind, alloc)?;
+    let (seq, _exit) = simulate(init, &cases, default.as_ref(), &test, kind, alloc)?;
     Some(seq)
 }
 
@@ -514,10 +514,10 @@ pub(crate) fn detect_loop<'b, 'a>(
     if !is_ident(&switch.discriminant, s) {
         return None;
     }
-    // No `default` clause (a fallback path we don't model).
-    if switch.cases.iter().any(|c| c.test.is_none()) {
-        return None;
-    }
+    // A `default` clause is allowed through the structural gate: the integer engine
+    // models a *trailing* default (the body for any unlisted state — see
+    // `parse_cases`), and every other consumer (the sval engine, `cff::build`)
+    // independently declines on it. More than one default is invalid JS.
     Some((switch, kind, test))
 }
 
@@ -654,98 +654,122 @@ pub(crate) struct ParsedCase<'b, 'a> {
     end: CaseEnd,
 }
 
-/// Parse every case into (emitted body, end behavior), keyed by its integer state.
+/// Parse every case into (emitted body, end behavior), keyed by its integer state,
+/// plus the body of an optional *trailing* `default:` clause (the fallback run when
+/// the state matches no explicit label — `simulate` routes a missing state there).
 /// Returns `None` (bail) on any shape we don't model soundly.
+///
+/// Only a *last* default is modelled: a mid-switch default would tangle fall-through
+/// order, so it declines. A default that itself falls through (no terminator) has no
+/// successor and also declines.
 pub(crate) fn parse_cases<'b, 'a>(
     switch: &'b SwitchStatement<'a>,
     s: &str,
     tables: &LookupTables,
-) -> Option<HashMap<i64, ParsedCase<'b, 'a>>> {
+) -> Option<(HashMap<i64, ParsedCase<'b, 'a>>, Option<ParsedCase<'b, 'a>>)> {
+    // Split off an optional trailing default; any earlier default is unmodelled.
+    let has_trailing_default = switch.cases.last().is_some_and(|c| c.test.is_none());
+    let labeled_len = switch.cases.len() - usize::from(has_trailing_default);
+    let labeled = &switch.cases[..labeled_len];
+    if labeled.iter().any(|c| c.test.is_none()) {
+        return None; // a default that is not the last case → unmodelled
+    }
+
     let mut out = HashMap::new();
-    // Each case's integer label, in textual order, so a fall-through case (no
-    // `break`) can name its successor's state. Computed up front; a non-integer
+    // Each labeled case's integer label, in textual order, so a fall-through case
+    // (no `break`) can name its successor's state. Computed up front; a non-integer
     // label anywhere makes the whole switch unmodellable.
-    let mut labels: Vec<i64> = Vec::with_capacity(switch.cases.len());
-    for case in &switch.cases {
+    let mut labels: Vec<i64> = Vec::with_capacity(labeled.len());
+    for case in labeled {
         labels.push(int_literal(case.test.as_ref()?)?);
     }
-    for (ci, case) in switch.cases.iter().enumerate() {
+    for (ci, case) in labeled.iter().enumerate() {
         let state = labels[ci];
-        // Obfuscators wrap each case body in a block (`case X: { … } break;`). Inline
-        // transparent blocks (no block-scoped declarations) so the transition and
-        // terminator become visible at the case's top level.
-        let mut flat: Vec<&Statement> = Vec::new();
-        flatten_case(&case.consequent, &mut flat);
-        // The first top-level terminator decides the case end; anything after it is
-        // dead (e.g. a `break` after a `return`). A case with *no* top-level control
-        // statement falls through into the textually-next case's body.
-        let Some(term_idx) = flat.iter().position(|st| is_top_level_control(st)) else {
-            // Fall-through: emit this case's body, then continue at the next case.
-            let Some(&next_state) = labels.get(ci + 1) else {
-                return None; // falls off the end of the switch — unmodelled
-            };
-            // The body must be dispatch-clean (no mention of `s`): there is no
-            // transition to drop here, so any reference/write to `s` is unmodelled.
-            let mut emit = Vec::new();
-            for &st in &flat {
-                if mentions(st, s) {
-                    return None;
-                }
-                emit.push(st);
-            }
-            if out
-                .insert(
-                    state,
-                    ParsedCase {
-                        emit,
-                        end: CaseEnd::FallThrough(next_state),
-                    },
-                )
-                .is_some()
-            {
-                return None; // duplicate case label
-            }
-            continue;
-        };
-        let (end, upto, terminal_incl) = match flat[term_idx] {
-            Statement::BreakStatement(b) if b.label.is_none() => {
-                let next = sole_transition(&flat[..term_idx], s, tables)?;
-                (CaseEnd::Step(next), term_idx, false)
-            }
-            Statement::ContinueStatement(c) if c.label.is_none() => {
-                let next = sole_transition(&flat[..term_idx], s, tables)?;
-                (CaseEnd::Step(next), term_idx, false)
-            }
-            Statement::ReturnStatement(_) | Statement::ThrowStatement(_) => {
-                // Emit the terminator too (it exits the machine / function).
-                (CaseEnd::Terminal, term_idx + 1, true)
-            }
-            _ => return None, // labeled break/continue → unmodeled
-        };
-
-        // Statements to emit: everything up to the terminator, minus the state
-        // transition(s). Validate the remainder is dispatch-clean (no `s`, no stray
-        // top-level control). For a `return`/`throw` end the terminator is the last
-        // emitted statement and is exempt from the control check.
-        let mut emit = Vec::new();
-        for (k, &st) in flat[..upto].iter().enumerate() {
-            let is_terminal_stmt = terminal_incl && k == upto - 1;
-            if is_state_transition(st, s, tables).is_some() {
-                continue; // drop the transition assignment
-            }
-            if mentions(st, s) {
-                return None; // body observes/alters dispatch state
-            }
-            if !is_terminal_stmt && is_top_level_control(st) {
-                return None; // a second dispatch exit we don't model
-            }
-            emit.push(st);
-        }
-        if out.insert(state, ParsedCase { emit, end }).is_some() {
+        // A labeled case may fall through into its textual successor's body.
+        let parsed = parse_case_body(case, s, tables, labels.get(ci + 1).copied())?;
+        if out.insert(state, parsed).is_some() {
             return None; // duplicate case label
         }
     }
-    Some(out)
+
+    // The trailing default, if any. It is last, so a fall-through has no successor
+    // (`None` next label) and declines.
+    let default = match has_trailing_default {
+        true => Some(parse_case_body(&switch.cases[labeled_len], s, tables, None)?),
+        false => None,
+    };
+    Some((out, default))
+}
+
+/// Parse one switch case's flattened body into a [`ParsedCase`]. `next_label` is the
+/// textual successor's state (for a fall-through case with no terminator); `None`
+/// means there is no successor, so a fall-through declines.
+fn parse_case_body<'b, 'a>(
+    case: &'b oxc_ast::ast::SwitchCase<'a>,
+    s: &str,
+    tables: &LookupTables,
+    next_label: Option<i64>,
+) -> Option<ParsedCase<'b, 'a>> {
+    // Obfuscators wrap each case body in a block (`case X: { … } break;`). Inline
+    // transparent blocks (no block-scoped declarations) so the transition and
+    // terminator become visible at the case's top level.
+    let mut flat: Vec<&Statement> = Vec::new();
+    flatten_case(&case.consequent, &mut flat);
+    // The first top-level terminator decides the case end; anything after it is
+    // dead (e.g. a `break` after a `return`). A case with *no* top-level control
+    // statement falls through into the textually-next case's body.
+    let Some(term_idx) = flat.iter().position(|st| is_top_level_control(st)) else {
+        // Fall-through: emit this case's body, then continue at the next case.
+        let next_state = next_label?; // falls off the end of the switch — unmodelled
+        // The body must be dispatch-clean (no mention of `s`): there is no
+        // transition to drop here, so any reference/write to `s` is unmodelled.
+        let mut emit = Vec::new();
+        for &st in &flat {
+            if mentions(st, s) {
+                return None;
+            }
+            emit.push(st);
+        }
+        return Some(ParsedCase {
+            emit,
+            end: CaseEnd::FallThrough(next_state),
+        });
+    };
+    let (end, upto, terminal_incl) = match flat[term_idx] {
+        Statement::BreakStatement(b) if b.label.is_none() => {
+            let next = sole_transition(&flat[..term_idx], s, tables)?;
+            (CaseEnd::Step(next), term_idx, false)
+        }
+        Statement::ContinueStatement(c) if c.label.is_none() => {
+            let next = sole_transition(&flat[..term_idx], s, tables)?;
+            (CaseEnd::Step(next), term_idx, false)
+        }
+        Statement::ReturnStatement(_) | Statement::ThrowStatement(_) => {
+            // Emit the terminator too (it exits the machine / function).
+            (CaseEnd::Terminal, term_idx + 1, true)
+        }
+        _ => return None, // labeled break/continue → unmodeled
+    };
+
+    // Statements to emit: everything up to the terminator, minus the state
+    // transition(s). Validate the remainder is dispatch-clean (no `s`, no stray
+    // top-level control). For a `return`/`throw` end the terminator is the last
+    // emitted statement and is exempt from the control check.
+    let mut emit = Vec::new();
+    for (k, &st) in flat[..upto].iter().enumerate() {
+        let is_terminal_stmt = terminal_incl && k == upto - 1;
+        if is_state_transition(st, s, tables).is_some() {
+            continue; // drop the transition assignment
+        }
+        if mentions(st, s) {
+            return None; // body observes/alters dispatch state
+        }
+        if !is_terminal_stmt && is_top_level_control(st) {
+            return None; // a second dispatch exit we don't model
+        }
+        emit.push(st);
+    }
+    Some(ParsedCase { emit, end })
 }
 
 /// Flatten a case consequent, inlining *transparent* blocks (those with no
@@ -874,9 +898,10 @@ pub(crate) enum ExitMode {
     Terminal,
 }
 
-pub(crate) fn simulate<'a>(
+pub(crate) fn simulate<'b, 'a>(
     init: i64,
-    cases: &HashMap<i64, ParsedCase<'_, 'a>>,
+    cases: &HashMap<i64, ParsedCase<'b, 'a>>,
+    default: Option<&ParsedCase<'b, 'a>>,
     test: &LoopTest,
     kind: LoopKind,
     alloc: &'a Allocator,
@@ -903,7 +928,9 @@ pub(crate) fn simulate<'a>(
             if !ft_seen.insert(state) {
                 return None; // fall-through revisiting a label → not a linear chain
             }
-            let case = cases.get(&state)?; // no matching case + no default → unmodeled
+            // A state with no explicit case is handled by the trailing `default:`
+            // body, if the switch had one; otherwise the chain is unmodelled.
+            let case = cases.get(&state).or(default)?;
             for st in &case.emit {
                 // Deep-clone each emitted statement into the arena so it survives the
                 // splice that replaces the original dispatcher.

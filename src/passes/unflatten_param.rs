@@ -385,8 +385,8 @@ impl<'a, 'c> Builder<'a, 'c> {
         let loop_stmt = body.statements.first()?;
         let state = param0_name(cand.func)?;
         let (switch, kind, test) = detect_loop(loop_stmt, &state)?;
-        let cases = parse_cases(switch, &state, self.tables)?;
-        let (mut seq, exit) = simulate(c, &cases, &test, kind, alloc)?;
+        let (cases, default) = parse_cases(switch, &state, self.tables)?;
+        let (mut seq, exit) = simulate(c, &cases, default.as_ref(), &test, kind, alloc)?;
         // Statements after the loop run only when the machine exits via the loop
         // test; a terminal (`return`/`throw`) case makes them unreachable.
         if exit == ExitMode::Test {
