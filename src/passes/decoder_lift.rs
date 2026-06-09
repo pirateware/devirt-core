@@ -2699,15 +2699,14 @@ fn has_liftable_site(
                         }
                     }
                 }
-                Expression::ComputedMemberExpression(m) => {
+                Expression::ComputedMemberExpression(m)
                     if freevars_of_expr(&m.object)
                         .free()
                         .iter()
-                        .any(|n| self.allowed.contains(n))
-                    {
-                        self.found = true;
-                        return;
-                    }
+                        .any(|n| self.allowed.contains(n)) =>
+                {
+                    self.found = true;
+                    return;
                 }
                 Expression::AssignmentExpression(a) => {
                     if matches!(a.operator, oxc_syntax::operator::AssignmentOperator::Assign) {
