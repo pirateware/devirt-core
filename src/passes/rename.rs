@@ -107,16 +107,17 @@ impl Pass for RenameByRole {
                 .symbol_flags(sym)
                 .intersects(SymbolFlags::Function | SymbolFlags::Class);
 
-            // Priority: assignment / behavior hint, then usage hint, then a
+            // Priority: assignment / behavior hint, then usage hint (how the
+            // binding is accessed — the main source of parameter names), then a
             // typed-but-generic fallback (`fn`/`var`).
-            let base = collector
+            let base: String = collector
                 .hints
                 .get(&sym)
-                .map(|s| s.as_str())
-                .or_else(|| usage_name(collector.usage.get(&sym)))
-                .unwrap_or(if is_fn { "fn" } else { "var" });
+                .cloned()
+                .or_else(|| usage_hint(collector.usage.get(&sym)))
+                .unwrap_or_else(|| if is_fn { "fn".into() } else { "var".into() });
 
-            let new = unique_name(base, &mut counters, &mut used);
+            let new = unique_name(&base, &mut counters, &mut used);
             rename.insert(sym, new);
         }
 
@@ -167,6 +168,39 @@ fn unique_name(
 /// re-rename its own output forever; all our bases have ≥ 3 such chars.
 fn is_opaque(name: &str) -> bool {
     name.starts_with("_0x") || name.chars().filter(|c| *c != '_' && *c != '$').count() <= 2
+}
+
+/// A property name usable as a *binding* hint (`var x = obj.<prop>` → name `x`
+/// after `<prop>`). It must read as meaningful — not machine-opaque, so the name
+/// we emit also survives the idempotence check and never gets re-renamed — and not
+/// one of a few container-noise words that describe the access path rather than the
+/// value (`prototype`, `constructor`, …). The text is the developer's own
+/// identifier, returned unchanged; collisions are resolved by the de-duplicator.
+fn good_property_hint(prop: &str) -> Option<&str> {
+    if is_opaque(prop) {
+        return None;
+    }
+    // Plumbing / universal members that name the *path* or a method every object
+    // carries — not the value behind it. `var x = o.prototype` or a param named
+    // after `o.hasOwnProperty` reads worse than a generic name.
+    if matches!(
+        prop,
+        "prototype"
+            | "constructor"
+            | "__proto__"
+            | "call"
+            | "apply"
+            | "bind"
+            | "hasOwnProperty"
+            | "isPrototypeOf"
+            | "propertyIsEnumerable"
+            | "toString"
+            | "toLocaleString"
+            | "valueOf"
+    ) {
+        return None;
+    }
+    Some(prop)
 }
 
 // ---------------------------------------------------------------------------
@@ -346,6 +380,20 @@ impl<'a> Traverse<'a, ()> for Collector {
         }
         if let Some(name) = name_from_expr(init) {
             self.record_hint(bid.symbol_id(), name);
+            return;
+        }
+        // `var x = obj.userAgent` / `var x = e.target` — name the binding after the
+        // property it reads. Obfuscated code is dominated by these `var t =
+        // <expr>.<prop>` temps, so this is the single largest source of otherwise-
+        // generic `varN` names. The property is an `IdentifierName` (its text is
+        // the developer's, surviving minification), so it is a strong hint; we use
+        // it only when it reads as meaningful (`good_property_hint`). A method
+        // *call* result (`a.push(b)`) is excluded — the method names the action,
+        // not the value — except the curated factories handled by `name_from_call`.
+        if let Expression::StaticMemberExpression(m) = init {
+            if let Some(hint) = good_property_hint(m.property.name.as_str()) {
+                self.record_hint(bid.symbol_id(), hint);
+            }
         }
     }
 
@@ -362,6 +410,16 @@ impl<'a> Traverse<'a, ()> for Collector {
         }
         if let Some(name) = name_from_function_body(node.body.as_deref()) {
             self.record_hint(id.symbol_id(), name);
+            return;
+        }
+        // Getter shape: `function(){ … return <obj>.<prop> }` — name the function
+        // after the property it yields (`return nav.userAgent` → `userAgent`). The
+        // returned property name is the developer's, so it describes the function's
+        // value well; method-call returns are left to the behaviour heuristic.
+        if let Some(prop) = returned_property(node.body.as_deref()) {
+            if let Some(h) = good_property_hint(prop) {
+                self.record_hint(id.symbol_id(), h);
+            }
         }
     }
 
@@ -591,6 +649,20 @@ fn name_from_function_body(body: Option<&oxc_ast::ast::FunctionBody<'_>>) -> Opt
     name_from_returned_expr(arg)
 }
 
+/// The static property name a function's value-return reads, if its last
+/// top-level `return` is `<obj>.<prop>` (a getter). Returns the property text
+/// (AST-borrowed), used as a naming hint after `good_property_hint` filtering.
+fn returned_property<'b>(body: Option<&'b oxc_ast::ast::FunctionBody<'_>>) -> Option<&'b str> {
+    let ret = body?.statements.iter().rev().find_map(|stmt| match stmt {
+        Statement::ReturnStatement(r) => Some(r),
+        _ => None,
+    })?;
+    match ret.argument.as_ref()? {
+        Expression::StaticMemberExpression(m) => Some(m.property.name.as_str()),
+        _ => None,
+    }
+}
+
 fn name_from_returned_expr(expr: &Expression<'_>) -> Option<&'static str> {
     match expr {
         Expression::BinaryExpression(b) => Some(name_from_binary_op(b.operator)),
@@ -720,13 +792,45 @@ fn known_global(name: &str) -> Option<&'static str> {
     })
 }
 
-/// Usage-based fallback: a binding only ever touched through list-mutation /
-/// list-inspection members is almost certainly an array accumulator.
-fn usage_name(props: Option<&Vec<String>>) -> Option<&'static str> {
+/// Usage-based naming: infer a binding's name from the members accessed through
+/// it. This is the main source of *parameter* names (a param has no initializer,
+/// only uses). In precision order:
+///  1. a recognisable type *signature* (DOM element, string) → the type name;
+///  2. only list-mutation / list-inspection members → `list`;
+///  3. a single distinct, meaningful accessed property → that property
+///     (`e.target` → `target`, `x.userAgent` → `userAgent`).
+/// Returns `None` when nothing is confident, falling through to `fn`/`var`.
+fn usage_hint(props: Option<&Vec<String>>) -> Option<String> {
     let props = props?;
     if props.is_empty() {
         return None;
     }
+    // (1) DOM-element signature: any access only a DOM node carries.
+    if props.iter().any(|p| {
+        matches!(
+            p.as_str(),
+            "appendChild"
+                | "removeChild"
+                | "insertBefore"
+                | "addEventListener"
+                | "removeEventListener"
+                | "setAttribute"
+                | "getAttribute"
+                | "querySelector"
+                | "querySelectorAll"
+                | "classList"
+                | "nodeType"
+                | "nodeName"
+                | "tagName"
+                | "innerHTML"
+                | "parentNode"
+                | "getBoundingClientRect"
+                | "dataset"
+        )
+    }) {
+        return Some("elem".into());
+    }
+    // (2) list signature: every access is a list mutation/inspection member.
     let list_like = props.iter().all(|p| {
         matches!(
             p.as_str(),
@@ -748,10 +852,44 @@ fn usage_name(props: Option<&Vec<String>>) -> Option<&'static str> {
         )
     });
     if list_like {
-        Some("list")
-    } else {
-        None
+        return Some("list".into());
     }
+    // (3) string signature: every access is a string member.
+    let str_like = props.iter().all(|p| {
+        matches!(
+            p.as_str(),
+            "charCodeAt"
+                | "charAt"
+                | "codePointAt"
+                | "substring"
+                | "substr"
+                | "toLowerCase"
+                | "toUpperCase"
+                | "indexOf"
+                | "lastIndexOf"
+                | "length"
+                | "split"
+                | "replace"
+                | "trim"
+                | "slice"
+                | "match"
+                | "concat"
+                | "startsWith"
+                | "endsWith"
+        )
+    });
+    if str_like {
+        return Some("str".into());
+    }
+    // (4) a single distinct, meaningful accessed property names the binding.
+    let mut distinct = props.iter().map(|s| s.as_str());
+    let first = distinct.next()?;
+    if props.iter().all(|p| p == first) {
+        if let Some(h) = good_property_hint(first) {
+            return Some(h.to_string());
+        }
+    }
+    None
 }
 
 /// ECMAScript reserved words (and a few contextual ones) we must never emit as a
