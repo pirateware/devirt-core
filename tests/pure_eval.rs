@@ -69,3 +69,17 @@ fn pure_iife_returning_array_materializes_and_cleans_up() {
 fn split_to_array_folds() {
     assert_eq!(deob("sink('a,b,c'.split(',').length);").trim(), "sink(3);");
 }
+
+#[test]
+fn pure_coercion_globals_fold() {
+    assert_eq!(deob("sink(Boolean(1) && Number('5') + 2);").trim(), "sink(7);");
+    assert_eq!(deob("sink(String(42) + Number('0x10'));").trim(), r#"sink("4216");"#);
+}
+
+#[test]
+fn shadowed_coercion_global_is_kept() {
+    // A local binding named `Number` means a bare `Number(...)` may be the shadow,
+    // so it must not be folded as the global.
+    let out = deob("function g(){ var Number = function(x){ return ext(x); }; return Number(5); } sink(g());");
+    assert!(out.contains("Number(5)") || out.contains("ext("), "shadowed coercion wrongly folded: {out}");
+}
