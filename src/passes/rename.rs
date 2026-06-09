@@ -24,10 +24,12 @@
 use std::collections::{HashMap, HashSet};
 
 use oxc_ast::ast::{
-    BindingIdentifier, BindingPattern, CallExpression, CatchClause, Expression, ForStatement,
-    FormalParameters, Function, FunctionBody, IdentifierReference, Program, Statement,
-    StaticMemberExpression, VariableDeclarator,
+    BindingIdentifier, BindingPattern, CallExpression, CatchClause, Declaration,
+    ExportDefaultDeclarationKind, Expression, ForStatement, FormalParameters, Function,
+    FunctionBody, IdentifierReference, ImportDeclarationSpecifier, ModuleExportName, Program,
+    Statement, StaticMemberExpression, VariableDeclarator,
 };
+use oxc_ast_visit::Visit;
 use oxc_syntax::operator::BinaryOperator;
 use oxc_syntax::symbol::{SymbolFlags, SymbolId};
 use oxc_traverse::{traverse_mut, Traverse, TraverseCtx};
@@ -51,12 +53,31 @@ impl Pass for RenameByRole {
         // Phase 1: scan the tree to gather a descriptive base-name hint per symbol
         // (from assignment / function behavior) and a record of how each symbol is
         // used as a member-access object (for the usage fallback).
+        // Top-level (root-scope) bindings are renamable only in an ES *module*: a
+        // module binding is module-private (not a property of the global object),
+        // so none of the script-only aliasing vectors apply — `globalThis.x` /
+        // `window[dyn]` / `for (k in globalThis)` / `delete globalThis.x` cannot
+        // reach it. The two vectors that *can* expose a module binding are pinned:
+        // it must not be `export`ed (or `import`ed — renaming would change the
+        // public/imported name), and the module must contain no *direct* `eval`
+        // (which can resolve a module-scope name by string). A script's top-level
+        // bindings remain off-limits (they become global properties with too many
+        // aliasing vectors to gate soundly here).
+        let is_module = program.source_type.is_module();
+        let pinned: HashSet<String> = if is_module {
+            collect_module_pinned(program)
+        } else {
+            HashSet::new()
+        };
+
         let scoping = build_scoping(program);
         let mut collector = Collector {
             hints: HashMap::new(),
             usage: HashMap::new(),
+            has_direct_eval: false,
         };
         let scoping = traverse_mut(&mut collector, allocator, program, scoping, ());
+        let allow_root = is_module && !collector.has_direct_eval;
 
         // Existing names we must not collide with, plus reserved words and
         // `undefined`. Seeding `used` with all of these guarantees every emitted
@@ -70,13 +91,15 @@ impl Pass for RenameByRole {
 
         let root = scoping.root_scope_id();
         for sym in scoping.symbol_ids() {
-            // Never rename root-scope (global / observable) bindings — they may
-            // be the program's public entry point, like DCE's removal guard.
-            if scoping.symbol_scope_id(sym) == root {
-                continue;
-            }
             let name = scoping.symbol_name(sym);
             if !is_opaque(name) {
+                continue;
+            }
+            // Root-scope bindings: only rename them in a module, when not pinned by
+            // an export/import and the module has no direct `eval`. A script's
+            // globals stay untouched (see `allow_root`). For non-module scripts
+            // `allow_root` is false, so this preserves the old "skip all root" rule.
+            if scoping.symbol_scope_id(sym) == root && (!allow_root || pinned.contains(name)) {
                 continue;
             }
 
@@ -147,6 +170,101 @@ fn is_opaque(name: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Module root-scope pinning
+// ---------------------------------------------------------------------------
+
+/// Names that must NOT be renamed at module root scope because they are part of
+/// the module's external interface: every `export`ed binding (renaming changes
+/// the public name) and every `import`ed local binding (renaming changes which
+/// export is bound). Top-level `import`/`export` are statements, so a single pass
+/// over `program.body` suffices.
+fn collect_module_pinned(program: &Program<'_>) -> HashSet<String> {
+    let mut out: HashSet<String> = HashSet::new();
+    for stmt in &program.body {
+        match stmt {
+            Statement::ExportNamedDeclaration(e) => {
+                if let Some(decl) = &e.declaration {
+                    decl_binding_names(decl, &mut out);
+                }
+                for spec in &e.specifiers {
+                    if let Some(n) = module_export_name(&spec.local) {
+                        out.insert(n);
+                    }
+                }
+            }
+            Statement::ExportDefaultDeclaration(e) => match &e.declaration {
+                ExportDefaultDeclarationKind::FunctionDeclaration(f) => {
+                    if let Some(id) = &f.id {
+                        out.insert(id.name.to_string());
+                    }
+                }
+                ExportDefaultDeclarationKind::ClassDeclaration(c) => {
+                    if let Some(id) = &c.id {
+                        out.insert(id.name.to_string());
+                    }
+                }
+                _ => {}
+            },
+            Statement::ImportDeclaration(d) => {
+                if let Some(specs) = &d.specifiers {
+                    for spec in specs {
+                        let local = match spec {
+                            ImportDeclarationSpecifier::ImportSpecifier(s) => &s.local,
+                            ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => &s.local,
+                            ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => &s.local,
+                        };
+                        out.insert(local.name.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The bound names a top-level `export <declaration>` introduces.
+fn decl_binding_names(decl: &Declaration<'_>, out: &mut HashSet<String>) {
+    match decl {
+        Declaration::FunctionDeclaration(f) => {
+            if let Some(id) = &f.id {
+                out.insert(id.name.to_string());
+            }
+        }
+        Declaration::ClassDeclaration(c) => {
+            if let Some(id) = &c.id {
+                out.insert(id.name.to_string());
+            }
+        }
+        Declaration::VariableDeclaration(v) => {
+            for d in &v.declarations {
+                binding_pattern_names(&d.id, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Every identifier bound by a (possibly destructuring) binding pattern.
+fn binding_pattern_names(pat: &BindingPattern<'_>, out: &mut HashSet<String>) {
+    struct N<'r>(&'r mut HashSet<String>);
+    impl<'a> Visit<'a> for N<'_> {
+        fn visit_binding_identifier(&mut self, id: &BindingIdentifier<'a>) {
+            self.0.insert(id.name.to_string());
+        }
+    }
+    N(out).visit_binding_pattern(pat);
+}
+
+fn module_export_name(n: &ModuleExportName<'_>) -> Option<String> {
+    match n {
+        ModuleExportName::IdentifierName(i) => Some(i.name.to_string()),
+        ModuleExportName::IdentifierReference(i) => Some(i.name.to_string()),
+        ModuleExportName::StringLiteral(s) => Some(s.value.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Phase 1 — hint collection
 // ---------------------------------------------------------------------------
 
@@ -157,6 +275,12 @@ struct Collector {
     /// Property names a symbol is accessed with as a member-expression object,
     /// e.g. `xs.push` records `push` for `xs`. Used only as a fallback.
     usage: HashMap<SymbolId, Vec<String>>,
+    /// Whether the program performs a *direct* `eval(...)` (callee is the bare
+    /// `eval` identifier). Direct eval can resolve a module-scope binding by its
+    /// string name, so its presence disables root-scope renaming. Indirect eval
+    /// (`(0,eval)(s)`, `window.eval(s)`) runs in global scope and cannot see a
+    /// module binding, so it is not flagged here.
+    has_direct_eval: bool,
 }
 
 impl Collector {
@@ -271,6 +395,11 @@ impl<'a> Traverse<'a, ()> for Collector {
         node: &mut CallExpression<'a>,
         _ctx: &mut TraverseCtx<'a, ()>,
     ) {
+        // Flag a direct `eval(...)` (bare-identifier callee) — it can reach a
+        // module-scope binding by name, gating root-scope renaming.
+        if matches!(&node.callee, Expression::Identifier(id) if id.name == "eval") {
+            self.has_direct_eval = true;
+        }
         // The method name may be a static member (`xs.reduce`) or a string-keyed
         // computed member (`xs["reduce"]`) left by partial string-array recovery.
         let method = match &node.callee {

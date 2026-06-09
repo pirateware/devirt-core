@@ -133,6 +133,66 @@ fn preserves_global_names() {
 }
 
 #[test]
+fn renames_module_top_level_private_binding() {
+    // In an ES module a top-level binding is module-private (not a global
+    // property), so a non-exported opaque one is safe to rename. Isolated rename
+    // pass (`.mjs` → module) so the binding isn't inlined first.
+    let out = run_pass("var _0xQz = window.x; sink(_0xQz, _0xQz);", "m.mjs", "rename");
+    assert!(
+        !out.contains("_0xQz"),
+        "module-private top-level binding not renamed: {out}"
+    );
+}
+
+#[test]
+fn preserves_exported_and_imported_module_names() {
+    // Renaming an exported binding would change the public name; renaming an
+    // imported local would change which export is bound. Both must be pinned.
+    let exp = run_pass("export var _0xQz = window.x; sink(_0xQz);", "m.mjs", "rename");
+    assert!(exp.contains("_0xQz"), "exported binding renamed: {exp}");
+
+    let imp = run_pass(
+        "import { _0xQz } from './m'; sink(_0xQz, _0xQz);",
+        "m.mjs",
+        "rename",
+    );
+    assert!(imp.contains("_0xQz"), "imported binding renamed: {imp}");
+}
+
+#[test]
+fn direct_eval_disables_module_root_renaming() {
+    // Direct `eval` can resolve a module-scope name by string, so root-scope
+    // renaming must be disabled when it is present (locals are still fair game,
+    // but this binding is root-scope).
+    let out = run_pass(
+        "var _0xQz = window.x; sink(_0xQz, eval('1'));",
+        "m.mjs",
+        "rename",
+    );
+    assert!(
+        out.contains("_0xQz"),
+        "module root binding renamed despite direct eval: {out}"
+    );
+}
+
+#[test]
+fn module_top_level_rename_end_to_end() {
+    // Full pipeline: a recursive (so non-inlinable) opaque top-level helper in a
+    // module is renamed, while the exported entry point is preserved.
+    let out = deobfuscate(
+        "function _0x3a(_0xn){ return _0xn <= 1 ? 1 : _0xn * _0x3a(_0xn - 1); }\
+         export function run(){ return _0x3a(window.x); }",
+        "m.mjs",
+    )
+    .code;
+    assert!(!out.contains("_0x3a"), "module helper not renamed: {out}");
+    assert!(
+        out.contains("export function run"),
+        "exported entry not preserved: {out}"
+    );
+}
+
+#[test]
 fn swc_helper_markers_get_canonical_names() {
     // A function carrying swc/babel's self-identifying directive prologue is named
     // from that marker, not the misleading body-shape heuristic (a `?:` body would
