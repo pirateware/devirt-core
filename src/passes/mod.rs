@@ -21,6 +21,7 @@ mod pure_eval;
 mod reconstruct_object;
 mod rename;
 mod sequence_split;
+mod single_iter_loop;
 mod unflatten;
 mod unflatten_cfg;
 mod unflatten_param;
@@ -47,6 +48,7 @@ pub use pure_eval::PureEval;
 pub use reconstruct_object::ReconstructObject;
 pub use rename::RenameByRole;
 pub use sequence_split::SequenceSplit;
+pub use single_iter_loop::SingleIterLoop;
 pub use unflatten::Unflatten;
 pub use unflatten_cfg::UnflattenCfg;
 pub use unflatten_param::UnflattenParam;
@@ -157,6 +159,9 @@ pub fn default_pipeline() -> Vec<Box<dyn Pass>> {
         // condition `if` to its taken branch) into the parent list. Runs right
         // before DCE so an unwrapped `{ return x; }` exposes its terminator and
         // DCE's unreachable-tail removal drops what followed in the same round.
+        // Unwrap `while (1) { … break; }` single-iteration loop wrappers into a
+        // block, which block-flatten then dissolves.
+        Box::new(SingleIterLoop::default()),
         Box::new(BlockFlatten::default()),
         Box::new(Dce::default()),
         // Remove pure stores to variables that are now read-never (spent
