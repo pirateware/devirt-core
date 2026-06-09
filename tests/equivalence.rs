@@ -2427,3 +2427,19 @@ fn mutated_aggregate_is_not_materialized() {
     // Rebound by a for-of head — the initial literal is stale.
     assert_equivalent("var s = [10, 20]; for (var s of [[7, 8]]) {} __r = s.join(',');");
 }
+
+// ---------------------------------------------------------------------------
+// Template-literal folding (src/passes/const_fold.rs). An untagged template whose
+// interpolations are all constant collapses to the string it produces; a runtime
+// interpolation or a tagged template is preserved.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn template_literal_fold_preserves_value() {
+    assert_equivalent("var n = 5; __r = `val: ${n * 2}`;");
+    assert_equivalent("__r = `${1 + 1}-${'a' + 'b'}-${true}-${null}`;");
+    // The result is a string; a numeric-looking interpolation must stay textual.
+    assert_equivalent("__r = `${10}${0}${0}`;");
+    // Runtime interpolation: not folded, but value preserved.
+    assert_equivalent("var x = String(1) === '1' ? 7 : 0; __r = `v=${x}`;");
+}
