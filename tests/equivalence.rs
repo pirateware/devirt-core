@@ -2404,3 +2404,26 @@ fn object_state_read_before_init_preserves_value() {
          __r = snap + ':' + ctx.acc;",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Immutable-aggregate receiver materialization (src/passes/pure_eval.rs). A
+// variable-bound const array/object receiver is resolved by re-materializing it in
+// the sandbox — only when it is provably never mutated, aliased, or rebound.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn immutable_aggregate_method_preserves_value() {
+    assert_equivalent("var a = ['a','b','c']; __r = a.join('-');");
+    assert_equivalent("var o = { a: { b: 7 }, c: 9 }; __r = o.a.b + o.c;");
+    // Numeric stays numeric; the type tag guards against a string conflation.
+    assert_equivalent("var n = [3, 1, 4]; __r = n.indexOf(4) + 1;");
+}
+
+#[test]
+fn mutated_aggregate_is_not_materialized() {
+    // The array is mutated after definition; folding its receiver to the literal
+    // would read a stale value. Declines, value preserved.
+    assert_equivalent("var a = [1, 2]; a.push(3); __r = a.join(',');");
+    // Rebound by a for-of head — the initial literal is stale.
+    assert_equivalent("var s = [10, 20]; for (var s of [[7, 8]]) {} __r = s.join(',');");
+}

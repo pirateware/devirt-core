@@ -51,9 +51,16 @@ impl Pass for PureEval {
             return false;
         };
         let scoping = build_scoping(program);
+        // Provably-immutable, closed (literal-only) aggregate bindings, as source we
+        // can re-materialize in the sandbox so a `var a = […]; a.join('-')` receiver
+        // resolves even though the array stays bound to a variable.
+        let aggregates = immutable_aggregates(program, &scoping);
+        let agg_names: std::collections::HashSet<String> = aggregates.keys().cloned().collect();
         let mut e = Evaluator {
             sandbox,
             changed: false,
+            aggregates,
+            agg_names,
         };
         traverse_mut(&mut e, allocator, program, scoping, ());
         self.changed = e.changed;
@@ -63,6 +70,10 @@ impl Pass for PureEval {
 
 struct Evaluator {
     sandbox: Sandbox,
+    /// name → source of its immutable, literal-only initializer (`['a','b']`).
+    aggregates: std::collections::HashMap<String, String>,
+    /// Just the keys of `aggregates`, for the free-name gate.
+    agg_names: std::collections::HashSet<String>,
     changed: bool,
 }
 
@@ -93,7 +104,10 @@ fn is_foldable_call(expr: &Expression<'_>) -> bool {
 
 impl<'a> Traverse<'a, ()> for Evaluator {
     fn enter_expression(&mut self, expr: &mut Expression<'a>, ctx: &mut TraverseCtx<'a, ()>) {
-        if !is_foldable_call(expr) {
+        // A foldable call, or a member access whose root is an immutable aggregate
+        // (`a.join(…)`, `o.a.b`) — the latter lets a variable-bound const array/
+        // object receiver resolve.
+        if !is_foldable_call(expr) && !self.is_aggregate_member(expr) {
             return;
         }
         // Only fold a call whose *result is consumed* (an initializer, argument, or
@@ -105,15 +119,26 @@ impl<'a> Traverse<'a, ()> for Evaluator {
         if ctx.parent().is_expression_statement() {
             return;
         }
-        // Closed + effect-free gate (empty pureset: only side-effect-free globals
-        // are tolerated as free names; no `this`, no writes to outer state).
-        if !freevars_of_expr(&*expr).all_allowed(&Default::default(), None, &Default::default()) {
+        // Closed + effect-free gate: every free name must be a side-effect-free
+        // global OR an immutable aggregate we can re-materialize (no `this`, no
+        // writes to outer state).
+        if !freevars_of_expr(&*expr).all_allowed(&self.agg_names, None, &Default::default()) {
             return;
         }
 
         let mut cg = oxc_codegen::Codegen::new();
         cg.print_expression(&*expr);
-        let src = format!("({});", cg.into_source_text());
+        let printed = cg.into_source_text();
+        // Materialize any immutable aggregate the expression reads, so its receiver
+        // resolves in the fresh sandbox. Soundness rests on the aggregate being
+        // provably never mutated/aliased (see `immutable_aggregates`).
+        let mut prelude = String::new();
+        for name in collect_ref_names(&*expr) {
+            if let Some(init) = self.aggregates.get(&name) {
+                prelude.push_str(&format!("var {name} = {init};\n"));
+            }
+        }
+        let src = format!("{prelude}({printed});");
 
         // Evaluate twice; require agreement (rejects non-determinism) and a
         // primitive result (the only thing with a literal form).
@@ -139,6 +164,131 @@ impl<'a> Traverse<'a, ()> for Evaluator {
         };
         self.changed = true;
     }
+}
+
+impl Evaluator {
+    /// A static/computed member access whose root receiver is an immutable
+    /// aggregate (`o.a.b`, `a[0].x`) — worth resolving to its primitive value.
+    fn is_aggregate_member(&self, expr: &Expression<'_>) -> bool {
+        let mut cur = expr;
+        loop {
+            match cur {
+                Expression::StaticMemberExpression(m) => cur = &m.object,
+                Expression::ComputedMemberExpression(m) => cur = &m.object,
+                Expression::Identifier(id) => return self.agg_names.contains(id.name.as_str()),
+                _ => return false,
+            }
+        }
+    }
+}
+
+/// Collect the names of every identifier *reference* in `expr` (free or not — the
+/// caller only intersects with the immutable-aggregate set, whose names are unique
+/// program-wide, so a stray match is impossible).
+fn collect_ref_names(expr: &Expression<'_>) -> std::collections::HashSet<String> {
+    use oxc_ast_visit::Visit;
+    struct R(std::collections::HashSet<String>);
+    impl<'a> Visit<'a> for R {
+        fn visit_identifier_reference(&mut self, it: &oxc_ast::ast::IdentifierReference<'a>) {
+            self.0.insert(it.name.to_string());
+        }
+    }
+    let mut r = R(std::collections::HashSet::new());
+    r.visit_expression(expr);
+    r.0
+}
+
+/// Provably-immutable, closed (literal-only) aggregate bindings: `name → init
+/// source`. A binding qualifies when it is a `var name = <array|object literal>`
+/// whose name is a unique symbol, is **not** in `mutable_aggregate_tables` (so it is
+/// never reassigned, member-written, `.push`-ed, or read bare into a mutable alias),
+/// and whose initializer is closed — its free names are all side-effect-free
+/// globals — so re-materializing it standalone in the sandbox is faithful.
+fn immutable_aggregates(
+    program: &Program<'_>,
+    scoping: &oxc_semantic::Scoping,
+) -> std::collections::HashMap<String, String> {
+    use oxc_ast::ast::{BindingPattern, Expression as E, Statement};
+    let mut mutable = crate::ir::mutable_aggregate_tables(program, scoping);
+    // `mutable_aggregate_tables` does not see a `for (var s of …)` / `for (s in …)`
+    // head, which rebinds `s` every iteration — exactly the SSA `exclude_for_head`
+    // hazard. Exclude any name bound or assigned by a for-in/for-of head so a
+    // rebound aggregate is never baked at its stale initial value.
+    mutable.extend(for_head_names(program));
+    let mut out = std::collections::HashMap::new();
+    // Count symbols per name to reject shadowed names (a name-keyed materialization
+    // must be unambiguous).
+    let mut name_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for n in scoping.symbol_names() {
+        *name_counts.entry(n.to_string()).or_default() += 1;
+    }
+    // Only top-level declarations (the program body); a function-scoped aggregate is
+    // not materialized here (its symbol scope is irrelevant to a name-based bake).
+    for stmt in &program.body {
+        let Statement::VariableDeclaration(vd) = stmt else {
+            continue;
+        };
+        for d in &vd.declarations {
+            let BindingPattern::BindingIdentifier(id) = &d.id else {
+                continue;
+            };
+            let name = id.name.as_str();
+            let Some(init) = &d.init else { continue };
+            if !matches!(init, E::ArrayExpression(_) | E::ObjectExpression(_)) {
+                continue;
+            }
+            if mutable.contains(name) || name_counts.get(name).copied().unwrap_or(0) != 1 {
+                continue;
+            }
+            // Closed initializer: only literals / side-effect-free globals inside.
+            if !freevars_of_expr(init).all_allowed(&Default::default(), None, &Default::default()) {
+                continue;
+            }
+            let mut cg = oxc_codegen::Codegen::new();
+            cg.print_expression(init);
+            out.insert(name.to_string(), cg.into_source_text());
+        }
+    }
+    out
+}
+
+/// Names bound or assigned by any `for-in` / `for-of` head (`for (var s of …)`,
+/// `for (s in …)`) — each is rebound per iteration, so its initial value is stale.
+fn for_head_names(program: &Program<'_>) -> std::collections::HashSet<String> {
+    use oxc_ast::ast::{BindingPattern, ForStatementLeft};
+    use oxc_ast_visit::Visit;
+    struct F(std::collections::HashSet<String>);
+    impl F {
+        fn note_left(&mut self, left: &ForStatementLeft<'_>) {
+            match left {
+                ForStatementLeft::VariableDeclaration(vd) => {
+                    for d in &vd.declarations {
+                        if let BindingPattern::BindingIdentifier(id) = &d.id {
+                            self.0.insert(id.name.to_string());
+                        }
+                    }
+                }
+                ForStatementLeft::AssignmentTargetIdentifier(id) => {
+                    self.0.insert(id.name.to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+    impl<'a> Visit<'a> for F {
+        fn visit_for_of_statement(&mut self, n: &oxc_ast::ast::ForOfStatement<'a>) {
+            self.note_left(&n.left);
+            oxc_ast_visit::walk::walk_for_of_statement(self, n);
+        }
+        fn visit_for_in_statement(&mut self, n: &oxc_ast::ast::ForInStatement<'a>) {
+            self.note_left(&n.left);
+            oxc_ast_visit::walk::walk_for_in_statement(self, n);
+        }
+    }
+    let mut f = F(std::collections::HashSet::new());
+    f.visit_program(program);
+    f.0
 }
 
 /// Build a numeric literal for `n`, wrapping negatives as `-(lit)` (the grammar
