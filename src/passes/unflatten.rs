@@ -60,7 +60,6 @@ use oxc_ast_visit::Visit;
 use oxc_semantic::Scoping;
 use oxc_span::SPAN;
 use oxc_syntax::operator::{AssignmentOperator, BinaryOperator};
-use oxc_traverse::{traverse_mut, Traverse, TraverseCtx};
 
 use crate::pass::Pass;
 
@@ -84,7 +83,12 @@ impl Pass for Unflatten {
         // aliasing to symbols). The unflatten analysis itself is name-based.
         let scoping = crate::util::build_scoping(program);
         self.tables = resolve_const_int_tables(program, &scoping);
-        traverse_mut(self, allocator, program, scoping, ());
+        // Hand-written recursion rather than `traverse_mut`: the linearized sequence
+        // is spliced in as freshly-cloned nodes with no `scope_id`, and the semantic
+        // traverser panics if it descends into one (a nested dispatcher inside a case
+        // body would trip it). We recurse children first (bottom-up), then linearize
+        // this list, and never re-descend into the spliced result this run.
+        self.walk_list(&mut program.body, AstBuilder::new(allocator));
         self.changed
     }
 }
@@ -160,12 +164,17 @@ fn const_int_array(expr: &Expression<'_>) -> Option<Vec<i64>> {
     Some(out)
 }
 
-impl<'a> Traverse<'a, ()> for Unflatten {
-    fn enter_statements(
-        &mut self,
-        stmts: &mut ArenaVec<'a, Statement<'a>>,
-        ctx: &mut TraverseCtx<'a, ()>,
-    ) {
+impl<'a> Unflatten {
+    /// Recurse a statement list bottom-up: descend into existing children, then
+    /// linearize a dispatcher in this list. The spliced sequence is not re-visited.
+    fn walk_list(&mut self, stmts: &mut ArenaVec<'a, Statement<'a>>, ast: AstBuilder<'a>) {
+        for stmt in stmts.iter_mut() {
+            self.recurse_stmt(stmt, ast);
+        }
+        self.process_list(stmts, ast);
+    }
+
+    fn process_list(&mut self, stmts: &mut ArenaVec<'a, Statement<'a>>, ast: AstBuilder<'a>) {
         // Find a `<state init> … while (s) { switch (s) {…} }` pair. The init and
         // the dispatcher loop need NOT be adjacent: the state var may have a
         // declaration or two between them (`var s = 1; var acc = 0; while(s){…}`),
@@ -198,9 +207,9 @@ impl<'a> Traverse<'a, ()> for Unflatten {
                     &stmts[j],
                     &s_name,
                     &self.tables,
-                    ctx.ast.allocator,
+                    ast.allocator,
                 )
-                .or_else(|| simulate_sval_at(&stmts[i], &stmts[j], &s_name, ctx.ast.allocator));
+                .or_else(|| simulate_sval_at(&stmts[i], &stmts[j], &s_name, ast.allocator));
                 let Some(seq) = seq else {
                     continue;
                 };
@@ -217,11 +226,11 @@ impl<'a> Traverse<'a, ()> for Unflatten {
         // (and elsewhere) are preserved in order. When the initializer is a
         // multi-declarator `var`, only the state declarator is dropped; its siblings
         // stay in place. `seq` already holds arena clones.
-        let old = std::mem::replace(stmts, ctx.ast.vec());
+        let old = std::mem::replace(stmts, ast.vec());
         let mut seq = Some(seq);
         for (k, s) in old.into_iter().enumerate() {
             if k == i {
-                if let Some(kept) = splice_remove_state(&s, &s_name, ctx.ast) {
+                if let Some(kept) = splice_remove_state(&s, &s_name, ast) {
                     stmts.push(kept);
                 }
                 continue; // drop (or trim) the state initializer
@@ -235,6 +244,89 @@ impl<'a> Traverse<'a, ()> for Unflatten {
             stmts.push(s);
         }
         self.changed = true;
+    }
+
+    /// Descend into every statement list reachable from `stmt` (best-effort). Mirrors
+    /// `unflatten_cfg`'s recursion; an unhandled container is simply not searched.
+    fn recurse_stmt(&mut self, stmt: &mut Statement<'a>, ast: AstBuilder<'a>) {
+        match stmt {
+            Statement::BlockStatement(b) => self.walk_list(&mut b.body, ast),
+            Statement::FunctionDeclaration(f) => {
+                if let Some(body) = &mut f.body {
+                    self.walk_list(&mut body.statements, ast);
+                }
+            }
+            Statement::VariableDeclaration(vd) => {
+                for d in &mut vd.declarations {
+                    if let Some(init) = &mut d.init {
+                        self.recurse_expr_fn(init, ast);
+                    }
+                }
+            }
+            Statement::ExpressionStatement(es) => self.recurse_expr_fn(&mut es.expression, ast),
+            Statement::ReturnStatement(r) => {
+                if let Some(arg) = &mut r.argument {
+                    self.recurse_expr_fn(arg, ast);
+                }
+            }
+            Statement::IfStatement(i) => {
+                self.recurse_stmt(&mut i.consequent, ast);
+                if let Some(alt) = &mut i.alternate {
+                    self.recurse_stmt(alt, ast);
+                }
+            }
+            Statement::ForStatement(f) => self.recurse_stmt(&mut f.body, ast),
+            Statement::ForInStatement(f) => self.recurse_stmt(&mut f.body, ast),
+            Statement::ForOfStatement(f) => self.recurse_stmt(&mut f.body, ast),
+            Statement::WhileStatement(w) => self.recurse_stmt(&mut w.body, ast),
+            Statement::DoWhileStatement(d) => self.recurse_stmt(&mut d.body, ast),
+            Statement::LabeledStatement(l) => self.recurse_stmt(&mut l.body, ast),
+            Statement::TryStatement(t) => {
+                self.walk_list(&mut t.block.body, ast);
+                if let Some(h) = &mut t.handler {
+                    self.walk_list(&mut h.body.body, ast);
+                }
+                if let Some(f) = &mut t.finalizer {
+                    self.walk_list(&mut f.body, ast);
+                }
+            }
+            Statement::SwitchStatement(sw) => {
+                for case in &mut sw.cases {
+                    self.walk_list(&mut case.consequent, ast);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn recurse_expr_fn(&mut self, expr: &mut Expression<'a>, ast: AstBuilder<'a>) {
+        match expr {
+            Expression::FunctionExpression(f) => {
+                if let Some(body) = &mut f.body {
+                    self.walk_list(&mut body.statements, ast);
+                }
+            }
+            Expression::ArrowFunctionExpression(f) => {
+                self.walk_list(&mut f.body.statements, ast);
+            }
+            Expression::CallExpression(c) => {
+                self.recurse_expr_fn(&mut c.callee, ast);
+                for arg in &mut c.arguments {
+                    if let Some(e) = arg.as_expression_mut() {
+                        self.recurse_expr_fn(e, ast);
+                    }
+                }
+            }
+            Expression::ParenthesizedExpression(p) => self.recurse_expr_fn(&mut p.expression, ast),
+            Expression::UnaryExpression(u) => self.recurse_expr_fn(&mut u.argument, ast),
+            Expression::SequenceExpression(s) => {
+                for e in &mut s.expressions {
+                    self.recurse_expr_fn(e, ast);
+                }
+            }
+            Expression::AssignmentExpression(a) => self.recurse_expr_fn(&mut a.right, ast),
+            _ => {}
+        }
     }
 }
 

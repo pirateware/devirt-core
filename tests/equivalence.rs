@@ -2571,3 +2571,18 @@ fn literal_receiver_mutator_preserves_value() {
     // A mutator on a *named* receiver must still NOT fold (observable mutation).
     assert_equivalent("var a = [3, 1, 2]; var s = a.sort(); __r = a[0] + ':' + s[0];");
 }
+
+#[test]
+fn nested_dispatchers_preserve_value() {
+    // Nested integer-state dispatchers (the contained-panic regression) linearize
+    // to the same accumulated value.
+    assert_equivalent(
+        "function f(x){ var s=1, r=0; \
+           while (s) { switch (s) { \
+             case 1: r = x; s = 2; break; \
+             case 2: { var t=1, acc=0; while (t) { switch (t) { \
+                        case 1: acc = r * 2; t = 2; break; \
+                        case 2: acc += 1; t = 0; break; } } r = acc; } s = 0; break; \
+           } } return r; } __r = f(7);",
+    );
+}

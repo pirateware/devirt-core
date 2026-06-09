@@ -500,3 +500,21 @@ fn conditional_arm_content_is_recovered() {
     assert!(!out.contains("switch"), "arm-content dispatcher survived: {out}");
     assert!(out.contains("acc += 5"), "arm content lost: {out}");
 }
+
+#[test]
+fn nested_dispatchers_do_not_panic_and_collapse() {
+    // A dispatcher inside another dispatcher's case body. Previously the cloned,
+    // scope-bearing inner block tripped a contained panic in the traverser, aborting
+    // all deobfuscation; now both linearize.
+    let out = deob(
+        "function f(x){ var s=1, r=0; \
+           while (s) { switch (s) { \
+             case 1: r = x; s = 2; break; \
+             case 2: { var t=1, acc=0; while (t) { switch (t) { \
+                        case 1: acc = r * 2; t = 2; break; \
+                        case 2: acc += 1; t = 0; break; } } r = acc; } s = 0; break; \
+           } } return r; } sink(f(inp()));",
+    );
+    assert!(!out.contains("switch"), "nested dispatchers survived: {out}");
+    assert!(!out.contains("while"), "nested loops survived: {out}");
+}
