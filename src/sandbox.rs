@@ -455,6 +455,45 @@ const HOST_GLOBALS: &[&str] = &[
     "Notification",
 ];
 
+/// WHATWG `atob`/`btoa` base64 codec, defined only if absent. The whole-program
+/// harness needs these for the same reason the partial-eval sandbox does — base64
+/// is a common decoder codec (`atob(table[i])`), and without it a real sample
+/// throws `ReferenceError` under the harness and its behavior signature is
+/// uncomparable. Kept spec-correct (6-bit accumulator, unpadded-safe).
+const BASE64_POLYFILL: &str = r#"
+(function(g){
+  var B="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  if (typeof g.atob === "undefined") {
+    g.atob = function(input){
+      var s=String(input).replace(/[ \t\n\f\r]/g,"");
+      if (s.length % 4 === 0) s=s.replace(/==?$/,"");
+      if (s.length % 4 === 1 || /[^+/0-9A-Za-z]/.test(s)) return null;
+      var out="",buf=0,bits=0;
+      for (var i=0;i<s.length;i++){
+        buf=(buf<<6)|B.indexOf(s.charAt(i)); bits+=6;
+        if (bits===24){ out+=String.fromCharCode((buf>>16)&255,(buf>>8)&255,buf&255); buf=0; bits=0; }
+      }
+      if (bits===12){ out+=String.fromCharCode((buf>>4)&255); }
+      else if (bits===18){ out+=String.fromCharCode((buf>>10)&255,(buf>>2)&255); }
+      return out;
+    };
+  }
+  if (typeof g.btoa === "undefined") {
+    g.btoa = function(data){
+      var s=String(data),out="";
+      for (var i=0;i<s.length;i+=3){
+        var c0=s.charCodeAt(i),c1=s.charCodeAt(i+1),c2=s.charCodeAt(i+2);
+        if (c0>255||c1>255||c2>255) throw new Error("btoa: out of range");
+        out+=B.charAt(c0>>2)+B.charAt(((c0&3)<<4)|((c1>>4)||0));
+        out+=isNaN(c1)?"=":B.charAt(((c1&15)<<2)|((c2>>6)||0));
+        out+=isNaN(c2)?"=":B.charAt(c2&63);
+      }
+      return out;
+    };
+  }
+})(globalThis);
+"#;
+
 /// One-time harness prelude: determinism freeze, a `console` that records into a
 /// global `__lines` array, and a deep permissive host proxy bound to every name
 /// in [`HOST_GLOBALS`]. Kept self-contained (no host calls of its own) so it
@@ -547,6 +586,7 @@ fn behavior_signature_impl(source: &str, _budget: Duration) -> Option<BehaviorSi
         .collect::<Vec<_>>()
         .join("\n");
     if ctx.eval(Source::from_bytes(HARNESS_PRELUDE)).is_err()
+        || ctx.eval(Source::from_bytes(BASE64_POLYFILL)).is_err()
         || ctx.eval(Source::from_bytes(&bind_hosts)).is_err()
     {
         return None;
