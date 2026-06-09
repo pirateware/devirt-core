@@ -2443,3 +2443,17 @@ fn template_literal_fold_preserves_value() {
     // Runtime interpolation: not folded, but value preserved.
     assert_equivalent("var x = String(1) === '1' ? 7 : 0; __r = `v=${x}`;");
 }
+
+// ---------------------------------------------------------------------------
+// Pure call/IIFE returning an array materializes to a literal (src/passes/
+// pure_eval.rs, reusing decoder-lift's size-capped splice). Lets the dead
+// table-builder scaffolding fall to DCE.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn array_returning_pure_call_preserves_value() {
+    assert_equivalent("var t = (function(){ return [3, 1, 4]; })(); __r = t[0] + t[2];");
+    assert_equivalent("__r = 'a,b,c'.split(',').join('|');");
+    // Element types are preserved through materialization (string stays string).
+    assert_equivalent("var t = (function(){ return ['1','0','0']; })(); __r = t[0] + t[1] + t[2];");
+}

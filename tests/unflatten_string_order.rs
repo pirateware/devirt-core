@@ -209,12 +209,15 @@ fn default_case_is_kept() {
 
 #[test]
 fn body_reading_cursor_is_kept() {
-    // A case body reads the order array (`a.length`) — it can observe dispatch state,
-    // so emitting it linearly would change behavior.
+    // A case body reads the order array *bare* (`log(a)`) — it observes dispatch
+    // state in a form that cannot be folded away, so linearizing (and removing `a`)
+    // would strand the reference. The unflattener must decline. (A foldable read
+    // like `a.length` is instead resolved to a constant and then linearizes
+    // soundly, via the pure-eval array-materialization path.)
     let out = deob(
         "(function () { \
            for (var a = \"0|1\".split(\"|\"), i = 0; true;) { \
-             switch (a[i++]) { case \"0\": log(a.length); continue; case \"1\": y(); continue; } \
+             switch (a[i++]) { case \"0\": log(a); continue; case \"1\": y(); continue; } \
              break; \
            } \
          })();",

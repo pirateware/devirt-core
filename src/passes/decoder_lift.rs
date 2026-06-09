@@ -2711,7 +2711,7 @@ impl<'a, 'r> Traverse<'a, ()> for Lifter<'a, 'r> {
 /// form exists (NaN/Infinity, or an array containing one). Arrays splice as array
 /// literals — the sandbox already capped their size, and every element is a
 /// primitive — so an array-returning decoder materializes to `[…]`.
-fn eval_value_to_expr<'a>(
+pub(crate) fn eval_value_to_expr<'a>(
     val: &EvalValue,
     span: oxc_span::Span,
     ctx: &mut TraverseCtx<'a, ()>,

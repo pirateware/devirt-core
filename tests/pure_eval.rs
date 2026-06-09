@@ -55,3 +55,17 @@ fn const_template_literal_folds_to_string() {
     let out = deob("sink(String.raw`a${1}b`);");
     assert!(out.contains("String.raw"), "tagged template wrongly folded: {out}");
 }
+
+#[test]
+fn pure_iife_returning_array_materializes_and_cleans_up() {
+    // A pure IIFE that returns a small array splices to the literal, so the dead
+    // scaffolding binding is then removed by DCE.
+    let out = deob("var t = (function(){ return ['a','b','c']; })(); sink(t.join('-'));");
+    assert!(out.contains(r#""a-b-c""#), "array IIFE not materialized/folded: {out}");
+    assert!(!out.contains("function"), "scaffolding IIFE survived: {out}");
+}
+
+#[test]
+fn split_to_array_folds() {
+    assert_eq!(deob("sink('a,b,c'.split(',').length);").trim(), "sink(3);");
+}
