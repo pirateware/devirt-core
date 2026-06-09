@@ -80,23 +80,37 @@ fn keep_statement(s: &Statement<'_>, scoping: &Scoping) -> bool {
             f.id.as_ref()
                 .is_none_or(|id| !fn_decl_is_dead(id.symbol_id(), f, scoping))
         }
-        // A bare literal statement (`80214130;`, `true;`, `null;`) computes a
-        // value that is immediately discarded with no side effect — pure
-        // obfuscation noise (often a spent opaque-predicate constant). Drop it.
-        // Strings are excluded: a leading string can be a directive-like marker
-        // and removing it is both low-value and potentially surprising.
+        // A bare literal statement (`80214130;`, `true;`, `null;`, `"h";`)
+        // computes a value that is immediately discarded with no side effect —
+        // pure obfuscation noise (a spent opaque-predicate constant, or the
+        // pure-RHS debris dead-store leaves when it strips `s = "h"` down to its
+        // value). Drop it.
+        //
+        // String literals are safe to drop here despite the directive-prologue
+        // rule: oxc parses a body's directive prologue into a *separate*
+        // `directives` field, never into the statement list. So a `StringLiteral`
+        // expression statement that reaches this list is provably not a directive
+        // (e.g. `"use strict"` survives because it lives in `body.directives`,
+        // which DCE never touches) — it is just inert noise.
         Statement::ExpressionStatement(es) => !is_dead_literal(&es.expression),
         _ => true,
     }
 }
 
 /// A literal expression whose evaluation has no side effect, so using it as a
-/// statement does nothing. Excludes string literals (directive concern).
+/// statement does nothing. String literals are included: a directive prologue is
+/// stored in the body's separate `directives` field, so any string-literal
+/// statement in the statement list is non-directive dead code (see
+/// `keep_statement`).
 fn is_dead_literal(expr: &oxc_ast::ast::Expression<'_>) -> bool {
     use oxc_ast::ast::Expression as E;
     matches!(
         expr,
-        E::NumericLiteral(_) | E::BooleanLiteral(_) | E::NullLiteral(_) | E::BigIntLiteral(_)
+        E::NumericLiteral(_)
+            | E::BooleanLiteral(_)
+            | E::NullLiteral(_)
+            | E::BigIntLiteral(_)
+            | E::StringLiteral(_)
     )
 }
 

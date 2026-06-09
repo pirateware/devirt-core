@@ -46,6 +46,27 @@ fn removes_function_only_referenced_by_its_own_self_write() {
     assert!(out.contains("sink(2)"), "live code lost: {out}");
 }
 
+/// A bare string-literal statement in the *statement list* is inert dead code
+/// (often the pure-RHS debris dead-store leaves behind), and is dropped. The
+/// directive prologue lives in the body's separate `directives` field, so this
+/// never touches a real `"use strict"`.
+#[test]
+fn drops_dead_string_literal_statement_but_keeps_directive() {
+    let src = r#"
+        "use strict";
+        sink(1);
+        "dead noise";
+        sink(2);
+    "#;
+    let out = deobfuscate(src, "t.js").code;
+    assert!(out.contains("\"use strict\""), "directive dropped: {out}");
+    assert!(!out.contains("\"dead noise\""), "dead string kept: {out}");
+    assert!(
+        out.contains("sink(1)") && out.contains("sink(2)"),
+        "live code lost: {out}"
+    );
+}
+
 /// Soundness guard: a function that *is* read (called) elsewhere must survive,
 /// even though it also self-reassigns. The read references pin it alive. Two
 /// calls returning a non-constant (`g()`) keep the pipeline from folding it away,
