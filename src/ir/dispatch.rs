@@ -252,6 +252,8 @@ pub fn interpret(model: &dyn DispatchModel) -> Option<(RecoveredCfg, StateNumber
                 content: Vec::new(),
                 cond_stmt: None,
                 edges,
+                true_content: Vec::new(),
+                false_content: Vec::new(),
             },
         );
     }

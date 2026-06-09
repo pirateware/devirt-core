@@ -75,6 +75,13 @@ pub struct CaseBlock {
     pub cond_stmt: Option<usize>,
     /// Outgoing edges (1 for unconditional/terminal, 2 for a conditional split).
     pub edges: Vec<Edge>,
+    /// For a conditional split, the dispatch-clean statements that run *inside* the
+    /// `IfTrue` / `IfFalse` arm before its transition is taken — e.g.
+    /// `if (c) { acc += 5; s = 3; } else { s = 2; }`. Indices are into the
+    /// respective arm block's flattened body (resolved by the caller's
+    /// `CaseSource::arm_content`). Empty when an arm is a bare transition.
+    pub true_content: Vec<usize>,
+    pub false_content: Vec<usize>,
 }
 
 /// The recovered state machine.
@@ -253,6 +260,8 @@ fn parse_case_block(
     let mut content: Vec<usize> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
     let mut cond_stmt: Option<usize> = None;
+    let mut true_content: Vec<usize> = Vec::new();
+    let mut false_content: Vec<usize> = Vec::new();
 
     // Classify the terminator first.
     let terminal = matches!(
@@ -279,8 +288,12 @@ fn parse_case_block(
             });
             continue;
         }
-        if let Some((cond_true, cond_false)) = conditional_transition(st, s, &target_of) {
+        if let Some(((cond_true, tc), (cond_false, fc))) =
+            conditional_transition(st, s, &target_of)
+        {
             cond_stmt = Some(k);
+            true_content = tc;
+            false_content = fc;
             edges.push(Edge {
                 guard: Guard::IfTrue,
                 target: cond_true,
@@ -311,6 +324,8 @@ fn parse_case_block(
             content,
             cond_stmt,
             edges,
+            true_content,
+            false_content,
         });
     }
 
@@ -325,41 +340,67 @@ fn parse_case_block(
         content,
         cond_stmt,
         edges,
+        true_content,
+        false_content,
     })
 }
 
-/// `if (cond) s = A; else s = B;` (each arm exactly one absolute transition) →
-/// `(target A, target B)`, each mapped through `target_of` (so an exit-state
-/// transition becomes `Exit`). Also accepts an arm that is a `{ s = X }` block.
+/// One conditional arm: its transition target and the indices (into the arm's
+/// flattened body) of the dispatch-clean content that runs before the transition.
+type Arm = (Target, Vec<usize>);
+
+/// `if (cond) <armA> else <armB>` where each arm is a single absolute transition
+/// `s = K`, optionally preceded by dispatch-clean content
+/// (`if (c) { acc += 5; s = 3; } else { s = 2; }`). Returns each arm's `(target,
+/// content)`, the target mapped through `target_of` (an exit-state transition
+/// becomes `Exit`) and the content as indices into that arm's flattened body (for
+/// the relooper to emit inside the arm before the transition).
 fn conditional_transition(
     stmt: &Statement<'_>,
     s: &str,
     target_of: &dyn Fn(i64) -> Target,
-) -> Option<(Target, Target)> {
+) -> Option<(Arm, Arm)> {
     let Statement::IfStatement(iff) = stmt else {
         return None;
     };
-    let then_t = arm_transition(&iff.consequent, s, target_of)?;
-    let else_t = match &iff.alternate {
-        Some(alt) => arm_transition(alt, s, target_of)?,
+    let (then_t, then_c) = arm_parse(&iff.consequent, s)?;
+    let (else_t, else_c) = match &iff.alternate {
+        Some(alt) => arm_parse(alt, s)?,
         None => return None, // no else → not a clean two-way split (v1 declines)
     };
-    Some((then_t, else_t))
+    Some(((target_of(then_t), then_c), (target_of(else_t), else_c)))
 }
 
-/// A branch arm that is exactly one absolute transition `s = K` (optionally
-/// wrapped in a single-statement block) → its target (via `target_of`).
-fn arm_transition(
-    stmt: &Statement<'_>,
-    s: &str,
-    target_of: &dyn Fn(i64) -> Target,
-) -> Option<Target> {
+/// Parse one conditional arm: it must contain **exactly one** absolute transition
+/// `s = K` (the edge), with every other statement being dispatch-clean content (no
+/// reference to `s`, no nested control). Returns the raw target state and the
+/// content indices into the arm's flattened body. The arm may be a bare `s = K`,
+/// a `{ s = K }` block, or a `{ content…; s = K; … }` block.
+fn arm_parse(stmt: &Statement<'_>, s: &str) -> Option<(i64, Vec<usize>)> {
+    let mut flat: Vec<&Statement> = Vec::new();
     match stmt {
-        Statement::BlockStatement(b) if b.body.len() == 1 => {
-            abs_transition(&b.body[0], s).map(target_of)
-        }
-        other => abs_transition(other, s).map(target_of),
+        Statement::BlockStatement(b) => flatten_case(&b.body, &mut flat),
+        other => flat.push(other),
     }
+    let mut target: Option<i64> = None;
+    let mut content: Vec<usize> = Vec::new();
+    for (i, &st) in flat.iter().enumerate() {
+        if let Some(t) = abs_transition(st, s) {
+            if target.is_some() {
+                return None; // two transitions in one arm → ambiguous
+            }
+            target = Some(t);
+            continue;
+        }
+        if writes_state(st, s) || mentions_state(st, s) {
+            return None; // arm content observes/alters dispatch state
+        }
+        if is_top_level_control(st) {
+            return None; // a nested break/return inside the arm → unmodeled
+        }
+        content.push(i);
+    }
+    Some((target?, content))
 }
 
 fn is_top_level_control(stmt: &Statement<'_>) -> bool {
@@ -478,6 +519,12 @@ pub fn structure<'a>(
     if block.edges.len() != 2 {
         return None;
     }
+    // This specialized form emits only `block.content` as the loop body; it has no
+    // place for per-arm content, so decline (→ general relooper) when an arm carries
+    // any. Otherwise the arm statements would be silently dropped.
+    if !block.true_content.is_empty() || !block.false_content.is_empty() {
+        return None;
+    }
     let cond_idx = block.cond_stmt?;
     let (mut if_true, mut if_false) = (None, None);
     for e in &block.edges {
@@ -581,6 +628,48 @@ impl<'b, 'a> super::relooper::CaseSource<'a> for SwitchSource<'b, 'a> {
         };
         Some(iff.test.clone_in(self.ast.allocator))
     }
+
+    fn arm_content(&self, k: i64, on_true: bool) -> Vec<Statement<'a>> {
+        let Some(block) = self.cfg.blocks.get(&k) else {
+            return Vec::new();
+        };
+        let idxs = if on_true {
+            &block.true_content
+        } else {
+            &block.false_content
+        };
+        if idxs.is_empty() {
+            return Vec::new();
+        }
+        // Resolve the arm's flattened body the same way `arm_parse` indexed it.
+        let (Some(cond_idx), Some(flat)) = (block.cond_stmt, self.flat_case(k)) else {
+            return Vec::new();
+        };
+        let Some(Statement::IfStatement(iff)) = flat.get(cond_idx).copied() else {
+            return Vec::new();
+        };
+        let arm = if on_true {
+            Some(&iff.consequent)
+        } else {
+            iff.alternate.as_ref()
+        };
+        let Some(arm) = arm else {
+            return Vec::new();
+        };
+        let mut aflat: Vec<&Statement> = Vec::new();
+        match arm {
+            Statement::BlockStatement(b) => flatten_case(&b.body, &mut aflat),
+            other => aflat.push(other),
+        }
+        let mut out = Vec::new();
+        for &i in idxs {
+            if let Some(st) = aflat.get(i) {
+                debug_assert!(!mentions_state(st, self.s));
+                out.push(st.clone_in(self.ast.allocator));
+            }
+        }
+        out
+    }
 }
 
 /// Structure an arbitrary **reducible** recovered dispatcher into `if/else` +
@@ -615,6 +704,8 @@ mod tests {
             content: Vec::new(),
             cond_stmt: None,
             edges,
+            true_content: Vec::new(),
+            false_content: Vec::new(),
         }
     }
     fn always(t: i64) -> Edge {

@@ -483,3 +483,20 @@ fn default_clause_dispatcher_linearizes() {
     assert!(!out.contains("switch"), "default-clause dispatcher survived: {out}");
     assert!(!out.contains("while"), "loop survived: {out}");
 }
+
+// ---------------------------------------------------------------------------
+// Conditional arms that carry content alongside the transition
+// (`if (c) { acc += 5; s = 3; } else { s = 2; }`) — recovered by the relooper.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn conditional_arm_content_is_recovered() {
+    let out = deob(
+        "function run(n){ var s = 1, acc = 0; while (s) { switch (s) { \
+         case 1: acc += 10; s = 3; break; \
+         case 3: if (acc < n) { acc += 5; s = 3; } else { s = 2; } break; \
+         case 2: s = 0; break; } } return acc; } sink(run(window.n));",
+    );
+    assert!(!out.contains("switch"), "arm-content dispatcher survived: {out}");
+    assert!(out.contains("acc += 5"), "arm content lost: {out}");
+}

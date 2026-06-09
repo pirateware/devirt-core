@@ -58,6 +58,14 @@ pub trait CaseSource<'a> {
     /// the conditional split was taken on). Only called for blocks with a two-way
     /// `IfTrue`/`IfFalse` split.
     fn cond(&self, k: i64) -> Option<Expression<'a>>;
+
+    /// Clone the dispatch-clean statements that run *inside* the `on_true` /
+    /// `on_false` arm of state `k`'s conditional split, before its transition is
+    /// taken. The default is none (both arms are bare transitions); a source that
+    /// models arm content overrides it.
+    fn arm_content(&self, _k: i64, _on_true: bool) -> Vec<Statement<'a>> {
+        Vec::new()
+    }
 }
 
 /// Densely-numbered view of the recovered graph for the dominator computation,
@@ -285,8 +293,11 @@ impl<'a, 's, S: CaseSource<'a>> Relooper<'a, 's, S> {
                         self.poison = true;
                         return out;
                     };
-                    let then_body = self.emit_branch(then_node, merge);
-                    let else_body = self.emit_branch(else_node, merge);
+                    // Per-arm content runs inside the arm, before its edge is taken.
+                    let mut then_body = self.src.arm_content(state, true);
+                    then_body.extend(self.emit_branch(then_node, merge));
+                    let mut else_body = self.src.arm_content(state, false);
+                    else_body.extend(self.emit_branch(else_node, merge));
                     out.push(self.if_stmt(cond, then_body, else_body));
                     match merge {
                         Some(m) => m,
@@ -503,8 +514,11 @@ impl<'a, 's, S: CaseSource<'a>> Relooper<'a, 's, S> {
                     self.poison = true;
                     return out;
                 };
-                let then_body = self.emit_branch(then_node, merge);
-                let else_body = self.emit_branch(else_node, merge);
+                // Per-arm content runs inside the arm, before its edge is taken.
+                let mut then_body = self.src.arm_content(state, true);
+                then_body.extend(self.emit_branch(then_node, merge));
+                let mut else_body = self.src.arm_content(state, false);
+                else_body.extend(self.emit_branch(else_node, merge));
                 out.push(self.if_stmt(cond, then_body, else_body));
                 match merge {
                     Some(m) => m,
@@ -701,6 +715,8 @@ mod tests {
             content: Vec::new(),
             cond_stmt: None,
             edges,
+            true_content: Vec::new(),
+            false_content: Vec::new(),
         }
     }
     fn always(t: i64) -> Edge {
