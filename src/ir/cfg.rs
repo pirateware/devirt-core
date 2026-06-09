@@ -267,7 +267,8 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             // here; their bodies are separate units (captured candidates are
             // already excluded by escape analysis), so we do not recurse.
             Statement::FunctionDeclaration(_) | Statement::ClassDeclaration(_) => {}
-            // try/with and anything we don't recognise: bail (sound).
+            Statement::TryStatement(t) => self.lower_try(t),
+            // with-statement and anything we don't recognise: bail (sound).
             _ => self.bailed = true,
         }
     }
@@ -303,6 +304,29 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             // Non-identifier binding patterns declare only non-candidate symbols
             // (escape analysis admits BindingIdentifier defs only); their init
             // was already lowered, so uses inside are captured.
+        }
+    }
+
+    fn lower_try(&mut self, t: &TryStatement<'a>) {
+        // Model `try { B } catch (e) { C } finally { F }` as barrier-bracketed
+        // straight-line regions. The barriers stop a single-block transform
+        // (`inline-single-use`) from pairing a def in one region with a use in
+        // another — where an exception edge could separate them — while still
+        // letting it reason *within* each body. Within a body, straight-line
+        // lowering is sound for that transform: it already requires the def→use
+        // gap to be effect-free, and an effect-free gap cannot throw, so it cannot
+        // divert to the handler. This replaces the old blanket bail on `try`,
+        // which left every (heavily try-wrapped) obfuscated function un-inlined.
+        self.emit(Event::Barrier);
+        self.lower_stmts(&t.block.body);
+        self.emit(Event::Barrier);
+        if let Some(handler) = &t.handler {
+            self.lower_stmts(&handler.body.body);
+            self.emit(Event::Barrier);
+        }
+        if let Some(finalizer) = &t.finalizer {
+            self.lower_stmts(&finalizer.body);
+            self.emit(Event::Barrier);
         }
     }
 

@@ -104,3 +104,23 @@ fn keeps_literal_body_of_expression_arrow() {
     assert!(out.contains("() => true"), "!0 body lost/mis-folded: {out}");
     assert!(out.contains("() => 7"), "numeric body lost/mis-folded: {out}");
 }
+
+/// Single-use temps inside a `try` block must inline. The CFG lowerer used to
+/// bail on `try`, so every (heavily try-wrapped) obfuscated function went
+/// un-inlined; modeling try/catch as barrier-bracketed straight-line regions
+/// lets a pure single-use member-path collapse while staying behavior-preserving.
+#[test]
+fn inlines_single_use_temps_inside_try_block() {
+    let src = r#"
+        function f() {
+            try {
+                var c = "call", a = "Function", b = "prototype", d = win[a][b][c];
+                return sink(d);
+            } catch (e) {}
+        }
+        run(f);
+    "#;
+    let out = deobfuscate(src, "t.js").code;
+    assert!(out.contains("win.Function.prototype.call"), "try-body path not inlined: {out}");
+    assert!(!out.contains("[a]") && !out.contains("[b]"), "temps left un-inlined: {out}");
+}
