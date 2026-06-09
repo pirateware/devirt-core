@@ -2281,3 +2281,47 @@ fn non_trailing_default_is_declined() {
          case 1: acc += 1; s = 2; break; } } __r = acc;",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Conditional-arm content in CFG recovery (src/ir/cff.rs, relooper). An arm may
+// carry dispatch-clean statements before its transition; the relooper emits them
+// inside the recovered branch. Each shape is paired with an adversarial sibling
+// (arm reads the state, or has its own control) that must decline. The
+// differential net confirms the value is preserved across recovery and decline.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn conditional_arm_content_preserves_value() {
+    // Loop whose body arm accumulates before looping back (the sample_4/s3 shape).
+    assert_equivalent(
+        "function run(n){ var s = 1, acc = 0; while (s) { switch (s) { \
+         case 1: acc += 10; s = 3; break; \
+         case 3: if (acc < n) { acc += 5; s = 3; } else { s = 2; } break; \
+         case 2: s = 0; break; } } return acc; } __r = run(40);",
+    );
+    // Content in BOTH arms, each routing to a different exit state.
+    assert_equivalent(
+        "function run(flag){ var s = 1, log = ''; while (s) { switch (s) { \
+         case 1: if (flag) { log += 'T'; s = 2; } else { log += 'F'; s = 3; } break; \
+         case 2: log += '2'; s = 0; break; \
+         case 3: log += '3'; s = 0; break; } } return log; } \
+         __r = run(String(1) === '1') + '|' + run(String(0) === '1');",
+    );
+    // Self-loop with arm content (the specialized do/while declines → relooper).
+    assert_equivalent(
+        "function run(n){ var s = 1, acc = 0, i = 0; while (s) { switch (s) { \
+         case 1: if (i >= n) { acc += 100; s = 0; } else { acc += i; i = i + 1; s = 1; } break; \
+         } } return acc; } __r = run(4);",
+    );
+}
+
+#[test]
+fn arm_reading_state_is_declined() {
+    // An arm whose content READS the dispatch state is unmodelled; recovery must
+    // decline and leave the dispatcher, which still runs correctly.
+    assert_equivalent(
+        "function run(n){ var s = 1, acc = 0; while (s) { switch (s) { \
+         case 1: if (acc < n) { acc += s; s = 1; } else { s = 0; } break; \
+         } } return acc; } __r = run(3);",
+    );
+}
