@@ -2515,3 +2515,19 @@ fn plain_object_materialization_preserves_value() {
         "var o = (function(){ return { n: 5, f: function(){ return 1; } }; })(); __r = o.n + o.f();",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Array-literal destructuring split (src/passes/destructure_split.rs).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn destructure_split_preserves_value() {
+    assert_equivalent("var [a, b, c] = [10, 20, 30]; __r = a + b + c;");
+    // Effect order: elements evaluate left-to-right, exactly once.
+    assert_equivalent(
+        "var log = ''; function f(){ log += 'f'; return 1; } function g(){ log += 'g'; return 2; } \
+         var [a, b] = [f(), g()]; __r = a + ':' + b + ':' + log;",
+    );
+    // Length mismatch keeps the (dropped) element's side effect by declining.
+    assert_equivalent("var hit = 0; var [a, b] = [1, 2, (hit = 1)]; __r = a + b + ':' + hit;");
+}
