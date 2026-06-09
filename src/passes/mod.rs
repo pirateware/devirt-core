@@ -8,6 +8,7 @@ mod dce;
 mod dead_object_prop;
 mod dead_store;
 mod decoder_lift;
+mod destructure_split;
 mod demultiplex;
 mod flatten_else;
 mod function_ctor;
@@ -33,6 +34,7 @@ pub use dce::Dce;
 pub use dead_object_prop::DeadObjectProp;
 pub use dead_store::DeadStore;
 pub use decoder_lift::DecoderLift;
+pub use destructure_split::DestructureSplit;
 pub use demultiplex::Demultiplex;
 pub use flatten_else::FlattenElse;
 pub use function_ctor::FunctionCtor;
@@ -61,6 +63,9 @@ pub fn default_pipeline() -> Vec<Box<dyn Pass>> {
         // Split statement-level comma chains into one statement per effect, so
         // later passes (fold, inline, DCE) see individual assignments.
         Box::new(SequenceSplit::default()),
+        // Split `var [a,b] = [x,y]` array-literal destructuring into one binding per
+        // element, so each exposes to const-folding. Sound only on the 1:1 shape.
+        Box::new(DestructureSplit::default()),
         // Lower a private object's integer state property (`while (ctx.s) switch
         // (ctx.s) { … ctx.s = K … }`) to a fresh local, so the identifier-state
         // unflatteners below can recover it. Runs before them; declines unless the
