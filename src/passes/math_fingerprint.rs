@@ -210,10 +210,37 @@ impl Pass for MathFingerprint {
             return false;
         }
 
+        // Build the operator candidates *once* (the index→`Matched` mapping is
+        // reused below) and install a fingerprinting harness in the sandbox that
+        // bakes the battery and the operator implementations as preamble globals.
+        // Each candidate then costs a *single* `$mf$mN(fn)` eval that loops over
+        // every operator in-VM, instead of one freshly-parsed battery snippet per
+        // (candidate × operator × determinism-repeat). The harness returns the
+        // unique matching operator index, or -1 for zero/ambiguous matches —
+        // exactly the decision `fingerprint()` made per-snippet, but without paying
+        // the per-eval parse/compile cost (~80 parses → 1 per candidate). See
+        // `build_harness`. The battery, op set, and "exactly one match" rule are
+        // unchanged, so the match decision is identical.
+        let cand2 = candidates(2);
+        let cand1 = candidates(1);
+        if !sandbox.setup(&build_harness(&cand2, &cand1)) {
+            return false;
+        }
+
         let mut matched: HashMap<String, Matched> = HashMap::new();
         for c in by_name.values() {
-            if let Some(m) = fingerprint(&sandbox, &c.name, c.arity) {
-                matched.insert(c.name.clone(), m);
+            let (match_fn, cands) = if c.arity == 2 {
+                ("$mf$m2", &cand2)
+            } else {
+                ("$mf$m1", &cand1)
+            };
+            if let Some(EvalValue::Num(n)) = sandbox.eval_to_value(&format!("{match_fn}({});", c.name))
+            {
+                if n >= 0.0 {
+                    if let Some((_, m)) = cands.get(n as usize) {
+                        matched.insert(c.name.clone(), *m);
+                    }
+                }
             }
         }
         if matched.is_empty() {
@@ -679,34 +706,12 @@ fn candidates(arity: usize) -> Vec<(String, Matched)> {
     v
 }
 
-/// Fingerprint `name` (defined in the sandbox) at the given arity. Returns the
-/// unique matching operator, or `None` if zero or more than one match.
-fn fingerprint(sandbox: &Sandbox, name: &str, arity: usize) -> Option<Matched> {
-    let mut found: Option<Matched> = None;
-    for (tok, matched) in candidates(arity) {
-        let snippet = if arity == 2 {
-            bin_snippet(name, &tok, &matched)
-        } else {
-            un_snippet(name, &tok, &matched)
-        };
-        if matches_twice(sandbox, &snippet) {
-            if found.is_some() {
-                return None; // battery did not discriminate — refuse to guess
-            }
-            found = Some(matched);
-        }
-    }
-    found
-}
-
-/// Evaluate `snippet` (a battery that returns a boolean) twice; a match requires
-/// `true` both times, so a non-deterministic body never matches.
-fn matches_twice(sandbox: &Sandbox, snippet: &str) -> bool {
-    matches!(sandbox.eval_to_value(snippet), Some(EvalValue::Bool(true)))
-        && matches!(sandbox.eval_to_value(snippet), Some(EvalValue::Bool(true)))
-}
-
-fn bin_snippet(name: &str, tok: &str, m: &Matched) -> String {
+/// The right-hand operator expression for a binary candidate — the exact text
+/// that followed `{name}(a,b),` in the old per-candidate snippet, wrapped as a
+/// callable `function(a,b){ return <expr>; }`. Baked into the harness's op array
+/// so the comparison `Object.is(fn(a,b), op(a,b))` is byte-for-byte the check the
+/// per-snippet path performed.
+fn op_fn_src2(tok: &str, m: &Matched) -> String {
     let (swap, coerce) = match m {
         Matched::Bin { swap, coerce, .. } => (*swap, *coerce),
         Matched::Log { swap, .. } => (*swap, false),
@@ -722,20 +727,54 @@ fn bin_snippet(name: &str, tok: &str, m: &Matched) -> String {
         }
     };
     let (l, r) = (wrap(l), wrap(r));
-    let pairs = bin_inputs_js();
-    format!(
-        "(function(){{var I={pairs};for(var i=0;i<I.length;i++){{var a=I[i][0],b=I[i][1];\
-         if(!Object.is({name}(a,b),(({l}){tok}({r}))))return false;}}return true;}})()"
-    )
+    format!("function(a,b){{return (({l}){tok}({r}));}}")
 }
 
-fn un_snippet(name: &str, tok: &str, m: &Matched) -> String {
+/// The unary analogue of [`op_fn_src2`].
+fn op_fn_src1(tok: &str, m: &Matched) -> String {
     let coerce = matches!(m, Matched::Un { coerce: true, .. });
     let a = if coerce { "(a|0)" } else { "a" };
-    let vals = un_inputs_js();
+    format!("function(a){{return ({tok}({a}));}}")
+}
+
+/// Build the fingerprinting harness installed once in the sandbox preamble. It
+/// defines the input battery and the operator implementations (in `candidates`
+/// order, so an index maps back to its `Matched`) as globals, plus a
+/// `$mf$mN(fn)` matcher per arity that loops every operator *in-VM* and returns
+/// the unique matching index, or `-1` for zero/ambiguous matches.
+///
+/// This is the batched equivalent of the old `fingerprint` + `matches_twice`
+/// loop: the agreement check is run twice (the determinism guard — a body that
+/// is not a pure function of its inputs never agrees twice), a second match
+/// short-circuits to `-1` ("battery did not discriminate — refuse to guess"),
+/// and the battery/operator set are identical. The win is purely cost: the
+/// battery and operator functions are parsed once instead of re-parsed for every
+/// candidate × operator × repeat.
+fn build_harness(cand2: &[(String, Matched)], cand1: &[(String, Matched)]) -> String {
+    let ops2 = cand2
+        .iter()
+        .map(|(tok, m)| op_fn_src2(tok, m))
+        .collect::<Vec<_>>()
+        .join(",");
+    let ops1 = cand1
+        .iter()
+        .map(|(tok, m)| op_fn_src1(tok, m))
+        .collect::<Vec<_>>()
+        .join(",");
+    let bin = bin_inputs_js();
+    let un = un_inputs_js();
     format!(
-        "(function(){{var I={vals};for(var i=0;i<I.length;i++){{var a=I[i];\
-         if(!Object.is({name}(a),({tok}({a}))))return false;}}return true;}})()"
+        "var $mf$BIN={bin};var $mf$UN={un};\
+         var $mf$OP2=[{ops2}];var $mf$OP1=[{ops1}];\
+         function $mf$ag2(f,o){{for(var i=0;i<$mf$BIN.length;i++){{\
+           var a=$mf$BIN[i][0],b=$mf$BIN[i][1];\
+           if(!Object.is(f(a,b),o(a,b)))return false;}}return true;}}\
+         function $mf$ag1(f,o){{for(var i=0;i<$mf$UN.length;i++){{\
+           var a=$mf$UN[i];if(!Object.is(f(a),o(a)))return false;}}return true;}}\
+         function $mf$m2(f){{var h=-1;for(var k=0;k<$mf$OP2.length;k++){{\
+           if($mf$ag2(f,$mf$OP2[k])&&$mf$ag2(f,$mf$OP2[k])){{if(h!==-1)return -1;h=k;}}}}return h;}}\
+         function $mf$m1(f){{var h=-1;for(var k=0;k<$mf$OP1.length;k++){{\
+           if($mf$ag1(f,$mf$OP1[k])&&$mf$ag1(f,$mf$OP1[k])){{if(h!==-1)return -1;h=k;}}}}return h;}}"
     )
 }
 
