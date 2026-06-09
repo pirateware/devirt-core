@@ -11,7 +11,7 @@ use oxc_allocator::{Allocator, Vec as ArenaVec};
 use oxc_ast::ast::{BindingPattern, Program, Statement, VariableDeclarator};
 use oxc_ast_visit::Visit;
 use oxc_semantic::Scoping;
-use oxc_traverse::{traverse_mut, Traverse, TraverseCtx};
+use oxc_traverse::{traverse_mut, Ancestor, Traverse, TraverseCtx};
 
 use crate::pass::Pass;
 use crate::util::{build_scoping, is_pure_simple};
@@ -64,12 +64,28 @@ impl<'a> Traverse<'a, ()> for Dce {
 
         // 3. Remove emptied declarations, bare empty statements, and unused
         //    function declarations (e.g. decoders left dead after lifting).
-        stmts.retain(|s| keep_statement(s, scoping));
+        //    Exception: an *expression-bodied* arrow (`() => 7`) stores its body
+        //    as a one-statement list whose single `ExpressionStatement` is the
+        //    implicit return — dropping it as a "dead literal" would empty the
+        //    arrow to the invalid `() =>`. Skip the prune for that list; the value
+        //    is returned, not discarded.
+        if !is_expression_arrow_body(ctx) {
+            stmts.retain(|s| keep_statement(s, scoping));
+        }
 
         if stmts.len() != before {
             self.changed = true;
         }
     }
+}
+
+/// True when the statement list currently being visited is the body of an
+/// expression-bodied arrow (`() => expr`), which oxc represents as a single-
+/// statement `FunctionBody` whose lone `ExpressionStatement` is the implicit
+/// return. The list's parent is `FunctionBodyStatements`; its grandparent is the
+/// arrow, carrying the `expression` flag.
+fn is_expression_arrow_body(ctx: &TraverseCtx<'_, ()>) -> bool {
+    matches!(ctx.ancestor(1), Ancestor::ArrowFunctionExpressionBody(a) if *a.expression())
 }
 
 fn keep_statement(s: &Statement<'_>, scoping: &Scoping) -> bool {

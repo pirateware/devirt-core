@@ -515,3 +515,52 @@ fn lifts_object_keyed_arguments() {
         "got: {out}"
     );
 }
+
+/// Generic global-object-alias codec: an obfuscator aliases the host global with
+/// `var g = window` (or `global`/`self`), then reads a codec off it
+/// (`g.atob`). A bare host handle in value position *is* the global object — in
+/// any runtime where the binding does not throw it equals `globalThis` — so the
+/// alias is admitted as `globalThis` in the sandbox preamble and the `atob`
+/// decoder it feeds becomes liftable. "T2JqZWN0" is base64 for "Object".
+#[test]
+fn lifts_atob_decoder_via_window_global_alias() {
+    // The alias is reused (atob + btoa) so the single-use inliner leaves it as a
+    // binding for decoder-lift to see — the shape real obfuscators ship.
+    let src = r#"
+        (function () {
+            var g = window;
+            function d(s) { return g.atob(s); }
+            function e(s) { return g.btoa(s); }
+            sink(d("T2JqZWN0"));
+            sink2(e);
+        })();
+    "#;
+    let out = deobfuscate(src, "t.js").code;
+    assert!(out.contains("sink(\"Object\")"), "atob alias not lifted: {out}");
+}
+
+/// The global-getter *probe* idiom: a function that tries `globalThis`, then the
+/// host handles `window`/`self` as fallbacks. The bare `return window` / `return
+/// self` arms must not poison the function's purity (before, they surfaced as
+/// free host names and the whole decoder library was declined). With them treated
+/// as the global idiom, the probe is pure, resolves to `globalThis` in the
+/// sandbox, and the `atob` decoder reached through it lifts.
+#[test]
+fn lifts_decoder_through_global_probe_with_host_fallbacks() {
+    let src = r#"
+        (function () {
+            function getGlobal() {
+                try { return globalThis; } catch (e) {}
+                try { return window; } catch (e) {}
+                return self;
+            }
+            var g = getGlobal();
+            function d(s) { return g.atob(s); }
+            function e(s) { return g.btoa(s); }
+            sink(d("T2JqZWN0"));
+            sink2(e);
+        })();
+    "#;
+    let out = deobfuscate(src, "t.js").code;
+    assert!(out.contains("sink(\"Object\")"), "probe-based decoder not lifted: {out}");
+}

@@ -84,3 +84,23 @@ fn keeps_self_reassigning_function_that_is_still_called() {
     let out = deobfuscate(src, "t.js").code;
     assert!(out.contains("function f"), "live fn removed: {out}");
 }
+
+/// Regression: an *expression-bodied* arrow (`() => 7`) is stored by oxc as a
+/// one-statement function body whose lone `ExpressionStatement` is the implicit
+/// return. DCE's dead-literal prune must not treat that statement as discardable
+/// noise — doing so emptied the arrow to the invalid `() =>`. The body's value is
+/// returned, so it is kept (and folded), and the result stays syntactically valid.
+#[test]
+fn keeps_literal_body_of_expression_arrow() {
+    let src = r#"
+        window.f = () => !1;
+        window.g = () => 3 + 4;
+        window.h = () => !0;
+        window.k = () => 7;
+    "#;
+    let out = deobfuscate(src, "t.js").code;
+    assert!(!out.contains("=> ;") && !out.contains("=>;"), "emptied arrow body: {out}");
+    assert!(out.contains("() => false"), "!1 body lost/mis-folded: {out}");
+    assert!(out.contains("() => true"), "!0 body lost/mis-folded: {out}");
+    assert!(out.contains("() => 7"), "numeric body lost/mis-folded: {out}");
+}

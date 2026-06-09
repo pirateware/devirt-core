@@ -875,6 +875,27 @@ impl<'a> Visit<'a> for FreeVars {
         oxc_ast_visit::walk::walk_new_expression(self, node);
     }
 
+    fn visit_return_statement(&mut self, node: &oxc_ast::ast::ReturnStatement<'a>) {
+        // The global-object *probe* idiom: a thunk `function(){ return window }`,
+        // one arm of the `globalThis || global || window || (function(){return
+        // this})()` getter obfuscators ship (this sample's `or1`). A *bare*
+        // `return window/global/self` evaluates to the global object — in the
+        // sandbox, the bound `globalThis`. Model it as the global idiom (exactly
+        // like bare `this` and `new Function("return this")()`) instead of letting
+        // the unbound host handle flow through as a free name and poison purity:
+        // consume the identifier and do not walk into it. Only the bare-identifier
+        // return matches — `return window.navigator`, `typeof window`, and every
+        // other shape still flow through as host reads and stay rejected, so this
+        // widens the gate by exactly the global-getter thunk and nothing else.
+        if let Some(Expression::Identifier(id)) = &node.argument {
+            if matches!(id.name.as_str(), "window" | "global" | "self") {
+                self.uses_global_idiom = true;
+                return;
+            }
+        }
+        oxc_ast_visit::walk::walk_return_statement(self, node);
+    }
+
     fn visit_assignment_expression(&mut self, node: &oxc_ast::ast::AssignmentExpression<'a>) {
         use oxc_ast::ast::AssignmentTarget as T;
         let simple = matches!(
@@ -1442,6 +1463,31 @@ impl<'a> Visit<'a> for ValBindScan<'a> {
     fn visit_variable_declarator(&mut self, node: &oxc_ast::ast::VariableDeclarator<'a>) {
         if let BindingPattern::BindingIdentifier(id) = &node.id {
             if let Some(init) = &node.init {
+                // Global-object alias: `var w = window | global | self`. A bare host
+                // handle in *value* position is the global object: in any runtime
+                // where this binding does not throw (a bare `window` ReferenceErrors
+                // where it is absent — Node, a worker), it equals `globalThis`. So we
+                // admit it with no free name (it cannot fail the host-read gate) and
+                // re-emit it as `globalThis`, which the sandbox binds. A decoder that
+                // reads `w.atob` / `w.TextDecoder` off it then proves pure and lifts —
+                // the generic `var g = window; g.atob(table[i])` codec shape every
+                // browser obfuscator ships. Narrow on purpose: only the *bare*
+                // identifier — `typeof window` and `window.x` stay host reads (kept by
+                // `typeof_host_global_is_not_misfolded`) and keep declining.
+                if let Expression::Identifier(gid) = init {
+                    if matches!(gid.name.as_str(), "window" | "global" | "self") {
+                        *self.name_counts.entry(id.name.to_string()).or_default() += 1;
+                        self.out.push(ValueBinding {
+                            name: id.name.to_string(),
+                            order: self.order,
+                            fv: FreeVars::default(), // no free names → passes every gate
+                            emit: format!("var {} = globalThis;", id.name),
+                        });
+                        self.order += 1;
+                        oxc_ast_visit::walk::walk_variable_declarator(self, node);
+                        return;
+                    }
+                }
                 // A value-binding is anything that is *not* a function (the
                 // function serializer's job) and *not* pure data (the data path's
                 // job): a member read, a call, a logical/conditional combinator, …

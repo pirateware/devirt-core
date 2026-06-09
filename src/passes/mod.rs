@@ -17,6 +17,7 @@ mod global_const_inline;
 mod math_fingerprint;
 mod member_normalize;
 mod objstate_lower;
+mod opaque_predicate;
 mod proxy_inline;
 mod pure_eval;
 mod reconstruct_object;
@@ -45,6 +46,7 @@ pub use global_const_inline::GlobalConstInline;
 pub use math_fingerprint::MathFingerprint;
 pub use member_normalize::MemberNormalize;
 pub use objstate_lower::ObjStateLower;
+pub use opaque_predicate::OpaquePredicate;
 pub use proxy_inline::ProxyInline;
 pub use pure_eval::PureEval;
 pub use reconstruct_object::ReconstructObject;
@@ -118,6 +120,12 @@ pub fn default_pipeline() -> Vec<Box<dyn Pass>> {
         // array becomes a literal once GlobalConstInline / member-normalize resolve
         // the `a[k]["split"]` accesses upstream, so it fires on a later fixpoint round.
         Box::new(UnflattenStringOrder),
+        // Fold always-false opaque predicates (`"key" in <empty trap fn>`) and
+        // short-circuit the dead `&&`/`||` they gate, so the decoy payloads they
+        // guard collapse to `if (false) …` / a bare `false`. Runs right before
+        // const-fold and DCE, which then delete the dead branch and the now-unused
+        // trap. See `src/passes/opaque_predicate.rs`.
+        Box::new(OpaquePredicate::default()),
         Box::new(ConstantFold::default()),
         // Reconstruct `new Function('a','b','return a+b')` (constant string args)
         // into a real `function (a,b) { return a+b; }`. Runs after const-fold so
