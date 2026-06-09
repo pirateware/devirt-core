@@ -109,3 +109,12 @@ fn custom_prototype_object_is_kept() {
     let out = deob("var o = (function(){ var p = { base: 1 }; var x = Object.create(p); x.own = 2; return x; })(); sink(o.own + o.base);");
     assert!(out.contains("Object.create"), "custom-proto object wrongly materialized: {out}");
 }
+
+#[test]
+fn mutator_on_literal_receiver_folds() {
+    // Mutating a throwaway literal is unobservable, so it folds.
+    assert_eq!(deob("sink(['a','b','c'].reverse().join(''));").trim(), r#"sink("cba");"#);
+    // The classic string-reverse decode idiom.
+    assert_eq!(deob("sink('!dlroW'.split('').reverse().join(''));").trim(), r#"sink("World!");"#);
+    assert_eq!(deob("sink([3,1,2].sort().join(','));").trim(), r#"sink("1,2,3");"#);
+}

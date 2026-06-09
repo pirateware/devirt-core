@@ -912,7 +912,11 @@ impl<'a> Visit<'a> for FreeVars {
             _ => None,
         };
         if let Some((name, object)) = prop {
-            if MUTATOR_METHODS.contains(&name) {
+            // Mutating a throwaway *literal* receiver (`['a','b'].reverse()`,
+            // `({}).x = …` via a method) is unobservable — the container is not bound
+            // anywhere, so the write escapes nothing. Only a receiver that could name
+            // outer/shared state records a write.
+            if MUTATOR_METHODS.contains(&name) && !is_literal_receiver(object) {
                 self.record_write(member_base(object));
             }
         }
@@ -1057,6 +1061,18 @@ fn member_base(e: &Expression<'_>) -> Option<String> {
         Expression::ComputedMemberExpression(m) => member_base(&m.object),
         _ => None,
     }
+}
+
+/// A receiver that is a freshly-built literal aggregate — mutating it cannot be
+/// observed (it is bound to no name). A string literal is immutable, so a mutator
+/// on it is likewise effect-free.
+fn is_literal_receiver(e: &Expression<'_>) -> bool {
+    matches!(
+        e,
+        Expression::ArrayExpression(_)
+            | Expression::ObjectExpression(_)
+            | Expression::StringLiteral(_)
+    )
 }
 
 pub(crate) fn freevars_of_expr(expr: &Expression<'_>) -> FreeVars {
