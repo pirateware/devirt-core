@@ -31,3 +31,19 @@ fn unknown_receiver_method_call_is_kept() {
     let out = deob("sink(window.parts.join(','));");
     assert!(out.contains("join"), "unknown-receiver call wrongly folded: {out}");
 }
+
+#[test]
+fn immutable_aggregate_receiver_folds() {
+    // A variable-bound const array receiver resolves via sandbox materialization.
+    let out = deob("var a = ['x','y','z']; sink(a.join('-'));");
+    assert!(out.contains(r#""x-y-z""#), "aggregate method not folded: {out}");
+    // Nested const-object member chain.
+    assert_eq!(deob("var o = { a: { b: 7 } }; sink(o.a.b);").trim(), "sink(7);");
+}
+
+#[test]
+fn mutated_or_escaped_aggregate_receiver_is_kept() {
+    // `.push` mutates the array, so its value is not its literal — must not fold.
+    let out = deob("var a = [1,2]; a.push(3); sink(a.join(','));");
+    assert!(out.contains("a.join") || out.contains("push"), "mutated array wrongly folded: {out}");
+}
