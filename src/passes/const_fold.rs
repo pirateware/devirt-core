@@ -78,6 +78,19 @@ impl<'a> Traverse<'a, ()> for ConstantFold {
             return;
         }
 
+        // An untagged template literal whose interpolations are all constant folds
+        // to a single string: `` `val: ${10}` `` → `"val: 10"`. Sound — the parts
+        // are pure literals, concatenated under JS string coercion.
+        if let Expression::TemplateLiteral(tl) = expr {
+            if let Some(s) = fold_template(tl) {
+                let span = tl.span;
+                let atom = ctx.ast.str(&s);
+                *expr = ctx.ast.expression_string_literal(span, atom, None);
+                self.changed = true;
+                return;
+            }
+        }
+
         // A ternary with a constant test collapses to its taken branch. Mirrors
         // the `if (<constant>)` statement fold; the conservative eval context
         // only resolves a pure test, so dropping the untaken branch is sound.
@@ -161,6 +174,38 @@ impl<'a> Traverse<'a, ()> for ConstantFold {
         };
         *stmt = taken;
         self.changed = true;
+    }
+}
+
+/// Concatenate an untagged template literal whose every interpolation is a
+/// primitive literal into the string it produces. Returns `None` (decline) on any
+/// non-literal interpolation, an un-cooked quasi (an invalid escape), or a numeric
+/// value outside the range where Rust and JS `ToString` provably agree.
+fn fold_template(tl: &oxc_ast::ast::TemplateLiteral<'_>) -> Option<String> {
+    let mut out = String::new();
+    for (i, q) in tl.quasis.iter().enumerate() {
+        out.push_str(q.value.cooked.as_ref()?.as_str());
+        if let Some(e) = tl.expressions.get(i) {
+            out.push_str(&stringify_literal(e)?);
+        }
+    }
+    Some(out)
+}
+
+/// JS `ToString` of a primitive-literal expression, for the cases where it is
+/// unambiguous. Numbers are limited to integers in the safe range so the formatted
+/// digits match JS exactly (large/fractional/exponential numbers decline).
+fn stringify_literal(e: &Expression<'_>) -> Option<String> {
+    match e {
+        Expression::StringLiteral(s) => Some(s.value.to_string()),
+        Expression::BooleanLiteral(b) => Some(b.value.to_string()),
+        Expression::NullLiteral(_) => Some("null".to_string()),
+        Expression::NumericLiteral(n)
+            if n.value.fract() == 0.0 && n.value.abs() < 9e15 =>
+        {
+            Some(format!("{}", n.value as i64))
+        }
+        _ => None,
     }
 }
 

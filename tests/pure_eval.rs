@@ -47,3 +47,11 @@ fn mutated_or_escaped_aggregate_receiver_is_kept() {
     let out = deob("var a = [1,2]; a.push(3); sink(a.join(','));");
     assert!(out.contains("a.join") || out.contains("push"), "mutated array wrongly folded: {out}");
 }
+
+#[test]
+fn const_template_literal_folds_to_string() {
+    assert_eq!(deob("sink(`a${1 + 1}b`);").trim(), r#"sink("a2b");"#);
+    // Tagged templates are not folded (the tag observes the raw parts).
+    let out = deob("sink(String.raw`a${1}b`);");
+    assert!(out.contains("String.raw"), "tagged template wrongly folded: {out}");
+}
