@@ -271,54 +271,68 @@ impl Pass for DecoderLift {
         // functions (the top-level data walk in `build_preamble` emits only pure
         // data vars), so a multi-declarator or deeply-nested decoder can't fall
         // through a crack. Names are unique, so flattening is collision-free.
-        let pure_func_decls = serialize_pure_funcs(program, &analysis.pure_funcs, allocator);
-
-        let preamble = build_preamble(
-            &tops,
-            &analysis,
-            &aliases,
-            &allowed,
-            &local_data,
-            &pure_func_decls,
-            &private_cache_decls,
-            &value_binding_src,
-            allocator,
-        );
-        // Two sandboxes seeded with *different* deterministic PRNGs. A decode is
-        // lifted only when both agree: a value that genuinely depends on RNG (a
-        // decoder shuffling a charset/seed — sample_7) differs between the seeds
-        // and is refused, so it is never baked to a non-portable literal, while a
-        // value independent of RNG agrees and lifts reproducibly. This is the
-        // soundness+determinism guard; see `Sandbox::new_seeded`.
-        let (Some(sandbox), Some(sandbox_alt)) = (
-            Sandbox::new_seeded(crate::sandbox::DEFAULT_RANDOM_SEED),
-            Sandbox::new_seeded(0x5151_4949),
-        ) else {
-            return false;
-        };
-        // Define the whole library once in each; per-call evals reuse it (fast +
-        // the array is rotated exactly once, as in the real program).
-        if !sandbox.setup(&preamble) || !sandbox_alt.setup(&preamble) {
-            return false;
-        }
 
         // Names of grounded invariants (incl. base-N arithmetic), for
         // materializing `x = <polynomial>` to `x = <constant>`.
         let grounded: HashSet<String> = local_data.iter().map(|(n, _)| n.clone()).collect();
 
-        let mut lifter = Lifter {
-            callable: &callable,
-            allowed: &allowed,
-            grounded: &grounded,
-            sandbox,
-            sandbox_alt,
-            memo: HashMap::new(),
-            changed: false,
-            _marker: std::marker::PhantomData,
-        };
-        let scoping = build_scoping(program);
-        traverse_mut(&mut lifter, allocator, program, scoping, ());
-        self.changed = lifter.changed;
+        // Cheap pre-scan before the expensive machinery. Building the whole-program
+        // preamble and standing up *two* Boa contexts costs work proportional to the
+        // number of pure bindings — paid every fixpoint round, even when there is no
+        // site a lift could touch (a bundle full of pure helpers with no decoder
+        // calls/tables, or a program already fully lifted). If nothing is liftable,
+        // the preamble + sandboxes + traversal can only report "no change", so skip
+        // them; the spent-rotation cleanup below still runs (it fires a round *after*
+        // the lifts, when no new site exists). Sound because the scan is a superset
+        // of the `Lifter`'s triggers — it never skips a round a lift was possible.
+        self.changed = false;
+        if has_liftable_site(program, &callable, &allowed, &grounded) {
+            let pure_func_decls =
+                serialize_pure_funcs(program, &analysis.pure_funcs, allocator);
+
+            let preamble = build_preamble(
+                &tops,
+                &analysis,
+                &aliases,
+                &allowed,
+                &local_data,
+                &pure_func_decls,
+                &private_cache_decls,
+                &value_binding_src,
+                allocator,
+            );
+            // Two sandboxes seeded with *different* deterministic PRNGs. A decode is
+            // lifted only when both agree: a value that genuinely depends on RNG (a
+            // decoder shuffling a charset/seed — sample_7) differs between the seeds
+            // and is refused, so it is never baked to a non-portable literal, while a
+            // value independent of RNG agrees and lifts reproducibly. This is the
+            // soundness+determinism guard; see `Sandbox::new_seeded`.
+            let (Some(sandbox), Some(sandbox_alt)) = (
+                Sandbox::new_seeded(crate::sandbox::DEFAULT_RANDOM_SEED),
+                Sandbox::new_seeded(0x5151_4949),
+            ) else {
+                return false;
+            };
+            // Define the whole library once in each; per-call evals reuse it (fast +
+            // the array is rotated exactly once, as in the real program).
+            if !sandbox.setup(&preamble) || !sandbox_alt.setup(&preamble) {
+                return false;
+            }
+
+            let mut lifter = Lifter {
+                callable: &callable,
+                allowed: &allowed,
+                grounded: &grounded,
+                sandbox,
+                sandbox_alt,
+                memo: HashMap::new(),
+                changed: false,
+                _marker: std::marker::PhantomData,
+            };
+            let scoping = build_scoping(program);
+            traverse_mut(&mut lifter, allocator, program, scoping, ());
+            self.changed = lifter.changed;
+        }
 
         // Strip spent scaffolding: a string-array rotation IIFE whose only
         // observable effect is mutating decoder tables that no *real* code reads
@@ -2639,6 +2653,104 @@ impl<'a, 'r> Lifter<'a, 'r> {
         );
         self.changed = true;
     }
+}
+
+/// Cheap pre-scan: does the program contain any site the [`Lifter`] could act on?
+/// This mirrors a *superset* of `Lifter`'s triggers — a call to a `callable`
+/// decoder, a computed-member read whose object touches an `allowed` table, or a
+/// `grounded`-name assignment/declarator with a foldable-arith RHS to
+/// materialize. When none exist, building the whole-program preamble and the two
+/// Boa sandboxes is pure waste (the traversal can only report "no change"), so the
+/// caller skips it. Being a superset keeps the skip sound: it never elides a round
+/// in which a lift was actually possible.
+fn has_liftable_site(
+    program: &Program<'_>,
+    callable: &HashSet<String>,
+    allowed: &HashSet<String>,
+    grounded: &HashSet<String>,
+) -> bool {
+    struct Scan<'r> {
+        callable: &'r HashSet<String>,
+        allowed: &'r HashSet<String>,
+        grounded: &'r HashSet<String>,
+        found: bool,
+    }
+    impl<'a, 'r> Visit<'a> for Scan<'r> {
+        fn visit_expression(&mut self, expr: &Expression<'a>) {
+            if self.found {
+                return;
+            }
+            match expr {
+                Expression::CallExpression(c) => {
+                    // Mirror `Lifter`'s call gate exactly (callee callable + every
+                    // free name allowed, empty cache whitelist) minus the eval —
+                    // so a call whose runtime args aren't liftable (a plain
+                    // `helper(localVar)`) doesn't force the sandbox build.
+                    if let Expression::Identifier(id) = &c.callee {
+                        if self.callable.contains(id.name.as_str())
+                            && freevars_of_expr(expr).all_allowed(
+                                self.allowed,
+                                None,
+                                &HashSet::new(),
+                            )
+                        {
+                            self.found = true;
+                            return;
+                        }
+                    }
+                }
+                Expression::ComputedMemberExpression(m) => {
+                    if freevars_of_expr(&m.object)
+                        .free()
+                        .iter()
+                        .any(|n| self.allowed.contains(n))
+                    {
+                        self.found = true;
+                        return;
+                    }
+                }
+                Expression::AssignmentExpression(a) => {
+                    if matches!(a.operator, oxc_syntax::operator::AssignmentOperator::Assign) {
+                        if let oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(id) =
+                            &a.left
+                        {
+                            if self.grounded.contains(id.name.as_str())
+                                && is_foldable_arith(&a.right)
+                            {
+                                self.found = true;
+                                return;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            oxc_ast_visit::walk::walk_expression(self, expr);
+        }
+
+        fn visit_variable_declarator(&mut self, node: &oxc_ast::ast::VariableDeclarator<'a>) {
+            if self.found {
+                return;
+            }
+            if let BindingPattern::BindingIdentifier(id) = &node.id {
+                if let Some(init) = &node.init {
+                    if self.grounded.contains(id.name.as_str()) && is_foldable_arith(init) {
+                        self.found = true;
+                        return;
+                    }
+                }
+            }
+            oxc_ast_visit::walk::walk_variable_declarator(self, node);
+        }
+    }
+    let mut scan = Scan {
+        callable,
+        allowed,
+        grounded,
+        found: false,
+    };
+    scan.visit_program(program);
+    scan.found
 }
 
 fn is_foldable_arith(e: &Expression<'_>) -> bool {
