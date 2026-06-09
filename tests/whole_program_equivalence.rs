@@ -35,6 +35,33 @@ fn assert_whole_program_equivalent(src: &str) {
 }
 
 #[test]
+fn relative_transition_dispatcher_program() {
+    // A flattened dispatcher whose state advances by *relative* steps (`s += 1`,
+    // `s -= 1`) with a conditional split and a back edge (state 2 ⇄ 3). The linear
+    // unflattener declines (it loops) and the absolute-only `cff::build` declines
+    // (relative transitions), so this is recovered — if at all — through the
+    // dispatch substrate. Whatever the pipeline does, observable output must match.
+    assert_whole_program_equivalent(
+        r#"
+        function f(n) {
+          var s = 1, acc = 0, i = 0;
+          while (s != 0) {
+            switch (s) {
+              case 1: acc = 0; i = 0; s += 1; break;
+              case 2: if (i < n) { s += 1; } else { s = 0; } break;
+              case 3: acc += i; i += 1; s -= 1; break;
+            }
+          }
+          return acc;
+        }
+        var r = [];
+        for (var k = 0; k < 7; k++) { r['push'](f(k)); }
+        console['log'](r['join'](','));
+        "#,
+    );
+}
+
+#[test]
 fn string_array_base64_decoder_cff_program() {
     // String array (in an IIFE) + indexed/base64 decoder + a linear CFF state
     // machine + member-access obfuscation. Exercises the harness base64 polyfill.

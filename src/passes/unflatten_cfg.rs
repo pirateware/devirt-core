@@ -83,15 +83,24 @@ impl<'a> Walker<'a> {
                 };
                 // Recover the state graph, using the loop test to classify exits.
                 let continues = |state: i64| test.continues(state);
-                let Some(cfg) = cff::build(switch, &s_name, entry, &continues) else {
-                    continue;
-                };
-                // Try the specialized self-loop → do/while first (it reads nicest), then
-                // fall back to the general relooper for arbitrary reducible branch/loop
-                // graphs the linear form declined on. Either declines soundly (→ leave
-                // the dispatcher) on shapes it cannot place.
-                let seq = cff::structure(switch, &s_name, &cfg, self.ast)
-                    .or_else(|| cff::structure_general(switch, &s_name, &cfg, self.ast));
+                // Absolute-transition path: `cff::build` recovers the graph directly
+                // from the AST (it models only `s = K`), then the specialized
+                // self-loop → do/while (reads nicest) or the general relooper.
+                let built = cff::build(switch, &s_name, entry, &continues);
+                let seq = built
+                    .as_ref()
+                    .and_then(|cfg| {
+                        cff::structure(switch, &s_name, cfg, self.ast)
+                            .or_else(|| cff::structure_general(switch, &s_name, cfg, self.ast))
+                    })
+                    // Fallback: the dispatch substrate abstract-interprets *relative*
+                    // transitions (`s += K`) the absolute-only `cff::build` declines on
+                    // (returning no graph at all). Purely additive — it runs only once
+                    // the absolute path yields nothing — and declines soundly (→ leave
+                    // the dispatcher) on any shape it cannot place exactly.
+                    .or_else(|| {
+                        cff::structure_via_dispatch(switch, &s_name, entry, &continues, self.ast)
+                    });
                 let Some(seq) = seq else {
                     continue;
                 };

@@ -31,8 +31,9 @@ use oxc_allocator::CloneIn;
 use oxc_ast::ast::*;
 use oxc_ast::AstBuilder;
 use oxc_span::SPAN;
-use oxc_syntax::operator::{AssignmentOperator, UnaryOperator};
+use oxc_syntax::operator::{AssignmentOperator, BinaryOperator, UnaryOperator, UpdateOperator};
 
+use super::dispatch::{interpret, IntCase, IntStateModel, IntTransition, StateNumbering, StateVal};
 use super::dom::Dominators;
 
 /// Where a transition goes: a concrete state, or out of the machine.
@@ -692,6 +693,372 @@ pub fn structure_general<'a>(
         ast,
     };
     super::relooper::structure_general(cfg, &src, ast)
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch-substrate structuring: model relative/lookup transitions via the
+// abstract interpreter (`super::dispatch`) the absolute-only `build` cannot.
+// ---------------------------------------------------------------------------
+//
+// `build` resolves each case's transition target straight from the AST, so it
+// only models *absolute* jumps (`s = K`): a relative step (`s += K`) has no
+// statically-known target without the current state. The `dispatch` substrate
+// closes that gap — it abstract-interprets the per-case transition algebra from
+// the entry, enumerating reachable states — and feeds the same relooper. This is
+// the production wiring of that (previously unwired) substrate; it runs only as a
+// fallback after the absolute-only path declines, so it is purely additive and
+// cannot change a dispatcher the existing path already handles.
+
+/// `s` as a bare identifier reference.
+fn is_ident(expr: &Expression<'_>, s: &str) -> bool {
+    matches!(expr, Expression::Identifier(id) if id.name == s)
+}
+
+/// A *relative* integer transition delta: `s += K`, `s -= K`, `s = s + K`,
+/// `s = K + s`, `s = s - K`, `s++`, `s--`. `K` must be an integer literal.
+/// Returns the signed delta added to `s`. (Absolute `s = K` is handled by
+/// `abs_transition`.)
+fn rel_transition(stmt: &Statement<'_>, s: &str) -> Option<i64> {
+    let Statement::ExpressionStatement(es) = stmt else {
+        return None;
+    };
+    match &es.expression {
+        Expression::AssignmentExpression(a) => {
+            let AssignmentTarget::AssignmentTargetIdentifier(id) = &a.left else {
+                return None;
+            };
+            if id.name != s {
+                return None;
+            }
+            match a.operator {
+                AssignmentOperator::Addition => int_literal(&a.right),
+                AssignmentOperator::Subtraction => int_literal(&a.right).map(|v| -v),
+                AssignmentOperator::Assign => {
+                    // `s = s + K` / `s = K + s` / `s = s - K`.
+                    let Expression::BinaryExpression(b) = &a.right else {
+                        return None;
+                    };
+                    match b.operator {
+                        BinaryOperator::Addition if is_ident(&b.left, s) => int_literal(&b.right),
+                        BinaryOperator::Addition if is_ident(&b.right, s) => int_literal(&b.left),
+                        BinaryOperator::Subtraction if is_ident(&b.left, s) => {
+                            int_literal(&b.right).map(|v| -v)
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+        Expression::UpdateExpression(u) => {
+            let SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = &u.argument else {
+                return None;
+            };
+            if id.name != s {
+                return None;
+            }
+            Some(match u.operator {
+                UpdateOperator::Increment => 1,
+                UpdateOperator::Decrement => -1,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The model-level transition a single statement encodes: an absolute jump or a
+/// relative step. `None` if the statement is not a recognized state transition.
+fn int_transition(stmt: &Statement<'_>, s: &str) -> Option<IntTransition> {
+    if let Some(k) = abs_transition(stmt, s) {
+        return Some(IntTransition::Abs(k));
+    }
+    rel_transition(stmt, s).map(IntTransition::Rel)
+}
+
+/// A case parsed into a [`dispatch`](super::dispatch) `IntCase` plus the indices
+/// that resolve its content/condition back to the original AST. One parse feeds
+/// both the model (which needs only `case`) and the [`DispatchSource`] (which
+/// needs the indices) — keeping the two views provably consistent.
+struct IntCaseParse {
+    case: IntCase,
+    /// Indices into the case's flattened body that are content (no `s` mention).
+    content: Vec<usize>,
+    /// The conditional `if`'s index, for a `Branch`.
+    cond_idx: Option<usize>,
+    /// Per-arm content indices (into each arm's flattened body), for a `Branch`.
+    true_content: Vec<usize>,
+    false_content: Vec<usize>,
+}
+
+/// Parse one switch case's flattened statements into an [`IntCaseParse`], or
+/// `None` on any shape not modeled exactly. Mirrors `parse_case_block`'s
+/// partition (content vs. transition vs. conditional split vs. terminator) but
+/// records *relative as well as absolute* transitions as model `IntTransition`s.
+fn classify_int_case(flat: &[&Statement<'_>], s: &str) -> Option<IntCaseParse> {
+    let term_idx = flat.iter().position(|st| is_top_level_control(st))?;
+    let terminal = matches!(
+        flat[term_idx],
+        Statement::ReturnStatement(_) | Statement::ThrowStatement(_)
+    );
+
+    let mut content: Vec<usize> = Vec::new();
+    let mut trans: Option<IntTransition> = None;
+    let mut branch: Option<(IntTransition, IntTransition)> = None;
+    let mut cond_idx: Option<usize> = None;
+    let mut true_content: Vec<usize> = Vec::new();
+    let mut false_content: Vec<usize> = Vec::new();
+
+    for (k, &st) in flat.iter().enumerate().take(term_idx) {
+        if let Some(t) = int_transition(st, s) {
+            if trans.is_some() || branch.is_some() {
+                return None; // a second transition → unmodeled
+            }
+            trans = Some(t);
+            continue;
+        }
+        if let Some(((tt, tc), (ft, fc))) = conditional_int_transition(st, s) {
+            if trans.is_some() || branch.is_some() {
+                return None;
+            }
+            cond_idx = Some(k);
+            true_content = tc;
+            false_content = fc;
+            branch = Some((tt, ft));
+            continue;
+        }
+        if writes_state(st, s) || mentions_state(st, s) {
+            return None; // content observes/alters state in an unmodeled way
+        }
+        content.push(k);
+    }
+
+    let case = if terminal {
+        // `return`/`throw`: re-emit the terminator as content; the machine exits.
+        // A pre-terminator `s = …` (if any) is dead (s is never read after the
+        // return) and was consumed into `trans`, so it is correctly dropped.
+        content.push(term_idx);
+        IntCase::Terminal
+    } else {
+        match (trans, branch) {
+            (Some(t), None) => IntCase::Step(t),
+            (None, Some((on_true, on_false))) => IntCase::Branch { on_true, on_false },
+            // A non-terminal case with no transition would re-test the unchanged
+            // state and spin; two transition forms is ambiguous. Decline both.
+            _ => return None,
+        }
+    };
+
+    Some(IntCaseParse {
+        case,
+        content,
+        cond_idx,
+        true_content,
+        false_content,
+    })
+}
+
+/// `if (cond) <armA> else <armB>` where each arm is a single (absolute or
+/// relative) transition, optionally preceded by dispatch-clean content. Returns
+/// each arm's `(transition, content-indices)`.
+#[allow(clippy::type_complexity)]
+fn conditional_int_transition(
+    stmt: &Statement<'_>,
+    s: &str,
+) -> Option<((IntTransition, Vec<usize>), (IntTransition, Vec<usize>))> {
+    let Statement::IfStatement(iff) = stmt else {
+        return None;
+    };
+    let then_arm = arm_parse_int(&iff.consequent, s)?;
+    let else_arm = arm_parse_int(iff.alternate.as_ref()?, s)?;
+    Some((then_arm, else_arm))
+}
+
+/// Parse one conditional arm: exactly one transition (the edge), every other
+/// statement dispatch-clean content. Returns the transition and the content
+/// indices into the arm's flattened body.
+fn arm_parse_int(stmt: &Statement<'_>, s: &str) -> Option<(IntTransition, Vec<usize>)> {
+    let mut flat: Vec<&Statement> = Vec::new();
+    match stmt {
+        Statement::BlockStatement(b) => flatten_case(&b.body, &mut flat),
+        other => flat.push(other),
+    }
+    let mut trans: Option<IntTransition> = None;
+    let mut content: Vec<usize> = Vec::new();
+    for (i, &st) in flat.iter().enumerate() {
+        if let Some(t) = int_transition(st, s) {
+            if trans.is_some() {
+                return None; // two transitions in one arm → ambiguous
+            }
+            trans = Some(t);
+            continue;
+        }
+        if writes_state(st, s) || mentions_state(st, s) {
+            return None;
+        }
+        if is_top_level_control(st) {
+            return None;
+        }
+        content.push(i);
+    }
+    Some((trans?, content))
+}
+
+/// A [`relooper::CaseSource`](super::relooper::CaseSource) over a switch whose
+/// graph was recovered by the dispatch interpreter. The relooper keys on the
+/// interpreter's *dense* state ids, so this maps each id back to its concrete
+/// integer state (via the [`StateNumbering`]) and re-derives content/condition
+/// from that case — cloning verbatim, exactly like [`SwitchSource`].
+struct DispatchSource<'b, 'a> {
+    switch: &'b SwitchStatement<'a>,
+    s: &'b str,
+    num: &'b StateNumbering,
+    ast: AstBuilder<'a>,
+}
+
+impl<'b, 'a> DispatchSource<'b, 'a> {
+    /// The concrete integer state behind a dense id.
+    fn state_of(&self, dense: i64) -> Option<i64> {
+        match self.num.state_of(dense)? {
+            StateVal::Int(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// Flatten the case for integer state `k` (same flattening the model used).
+    fn flat_case(&self, k: i64) -> Option<Vec<&'b Statement<'a>>> {
+        let case = self
+            .switch
+            .cases
+            .iter()
+            .find(|c| c.test.as_ref().and_then(int_literal) == Some(k))?;
+        let mut flat: Vec<&Statement> = Vec::new();
+        flatten_case(&case.consequent, &mut flat);
+        Some(flat)
+    }
+}
+
+impl<'b, 'a> super::relooper::CaseSource<'a> for DispatchSource<'b, 'a> {
+    fn content(&self, dense: i64) -> Vec<Statement<'a>> {
+        let Some(state) = self.state_of(dense) else {
+            return Vec::new();
+        };
+        let Some(flat) = self.flat_case(state) else {
+            return Vec::new();
+        };
+        let Some(parsed) = classify_int_case(&flat, self.s) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for &i in &parsed.content {
+            if let Some(st) = flat.get(i) {
+                debug_assert!(!mentions_state(st, self.s));
+                out.push(st.clone_in(self.ast.allocator));
+            }
+        }
+        out
+    }
+
+    fn cond(&self, dense: i64) -> Option<Expression<'a>> {
+        let state = self.state_of(dense)?;
+        let flat = self.flat_case(state)?;
+        let cond_idx = classify_int_case(&flat, self.s)?.cond_idx?;
+        let Statement::IfStatement(iff) = flat.get(cond_idx)? else {
+            return None;
+        };
+        Some(iff.test.clone_in(self.ast.allocator))
+    }
+
+    fn arm_content(&self, dense: i64, on_true: bool) -> Vec<Statement<'a>> {
+        let Some(state) = self.state_of(dense) else {
+            return Vec::new();
+        };
+        let Some(flat) = self.flat_case(state) else {
+            return Vec::new();
+        };
+        let Some(parsed) = classify_int_case(&flat, self.s) else {
+            return Vec::new();
+        };
+        let idxs = if on_true {
+            &parsed.true_content
+        } else {
+            &parsed.false_content
+        };
+        if idxs.is_empty() {
+            return Vec::new();
+        }
+        let Some(cond_idx) = parsed.cond_idx else {
+            return Vec::new();
+        };
+        let Some(Statement::IfStatement(iff)) = flat.get(cond_idx).copied() else {
+            return Vec::new();
+        };
+        let arm = if on_true {
+            Some(&iff.consequent)
+        } else {
+            iff.alternate.as_ref()
+        };
+        let Some(arm) = arm else {
+            return Vec::new();
+        };
+        let mut aflat: Vec<&Statement> = Vec::new();
+        match arm {
+            Statement::BlockStatement(b) => flatten_case(&b.body, &mut aflat),
+            other => aflat.push(other),
+        }
+        let mut out = Vec::new();
+        for &i in idxs {
+            if let Some(st) = aflat.get(i) {
+                debug_assert!(!mentions_state(st, self.s));
+                out.push(st.clone_in(self.ast.allocator));
+            }
+        }
+        out
+    }
+}
+
+/// Recover a flattened integer-state dispatcher whose transitions may be
+/// *relative* (not just absolute), by abstract-interpreting the transition
+/// algebra (`super::dispatch`) from the entry and structuring the resulting graph
+/// with the general relooper. Declines (`None`) on any case the model cannot
+/// describe exactly, when the entry does not enter the loop, or on any graph the
+/// relooper cannot place — leaving the dispatcher untouched.
+pub fn structure_via_dispatch<'a>(
+    switch: &SwitchStatement<'a>,
+    s: &str,
+    entry: i64,
+    continues: &dyn Fn(i64) -> bool,
+    ast: AstBuilder<'a>,
+) -> Option<Vec<Statement<'a>>> {
+    // The dispatcher must actually enter at the entry; otherwise the loop body
+    // never runs and re-emitting its cases would invent code.
+    if !continues(entry) {
+        return None;
+    }
+    // Extract the per-state transition algebra from the switch.
+    let mut cases: HashMap<i64, IntCase> = HashMap::new();
+    for case in &switch.cases {
+        let state = int_literal(case.test.as_ref()?)?;
+        let mut flat: Vec<&Statement> = Vec::new();
+        flatten_case(&case.consequent, &mut flat);
+        let parsed = classify_int_case(&flat, s)?;
+        if cases.insert(state, parsed.case).is_some() {
+            return None; // duplicate label
+        }
+    }
+    if !cases.contains_key(&entry) {
+        return None;
+    }
+
+    // Abstract-interpret the model into a recovered graph, then structure it.
+    let model = IntStateModel::new(entry, &cases, continues);
+    let (cfg, num) = interpret(&model)?;
+    let src = DispatchSource {
+        switch,
+        s,
+        num: &num,
+        ast,
+    };
+    super::relooper::structure_general(&cfg, &src, ast)
 }
 
 #[cfg(test)]
