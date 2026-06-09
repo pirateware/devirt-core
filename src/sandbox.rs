@@ -183,6 +183,11 @@ pub enum EvalValue {
     Num(f64),
     Bool(bool),
     Arr(Vec<EvalValue>),
+    /// A plain object's own enumerable string-keyed entries, in key order. Produced
+    /// only for ordinary objects (used by the `JSON.parse` fold, whose result is by
+    /// spec a plain data object); the splice path materializes it as an object
+    /// literal, capped by the same element budget as arrays.
+    Obj(Vec<(String, EvalValue)>),
 }
 
 /// Default `Math.random` seed for the partial-evaluation sandbox. Boa seeds
@@ -610,24 +615,49 @@ fn value_to_eval(v: &JsValue, budget: &mut usize, ctx: &mut Context) -> Option<E
         return Some(EvalValue::Bool(b));
     }
     if let Some(obj) = v.as_object() {
-        if !obj.is_array() {
+        if obj.is_array() {
+            let arr = JsArray::from_object(obj).ok()?;
+            let len = usize::try_from(arr.length(ctx).ok()?).ok()?;
+            if len > *budget {
+                return None; // would exceed the materialization cap
+            }
+            *budget -= len;
+            let mut out = Vec::with_capacity(len);
+            for i in 0..len {
+                // A hole reads back as `undefined` here, and a non-convertible
+                // element returns `None` — either disqualifies the whole array,
+                // since splicing it would change semantics or require a non-literal
+                // form.
+                let elem = arr.at(i as i64, ctx).ok()?;
+                out.push(value_to_eval(&elem, budget, ctx)?);
+            }
+            return Some(EvalValue::Arr(out));
+        }
+        // A plain ordinary object: materialize its own enumerable string-keyed
+        // entries. Restricted to ordinary objects (no exotic/proxy behavior); the
+        // caller (the `JSON.parse` fold) further guarantees the result is a plain
+        // data object with no accessors, so reading each value is faithful.
+        if !obj.is_ordinary() {
             return None;
         }
-        let arr = JsArray::from_object(obj).ok()?;
-        let len = usize::try_from(arr.length(ctx).ok()?).ok()?;
-        if len > *budget {
-            return None; // would exceed the materialization cap
+        let keys = obj.own_property_keys(ctx).ok()?;
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            // Only string keys (no symbols / array-index exotics). The caller
+            // guarantees the object is plain (a `JSON.parse` result), so every own
+            // string key is an enumerable data property — read its value directly.
+            let boa_engine::property::PropertyKey::String(s) = &key else {
+                return None;
+            };
+            if *budget == 0 {
+                return None;
+            }
+            *budget -= 1;
+            let name = s.to_std_string_lossy();
+            let val = obj.get(key.clone(), ctx).ok()?;
+            out.push((name, value_to_eval(&val, budget, ctx)?));
         }
-        *budget -= len;
-        let mut out = Vec::with_capacity(len);
-        for i in 0..len {
-            // A hole reads back as `undefined` here, and a non-convertible element
-            // returns `None` — either disqualifies the whole array, since splicing
-            // it would change semantics or require a non-literal form.
-            let elem = arr.at(i as i64, ctx).ok()?;
-            out.push(value_to_eval(&elem, budget, ctx)?);
-        }
-        return Some(EvalValue::Arr(out));
+        return Some(EvalValue::Obj(out));
     }
     None
 }

@@ -2735,6 +2735,25 @@ pub(crate) fn eval_value_to_expr<'a>(
             }
             ctx.ast.expression_array(span, arr)
         }
+        EvalValue::Obj(entries) => {
+            let mut props = ctx.ast.vec();
+            for (k, val) in entries {
+                let value = eval_value_to_expr(val, span, ctx)?;
+                let key = oxc_ast::ast::PropertyKey::StringLiteral(
+                    ctx.ast.alloc_string_literal(span, ctx.ast.str(k), None),
+                );
+                props.push(ctx.ast.object_property_kind_object_property(
+                    span,
+                    oxc_ast::ast::PropertyKind::Init,
+                    key,
+                    value,
+                    false,
+                    false,
+                    false,
+                ));
+            }
+            ctx.ast.expression_object(span, props)
+        }
     })
 }
 

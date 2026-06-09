@@ -2482,3 +2482,25 @@ fn shadowed_coercion_global_preserves_value() {
         "function go(){ var String = function(x){ return 'S' + x; }; return String(7); } __r = go();",
     );
 }
+
+// ---------------------------------------------------------------------------
+// JSON.parse object/array materialization (src/passes/pure_eval.rs). A constant
+// `JSON.parse(<literal>)` resolves to the plain data structure it produces;
+// shadowed `JSON` and non-JSON object results decline.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn json_parse_fold_preserves_value() {
+    assert_equivalent(r#"var c = JSON.parse('{"a":5,"b":"x"}'); __r = c.a + c.b;"#);
+    assert_equivalent(r#"var d = JSON.parse('{"items":[1,2,3],"n":{"k":9}}'); __r = d.items[1] + d.n.k;"#);
+    assert_equivalent(r#"__r = JSON.parse('[10,20,30]')[2] + 1;"#);
+    // String element stays a string after materialization.
+    assert_equivalent(r#"__r = JSON.parse('{"v":"1"}').v + JSON.parse('[0]')[0];"#);
+}
+
+#[test]
+fn shadowed_json_parse_preserves_value() {
+    assert_equivalent(
+        "function go(){ var JSON = { parse: function(s){ return { a: 99 }; } }; return JSON.parse('x').a; } __r = go();",
+    );
+}
