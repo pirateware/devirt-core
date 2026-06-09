@@ -133,7 +133,71 @@ fn literal_array_form_collapses() {
     assert!(in_ < im, "array order not honored: {out}");
 }
 
+#[test]
+fn while_form_hoisted_init_collapses() {
+    // The same dispatcher with the cursor setup hoisted before a `while (true)`
+    // instead of in a `for`-init — what lowering a `for(index)` wrapper leaves.
+    let out = deob(
+        "(function () { \
+           var a = \"2|0|1\".split(\"|\"), i = 0; \
+           while (true) { \
+             switch (a[i++]) { \
+               case \"0\": b0(); continue; \
+               case \"1\": b1(); continue; \
+               case \"2\": b2(); continue; \
+             } \
+             break; \
+           } \
+         })();",
+    );
+    assert!(!out.contains("switch"), "switch survived: {out}");
+    assert!(!out.contains("split"), "order array survived: {out}");
+    let i2 = out.find("b2()").expect("b2 missing");
+    let i0 = out.find("b0()").expect("b0 missing");
+    let i1 = out.find("b1()").expect("b1 missing");
+    assert!(i2 < i0 && i0 < i1, "statements out of array order: {out}");
+}
+
+#[test]
+fn while_form_two_init_statements_collapses() {
+    // The cursor and array declared in two separate preceding statements.
+    let out = deob(
+        "(function () { \
+           var a = [\"1\", \"0\"]; \
+           var i = 0; \
+           while (1) { \
+             switch (a[i++]) { case \"0\": m(); continue; case \"1\": n(); continue; } \
+             break; \
+           } \
+         })();",
+    );
+    assert!(!out.contains("switch"), "switch survived: {out}");
+    let in_ = out.find("n()").unwrap();
+    let im = out.find("m()").unwrap();
+    assert!(in_ < im, "array order not honored: {out}");
+}
+
 // --- adversarial: must NOT fire ------------------------------------------
+
+#[test]
+fn while_form_cursor_escape_is_kept() {
+    // While-form, but the cursor `i` is read after the loop — not dispatch-only,
+    // so linearizing would strand the reference. Must decline.
+    let out = deob(
+        "(function () { \
+           var a = \"0|1\".split(\"|\"), i = 0; \
+           while (true) { \
+             switch (a[i++]) { case \"0\": x(); continue; case \"1\": y(); continue; } \
+             break; \
+           } \
+           sink(i); \
+         })();",
+    );
+    assert!(
+        out.contains("switch"),
+        "escaping-cursor while dispatcher wrongly collapsed: {out}"
+    );
+}
 
 #[test]
 fn mutated_order_array_is_kept() {

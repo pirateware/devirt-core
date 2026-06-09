@@ -140,88 +140,130 @@ impl<'a> Walker<'a> {
     }
 
     fn try_recover(&mut self, stmts: &mut ArenaVec<'a, Statement<'a>>) {
-        let mut hit: Option<(usize, Vec<Statement<'a>>)> = None;
+        // Each hit is the inclusive statement range `[start, end]` to replace with
+        // the linearized `seq`. The for-form is a single statement (`start == end`);
+        // the while-form also consumes its preceding hoisted-init statement(s).
+        let mut hit: Option<(usize, usize, Vec<Statement<'a>>)> = None;
         for i in 0..stmts.len() {
-            let Statement::ForStatement(f) = &stmts[i] else {
-                continue;
-            };
-            // The loop must never exit via its own test: `for (…; true; )` or
-            // `for (…; ; )`. A loop with a real test could fall through before the
-            // chain ends — not a static linear walk.
-            let test_is_always = match &f.test {
-                None => true,
-                Some(Expression::BooleanLiteral(b)) => b.value,
-                _ => false,
-            };
-            if !test_is_always {
-                continue;
+            if let Some(seq) = self.try_for_form(&stmts[i]) {
+                hit = Some((i, i, seq));
+                break;
             }
-            // No `for`-update clause: the cursor is advanced solely by `i++` inside
-            // the discriminant. An update would be a second, unmodeled mutation.
-            if f.update.is_some() {
-                continue;
+            if let Some((start, seq)) = self.try_while_form(stmts, i) {
+                hit = Some((start, i, seq));
+                break;
             }
-            let Some(init) = &f.init else { continue };
-            let Some((arr_name, idx_name, keys)) = parse_init(init) else {
-                continue;
-            };
-            // The order array must be provably immutable (never `push`/`[k]=`/etc.).
-            if self.mutable.contains(&arr_name) {
-                continue;
-            }
-            // Body: `switch (a[i++]) { … }`, optionally wrapped in a block and/or
-            // trailed by a `break`. `has_break_exit` is true when the loop body has a
-            // trailing `break` reachable when the switch matches nothing — i.e. the
-            // loop cleanly exits once the cursor runs off the end of the array.
-            let Some((switch, has_break_exit)) = body_switch(&f.body, &arr_name, &idx_name) else {
-                continue;
-            };
-            if switch.cases.iter().any(|c| c.test.is_none()) {
-                continue; // no `default` clause
-            }
-            let Some(cases) = parse_cases(switch, &arr_name, &idx_name) else {
-                continue;
-            };
-            // `a` and `i` must be dispatch-only: referenced *nowhere* outside this
-            // `for` statement, program-wide. Compare each name's total occurrence
-            // count to its count inside the for-statement; equal ⇒ no escape. (The
-            // census counts binding ids too, so the param/var declaration of `a`/`i`
-            // outside the loop also counts as an escape and is correctly rejected —
-            // unless, as in the CFF shape, the name's only binding is the for-init
-            // assignment target, which lives inside the for-statement.)
-            let for_stmt = &stmts[i];
-            let arr_local = count_name_in_stmt(for_stmt, &arr_name);
-            let idx_local = count_name_in_stmt(for_stmt, &idx_name);
-            if self.global_counts.get(&arr_name).copied().unwrap_or(0) != arr_local
-                || self.global_counts.get(&idx_name).copied().unwrap_or(0) != idx_local
-            {
-                continue;
-            }
-            let Some(seq) = simulate_sequence(&keys, &cases, has_break_exit, self.ast.allocator)
-            else {
-                continue;
-            };
-            hit = Some((i, seq));
-            break;
         }
 
-        let Some((i, seq)) = hit else {
+        let Some((start, end, seq)) = hit else {
             return;
         };
-        // Splice: replace the `for` dispatcher (statement i) with the linear
+        // Splice: replace the dispatcher range `[start, end]` with the linear
         // sequence. Everything else stays in order.
         let old = std::mem::replace(stmts, self.ast.vec());
         let mut seq = Some(seq);
         for (k, s) in old.into_iter().enumerate() {
-            if k == i {
+            if k == start {
                 for st in seq.take().unwrap() {
                     stmts.push(st);
                 }
-                continue;
+            }
+            if (start..=end).contains(&k) {
+                continue; // drop the originals in the dispatcher range
             }
             stmts.push(s);
         }
         self.changed = true;
+    }
+
+    /// `for (a = <const arr>, i = 0; true; ) switch (a[i++]) { … }` — the cursor
+    /// setup lives in the for-init. Returns the linearized sequence, or `None`.
+    fn try_for_form(&self, stmt: &Statement<'a>) -> Option<Vec<Statement<'a>>> {
+        let Statement::ForStatement(f) = stmt else {
+            return None;
+        };
+        // The loop must never exit via its own test: `for (…; true; )` /
+        // `for (…; ; )`. A real test could fall through before the chain ends.
+        let test_is_always = match &f.test {
+            None => true,
+            Some(Expression::BooleanLiteral(b)) => b.value,
+            _ => false,
+        };
+        if !test_is_always {
+            return None;
+        }
+        // No `for`-update clause: the cursor advances solely via `i++` in the
+        // discriminant. An update would be a second, unmodeled mutation.
+        if f.update.is_some() {
+            return None;
+        }
+        let (arr_name, idx_name, keys) = parse_init(f.init.as_ref()?)?;
+        let (switch, has_break_exit) = body_switch(&f.body, &arr_name, &idx_name)?;
+        // Escape gate over the single `for` statement (see `finish`).
+        self.finish(&arr_name, &idx_name, &keys, switch, has_break_exit, &[stmt])
+    }
+
+    /// `var a = <const arr>, i = 0; while (true) { switch (a[i++]) { … } [break;] }`
+    /// — the equivalent dispatcher whose cursor setup is hoisted to statement(s)
+    /// preceding the loop (the obfuscator emits this, and lowering a `for(index)`
+    /// wrapper leaves it). Returns `(start_index, sequence)`: the index of the
+    /// first init statement consumed, and the linearized body.
+    fn try_while_form(
+        &self,
+        stmts: &[Statement<'a>],
+        i: usize,
+    ) -> Option<(usize, Vec<Statement<'a>>)> {
+        let Statement::WhileStatement(w) = &stmts[i] else {
+            return None;
+        };
+        // `while (true)` / `while (1)` — never exits via the test.
+        let always = matches!(&w.test, Expression::BooleanLiteral(b) if b.value)
+            || int_literal(&w.test).is_some_and(|n| n != 0);
+        if !always {
+            return None;
+        }
+        let (start, pairs) = gather_hoisted_init(stmts, i)?;
+        let (arr_name, idx_name, keys) = pairs_to_init(pairs)?;
+        let (switch, has_break_exit) = body_switch(&w.body, &arr_name, &idx_name)?;
+        // Escape gate spans the init statement(s) plus the loop — `a`/`i` must be
+        // referenced nowhere else (see `finish`). The init's binding ids are not
+        // counted (the census skips declarations), so a clean dispatcher's only
+        // counted references are the single `a[i++]` read and `i++`.
+        let escape: Vec<&Statement<'a>> = stmts[start..=i].iter().collect();
+        let seq = self.finish(&arr_name, &idx_name, &keys, switch, has_break_exit, &escape)?;
+        Some((start, seq))
+    }
+
+    /// Shared gating + linearization for both dispatcher forms. `escape_stmts` is
+    /// the set of statements the cursor `a`/`i` is allowed to appear in; if either
+    /// name's program-wide reference count exceeds its count there, the cursor
+    /// escapes and we decline.
+    fn finish(
+        &self,
+        arr_name: &str,
+        idx_name: &str,
+        keys: &[Key],
+        switch: &SwitchStatement<'a>,
+        has_break_exit: bool,
+        escape_stmts: &[&Statement<'a>],
+    ) -> Option<Vec<Statement<'a>>> {
+        // The order array must be provably immutable (never `push`/`[k]=`/etc.).
+        if self.mutable.contains(arr_name) {
+            return None;
+        }
+        if switch.cases.iter().any(|c| c.test.is_none()) {
+            return None; // no `default` clause
+        }
+        let cases = parse_cases(switch, arr_name, idx_name)?;
+        let count_in = |name: &str| -> usize {
+            escape_stmts.iter().map(|s| count_name_in_stmt(s, name)).sum()
+        };
+        if self.global_counts.get(arr_name).copied().unwrap_or(0) != count_in(arr_name)
+            || self.global_counts.get(idx_name).copied().unwrap_or(0) != count_in(idx_name)
+        {
+            return None;
+        }
+        simulate_sequence(keys, &cases, has_break_exit, self.ast.allocator)
     }
 
     /// Descend into every statement list reachable from `stmt`, so nested
@@ -327,45 +369,17 @@ enum Key {
 fn parse_init(init: &ForStatementInit<'_>) -> Option<(String, String, Vec<Key>)> {
     // Collect the (target-name, init-expr) pairs in source order.
     let pairs: Vec<(String, &Expression<'_>)> = match init {
-        ForStatementInit::VariableDeclaration(vd) => {
-            let mut out = Vec::with_capacity(vd.declarations.len());
-            for d in &vd.declarations {
-                let BindingPattern::BindingIdentifier(id) = &d.id else {
-                    return None;
-                };
-                out.push((id.name.to_string(), d.init.as_ref()?));
-            }
-            out
-        }
+        ForStatementInit::VariableDeclaration(vd) => decl_pairs(vd)?,
         // An expression init: a single assignment or a comma sequence of them.
-        _ => {
-            let expr = init.as_expression()?;
-            let mut exprs: Vec<&Expression<'_>> = Vec::new();
-            match expr {
-                Expression::SequenceExpression(seq) => {
-                    for e in &seq.expressions {
-                        exprs.push(e);
-                    }
-                }
-                other => exprs.push(other),
-            }
-            let mut out = Vec::with_capacity(exprs.len());
-            for e in exprs {
-                let Expression::AssignmentExpression(a) = e else {
-                    return None;
-                };
-                if a.operator != AssignmentOperator::Assign {
-                    return None;
-                }
-                let AssignmentTarget::AssignmentTargetIdentifier(id) = &a.left else {
-                    return None;
-                };
-                out.push((id.name.to_string(), &a.right));
-            }
-            out
-        }
+        _ => assign_pairs(init.as_expression()?)?,
     };
+    pairs_to_init(pairs)
+}
 
+/// Reduce the ordered `(name, init-expr)` pairs to `(array, cursor, keys)`. The
+/// shared tail of every init form: exactly two bindings — a constant key array,
+/// then a cursor initialized to `0`.
+fn pairs_to_init(pairs: Vec<(String, &Expression<'_>)>) -> Option<(String, String, Vec<Key>)> {
     if pairs.len() != 2 {
         return None;
     }
@@ -380,6 +394,90 @@ fn parse_init(init: &ForStatementInit<'_>) -> Option<(String, String, Vec<Key>)>
     }
     let keys = const_key_array(arr_init)?;
     Some((arr_name.clone(), idx_name.clone(), keys))
+}
+
+/// `var a = …, i = …` → its `(name, init)` pairs. Every declarator must be a
+/// plain identifier with an initializer.
+fn decl_pairs<'b, 'a>(
+    vd: &'b oxc_ast::ast::VariableDeclaration<'a>,
+) -> Option<Vec<(String, &'b Expression<'a>)>> {
+    let mut out = Vec::with_capacity(vd.declarations.len());
+    for d in &vd.declarations {
+        let BindingPattern::BindingIdentifier(id) = &d.id else {
+            return None;
+        };
+        out.push((id.name.to_string(), d.init.as_ref()?));
+    }
+    Some(out)
+}
+
+/// `a = …` or `a = …, i = …` (a comma sequence of simple assignments) → its
+/// `(name, init)` pairs.
+fn assign_pairs<'b, 'a>(expr: &'b Expression<'a>) -> Option<Vec<(String, &'b Expression<'a>)>> {
+    let mut exprs: Vec<&Expression<'_>> = Vec::new();
+    match expr {
+        Expression::SequenceExpression(seq) => {
+            for e in &seq.expressions {
+                exprs.push(e);
+            }
+        }
+        other => exprs.push(other),
+    }
+    let mut out = Vec::with_capacity(exprs.len());
+    for e in exprs {
+        let Expression::AssignmentExpression(a) = e else {
+            return None;
+        };
+        if a.operator != AssignmentOperator::Assign {
+            return None;
+        }
+        let AssignmentTarget::AssignmentTargetIdentifier(id) = &a.left else {
+            return None;
+        };
+        out.push((id.name.to_string(), &a.right));
+    }
+    Some(out)
+}
+
+/// Interpret a *statement* as part of a hoisted dispatcher init — the while-form
+/// `var a = …, i = 0; while (true) …` where the cursor setup precedes the loop
+/// instead of living in a `for`-init. Accepts a `var` declaration or an
+/// assignment/comma-sequence expression statement.
+fn stmt_pairs<'b, 'a>(stmt: &'b Statement<'a>) -> Option<Vec<(String, &'b Expression<'a>)>> {
+    match stmt {
+        Statement::VariableDeclaration(vd) => decl_pairs(vd),
+        Statement::ExpressionStatement(es) => assign_pairs(&es.expression),
+        _ => None,
+    }
+}
+
+/// Collect the cursor-init `(name, init)` pairs from the statement(s) immediately
+/// preceding the while-loop at `i`, returning the first consumed index. Accepts
+/// either one statement that binds both (`var a = …, i = 0;`) or two adjacent
+/// statements that bind one each (`var a = …; var i = 0;`). The init must sit
+/// directly before the loop so the spliced range stays contiguous.
+fn gather_hoisted_init<'b, 'a>(
+    stmts: &'b [Statement<'a>],
+    i: usize,
+) -> Option<(usize, Vec<(String, &'b Expression<'a>)>)> {
+    if i == 0 {
+        return None;
+    }
+    if let Some(pairs) = stmt_pairs(&stmts[i - 1]) {
+        if pairs.len() == 2 {
+            return Some((i - 1, pairs));
+        }
+        if pairs.len() == 1 && i >= 2 {
+            if let Some(prev) = stmt_pairs(&stmts[i - 2]) {
+                if prev.len() == 1 {
+                    let mut combined = prev;
+                    combined.extend(pairs);
+                    return Some((i - 2, combined));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Resolve a provably constant array of dispatch keys from the array initializer:
