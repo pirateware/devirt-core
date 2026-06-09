@@ -32,7 +32,7 @@ use oxc_traverse::{traverse_mut, Traverse, TraverseCtx};
 
 use crate::pass::Pass;
 use crate::passes::decoder_lift::freevars_of_expr;
-use crate::sandbox::{EvalValue, Sandbox};
+use crate::sandbox::Sandbox;
 use crate::util::build_scoping;
 
 #[derive(Default)]
@@ -140,28 +140,20 @@ impl<'a> Traverse<'a, ()> for Evaluator {
         }
         let src = format!("{prelude}({printed});");
 
-        // Evaluate twice; require agreement (rejects non-determinism) and a
-        // primitive result (the only thing with a literal form).
+        // Evaluate twice; require agreement (rejects non-determinism). The result
+        // splices to its literal form — a primitive, or a (sandbox size-capped)
+        // array literal, which materializes a pure IIFE's table so DCE can drop the
+        // now-dead scaffolding once it is the only reader.
         let val = match self.sandbox.eval_to_value(&src) {
             Some(a) if self.sandbox.eval_to_value(&src).as_ref() == Some(&a) => a,
             _ => return,
         };
 
         let span = expr.span();
-        *expr = match val {
-            EvalValue::Str(s) => {
-                let v = ctx.ast.str(&s);
-                ctx.ast.expression_string_literal(span, v, None)
-            }
-            EvalValue::Num(n) if n.is_finite() => num_literal(n, span, ctx),
-            EvalValue::Bool(b) => ctx.ast.expression_boolean_literal(span, b),
-            // NaN / Infinity have no numeric literal form — leave the IIFE.
-            EvalValue::Num(_) => return,
-            // Array results are handled only by decoder-lift's size-capped splice;
-            // pure-eval declines them (a pure IIFE returning an array is rare and
-            // not worth materializing here).
-            EvalValue::Arr(_) => return,
+        let Some(new_expr) = crate::passes::decoder_lift::eval_value_to_expr(&val, span, ctx) else {
+            return; // NaN/Infinity or a non-materializable array
         };
+        *expr = new_expr;
         self.changed = true;
     }
 }
@@ -289,23 +281,4 @@ fn for_head_names(program: &Program<'_>) -> std::collections::HashSet<String> {
     let mut f = F(std::collections::HashSet::new());
     f.visit_program(program);
     f.0
-}
-
-/// Build a numeric literal for `n`, wrapping negatives as `-(lit)` (the grammar
-/// has no negative numeric literal). Mirrors the helper in `decoder_lift`.
-fn num_literal<'a>(n: f64, span: oxc_span::Span, ctx: &mut TraverseCtx<'a, ()>) -> Expression<'a> {
-    use oxc_syntax::number::NumberBase;
-    if n.is_sign_negative() {
-        let lit = ctx
-            .ast
-            .expression_numeric_literal(span, -n, None, NumberBase::Decimal);
-        ctx.ast.expression_unary(
-            span,
-            oxc_syntax::operator::UnaryOperator::UnaryNegation,
-            lit,
-        )
-    } else {
-        ctx.ast
-            .expression_numeric_literal(span, n, None, NumberBase::Decimal)
-    }
 }
