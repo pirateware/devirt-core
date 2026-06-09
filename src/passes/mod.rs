@@ -10,6 +10,7 @@ mod dead_store;
 mod decoder_lift;
 mod demultiplex;
 mod flatten_else;
+mod function_ctor;
 mod global_const_inline;
 mod math_fingerprint;
 mod member_normalize;
@@ -33,6 +34,7 @@ pub use dead_store::DeadStore;
 pub use decoder_lift::DecoderLift;
 pub use demultiplex::Demultiplex;
 pub use flatten_else::FlattenElse;
+pub use function_ctor::FunctionCtor;
 pub use global_const_inline::GlobalConstInline;
 pub use math_fingerprint::MathFingerprint;
 pub use member_normalize::MemberNormalize;
@@ -93,6 +95,11 @@ pub fn default_pipeline() -> Vec<Box<dyn Pass>> {
         // the `a[k]["split"]` accesses upstream, so it fires on a later fixpoint round.
         Box::new(UnflattenStringOrder),
         Box::new(ConstantFold::default()),
+        // Reconstruct `new Function('a','b','return a+b')` (constant string args)
+        // into a real `function (a,b) { return a+b; }`. Runs after const-fold so
+        // lifted/decoded string args are literal, and before the inliners/pure-eval
+        // so the recovered function body is folded further.
+        Box::new(FunctionCtor),
         Box::new(AssignedOnceInline),
         // Fingerprint algebraic operator-proxy functions (`fn(a,b)` that is really
         // `a+b`, `a^b`, …) by running them in the sandbox and matching a single

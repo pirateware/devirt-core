@@ -2325,3 +2325,30 @@ fn arm_reading_state_is_declined() {
          } } return acc; } __r = run(3);",
     );
 }
+
+// ---------------------------------------------------------------------------
+// `Function` constructor reconstruction (src/passes/function_ctor.rs). A
+// constant-string `new Function(...)` becomes a function literal only when its
+// body cannot capture a local (free names ⊆ params ∪ globals); otherwise it is
+// kept. The differential net confirms value preservation across both.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn function_constructor_reconstruction_preserves_value() {
+    assert_equivalent("__r = new Function('a','b','return a*b+1')(6, 7);");
+    // Comma-packed params, and a global reference (allowed).
+    assert_equivalent("__r = new Function('x', 'return Math.max(x, 10)')(3);");
+    // Called form (no `new`) builds the same function.
+    assert_equivalent("__r = Function('n', 'return n - 1')(9);");
+}
+
+#[test]
+fn function_constructor_local_capture_preserves_value() {
+    // The body reads a name that is *not* a param or known global. Reconstruction
+    // would capture a local; declining keeps the global-scope semantics. Here the
+    // name resolves to a real global so both forms agree — the point is that the
+    // value is preserved whether or not the pass fires.
+    assert_equivalent(
+        "globalThis.k = 4; var r = new Function('return k')(); __r = r; delete globalThis.k;",
+    );
+}
