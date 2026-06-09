@@ -2562,3 +2562,12 @@ fn single_iter_loop_preserves_value() {
         "var i = 0, acc = 0; while (1) { i++; acc += i; if (i < 4) continue; break; } __r = acc;",
     );
 }
+
+#[test]
+fn literal_receiver_mutator_preserves_value() {
+    assert_equivalent("__r = ['a','b','c'].reverse().join('');");
+    assert_equivalent("__r = '!olleh'.split('').reverse().join('');");
+    assert_equivalent("__r = [3, 1, 2].sort().join(',');");
+    // A mutator on a *named* receiver must still NOT fold (observable mutation).
+    assert_equivalent("var a = [3, 1, 2]; var s = a.sort(); __r = a[0] + ':' + s[0];");
+}
