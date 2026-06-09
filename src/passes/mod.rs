@@ -4,6 +4,7 @@ mod assigned_once;
 mod block_flatten;
 mod computed_state;
 mod const_fold;
+mod const_object_inline;
 mod dce;
 mod dead_object_prop;
 mod dead_store;
@@ -31,6 +32,7 @@ pub use assigned_once::AssignedOnceInline;
 pub use block_flatten::BlockFlatten;
 pub use computed_state::ComputedState;
 pub use const_fold::ConstantFold;
+pub use const_object_inline::ConstObjectInline;
 pub use dce::Dce;
 pub use dead_object_prop::DeadObjectProp;
 pub use dead_store::DeadStore;
@@ -80,6 +82,14 @@ pub fn default_pipeline() -> Vec<Box<dyn Pass>> {
         // values it consumes are produced upstream by decoder-lift's base-N
         // arithmetic materialization, so it fires on a later fixpoint round.
         Box::new(GlobalConstInline),
+        // Inline reads of a non-escaping, write-once object literal's literal
+        // properties program-wide (`O.koPtQ` → `"Original:"`) — the obfuscator's
+        // string-map dictionary. The interprocedural complement to SsaOpt's
+        // intraprocedural fold: it reaches reads stranded inside persistent proxy
+        // closures. Runs here so the resolved literals feed the opaque-predicate
+        // folds and the string-order unflattener below; chained dictionaries
+        // (`O2.k = O1.j`) resolve one hop per fixpoint round.
+        Box::new(ConstObjectInline::default()),
         // Normalize a *computed/object-state* discriminant (`switch(obj + counter)`
         // where `obj` provably coerces to a constant) into a plain counter
         // dispatcher (`switch(counter)` with offset labels), so the unflatteners
