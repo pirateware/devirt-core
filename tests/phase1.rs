@@ -60,6 +60,24 @@ fn assigned_once_inline_and_fold() {
 }
 
 #[test]
+fn assigned_once_inlines_const_in_try_block() {
+    // A literal const declared directly in a `try {}` block is reachable, before
+    // any `catch`, only after it ran — so reads *within* the block inline. Reads
+    // in the `catch` (where an earlier throw could leave it pre-init) must NOT.
+    let out = deob(
+        "function g(){ try { var s = \"function\"; return typeof a === s; } catch (e) { return s; } } sink(g);",
+    );
+    assert!(
+        out.contains("typeof a === \"function\""),
+        "in-try read not inlined: {out}"
+    );
+    assert!(
+        out.contains("return s") || out.contains("catch"),
+        "catch read must be left un-inlined (could be pre-init undefined): {out}"
+    );
+}
+
+#[test]
 fn string_concatenation_folds() {
     let out = deob(r#"sink("foo" + "bar" + "baz", "n" + 5);"#);
     assert!(

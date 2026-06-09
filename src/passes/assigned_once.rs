@@ -29,7 +29,7 @@ use oxc_ast::ast::{BindingPattern, Expression, Program, VariableDeclarator};
 use oxc_semantic::Scoping;
 use oxc_syntax::scope::{ScopeFlags, ScopeId};
 use oxc_syntax::symbol::SymbolId;
-use oxc_traverse::{traverse_mut, Traverse, TraverseCtx};
+use oxc_traverse::{traverse_mut, Ancestor, Traverse, TraverseCtx};
 
 use crate::pass::Pass;
 use crate::util::{build_scoping, is_inlineable_literal};
@@ -88,6 +88,13 @@ struct Const<'a> {
     func_scope: ScopeId,
     /// Source offset just past the declarator; a read must start at or after it.
     decl_end: u32,
+    /// Source offset past which a read is no longer guaranteed to see the
+    /// initialized value. `u32::MAX` for a declarator that runs unconditionally
+    /// (directly in the function/root). For one sitting directly in a `try {}`
+    /// block it is the block's end: a read in the `catch`/`finally` or after the
+    /// `try` could observe the pre-init `undefined` (an earlier try statement may
+    /// have thrown before the declarator ran), so it is excluded.
+    region_end: u32,
 }
 
 struct Collector<'a> {
@@ -114,15 +121,23 @@ impl<'a> Traverse<'a, ()> for Collector<'a> {
         if ctx.scoping().symbol_is_mutated(sym) {
             return;
         }
-        // Unconditional-execution gate: the declarator must sit directly in its
-        // function/root scope. Any wrapping block/if/loop/switch/try introduces
-        // an intermediate scope, so a nested declarator fails this check and is
-        // never recorded (its init might be skipped at runtime).
+        // Execution gate. The cheap, sound case is a declarator directly in its
+        // function/root scope: it runs unconditionally, exactly once, before any
+        // later statement — so every later read (in that function) is safe.
+        // We additionally admit a declarator sitting *directly* in a `try {}`
+        // block; there the safe region is bounded to the block (see `region_end`).
+        // Anything else (an `if`/loop/switch body, a `catch`, a nested block) might
+        // be skipped at runtime, so it stays poisoned.
         let scope = ctx.current_scope_id();
-        if enclosing_function(ctx.scoping(), scope) != scope {
+        let func_scope = enclosing_function(ctx.scoping(), scope);
+        let region_end = if func_scope == scope {
+            u32::MAX
+        } else if let Some(end) = direct_try_block_region(ctx) {
+            end
+        } else {
             self.poisoned.insert(sym);
             return;
-        }
+        };
         // Two declarations writing the same symbol → value is ambiguous; poison.
         if self.values.contains_key(&sym) {
             self.poisoned.insert(sym);
@@ -133,8 +148,9 @@ impl<'a> Traverse<'a, ()> for Collector<'a> {
             sym,
             Const {
                 value,
-                func_scope: scope,
+                func_scope,
                 decl_end: node.span.end,
+                region_end,
             },
         );
     }
@@ -156,6 +172,33 @@ impl<'a> Traverse<'a, ()> for Collector<'a> {
         _ctx: &mut TraverseCtx<'a, ()>,
     ) {
         poison_for_head(&node.left, &mut self.poisoned);
+    }
+}
+
+/// If the declarator sits *directly* in a `try { … }` block — a top-level
+/// statement of the block, not nested in an inner `if`/loop/block — return the
+/// block's end offset. Within `[decl_end, block_end)` a read is guaranteed to see
+/// the initialized value (control reached it, so it passed the unconditional
+/// declarator). Past it (`catch`/`finally`, or after the `try`) a read could see
+/// the pre-init `undefined`, so it is excluded. Returns `None` for any other
+/// nesting, which the caller poisons.
+fn direct_try_block_region(ctx: &TraverseCtx<'_, ()>) -> Option<u32> {
+    let mut ancestors = ctx.ancestors();
+    // The first statement-list owner above the declarator (skipping the
+    // intervening `VariableDeclaration`). If it is the function/program body the
+    // unconditional case already applied; here we only care about a block.
+    let block_end = loop {
+        match ancestors.next()? {
+            Ancestor::BlockStatementBody(b) => break b.span().end,
+            Ancestor::FunctionBodyStatements(_) | Ancestor::ProgramBody(_) => return None,
+            _ => continue,
+        }
+    };
+    // That block must be a `try`'s `block` (not a `catch`/`finally` body, an
+    // `if`/loop body, or a bare nested block).
+    match ancestors.next()? {
+        Ancestor::TryStatementBlock(_) => Some(block_end),
+        _ => None,
     }
 }
 
@@ -204,7 +247,7 @@ impl<'a, 'm> Traverse<'a, ()> for Replacer<'a, 'm> {
         if enclosing_function(ctx.scoping(), ctx.current_scope_id()) != konst.func_scope {
             return;
         }
-        if idref.span.start < konst.decl_end {
+        if idref.span.start < konst.decl_end || idref.span.start >= konst.region_end {
             return;
         }
         *expr = konst.value.clone_in(ctx.ast.allocator);
