@@ -1,0 +1,54 @@
+name: Equivalence
+
+# Differential behavioral-equivalence gate over the corpus: each sample is run
+# (under the deterministic whole-program harness) before and after
+# deobfuscation, and their behavior signatures — terminal outcome + console
+# output sequence — must match. This is the soundness counterpart to the
+# readability `score` workflow: `score` measures how much output shrank; this
+# proves the output still behaves the same.
+#
+# Manual trigger only for now (run it on demand from the Actions tab). To make it
+# a hard release gate, add the same `push: tags: ['v*']` trigger the score
+# workflow uses — `report --equiv` already exits non-zero on any mismatch, so the
+# job fails the moment a sample's behavior changes.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: equiv-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  equiv:
+    name: differential behavioral equivalence
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build report
+        run: cargo build --release --bin report
+
+      - name: Pull corpus
+        run: scripts/pull-corpus.sh
+
+      # `report --equiv` prints a per-source markdown table and exits non-zero on
+      # any behavior mismatch. `pipefail` ensures that non-zero exit (not `tee`'s)
+      # fails the job.
+      - name: Equivalence check
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo run --release --bin report -- --equiv | tee -a "$GITHUB_STEP_SUMMARY"

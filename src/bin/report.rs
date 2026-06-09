@@ -20,10 +20,12 @@
 //!   --markdown      print the aggregate scoreboard as a GitHub table (for the
 //!                   dataset card / README), instead of the fixed-width table
 use devirt_core::deobfuscate;
+use devirt_core::sandbox::{behavior_signature, BehaviorSignature, RunOutcome};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Default)]
 struct Agg {
@@ -38,6 +40,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let show_files = args.iter().any(|a| a == "--files");
     let markdown = args.iter().any(|a| a == "--markdown");
+    let equiv = args.iter().any(|a| a == "--equiv");
     let json_path = flag_value(&args, "--json");
     let root = args
         .iter()
@@ -56,6 +59,13 @@ fn main() {
             root.display()
         );
         std::process::exit(1);
+    }
+
+    // Differential equivalence mode: run each sample and its deobfuscated form
+    // under the whole-program behavior harness and require identical signatures.
+    // Exits non-zero on any mismatch, so it can gate releases.
+    if equiv {
+        std::process::exit(run_equiv(&files, &root));
     }
 
     // Optional per-sample JSONL for the HF Dataset Viewer.
@@ -131,6 +141,122 @@ fn main() {
 
 fn flag_value(args: &[String], flag: &str) -> Option<String> {
     args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned()
+}
+
+// ---------------------------------------------------------------------------
+// Differential behavioral-equivalence harness
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct EquivAgg {
+    /// Comparable samples (ran cleanly before deobfuscation).
+    checked: usize,
+    matched: usize,
+    mismatched: usize,
+    /// Non-comparable before deobfuscation (timed out / harness couldn't run it).
+    skipped: usize,
+}
+
+/// Run the differential equivalence check over every sample: capture the
+/// whole-program behavior signature (terminal outcome + console output sequence)
+/// before and after deobfuscation, and require them to match. A sample that did
+/// not run comparably *before* deobfuscation (a timeout, or a host the harness
+/// can't construct) is skipped — it carries no ground truth to compare against.
+/// Returns the process exit code: non-zero iff any comparable sample's behavior
+/// changed (a soundness regression).
+fn run_equiv(files: &[PathBuf], root: &Path) -> i32 {
+    // Boa has no wall clock; the bound is the engine's loop-iteration ceiling, so
+    // this duration is nominal (kept for the API).
+    let budget = Duration::from_secs(5);
+
+    let mut groups: BTreeMap<String, EquivAgg> = BTreeMap::new();
+    let mut total = EquivAgg::default();
+    let mut mismatches: Vec<String> = Vec::new();
+
+    for p in files {
+        let Ok(src) = fs::read_to_string(p) else { continue };
+        let name = p.file_name().unwrap().to_string_lossy();
+        let source = group_of(root, p);
+        let g = groups.entry(source.clone()).or_default();
+
+        let before = behavior_signature(&src, budget);
+        if !comparable(&before) {
+            g.skipped += 1;
+            total.skipped += 1;
+            continue;
+        }
+        let r = deobfuscate(&src, &name);
+        let after = behavior_signature(&r.code, budget);
+
+        g.checked += 1;
+        total.checked += 1;
+        if before == after {
+            g.matched += 1;
+            total.matched += 1;
+        } else {
+            g.mismatched += 1;
+            total.mismatched += 1;
+            if mismatches.len() < 50 {
+                mismatches.push(format!(
+                    "- `{}`\n    - before: {}\n    - after:  {}",
+                    rel(root, p),
+                    describe(&before),
+                    describe(&after),
+                ));
+            }
+        }
+    }
+
+    // Markdown summary (renders in a terminal and in $GITHUB_STEP_SUMMARY).
+    println!("| source | comparable | matched | mismatched | skipped |");
+    println!("|---|--:|--:|--:|--:|");
+    let row = |name: &str, a: &EquivAgg| {
+        println!(
+            "| `{}` | {} | {} | {} | {} |",
+            name, a.checked, a.matched, a.mismatched, a.skipped
+        );
+    };
+    for (name, a) in &groups {
+        row(name, a);
+    }
+    row("TOTAL", &total);
+
+    if total.mismatched == 0 {
+        println!(
+            "\n✅ equivalence: {} comparable samples, all behavior-preserving ({} skipped as non-comparable).",
+            total.checked, total.skipped
+        );
+        0
+    } else {
+        println!("\n❌ equivalence: {} behavior MISMATCH(es):\n", total.mismatched);
+        for m in &mismatches {
+            println!("{m}");
+        }
+        if total.mismatched > mismatches.len() {
+            println!("… and {} more", total.mismatched - mismatches.len());
+        }
+        1
+    }
+}
+
+/// A signature is comparable only if the original program ran to a defined
+/// outcome under the harness. A timeout (a polling loop the shim never breaks)
+/// and the synthetic `HarnessError` (the runtime couldn't even be built) carry no
+/// ground truth, so such samples are excluded rather than counted as failures.
+fn comparable(s: &BehaviorSignature) -> bool {
+    !matches!(s.outcome, RunOutcome::TimedOut)
+        && s.outcome != RunOutcome::Threw("HarnessError".to_string())
+}
+
+/// A short, diff-friendly rendering of a behavior signature for mismatch reports.
+fn describe(s: &BehaviorSignature) -> String {
+    let outcome = match &s.outcome {
+        RunOutcome::Completed => "completed".to_string(),
+        RunOutcome::Threw(n) => format!("threw {n}"),
+        RunOutcome::TimedOut => "timed-out".to_string(),
+    };
+    let preview: Vec<&str> = s.output.iter().take(3).map(|l| l.as_str()).collect();
+    format!("{outcome}; {} output line(s) {:?}", s.output.len(), preview)
 }
 
 fn print_row(name: &str, a: &Agg) {

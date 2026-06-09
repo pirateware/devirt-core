@@ -67,7 +67,15 @@ cargo run --release --bin report        # per-source readability scoreboard
 cargo run --release --bin report --files  # …plus every sample listed
 cargo run --release --bin report -- --json samples/metrics.jsonl --markdown
                                         # per-sample JSONL (HF viewer) + markdown card
+cargo run --release --bin report -- --equiv  # differential behavioral-equivalence gate
 ```
+
+`--equiv` is the soundness counterpart to the readability score: it runs each
+sample through the whole-program harness (`sandbox::behavior_signature`) before
+and after deobfuscation and requires identical signatures (terminal outcome +
+console output sequence), exiting non-zero on any mismatch. Samples that don't
+run comparably to begin with (a timeout, or a host the harness can't construct)
+are skipped. The `Equivalence` workflow runs it over the corpus on demand.
 
 The report groups samples by source (`generated`, `real/npm`, `real/tranco`,
 `real/httparchive`) and shows `kept%` plus **opaque% in→out** — the fraction of
