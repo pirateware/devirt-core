@@ -30,6 +30,7 @@ rustc-ice-*.txt
 # Local scratch input/output
 /in.js
 /out.js
+/orig.js
 
 # Obfuscated-JS corpus — pulled from the Hugging Face dataset, never vendored here
 # (scripts/pull-corpus.sh). Generate into it with scripts/gen-corpus.mjs.

@@ -23,6 +23,7 @@ oxc_syntax    = "0.134.0"
 oxc_ecmascript = "0.134.0"
 boa_engine = "0.21.1"
 oxc_ast_visit = "0.134.0"
+rayon = "1"
 
 [profile.release]
 opt-level = 3
