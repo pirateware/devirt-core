@@ -2504,3 +2504,14 @@ fn shadowed_json_parse_preserves_value() {
         "function go(){ var JSON = { parse: function(s){ return { a: 99 }; } }; return JSON.parse('x').a; } __r = go();",
     );
 }
+
+#[test]
+fn plain_object_materialization_preserves_value() {
+    // A pure IIFE returning a plain object resolves to the object literal.
+    assert_equivalent("var o = (function(){ return { a: 1, b: 'x' }; })(); __r = o.a + o.b;");
+    // A function-valued property is not literal-materializable, so the whole object
+    // declines — value preserved either way.
+    assert_equivalent(
+        "var o = (function(){ return { n: 5, f: function(){ return 1; } }; })(); __r = o.n + o.f();",
+    );
+}

@@ -95,3 +95,17 @@ fn shadowed_json_is_kept() {
     let out = deob("function g(){ var JSON = { parse: function(s){ return { a: 99 }; } }; return JSON.parse('x').a; } sink(g());");
     assert!(out.contains("JSON.parse") || out.contains("99"), "shadowed JSON mis-folded: {out}");
 }
+
+#[test]
+fn plain_object_result_materializes() {
+    // Generalized beyond JSON: a pure IIFE returning a plain object folds too.
+    assert_eq!(deob("sink((function(){ return { a: 1, b: 2 }; })().a);").trim(), "sink(1);");
+}
+
+#[test]
+fn custom_prototype_object_is_kept() {
+    // An object with a non-Object.prototype prototype must not be materialized (a
+    // literal would not reproduce the inherited members).
+    let out = deob("var o = (function(){ var p = { base: 1 }; var x = Object.create(p); x.own = 2; return x; })(); sink(o.own + o.base);");
+    assert!(out.contains("Object.create"), "custom-proto object wrongly materialized: {out}");
+}
