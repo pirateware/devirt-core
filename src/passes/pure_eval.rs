@@ -32,7 +32,7 @@ use oxc_traverse::{traverse_mut, Traverse, TraverseCtx};
 
 use crate::pass::Pass;
 use crate::passes::decoder_lift::freevars_of_expr;
-use crate::sandbox::{EvalValue, Sandbox};
+use crate::sandbox::Sandbox;
 use crate::util::build_scoping;
 
 #[derive(Default)]
@@ -70,7 +70,6 @@ impl Pass for PureEval {
             aggregates,
             agg_names,
             safe_coercion,
-            json_is_global: !bound.contains("JSON"),
         };
         traverse_mut(&mut e, allocator, program, scoping, ());
         self.changed = e.changed;
@@ -86,9 +85,6 @@ struct Evaluator {
     agg_names: std::collections::HashSet<String>,
     /// Pure coercion globals (`Boolean`/`Number`/…) provably not shadowed locally.
     safe_coercion: std::collections::HashSet<&'static str>,
-    /// `true` when `JSON` is not shadowed — so `JSON.parse(<literal>)` can fold to an
-    /// object/array literal (its result is by spec a plain data structure).
-    json_is_global: bool,
     changed: bool,
 }
 
@@ -115,19 +111,6 @@ fn is_foldable_call(expr: &Expression<'_>) -> bool {
             | Expression::StaticMemberExpression(_)
             | Expression::ComputedMemberExpression(_)
     )
-}
-
-/// Is `expr` a `JSON.parse(…)` call? (Used to gate object-literal materialization
-/// to the one form whose result is a guaranteed-plain data object.)
-fn is_json_parse_call(expr: &Expression<'_>) -> bool {
-    let Expression::CallExpression(call) = expr else {
-        return false;
-    };
-    let Expression::StaticMemberExpression(m) = &call.callee else {
-        return false;
-    };
-    m.property.name == "parse"
-        && matches!(&m.object, Expression::Identifier(id) if id.name == "JSON")
 }
 
 /// Pure global functions that return a primitive and that oxc's constant evaluator
@@ -187,13 +170,6 @@ impl<'a> Traverse<'a, ()> for Evaluator {
             Some(a) if self.sandbox.eval_to_value(&src).as_ref() == Some(&a) => a,
             _ => return,
         };
-
-        // An object literal is only materialized for `JSON.parse(<literal>)`, whose
-        // result is by spec a plain data object (no accessors / exotic prototype) —
-        // the one case `value_to_eval`'s object read is guaranteed faithful.
-        if matches!(val, EvalValue::Obj(_)) && !(self.json_is_global && is_json_parse_call(expr)) {
-            return;
-        }
 
         let span = expr.span();
         let Some(new_expr) = crate::passes::decoder_lift::eval_value_to_expr(&val, span, ctx) else {

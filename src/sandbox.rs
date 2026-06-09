@@ -633,29 +633,47 @@ fn value_to_eval(v: &JsValue, budget: &mut usize, ctx: &mut Context) -> Option<E
             }
             return Some(EvalValue::Arr(out));
         }
-        // A plain ordinary object: materialize its own enumerable string-keyed
-        // entries. Restricted to ordinary objects (no exotic/proxy behavior); the
-        // caller (the `JSON.parse` fold) further guarantees the result is a plain
-        // data object with no accessors, so reading each value is faithful.
+        // A plain data object: materialize its own enumerable *data* properties.
+        // Sound in isolation — we require an ordinary object whose prototype is the
+        // standard `Object.prototype`, take only own enumerable properties, and read
+        // each value from the data descriptor directly (so no getter ever runs and
+        // an accessor property declines the whole object). A materialized `{…}`
+        // literal thus has the same own data, prototype, and observable reads.
         if !obj.is_ordinary() {
             return None;
         }
+        let object_proto = ctx.intrinsics().constructors().object().prototype();
+        if obj.prototype().as_ref() != Some(&object_proto) {
+            return None; // custom prototype → a literal would not reproduce it
+        }
         let keys = obj.own_property_keys(ctx).ok()?;
-        let mut out = Vec::with_capacity(keys.len());
-        for key in keys {
-            // Only string keys (no symbols / array-index exotics). The caller
-            // guarantees the object is plain (a `JSON.parse` result), so every own
-            // string key is an enumerable data property — read its value directly.
-            let boa_engine::property::PropertyKey::String(s) = &key else {
-                return None;
-            };
+        // Pull (name, value) pairs out under a single borrow, then recurse with the
+        // borrow released (recursion needs `&mut ctx`).
+        let mut pending: Vec<(String, JsValue)> = Vec::with_capacity(keys.len());
+        {
+            let borrowed = obj.borrow();
+            let props = borrowed.properties();
+            for key in &keys {
+                // Only string keys (no symbols / array-index exotics).
+                let boa_engine::property::PropertyKey::String(s) = key else {
+                    return None;
+                };
+                let desc = props.get(key)?;
+                if desc.enumerable() != Some(true) {
+                    continue; // own but non-enumerable → not part of the literal
+                }
+                // `value()` is `Some` only for a data descriptor; an accessor → None.
+                let value = desc.value()?.clone();
+                pending.push((s.to_std_string_lossy(), value));
+            }
+        }
+        let mut out = Vec::with_capacity(pending.len());
+        for (name, value) in pending {
             if *budget == 0 {
                 return None;
             }
             *budget -= 1;
-            let name = s.to_std_string_lossy();
-            let val = obj.get(key.clone(), ctx).ok()?;
-            out.push((name, value_to_eval(&val, budget, ctx)?));
+            out.push((name, value_to_eval(&value, budget, ctx)?));
         }
         return Some(EvalValue::Obj(out));
     }
