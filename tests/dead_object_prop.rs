@@ -87,6 +87,16 @@ fn impure_value_member_kept() {
 
 #[test]
 fn getter_kept() {
-    let out = deob("(function(){ var O = { a: 1, get g(){ return side(); } }; return O.a; })();");
+    // The getter is *read* (`O.g`), so the object stays live. `const-object-inline`
+    // must not treat the accessor as an inlinable literal — `O.g` has to remain a
+    // real property access that triggers the getter — while the dead data member
+    // `a: 1` is pruned. (Were `g` unread, the whole object would soundly collapse,
+    // since defining a getter has no side effect; see
+    // `unaccessed_pure_members_removed` for that stronger-result precedent.)
+    let out = deob("(function(){ var O = { a: 1, get g(){ return side(); } }; return O.g; })();");
     assert!(out.contains("get g"), "accessor wrongly dropped: {out}");
+    assert!(
+        out.contains("O.g") || out.contains(".g"),
+        "getter read wrongly inlined: {out}"
+    );
 }

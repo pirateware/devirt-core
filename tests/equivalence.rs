@@ -2409,6 +2409,47 @@ fn object_state_read_before_init_preserves_value() {
 }
 
 // ---------------------------------------------------------------------------
+// Constant object-property inlining (src/passes/const_object_inline.rs). Reads of
+// a non-escaping, write-once, first-statement object literal's literal properties
+// are folded program-wide — but any escape or mutation must make it decline.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn const_object_inline_preserves_value() {
+    // A string-map dictionary read across a persistent closure (the case SsaOpt's
+    // intraprocedural fold cannot reach): the read still resolves.
+    assert_equivalent(
+        "var O = { msg: 'HIT', n: 7 }; var f = function(){ return O.msg + O.n; }; __r = f();",
+    );
+    // Chained dictionaries resolve one hop per round.
+    assert_equivalent("var O = { x: 'P' }; var P = { y: O.x }; __r = P.y;");
+    // An opaque predicate over two distinct constants folds to its taken branch.
+    assert_equivalent(
+        "var O = { a: 'p', b: 'q', hit: 'YES' }; __r = (O.a === O.b) ? 'NO' : O.hit;",
+    );
+}
+
+#[test]
+fn const_object_mutation_preserves_value() {
+    // Same property reassigned after init — must NOT inline the stale initial value.
+    assert_equivalent("var O = { a: 'INIT' }; O.a = 'CHANGED'; __r = O.a;");
+    // Compound member write.
+    assert_equivalent("var O = { n: 1 }; O.n += 5; __r = O.n;");
+    // Update expression on a member.
+    assert_equivalent("var O = { n: 1 }; O.n++; __r = O.n;");
+    // `delete` mutates the object.
+    assert_equivalent(
+        "var O = { a: 1, b: 2 }; delete O.a; __r = (O.a === undefined) + ':' + O.b;",
+    );
+    // The object escapes by reference; a callee could observe/mutate it.
+    assert_equivalent(
+        "function bump(o){ o.a = 9; } var O = { a: 1 }; bump(O); __r = O.a;",
+    );
+    // Computed access cannot be statically resolved.
+    assert_equivalent("var O = { a: 'X', b: 'Y' }; var k = 'b'; __r = O[k];");
+}
+
+// ---------------------------------------------------------------------------
 // Immutable-aggregate receiver materialization (src/passes/pure_eval.rs). A
 // variable-bound const array/object receiver is resolved by re-materializing it in
 // the sandbox — only when it is provably never mutated, aliased, or rebound.
