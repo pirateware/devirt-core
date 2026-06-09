@@ -83,3 +83,15 @@ fn shadowed_coercion_global_is_kept() {
     let out = deob("function g(){ var Number = function(x){ return ext(x); }; return Number(5); } sink(g());");
     assert!(out.contains("Number(5)") || out.contains("ext("), "shadowed coercion wrongly folded: {out}");
 }
+
+#[test]
+fn json_parse_object_materializes() {
+    assert_eq!(deob(r#"sink(JSON.parse('{"a":5,"b":"x"}').a);"#).trim(), "sink(5);");
+    assert_eq!(deob(r#"sink(JSON.parse('[10,20,30]')[2]);"#).trim(), "sink(30);");
+}
+
+#[test]
+fn shadowed_json_is_kept() {
+    let out = deob("function g(){ var JSON = { parse: function(s){ return { a: 99 }; } }; return JSON.parse('x').a; } sink(g());");
+    assert!(out.contains("JSON.parse") || out.contains("99"), "shadowed JSON mis-folded: {out}");
+}
