@@ -14,6 +14,7 @@ mod function_ctor;
 mod global_const_inline;
 mod math_fingerprint;
 mod member_normalize;
+mod objstate_lower;
 mod proxy_inline;
 mod pure_eval;
 mod reconstruct_object;
@@ -38,6 +39,7 @@ pub use function_ctor::FunctionCtor;
 pub use global_const_inline::GlobalConstInline;
 pub use math_fingerprint::MathFingerprint;
 pub use member_normalize::MemberNormalize;
+pub use objstate_lower::ObjStateLower;
 pub use proxy_inline::ProxyInline;
 pub use pure_eval::PureEval;
 pub use reconstruct_object::ReconstructObject;
@@ -59,6 +61,11 @@ pub fn default_pipeline() -> Vec<Box<dyn Pass>> {
         // Split statement-level comma chains into one statement per effect, so
         // later passes (fold, inline, DCE) see individual assignments.
         Box::new(SequenceSplit::default()),
+        // Lower a private object's integer state property (`while (ctx.s) switch
+        // (ctx.s) { … ctx.s = K … }`) to a fresh local, so the identifier-state
+        // unflatteners below can recover it. Runs before them; declines unless the
+        // object provably never escapes.
+        Box::new(ObjStateLower),
         // Inline program-wide write-once literal constants defined in an init
         // function and read elsewhere (`case varN:` → `case 19:`). Runs before
         // `unflatten` so symbolic case labels become numeric and the dispatcher

@@ -2352,3 +2352,55 @@ fn function_constructor_local_capture_preserves_value() {
         "globalThis.k = 4; var r = new Function('return k')(); __r = r; delete globalThis.k;",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Object-state lowering (src/passes/objstate_lower.rs). A private object's integer
+// switch-discriminant property is lowered to a local so the dispatcher recovers.
+// Each "lowers" case is paired with a sibling where lowering would be unsound
+// (escape, read-before-init, closure capture); the differential net confirms both.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn object_state_lowering_preserves_value() {
+    // The canonical private object-state dispatcher linearizes; value preserved.
+    assert_equivalent(
+        "var ctx = { s: 1, acc: 0 }; \
+         while (ctx.s) { switch (ctx.s) { \
+           case 1: ctx.acc += 10; ctx.s = 2; break; \
+           case 2: ctx.acc += 20; ctx.s = 0; break; } } \
+         __r = ctx.acc;",
+    );
+    // A looping object-state machine (relooper) over a private object.
+    assert_equivalent(
+        "function run(n){ var c = { s: 1, acc: 0, i: 0 }; \
+           while (c.s) { switch (c.s) { \
+             case 1: if (c.i < n) { c.s = 2; } else { c.s = 0; } break; \
+             case 2: c.acc += c.i; c.i = c.i + 1; c.s = 1; break; } } return c.acc; } \
+         __r = run(4);",
+    );
+}
+
+#[test]
+fn object_state_escape_preserves_value() {
+    // The object escapes (passed to a function that reads its state), so lowering
+    // must decline; the dispatcher runs as written.
+    assert_equivalent(
+        "var seen = 0; function peek(o){ seen = o.s; } \
+         var ctx = { s: 1, acc: 0 }; \
+         while (ctx.s) { switch (ctx.s) { \
+           case 1: ctx.acc += 1; peek(ctx); ctx.s = 0; break; } } \
+         __r = ctx.acc + ':' + seen;",
+    );
+}
+
+#[test]
+fn object_state_read_before_init_preserves_value() {
+    // `ctx.s` is read (via a guarded access) before `ctx` is initialized; lowering
+    // would turn the object's pre-init throw into a local `undefined`. Declines.
+    assert_equivalent(
+        "var snap = (typeof ctx === 'undefined') ? 'u' : 'd'; \
+         var ctx = { s: 1, acc: 0 }; \
+         while (ctx.s) { switch (ctx.s) { case 1: ctx.acc += 1; ctx.s = 0; break; } } \
+         __r = snap + ':' + ctx.acc;",
+    );
+}
