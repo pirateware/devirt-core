@@ -167,3 +167,26 @@ fn generator_call_is_not_inlined() {
         "#,
     );
 }
+
+#[test]
+fn string_array_rotation_via_inline_iife_is_replayed() {
+    // A direct-literal string array rotated by an inline `(function(a,n){ while(--n)
+    // a.push(a.shift()); })(arr, k)` IIFE. The rotation must be replayed before the
+    // table is baked — otherwise lifted decodes read the un-rotated order.
+    assert_whole_program_equivalent(
+        r#"
+        var arr = ['ab', 'cd', 'ef'];
+        (function (a, n) { while (--n) { a.push(a.shift()); } })(arr, 2);
+        function d(i) { return arr[i]; }
+        console.log(d(0) + d(1) + d(2));
+        "#,
+    );
+    assert_whole_program_equivalent(
+        r#"
+        var t = ['one', 'two', 'three', 'four'];
+        (function (a, n) { while (--n) { a.push(a.shift()); } })(t, 3);
+        function get(i) { return t[i - 0]; }
+        console.log(get(0), get(1), get(2), get(3));
+        "#,
+    );
+}
