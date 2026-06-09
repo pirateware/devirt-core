@@ -21,3 +21,17 @@ fn unsound_shapes_are_left_intact() {
     // Length mismatch (a dropped element could carry a side effect).
     assert!(deob("var [a, b] = [1, 2, 3]; sink(a);").contains("1,"), "length-mismatch split");
 }
+
+#[test]
+fn object_literal_destructuring_splits() {
+    assert_eq!(deob("var {a, b} = { a: 1, b: 2 }; sink(a + b);").trim().lines().last().unwrap(), "sink(3);");
+    assert_eq!(deob("var { a: x, b: y } = { a: 10, b: 20 }; sink(x + y);").trim().lines().last().unwrap(), "sink(30);");
+}
+
+#[test]
+fn unsound_object_shapes_are_kept() {
+    // Impure value: dropping/reordering would lose the effect.
+    assert!(deob("function f(){ var {a}={a:1,b:side()}; return a; } sink(f());").contains("side()"), "impure-value split");
+    // Missing key would bind undefined.
+    assert!(deob("var {a,c}={a:1,b:2}; sink(c);").contains('{'), "missing-key split");
+}

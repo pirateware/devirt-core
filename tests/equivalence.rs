@@ -2531,3 +2531,15 @@ fn destructure_split_preserves_value() {
     // Length mismatch keeps the (dropped) element's side effect by declining.
     assert_equivalent("var hit = 0; var [a, b] = [1, 2, (hit = 1)]; __r = a + b + ':' + hit;");
 }
+
+#[test]
+fn object_destructure_split_preserves_value() {
+    assert_equivalent("var { a, b } = { a: 10, b: 'x' }; __r = a + b;");
+    assert_equivalent("var { a: x, b: y } = { a: 3, b: 4 }; __r = x * y;");
+    // Reordered pattern vs. literal, pure values — value preserved.
+    assert_equivalent("var { b, a } = { a: 1, b: 2 }; __r = a + ':' + b;");
+    // Impure value declines; the side effect (and value) is preserved.
+    assert_equivalent(
+        "var hit = 0; var { a } = { a: 5, b: (hit = 1) }; __r = a + ':' + hit;",
+    );
+}
