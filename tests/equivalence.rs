@@ -2012,15 +2012,18 @@ fn relooper_structures_loop_with_return_terminator() {
 #[test]
 fn relooper_declines_irreducible() {
     // Two states with cross edges (a jump into a loop body): irreducible. The pass
-    // must decline — the dispatcher stays, value preserved either way.
+    // must decline — the dispatcher stays, value preserved either way. The case-1
+    // split targets *both* loop entries (2 and 3); its test is `Math.random() < 2`,
+    // which is always true at runtime (so the path is deterministic and equivalence
+    // holds) but cannot be folded — the double-eval guard rejects `Math.random()` as
+    // nondeterministic, so the edge stays two-way and the graph stays irreducible.
     assert_declined(
         r#"
         var v = 0, i = 0;
-        var enter = (String(1) === "1") ? 2 : 3;
         var s = 1;
         while (s) {
             switch (s) {
-                case 1: s = enter; break;
+                case 1: if (Math.random() < 2) { s = 2; } else { s = 3; } break;
                 case 2: v += 1; i = i + 1; if (i < 3) { s = 3; } else { s = 0; } break;
                 case 3: v += 10; i = i + 1; if (i < 3) { s = 2; } else { s = 0; } break;
             }
@@ -2456,4 +2459,26 @@ fn array_returning_pure_call_preserves_value() {
     assert_equivalent("__r = 'a,b,c'.split(',').join('|');");
     // Element types are preserved through materialization (string stays string).
     assert_equivalent("var t = (function(){ return ['1','0','0']; })(); __r = t[0] + t[1] + t[2];");
+}
+
+// ---------------------------------------------------------------------------
+// Pure coercion-global folding (src/passes/pure_eval.rs). `Boolean`/`Number`/
+// `String`/… with constant args fold to their primitive; a locally-shadowed name
+// is left alone.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn coercion_global_fold_preserves_value() {
+    assert_equivalent("__r = Boolean(0) ? 'a' : 'b';");
+    assert_equivalent("__r = Number('42') + Number('0x10');");
+    assert_equivalent("__r = String(123) + String(true);");
+    assert_equivalent("__r = parseInt('0x1f', 16) + parseFloat('3.5');");
+}
+
+#[test]
+fn shadowed_coercion_global_preserves_value() {
+    // The local `String` shadow must be honored, not folded as the global.
+    assert_equivalent(
+        "function go(){ var String = function(x){ return 'S' + x; }; return String(7); } __r = go();",
+    );
 }

@@ -56,11 +56,20 @@ impl Pass for PureEval {
         // resolves even though the array stays bound to a variable.
         let aggregates = immutable_aggregates(program, &scoping);
         let agg_names: std::collections::HashSet<String> = aggregates.keys().cloned().collect();
+        // Pure coercion globals safe to fold as bare calls: those not bound anywhere
+        // in the program (so a `Number(…)` cannot be a local shadow of the global).
+        let bound: std::collections::HashSet<&str> = scoping.symbol_names().collect();
+        let safe_coercion: std::collections::HashSet<&'static str> = PURE_COERCION_GLOBALS
+            .iter()
+            .copied()
+            .filter(|n| !bound.contains(n))
+            .collect();
         let mut e = Evaluator {
             sandbox,
             changed: false,
             aggregates,
             agg_names,
+            safe_coercion,
         };
         traverse_mut(&mut e, allocator, program, scoping, ());
         self.changed = e.changed;
@@ -74,6 +83,8 @@ struct Evaluator {
     aggregates: std::collections::HashMap<String, String>,
     /// Just the keys of `aggregates`, for the free-name gate.
     agg_names: std::collections::HashSet<String>,
+    /// Pure coercion globals (`Boolean`/`Number`/…) provably not shadowed locally.
+    safe_coercion: std::collections::HashSet<&'static str>,
     changed: bool,
 }
 
@@ -85,10 +96,10 @@ struct Evaluator {
 ///     built-ins const-fold cannot reach (`['a','b'].join('')`, `"x".toUpperCase()`,
 ///     `[…].concat(…)`). A user method like `obj.m()` has `obj` as a free name and
 ///     is rejected by the gate; a literal/`Math`/`String` receiver passes.
-///
-/// Bare global calls (`parseInt(…)`, `Math.max(…)`) are intentionally excluded —
-/// const-fold/oxc already evaluate those, so adding them here would only duplicate
-/// work and run `freevars` over every plain `foo()` call site.
+///   * a **pure coercion global** — `Boolean(…)`, `Number(…)`, `String(…)` and
+///     friends, which oxc's evaluator does not fold (unlike `parseInt`/`Math.max`).
+///     Restricted to a fixed whitelist so the `freevars` walk is not run over every
+///     plain `foo()` call site; the closed gate then proves the argument is pure.
 fn is_foldable_call(expr: &Expression<'_>) -> bool {
     let Expression::CallExpression(call) = expr else {
         return false;
@@ -102,12 +113,23 @@ fn is_foldable_call(expr: &Expression<'_>) -> bool {
     )
 }
 
+/// Pure global functions that return a primitive and that oxc's constant evaluator
+/// does not fold. Limited to value coercions whose result is fully determined by
+/// (pure) arguments — the closed gate still proves the arguments are side-effect
+/// free, and the double-eval guard rejects any nondeterminism.
+const PURE_COERCION_GLOBALS: &[&str] = &[
+    "Boolean", "Number", "String", "parseInt", "parseFloat", "isNaN", "isFinite",
+];
+
 impl<'a> Traverse<'a, ()> for Evaluator {
     fn enter_expression(&mut self, expr: &mut Expression<'a>, ctx: &mut TraverseCtx<'a, ()>) {
-        // A foldable call, or a member access whose root is an immutable aggregate
-        // (`a.join(…)`, `o.a.b`) — the latter lets a variable-bound const array/
-        // object receiver resolve.
-        if !is_foldable_call(expr) && !self.is_aggregate_member(expr) {
+        // A foldable call, a member access whose root is an immutable aggregate
+        // (`a.join(…)`, `o.a.b`), or a bare call to a non-shadowed pure coercion
+        // global (`Number('5')`).
+        if !is_foldable_call(expr)
+            && !self.is_aggregate_member(expr)
+            && !self.is_safe_coercion_call(expr)
+        {
             return;
         }
         // Only fold a call whose *result is consumed* (an initializer, argument, or
@@ -159,6 +181,15 @@ impl<'a> Traverse<'a, ()> for Evaluator {
 }
 
 impl Evaluator {
+    /// A bare call `f(…)` where `f` is a pure coercion global proven not shadowed.
+    fn is_safe_coercion_call(&self, expr: &Expression<'_>) -> bool {
+        let Expression::CallExpression(call) = expr else {
+            return false;
+        };
+        matches!(&call.callee, Expression::Identifier(id)
+            if self.safe_coercion.contains(id.name.as_str()))
+    }
+
     /// A static/computed member access whose root receiver is an immutable
     /// aggregate (`o.a.b`, `a[0].x`) — worth resolving to its primitive value.
     fn is_aggregate_member(&self, expr: &Expression<'_>) -> bool {
