@@ -2543,3 +2543,22 @@ fn object_destructure_split_preserves_value() {
         "var hit = 0; var { a } = { a: 5, b: (hit = 1) }; __r = a + ':' + hit;",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Single-iteration loop unwrapping (src/passes/single_iter_loop.rs).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn single_iter_loop_preserves_value() {
+    assert_equivalent("var r = 0; while (1) { r = 6 * 7; break; } __r = r;");
+    assert_equivalent("__r = (function(){ for (;;) { var v = 5; return v + 1; } })();");
+    // Inner switch break is preserved; outer single-iteration unwrapped.
+    assert_equivalent(
+        "function f(n){ var r = 0; while (true) { switch (n) { case 1: r = 10; break; default: r = 20; } break; } return r; } \
+         __r = f(1) + ':' + f(9);",
+    );
+    // A real loop (continue) must be preserved → value still correct.
+    assert_equivalent(
+        "var i = 0, acc = 0; while (1) { i++; acc += i; if (i < 4) continue; break; } __r = acc;",
+    );
+}
