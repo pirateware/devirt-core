@@ -482,7 +482,15 @@ struct Inliner<'a> {
 }
 
 impl<'a> Traverse<'a, ()> for Inliner<'a> {
-    fn enter_expression(&mut self, expr: &mut Expression<'a>, ctx: &mut TraverseCtx<'a, ()>) {
+    /// Inline on **exit**, not enter: when an argument carries a function/arrow/
+    /// class, the spliced body holds a clone whose `scope_id` cell is reset to
+    /// `None`. Replacing on enter would make `traverse_mut` descend into that
+    /// clone and panic unwrapping the missing `scope_id`; replacing on exit means
+    /// the walker has already finished this node's children and never re-descends.
+    /// The stale `scope_id` is harmless — the next pass rebuilds scoping. Because
+    /// we visit bottom-up, an argument that is itself a proxy call is already
+    /// resolved by the time its enclosing call is inlined.
+    fn exit_expression(&mut self, expr: &mut Expression<'a>, ctx: &mut TraverseCtx<'a, ()>) {
         let replacement: Option<Expression<'a>> = {
             let Expression::CallExpression(call) = &*expr else {
                 return;
@@ -524,14 +532,12 @@ impl<'a> Traverse<'a, ()> for Inliner<'a> {
                 if proxy.unused.contains(param) && !is_side_effect_free(ae) {
                     return; // would drop the argument's side effect
                 }
-                // A cloned argument containing a function/class/arrow carries
-                // scope cells that are reset to None by the clone; the traverse
-                // walker unwraps a function's scope_id and would panic when it
-                // descends into the spliced node. Such args are rare for operator
-                // proxies, so just decline the inline (semantics unaffected).
-                if contains_scoped_node(ae) {
-                    return;
-                }
+                // A function/arrow/class argument is only reached here for a
+                // single-use param (`multi_use`/`unused` args that aren't
+                // side-effect-free already declined above), so it is moved to
+                // exactly one site — no duplication. The clone's reset `scope_id`
+                // is safe because we inline on exit (see `exit_expression`).
+                //
                 // Receiver guard: an apply proxy detaches its callee from any
                 // receiver. Substituting a member expression into callee position
                 // would re-bind `this`, changing semantics — decline.
@@ -635,36 +641,6 @@ fn resolve_proxy_call<'a, 'e>(
         }
     }
     Some((base, out))
-}
-
-/// Whether `expr` contains a node that owns a scope (function, arrow, class).
-/// Cloning such a node resets its scope_id cell to None, which the traverse
-/// walker later unwraps — so we must not splice one mid-traversal.
-fn contains_scoped_node(expr: &Expression<'_>) -> bool {
-    struct Finder {
-        found: bool,
-    }
-    impl<'a> Visit<'a> for Finder {
-        fn visit_function(
-            &mut self,
-            _f: &oxc_ast::ast::Function<'a>,
-            _flags: oxc_syntax::scope::ScopeFlags,
-        ) {
-            self.found = true; // do not recurse: one is enough
-        }
-        fn visit_arrow_function_expression(
-            &mut self,
-            _f: &oxc_ast::ast::ArrowFunctionExpression<'a>,
-        ) {
-            self.found = true;
-        }
-        fn visit_class(&mut self, _c: &oxc_ast::ast::Class<'a>) {
-            self.found = true;
-        }
-    }
-    let mut f = Finder { found: false };
-    f.visit_expression(expr);
-    f.found
 }
 
 fn is_member_expr(expr: &Expression<'_>) -> bool {

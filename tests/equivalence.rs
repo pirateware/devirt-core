@@ -129,6 +129,15 @@ fn apply_proxy_preserves_value_and_receiver() {
         __r = O.ap(obj.get);
         "#,
     );
+    // Apply proxy with a *function-expression* argument (the call-forwarder shape).
+    // Now inlined on exit; the function is created and invoked exactly once, so the
+    // value is preserved.
+    assert_equivalent(
+        r#"
+        var O = { ap: function(f, x){ return f(x); } };
+        __r = O.ap(function(n){ return n * 3; }, 4);
+        "#,
+    );
 }
 
 #[test]

@@ -110,17 +110,28 @@ fn apply_proxy_with_method_arg_is_not_inlined() {
 }
 
 #[test]
-fn function_argument_does_not_panic_and_is_skipped() {
-    // Splicing a cloned function arg would reset its scope_id and crash the
-    // walker; such calls must be left intact, not inlined.
+fn function_argument_inlines_without_panic() {
+    // A function arg resets its clone's scope_id; inlining on *exit* keeps the
+    // walker from descending into it, so the call inlines instead of being
+    // skipped. The param is single-use, so the function is moved to one site.
     let out = deob(
         "var O = { eq: function(a,b){ return a === b; } };
          sink(O.eq(function(){ return 1; }, g));",
     );
-    assert!(
-        out.contains("O.eq("),
-        "function-arg call should be left intact: {out}"
+    assert!(!out.contains("O.eq("), "function-arg call not inlined: {out}");
+    assert!(out.contains("=== g"), "body not substituted: {out}");
+}
+
+#[test]
+fn call_forwarder_with_function_arg_inlines() {
+    // The obfuscator's self-defending call proxy: `f(a, b)` forwarder invoked as
+    // `P.uPWCB(fn, ctx, cb)` → `fn(ctx, cb)`, even with a function callback arg.
+    let out = deob(
+        "var P = { uPWCB: function(f, a, b){ return f(a, b); } };
+         var r = P.uPWCB(host, this, function(){ return 7; }); sink(r);",
     );
+    assert!(!out.contains("uPWCB"), "call proxy survived: {out}");
+    assert!(out.contains("host(this, function"), "forward not applied: {out}");
 }
 
 #[test]
