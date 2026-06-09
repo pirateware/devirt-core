@@ -2267,9 +2267,34 @@ fn build_preamble<'a>(
     // among the real rotations) must not take the library down with it — in the
     // real, non-crashing program that throw is caught upstream, so swallowing it
     // here makes the sandbox *more* faithful, and a genuine rotation never throws.
+    // Names baked into the preamble as a pure *data-table* declaration
+    // (`var t = […]` / `{…}`). A rotation IIFE that references one of these mutates
+    // the baked copy, so it must be replayed — otherwise the table stays un-rotated
+    // and every lifted decode through it is wrong. (Value-binding / decoder names are
+    // handled by `pure_funcs`; restricting the extra set to literal data tables keeps
+    // a value-binding table's own setup IIFE from being mis-collected here.)
+    let mut table_names: HashSet<String> = HashSet::new();
+    for stmt in tops {
+        if statement_is_pure(stmt, analysis) {
+            if let Statement::VariableDeclaration(vd) = stmt {
+                for d in &vd.declarations {
+                    if let BindingPattern::BindingIdentifier(id) = &d.id {
+                        if matches!(
+                            d.init.as_ref(),
+                            Some(Expression::ArrayExpression(_) | Expression::ObjectExpression(_))
+                        ) {
+                            table_names.insert(id.name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let mut iifes = IifeCollector {
         allowed,
         pure_funcs: &analysis.pure_funcs,
+        data_names: &table_names,
         out: Vec::new(),
     };
     for stmt in tops {
@@ -2532,6 +2557,8 @@ impl<'a> Visit<'a> for AliasCollector {
 struct IifeCollector<'r> {
     allowed: &'r HashSet<String>,
     pure_funcs: &'r HashSet<String>,
+    /// Names baked as pure literal data tables — a rotation touching one is replayed.
+    data_names: &'r HashSet<String>,
     out: Vec<String>,
 }
 
@@ -2545,12 +2572,19 @@ impl<'a, 'r> Visit<'a> for IifeCollector<'r> {
             if is_iife {
                 let fv = freevars_of_expr(expr);
                 let free = fv.free();
-                let touches_decoder = free.iter().any(|n| self.pure_funcs.contains(n));
+                // The IIFE must touch a baked decoder function. An array *rotation*
+                // that references only a baked *data table* (not a decoder fn) —
+                // `(function(a,n){ while(--n) a.push(a.shift()); })(arr, 2)` — is also
+                // replayed, so a rotation-only table (admitted by `scan_live_mutated`)
+                // is baked in its rotated form, not stale.
+                let touches_baked = free
+                    .iter()
+                    .any(|n| self.pure_funcs.contains(n) || self.data_names.contains(n));
                 let pure = !fv.impure
                     && free
                         .iter()
                         .all(|n| self.allowed.contains(n) || GLOBALS.contains(&n.as_str()));
-                if touches_decoder && pure {
+                if touches_baked && pure {
                     let mut cg = Codegen::new();
                     cg.print_expression(expr);
                     self.out.push(cg.into_source_text());
