@@ -1805,6 +1805,26 @@ fn string_order_chain_preserves_value_and_order() {
 }
 
 #[test]
+fn string_order_while_form_preserves_value_and_order() {
+    // The hoisted-init while-form: cursor setup precedes `while (true)`. Same
+    // array-driven order must hold.
+    assert_equivalent(
+        "var log = ''; \
+         (function () { \
+           var a = \"2|0|1\".split(\"|\"), i = 0; \
+           while (true) { \
+             switch (a[i++]) { \
+               case \"0\": log += 'b'; continue; \
+               case \"1\": log += 'c'; continue; \
+               case \"2\": log += 'a'; continue; \
+             } \
+             break; \
+           } \
+         })(); __r = log;",
+    );
+}
+
+#[test]
 fn string_order_return_terminal_preserves_value() {
     // A `return` case stops the walk mid-array; later keys must not run.
     assert_equivalent(
