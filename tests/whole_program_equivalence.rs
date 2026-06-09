@@ -123,3 +123,47 @@ fn throwing_program_signature_matches() {
         "#,
     );
 }
+
+#[test]
+fn host_global_in_try_catch_is_not_misfolded() {
+    // Under the host shim `window` is bound (the permissive proxy), so the `try`
+    // succeeds. A deobfuscator that evaluated this in its bare sandbox — where
+    // `window` is unbound — would have the `catch` swallow a sandbox-only
+    // ReferenceError and fold to 99, diverging from the real host.
+    assert_whole_program_equivalent(
+        r#"
+        var out = (function () { try { return window.someKey; } catch (e) { return 99; } })();
+        console.log(typeof out);
+        "#,
+    );
+}
+
+#[test]
+fn typeof_host_global_is_not_misfolded() {
+    assert_whole_program_equivalent(r#"console.log((function () { return typeof window; })());"#);
+}
+
+#[test]
+fn async_function_call_is_not_inlined() {
+    // `a()` yields a Promise; folding it to the body value (21) would make
+    // `a().then(…)` a `TypeError` (numbers have no `.then`) — a different outcome.
+    assert_whole_program_equivalent(
+        r#"
+        async function a() { return 21; }
+        a().then(function (v) { console.log('resolved', v * 2); });
+        console.log('sync');
+        "#,
+    );
+}
+
+#[test]
+fn generator_call_is_not_inlined() {
+    // `g()` yields an iterator, not the body value.
+    assert_whole_program_equivalent(
+        r#"
+        function* g() { return 5; }
+        var it = g();
+        console.log(typeof it.next);
+        "#,
+    );
+}

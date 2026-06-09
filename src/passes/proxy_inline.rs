@@ -207,12 +207,16 @@ impl<'a> ProxyCollector<'a> {
             };
             let key = format!("{obj}.{prop_name}");
             match &p.value {
-                Expression::FunctionExpression(f) if f.id.is_none() => {
+                // Skip `async`/generator functions: their call yields a Promise /
+                // iterator, not the body's return value, so inlining it is unsound.
+                Expression::FunctionExpression(f)
+                    if f.id.is_none() && !f.r#async && !f.generator =>
+                {
                     if let Some(body) = &f.body {
                         self.try_record(key, obj.to_string(), &f.params, body, false);
                     }
                 }
-                Expression::ArrowFunctionExpression(f) => {
+                Expression::ArrowFunctionExpression(f) if !f.r#async => {
                     self.try_record(key, obj.to_string(), &f.params, &f.body, f.expression);
                 }
                 _ => {}
@@ -245,7 +249,11 @@ impl<'a> Visit<'a> for ProxyCollector<'a> {
         if let (Some(id), Some(body)) = (&func.id, &func.body) {
             let name = id.name.to_string();
             *self.value_writes.entry(name.clone()).or_default() += 1;
-            self.try_record(name.clone(), name, &func.params, body, false);
+            // An `async`/generator function call yields a Promise / iterator, not the
+            // body's return value — never record it as an inlinable proxy.
+            if !func.r#async && !func.generator {
+                self.try_record(name.clone(), name, &func.params, body, false);
+            }
         }
         oxc_ast_visit::walk::walk_function(self, func, flags);
     }
@@ -257,12 +265,14 @@ impl<'a> Visit<'a> for ProxyCollector<'a> {
                 *self.value_writes.entry(name.clone()).or_default() += 1;
             }
             match &node.init {
-                Some(Expression::FunctionExpression(f)) if f.id.is_none() => {
+                Some(Expression::FunctionExpression(f))
+                    if f.id.is_none() && !f.r#async && !f.generator =>
+                {
                     if let Some(body) = &f.body {
                         self.try_record(name.clone(), name, &f.params, body, false);
                     }
                 }
-                Some(Expression::ArrowFunctionExpression(f)) => {
+                Some(Expression::ArrowFunctionExpression(f)) if !f.r#async => {
                     self.try_record(name.clone(), name, &f.params, &f.body, f.expression);
                 }
                 Some(Expression::ObjectExpression(obj)) => {

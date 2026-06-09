@@ -62,15 +62,15 @@ pub(crate) const GLOBALS: &[&str] = &[
     "NaN",
     "Infinity",
     "Date",
-    // Global-object handles. A decoder's environment-detection prelude reads
-    // these (`globalThis || global || window || self`) to find `String`,
-    // `Array`, etc. Referencing them is side-effect free; in the sandbox only
-    // `globalThis` is actually bound, so a decoder that hard-depends on a missing
-    // one simply fails to eval and is left untouched (execution is the validator).
+    // The global-object handle. `globalThis` is bound in the sandbox exactly as at
+    // runtime, so reading it (and `globalThis.String`, the env-detection idiom) is
+    // sound. The *unbound* host handles `window`/`global`/`self` are deliberately
+    // NOT listed: in the sandbox they raise `ReferenceError`, which a bare reference
+    // surfaces (the eval fails → decline) but a `try/catch` or `typeof` swallows —
+    // folding to a value that disagrees with the real host (where they ARE bound).
+    // Treating them as free names rejects exactly those unsound folds; a decoder
+    // that truly needs one is declined rather than mis-evaluated.
     "globalThis",
-    "window",
-    "global",
-    "self",
     // Collections & symbols — common in modern decoders (e.g. a Map charset
     // lookup). Pure to construct; mutation stays inside the sandbox.
     "Map",
