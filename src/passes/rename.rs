@@ -799,6 +799,7 @@ fn known_global(name: &str) -> Option<&'static str> {
 ///  2. only list-mutation / list-inspection members → `list`;
 ///  3. a single distinct, meaningful accessed property → that property
 ///     (`e.target` → `target`, `x.userAgent` → `userAgent`).
+///
 /// Returns `None` when nothing is confident, falling through to `fn`/`var`.
 fn usage_hint(props: Option<&Vec<String>>) -> Option<String> {
     let props = props?;
