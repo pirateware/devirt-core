@@ -1,0 +1,17 @@
+[package]
+name = "devirt-cli"
+description = "Command-line deobfuscator: parse, run the fixpoint pipeline, print readable JavaScript."
+keywords = ["deobfuscator", "javascript", "obfuscation", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "deob"
+path = "src/main.rs"
+
+[dependencies]
+devirt-core.workspace = true

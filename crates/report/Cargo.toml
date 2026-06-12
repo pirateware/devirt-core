@@ -1,0 +1,20 @@
+# Maintainer/corpus tooling: readability scoring + the differential
+# behavioral-equivalence gate over ./samples. Not a user-facing artifact, so it
+# is not published to crates.io.
+[package]
+name = "devirt-report"
+description = "Corpus readability scoring and behavioral-equivalence gate for devirt-core."
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "report"
+path = "src/main.rs"
+
+[dependencies]
+devirt-core.workspace = true
+rayon.workspace = true

@@ -23,10 +23,21 @@ nothing (fixpoint). Passes live in `src/passes/` and are registered in
 Control-flow recovery uses an SSA-based IR (`src/ir/`) with dominator analysis and
 a relooper to rebuild structured code from flattened dispatchers.
 
+## Layout
+
+This is a Cargo workspace with three crates under `crates/`:
+
+- **`devirt-core`** (`crates/core`) — the library (import name `devirt_core`); all
+  passes, the IR, and the sandbox live here.
+- **`devirt-cli`** (`crates/cli`) — the `deob` command-line front-end.
+- **`devirt-report`** (`crates/report`) — the `report` corpus-scoring / equivalence
+  tool (maintainer tooling, not published).
+
 ## Build
 
 ```sh
-cargo build --release
+cargo build --release            # builds the whole workspace
+cargo build --release -p devirt-core   # …or a single crate
 ```
 
 ## CLI
@@ -128,3 +139,16 @@ over adversarial input, so two host-crash vectors are contained:
   overflow) collapses to the worker thread's `join()` returning `Err`, and
   `deobfuscate` falls back to returning the input cleanly reformatted with
   `Report::error` set. Callers never see a crash.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.

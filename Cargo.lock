@@ -290,8 +290,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "devirt-cli"
+version = "0.3.0"
+dependencies = [
+ "devirt-core",
+]
+
+[[package]]
 name = "devirt-core"
-version = "0.2.4"
+version = "0.3.0"
 dependencies = [
  "boa_engine",
  "oxc_allocator",
@@ -304,6 +311,13 @@ dependencies = [
  "oxc_span",
  "oxc_syntax",
  "oxc_traverse",
+]
+
+[[package]]
+name = "devirt-report"
+version = "0.3.0"
+dependencies = [
+ "devirt-core",
  "rayon",
 ]
 

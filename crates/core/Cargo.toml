@@ -1,0 +1,27 @@
+[package]
+name = "devirt-core"
+description = "A generic, sample-agnostic JavaScript deobfuscator built as a compiler: a fixpoint of semantics-preserving AST rewrites over oxc."
+keywords = ["deobfuscator", "javascript", "obfuscation", "ast", "compiler"]
+categories = ["development-tools", "parsing"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "devirt_core"
+path = "src/lib.rs"
+
+[dependencies]
+oxc_allocator.workspace = true
+oxc_parser.workspace = true
+oxc_ast.workspace = true
+oxc_semantic.workspace = true
+oxc_traverse.workspace = true
+oxc_codegen.workspace = true
+oxc_span.workspace = true
+oxc_syntax.workspace = true
+oxc_ecmascript.workspace = true
+oxc_ast_visit.workspace = true
+boa_engine.workspace = true

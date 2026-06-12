@@ -1,29 +1,32 @@
-[package]
-name = "devirt-core"
-version = "0.2.4"
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/cli", "crates/report"]
+
+# Shared package metadata. Each crate inherits these with `field.workspace = true`,
+# so version/license/repository are set in exactly one place.
+[workspace.package]
+version = "0.3.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/devirt-dev/devirt-core"
+authors = ["Vasco Smith <vasie1337@gmail.com>"]
 
-[[bin]]
-name = "deob"
-path = "src/main.rs"
-
-[[bin]]
-name = "report"
-path = "src/bin/report.rs"
-
-[dependencies]
-oxc_allocator = "0.134.0"
-oxc_parser    = "0.134.0"
-oxc_ast       = "0.134.0"
-oxc_semantic  = "0.134.0"
-oxc_traverse  = "0.134.0"
-oxc_codegen   = "0.134.0"
-oxc_span      = "0.134.0"
-oxc_syntax    = "0.134.0"
+# Dependency versions pinned once for the whole workspace; crates opt in by name
+# with `<dep>.workspace = true`.
+[workspace.dependencies]
+devirt-core    = { path = "crates/core", version = "0.3.0" }
+oxc_allocator  = "0.134.0"
+oxc_parser     = "0.134.0"
+oxc_ast        = "0.134.0"
+oxc_semantic   = "0.134.0"
+oxc_traverse   = "0.134.0"
+oxc_codegen    = "0.134.0"
+oxc_span       = "0.134.0"
+oxc_syntax     = "0.134.0"
 oxc_ecmascript = "0.134.0"
-boa_engine = "0.21.1"
-oxc_ast_visit = "0.134.0"
-rayon = "1"
+oxc_ast_visit  = "0.134.0"
+boa_engine     = "0.21.1"
+rayon          = "1"
 
 [profile.release]
 opt-level = 3
