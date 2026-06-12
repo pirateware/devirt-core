@@ -15,3 +15,14 @@ path = "src/main.rs"
 
 [dependencies]
 devirt-core.workspace = true
+
+# Lets `cargo binstall devirt-cli` download the prebuilt `deob` archives produced
+# by .github/workflows/release.yml instead of compiling from source. The release
+# tag is `v{version}`, the archive is `deob-v{version}-{target}`.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/deob-v{ version }-{ target }{ archive-suffix }"
+bin-dir = "deob{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"

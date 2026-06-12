@@ -1,0 +1,67 @@
+name: Release binaries
+
+# Cross-compile the `deob` CLI for the common desktop targets and attach the
+# archives (+ sha256 checksums) to the GitHub release for the tag.
+#
+# Runs automatically on every `v*` tag push. To backfill a tag that was created
+# before this workflow existed, dispatch it manually from the Actions tab and
+# pass that tag (e.g. v0.3.0) as the input.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build from and upload to (e.g. v0.3.0)'
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  upload:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu,  os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-latest }
+          - { target: x86_64-apple-darwin,        os: macos-latest }
+          - { target: aarch64-apple-darwin,       os: macos-latest }
+          - { target: x86_64-pc-windows-msvc,     os: windows-latest }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Cross linker for non-native Linux targets (a no-op for the native one).
+      - name: Set up cross toolchain
+        if: runner.os == 'Linux'
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Build and upload `deob`
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: deob
+          package: devirt-cli
+          target: ${{ matrix.target }}
+          archive: deob-$tag-$target
+          tar: unix
+          zip: windows
+          checksum: sha256
+          locked: true
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}

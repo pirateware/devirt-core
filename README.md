@@ -23,6 +23,22 @@ nothing (fixpoint). Passes live in `src/passes/` and are registered in
 Control-flow recovery uses an SSA-based IR (`src/ir/`) with dominator analysis and
 a relooper to rebuild structured code from flattened dispatchers.
 
+## Install
+
+Prebuilt `deob` binaries for Linux, macOS, and Windows (x86_64 + arm64) are
+attached to each [release](https://github.com/devirt-dev/devirt-core/releases).
+
+```sh
+# No Rust toolchain needed — download the prebuilt binary via cargo-binstall:
+cargo binstall --git https://github.com/devirt-dev/devirt-core devirt-cli
+
+# …or build + install from source (needs a Rust toolchain):
+cargo install --git https://github.com/devirt-dev/devirt-core devirt-cli
+```
+
+Either way you get a `deob` binary on your `PATH`. You can also grab an archive
+directly from the releases page and drop `deob` somewhere on your `PATH`.
+
 ## Layout
 
 This is a Cargo workspace with three crates under `crates/`:
