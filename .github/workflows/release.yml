@@ -18,6 +18,13 @@ on:
 permissions:
   contents: write
 
+# Windows GitHub runners intermittently drop crates.io downloads with HTTP/2
+# stream resets ("Failed receiving HTTP2 data"); disabling multiplexing makes
+# cargo's fetches reliable.
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "5"
+
 concurrency:
   group: release-${{ inputs.tag || github.ref }}
   cancel-in-progress: false
